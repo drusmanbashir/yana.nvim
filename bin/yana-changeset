@@ -1,0 +1,459 @@
+#!/usr/bin/env python3
+# yana-changeset — walk overlay upper layer and emit typed operations.
+"""Read an overlay upper directory against a workspace lower tree and emit typed
+operations as NUL-delimited records on stdout. Metadata goes to --meta-out only."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import os
+import stat
+import sys
+
+VERSION = "yana-changeset-v1"
+OPAQUE_XATTR = "user.overlay.opaque"
+
+# Control-plane floor — the Python mirror of lua/yana/safety/control_plane.lua.
+# A control-plane path belongs to another program's own state machine (git, hg,
+# svn); it is walked and COUNTED so nothing is silent, but is never emitted as a
+# reviewable content operation. the fixed safety contract control-plane invariant;
+# the immutable control-plane rules "Wall 4". The floor is immutable — config may
+# ADD segments, never remove one — so a lower-cased set is unioned with the
+# floor unconditionally. Kept deliberately identical to the Lua module across
+# this process boundary; both cite the spec as the single source of truth.
+CONTROL_PLANE_FLOOR = (".git", ".hg", ".svn")
+
+
+def control_plane_segments(extra=None) -> set[str]:
+    segs: set[str] = set()
+    if extra:
+        for seg in extra:
+            if isinstance(seg, str) and seg:
+                segs.add(seg.lower())
+    segs.update(CONTROL_PLANE_FLOOR)  # floor wins; cannot be removed by config
+    return segs
+
+
+def is_control_plane(rel: str, segments: set[str] | None = None) -> bool:
+    """Lexical, workspace-relative segment match, case-folded, anywhere in the
+    path — the segment itself or any descendant. Segment match, never prefix:
+    `.gitignore`, `.github`, `foo.git` are ALLOWED; `.git`, `.git/config`,
+    `a/.GIT/b` are refused."""
+    if not isinstance(rel, str) or rel == "":
+        return False
+    if segments is None:
+        segs = control_plane_segments()
+    else:
+        # Union the immutable floor even into a supplied set — an empty or
+        # A caller-supplied set can never remove `.git`/`.hg`/`.svn`.
+        segs = set(segments) | {s.lower() for s in CONTROL_PLANE_FLOOR}
+    for part in rel.split("/"):
+        if part and part.lower() in segs:
+            return True
+    return False
+
+
+# Top-level entries of a BARE repository — mirror of control_plane.lua BARE_NAMES.
+BARE_NAMES = frozenset(
+    {
+        "head",
+        "config",
+        "objects",
+        "refs",
+        "packed-refs",
+        "hooks",
+        "info",
+        "branches",
+        "description",
+        "orig_head",
+        "fetch_head",
+        "logs",
+        "worktrees",
+        "index",
+    }
+)
+
+
+def is_bare_entry(rel: str) -> bool:
+    """Whether the FIRST segment is a bare-repo root entry. The caller must have
+    proven the workspace is bare; this only classifies the name."""
+    if not isinstance(rel, str) or rel == "":
+        return False
+    return rel.split("/", 1)[0].lower() in BARE_NAMES
+
+
+def workspace_is_bare(workspace: str) -> bool:
+    """Proof (not a name-guess) that the workspace root is a bare repository: the
+    HEAD/objects/refs triad plus a config marked `core.bare = true`. An ordinary
+    project with a stray top-level HEAD is NOT treated as bare (no false refusal)."""
+    import re as _re
+
+    if not (
+        os.path.exists(os.path.join(workspace, "HEAD"))
+        and os.path.isdir(os.path.join(workspace, "objects"))
+        and os.path.isdir(os.path.join(workspace, "refs"))
+    ):
+        return False
+    try:
+        with open(os.path.join(workspace, "config"), "r", encoding="utf-8", errors="replace") as f:
+            cfg = f.read()
+    except OSError:
+        return False
+    return _re.search(r"bare\s*=\s*true", cfg) is not None
+
+
+# Fingerprint recorded when the lower layer holds no regular file at the touched
+# path. An agent-created file is reviewed against the empty content, so this is
+# the value the accept-time recheck compares with.
+ABSENT_FINGERPRINT = hashlib.sha256(b"").hexdigest()
+
+
+class ChangesetError(Exception):
+    pass
+
+
+def die_usage(msg: str) -> None:
+    print(f"yana-changeset: {msg}", file=sys.stderr)
+    print("yana-changeset: run with --help for usage", file=sys.stderr)
+    sys.exit(64)
+
+
+def realpath(path: str) -> str:
+    return os.path.realpath(path)
+
+
+def is_whiteout(st: os.stat_result) -> bool:
+    return stat.S_ISCHR(st.st_mode) and st.st_rdev == 0
+
+
+def read_opaque(path: str) -> bool:
+    try:
+        attrs = os.listxattr(path)
+    except OSError as exc:
+        raise ChangesetError(f"cannot read xattrs on {path}: {exc}") from exc
+    if OPAQUE_XATTR not in attrs:
+        return False
+    try:
+        val = os.getxattr(path, OPAQUE_XATTR)
+    except OSError as exc:
+        raise ChangesetError(f"cannot read {OPAQUE_XATTR} on {path}: {exc}") from exc
+    return val in (b"y", b"Y")
+
+
+def read_symlink_target(path: str) -> str:
+    try:
+        return os.readlink(path)
+    except OSError as exc:
+        raise ChangesetError(f"cannot read symlink {path}: {exc}") from exc
+
+
+def read_file_bytes(path: str) -> bytes:
+    try:
+        with open(path, "rb") as f:
+            return f.read()
+    except OSError as exc:
+        raise ChangesetError(f"cannot read file {path}: {exc}") from exc
+
+
+def mode_bits(st: os.stat_result) -> int:
+    return stat.S_IMODE(st.st_mode)
+
+
+def file_kind(st: os.stat_result) -> str:
+    if stat.S_ISREG(st.st_mode):
+        return "file"
+    if stat.S_ISDIR(st.st_mode):
+        return "dir"
+    if stat.S_ISLNK(st.st_mode):
+        return "symlink"
+    if stat.S_ISCHR(st.st_mode):
+        return "char"
+    if stat.S_ISBLK(st.st_mode):
+        return "block"
+    if stat.S_ISFIFO(st.st_mode):
+        return "fifo"
+    if stat.S_ISSOCK(st.st_mode):
+        return "sock"
+    return "other"
+
+
+def encode_record(fields: list[str | bytes]) -> bytes:
+    out = bytearray()
+    for i, field in enumerate(fields):
+        if i:
+            out.append(0)
+        if isinstance(field, str):
+            out.extend(field.encode("utf-8", "surrogateescape"))
+        else:
+            out.extend(field)
+    out.append(0)
+    out.append(0)
+    return bytes(out)
+
+
+def lstat_lower(lower_path: str) -> os.stat_result | None:
+    try:
+        return os.lstat(lower_path)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise ChangesetError(f"cannot stat lower path {lower_path}: {exc}") from exc
+
+
+def lower_evidence(lower_path: str, st_lower: os.stat_result | None) -> list[str]:
+    """The tagged before-state of one touched path, as the fields that follow it.
+
+    One observation, emitted whole: the fingerprint slot first, then the tag and
+    whatever that tag needs (mode for a file or a symlink, target for a symlink,
+    the real kind for anything else). A state with no content — absence, a
+    symlink, a directory — carries the empty fingerprint in that slot, because
+    the consumer requires a fingerprint field on every record and the tag is
+    what separates those states from an empty file.
+
+    `st_lower` is passed in rather than looked up here so the caller's single
+    lstat is the one the evidence describes.
+    """
+    if st_lower is None:
+        return [ABSENT_FINGERPRINT, "state=absent"]
+    kind = file_kind(st_lower)
+    if kind == "file":
+        return [
+            hashlib.sha256(read_file_bytes(lower_path)).hexdigest(),
+            "state=file",
+            f"mode={mode_bits(st_lower):o}",
+        ]
+    if kind == "symlink":
+        return [
+            ABSENT_FINGERPRINT,
+            "state=link",
+            f"mode={mode_bits(st_lower):o}",
+            f"target={read_symlink_target(lower_path)}",
+        ]
+    return [ABSENT_FINGERPRINT, "state=other", f"kind={kind}"]
+
+
+def compare_path(upper_path: str, lower_path: str, st_upper: os.stat_result) -> list[list[str]]:
+    """Classify one upper entry against the lower layer.
+
+    A whole-file content operation carries its own before-EVIDENCE after the
+    fingerprint: the tagged lower state (`absent`, `file`, `link`, or `other`
+    with the kind), plus the mode and symlink target where those exist. All of
+    it comes from THE SAME lower-layer observation that decided the operation
+    exists.
+
+    That is the point of emitting it here rather than letting the caller look
+    again: between two observations a human save can land, and evidence recorded
+    from the later one describes a file the classification never saw. A path that
+    was ABSENT when classified and has since been created reads back as an empty
+    file, whose fingerprint equals the empty fingerprint the create was recorded
+    with — so the accept-time recheck matches and overwrites a file nobody read.
+    The tag is what separates those two states, and it is only trustworthy if it
+    is taken here.
+    """
+    ops: list[list[str]] = []
+    upper_kind = file_kind(st_upper)
+
+    if upper_kind == "char" and is_whiteout(st_upper):
+        return ops
+
+    try:
+        st_lower = os.lstat(lower_path)
+    except FileNotFoundError:
+        if upper_kind == "dir":
+            ops.append(["create", "dir"])
+        elif upper_kind == "symlink":
+            ops.append(["create", "symlink", read_symlink_target(upper_path)])
+        elif upper_kind == "file":
+            ops.append(["create", "file", *lower_evidence(lower_path, None)])
+        else:
+            ops.append(["create", upper_kind])
+        return ops
+
+    lower_kind = file_kind(st_lower)
+    if upper_kind != lower_kind:
+        # The lower object exists and is not the kind the upper layer holds, so
+        # it has no content fingerprint. The evidence says so in full — the tag
+        # is the lower object's real kind, never absence — and a whole-file
+        # content operation over it is refused by name at staging rather than
+        # carried to an applier that can only refuse it there.
+        #
+        # The paired delete carries the SAME evidence, from the same lstat: it
+        # is a record of a real-tree action too, and a record without a tagged
+        # before-state is one a consumer would have to re-derive by looking
+        # again.
+        lower_ev = lower_evidence(lower_path, st_lower)
+        ops.append(["delete", lower_kind, *lower_ev])
+        if upper_kind == "symlink":
+            ops.append(["create", "symlink", read_symlink_target(upper_path)])
+        elif upper_kind == "file":
+            ops.append(["create", "file", *lower_ev])
+        elif upper_kind == "dir":
+            ops.append(["create", "dir"])
+        else:
+            ops.append(["create", upper_kind])
+        return ops
+
+    if upper_kind == "symlink":
+        upper_target = read_symlink_target(upper_path)
+        lower_target = read_symlink_target(lower_path)
+        if upper_target != lower_target:
+            ops.append(["symlink", upper_target])
+        elif mode_bits(st_upper) != mode_bits(st_lower):
+            ops.append(["mode", f"{mode_bits(st_upper):o}"])
+        return ops
+
+    if upper_kind == "dir":
+        if mode_bits(st_upper) != mode_bits(st_lower):
+            ops.append(["mode", f"{mode_bits(st_upper):o}"])
+        return ops
+
+    if upper_kind == "file":
+        upper_bytes = read_file_bytes(upper_path)
+        lower_bytes = read_file_bytes(lower_path)
+        changed_bytes = upper_bytes != lower_bytes
+        changed_mode = mode_bits(st_upper) != mode_bits(st_lower)
+        if changed_bytes:
+            # Fingerprint AND state of the very object `changed_bytes` was
+            # decided on: one observation, emitted whole. When the mode also
+            # changed, carry the after-mode on the same record so a compound
+            # edit stays one decision (shortlist 3b).
+            rec = [
+                "modify",
+                "file",
+                hashlib.sha256(lower_bytes).hexdigest(),
+                "state=file",
+                f"mode={mode_bits(st_lower):o}",
+            ]
+            if changed_mode:
+                rec.append(f"new-mode={mode_bits(st_upper):o}")
+            ops.append(rec)
+        elif changed_mode:
+            ops.append(["mode", f"{mode_bits(st_upper):o}"])
+        return ops
+
+    if mode_bits(st_upper) != mode_bits(st_lower):
+        ops.append(["mode", f"{mode_bits(st_upper):o}"])
+    return ops
+
+
+def on_walk_error(err: OSError) -> None:
+    raise ChangesetError(f"walk failed at {err.filename}: {err.strerror}") from err
+
+
+def walk_upper(workspace: str, upper: str) -> list[tuple[str, ...]]:
+    records: list[tuple[str, ...]] = []
+    cp_segments = control_plane_segments()
+    # Proven once per walk: if the workspace root is a bare repository, its
+    # top-level HEAD/objects/refs/config are control plane even without a `.git`
+    # segment. Ordinary projects are unaffected — the proof requires
+    # the config `bare = true` marker, not just the names.
+    ws_bare = workspace_is_bare(workspace)
+
+    for dirpath, dirnames, filenames in os.walk(upper, topdown=True, followlinks=False, onerror=on_walk_error):
+        rel_dir = "" if dirpath == upper else os.path.relpath(dirpath, upper)
+        if rel_dir == ".":
+            rel_dir = ""
+
+        dirnames.sort()
+        filenames = sorted(filenames)
+
+        entries = [(n, False) for n in dirnames] + [(n, True) for n in filenames]
+        for name, is_file in entries:
+            upper_path = os.path.join(dirpath, name)
+            rel = name if not rel_dir else f"{rel_dir}/{name}"
+
+            # Control-plane refusal at the producer. The path is
+            # still WALKED and RECORDED here — one `control-plane` record per
+            # path, a non-content kind — so the turn summary can count it ("wrote
+            # N control-plane files — discarded with the overlay") and nothing is
+            # silent. It is simply never emitted as a create/modify/delete, so it
+            # can never become a review offer or a reviewable typed operation.
+            # os.walk still descends into the directory, so every internal file
+            # is counted, not just the top segment.
+            if is_control_plane(rel, cp_segments) or (ws_bare and is_bare_entry(rel)):
+                records.append(("control-plane", rel))
+                continue
+
+            try:
+                st = os.lstat(upper_path)
+            except OSError as exc:
+                raise ChangesetError(f"cannot stat upper entry {upper_path}: {exc}") from exc
+
+            if is_whiteout(st):
+                # A WHITEOUT DELETE CARRIES ITS BEFORE-EVIDENCE LIKE EVERY OTHER
+                # RECORD. It used to carry the path and nothing else, so the one
+                # consumer that could act on it had to look at the real tree
+                # again to decide what it was deleting — a second observation,
+                # with a human save fitting between it and the classification
+                # this record already made. The applier destroys the whole object
+                # on this record's word; it is the last record that may travel
+                # without saying what it saw.
+                lower_path = os.path.join(workspace, rel)
+                st_lower = lstat_lower(lower_path)
+                detail = file_kind(st_lower) if st_lower is not None else "absent"
+                records.append(("delete", rel, detail, *lower_evidence(lower_path, st_lower)))
+                continue
+
+            if stat.S_ISDIR(st.st_mode):
+                lower_path = os.path.join(workspace, rel)
+                if read_opaque(upper_path):
+                    records.append(("opaque", rel))
+                for op_fields in compare_path(upper_path, lower_path, st):
+                    if op_fields[0] == "create" and ("opaque", rel) in records:
+                        continue
+                    records.append(tuple([op_fields[0], rel, *op_fields[1:]]))
+                continue
+
+            lower_path = os.path.join(workspace, rel)
+            for op_fields in compare_path(upper_path, lower_path, st):
+                records.append(tuple([op_fields[0], rel, *op_fields[1:]]))
+
+    records.sort(key=lambda r: (r[1], r[0]))
+    return records
+
+
+def write_meta(path: str, workspace: str, upper: str, count: int) -> None:
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(f"# {VERSION}\n")
+            f.write(f"workspace={workspace}\n")
+            f.write(f"upper={upper}\n")
+            f.write(f"count={count}\n")
+    except OSError as exc:
+        raise ChangesetError(f"cannot write meta file {path}: {exc}") from exc
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(prog="yana-changeset")
+    parser.add_argument("--workspace", required=True, help="Real workspace (lower) directory")
+    parser.add_argument("--upper", required=True, help="Overlay upper directory")
+    parser.add_argument("--meta-out", help="Metadata text file (out of band)")
+    args = parser.parse_args()
+
+    workspace = realpath(args.workspace)
+    upper = realpath(args.upper)
+
+    if not os.path.isdir(workspace):
+        die_usage(f"workspace is not a directory: {args.workspace}")
+    if not os.path.isdir(upper):
+        die_usage(f"upper is not a directory: {args.upper}")
+
+    try:
+        records = walk_upper(workspace, upper)
+        if args.meta_out:
+            write_meta(args.meta_out, workspace, upper, len(records))
+        out = sys.stdout.buffer
+        for rec in records:
+            out.write(encode_record(list(rec)))
+        try:
+            out.flush()
+        except BrokenPipeError:
+            sys.exit(0)
+    except ChangesetError as exc:
+        print(f"yana-changeset: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

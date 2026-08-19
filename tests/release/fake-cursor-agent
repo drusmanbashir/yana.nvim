@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+for arg in "$@"; do
+	if [[ "$arg" == "--list-models" ]]; then
+		printf 'Available models\n\nauto - Auto (current)\n'
+		exit 0
+	fi
+done
+
+printf '%s\n' \
+	'{"type":"system","subtype":"init","session_id":"yana-release-smoke","model":"Auto"}' \
+	'{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"release smoke"}]},"session_id":"yana-release-smoke"}' \
+	'{"type":"result","subtype":"success","is_error":false,"result":"release smoke","session_id":"yana-release-smoke","usage":{"inputTokens":1,"outputTokens":1}}'

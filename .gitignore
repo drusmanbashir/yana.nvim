@@ -1,0 +1,7 @@
+nvim.log
+.nvimlog
+tests/scratch/
+
+# macOS Finder
+.DS_Store
+.yana/

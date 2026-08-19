@@ -1,0 +1,591 @@
+#!/usr/bin/env bash
+# yana-sandbox — standalone bwrap confinement with refusal gates and self-check.
+set -euo pipefail
+
+readonly EXIT_USAGE=64
+readonly EXIT_REFUSE=65
+readonly EXIT_NO_SANDBOX=66
+readonly EXIT_SELF_CHECK=67
+
+if [[ -z "${HOME:-}" ]]; then
+	echo "yana-sandbox: HOME is unset - set HOME to the operator home" >&2
+	exit "$EXIT_USAGE"
+fi
+
+readonly DEFAULT_MAX_ROOT_SIZE=$((5 * 1024 * 1024 * 1024))
+readonly DEFAULT_MAX_ROOT_ENTRIES=500000
+
+# Root-approval cache. The size caps are a property of a root, not of a turn, so
+# the walk that enforces them runs once when the root is approved and every later
+# turn reads the recorded verdict in O(1) (the isolation contract, "Root size
+# caps are decided at approval").
+readonly ROOT_LIMITS_FILE="root-limits"
+readonly ROOT_LIMITS_VERSION=1
+
+BWRAP="${YANA_SANDBOX_BWRAP:-${YANA_JAIL_BWRAP:-bwrap}}"
+STATE_ROOT="${YANA_STATE_ROOT:-$HOME/.local/state/yana}"
+WORKSPACE=""
+SHADOW=""
+PRIVATE=""
+MAX_ROOT_SIZE="$DEFAULT_MAX_ROOT_SIZE"
+MAX_ROOT_ENTRIES="$DEFAULT_MAX_ROOT_ENTRIES"
+CHECK_ONLY=0
+PREFLIGHT_ONLY=0
+APPROVE_ROOT=0
+CMD=()
+
+usage() {
+	cat <<'EOF'
+Usage: yana-sandbox --workspace DIR --shadow DIR [--private DIR]
+                         [--state-root DIR]
+                         [--max-root-size BYTES] [--max-root-entries N]
+                         [--check | --preflight-only] -- CMD [ARGS...]
+       yana-sandbox --approve-root --workspace DIR [--state-root DIR]
+                         [--max-root-size BYTES] [--max-root-entries N]
+
+--approve-root walks the root once, checks it against the size caps, and records
+the verdict under the root's own state directory, keyed by the root's filesystem
+identity. Every later turn reads that verdict in constant time: --preflight-only
+never walks, and refuses when no verdict is recorded for the root's current
+identity. Approve a root again after it moves, is replaced, or grows.
+
+Exit codes:
+  64  usage error
+  65  structural or size refusal (override size caps with the flags named in the message)
+  66  sandbox unavailable (bwrap missing or namespace creation failed)
+  67  confinement self-check failed
+  other  confined command exit code, passed through unchanged
+
+~/.cursor is bind-mounted read-write to the real host directory so cursor-agent can
+refresh credentials; it is the only host path the confined command can write.
+EOF
+}
+
+die_usage() {
+	echo "yana-sandbox: $*" >&2
+	echo "yana-sandbox: run with --help for usage" >&2
+	exit "$EXIT_USAGE"
+}
+
+refuse() {
+	echo "yana-sandbox: $*" >&2
+	exit "$EXIT_REFUSE"
+}
+
+refuse_no_sandbox() {
+	echo "yana-sandbox: $*" >&2
+	exit "$EXIT_NO_SANDBOX"
+}
+
+refuse_self_check() {
+	echo "yana-sandbox: confinement self-check failed: $*" >&2
+	exit "$EXIT_SELF_CHECK"
+}
+
+realpath_safe() {
+	local target=$1
+	if [[ ! -e "$target" ]]; then
+		local dir
+		dir=$(dirname -- "$target")
+		dir=$(realpath_safe "$dir")
+		echo "${dir%/}/$(basename -- "$target")"
+		return 0
+	fi
+	readlink -f -- "$target"
+}
+
+components_below_root() {
+	local p="${1%/}"
+	if [[ -z "$p" || "$p" == "/" ]]; then
+		echo 0
+		return
+	fi
+	local rest="${p#/}"
+	local count=1
+	local tail="$rest"
+	while [[ "$tail" == */* ]]; do
+		count=$((count + 1))
+		tail="${tail#*/}"
+	done
+	echo "$count"
+}
+
+path_is_prefix() {
+	local parent=$1 child=$2
+	[[ "$child" == "$parent" || "$child" == "$parent"/* ]]
+}
+
+ensure_bwrap() {
+	if [[ ! -x "$BWRAP" ]] && ! command -v "$BWRAP" >/dev/null 2>&1; then
+		refuse_no_sandbox "bwrap not found at '$BWRAP' — install bubblewrap or set YANA_SANDBOX_BWRAP"
+	fi
+	if [[ ! -x "$BWRAP" ]]; then
+		BWRAP=$(command -v "$BWRAP")
+	fi
+}
+
+validate_workspace() {
+	local ws_real passwd_home env_home depth
+
+	ws_real=$(realpath_safe "$WORKSPACE")
+	passwd_home=$(getent passwd "${USER:-$(id -un)}" 2>/dev/null | cut -d: -f6 || true)
+	if [[ -n "$passwd_home" ]]; then
+		passwd_home=$(realpath_safe "$passwd_home")
+	fi
+	env_home=""
+	if [[ -n "${HOME:-}" ]]; then
+		env_home=$(realpath_safe "$HOME")
+	fi
+
+	if [[ "$ws_real" == "/" ]]; then
+		refuse "workspace resolves to / — refusing to sandbox the filesystem root"
+	fi
+	if [[ -n "$passwd_home" && "$ws_real" == "$passwd_home" ]]; then
+		refuse "workspace resolves to the user home directory ($passwd_home, passwd lookup) — pick a project subdirectory"
+	fi
+	if [[ -n "$env_home" && "$ws_real" == "$env_home" ]]; then
+		refuse "workspace resolves to the user home directory ($env_home, \$HOME) — pick a project subdirectory"
+	fi
+	depth=$(components_below_root "$ws_real")
+	if (( depth < 2 )); then
+		refuse "workspace '$ws_real' has fewer than 2 path components below root — pick a deeper directory (e.g. /home/user/project)"
+	fi
+	if [[ ! -d "$ws_real" ]]; then
+		refuse "workspace '$WORKSPACE' does not exist or is not a directory"
+	fi
+
+	WORKSPACE="$ws_real"
+
+	# The root's own state directory holds the approval verdict, so it is subject
+	# to the same disjointness rule bin/yana-turn applies: state inside the
+	# workspace would be covered by the overlay mount and read back as a change.
+	STATE_ROOT=$(realpath_safe "$STATE_ROOT")
+	if path_is_prefix "$WORKSPACE" "$STATE_ROOT" || path_is_prefix "$STATE_ROOT" "$WORKSPACE"; then
+		refuse "state root ($STATE_ROOT) must be disjoint from workspace ($WORKSPACE) — pass --state-root DIR"
+	fi
+}
+
+validate_shadow_paths() {
+	local sh_real
+	sh_real=$(realpath_safe "$SHADOW")
+
+	if [[ ! -d "$sh_real" ]]; then
+		refuse "shadow '$SHADOW' does not exist or is not a directory"
+	fi
+	if path_is_prefix "$WORKSPACE" "$sh_real" || path_is_prefix "$sh_real" "$WORKSPACE"; then
+		refuse "shadow and workspace must not nest (workspace=$WORKSPACE shadow=$sh_real)"
+	fi
+	local tmp_real
+	tmp_real=$(realpath_safe /tmp)
+	if path_is_prefix "$tmp_real" "$sh_real"; then
+		refuse "shadow under /tmp ($tmp_real) — /tmp is a fresh tmpfs inside the sandbox and cannot hold a shadow; use a persistent path (e.g. under \$HOME or /s/)"
+	fi
+
+	SHADOW="$sh_real"
+	if [[ -z "$PRIVATE" ]]; then
+		PRIVATE="${SHADOW%/}/../private"
+	fi
+	PRIVATE=$(realpath_safe "$PRIVATE")
+	mkdir -p "$PRIVATE"
+}
+
+refuse_size_cap() {
+	refuse "workspace exceeds --max-root-size cap ($MAX_ROOT_SIZE bytes) — override with --max-root-size BYTES"
+}
+
+refuse_entries_cap() {
+	refuse "workspace exceeds --max-root-entries cap ($MAX_ROOT_ENTRIES entries) — override with --max-root-entries N"
+}
+
+# Filesystem identity, not spelling. `readlink -f` resolves symlinks; it does not
+# resolve bind mounts, so two disjoint pathnames can name one directory and one
+# pathname can name two directories over time. The approval verdict is therefore
+# keyed on (st_dev, st_ino, birth) — device and inode as a bind alias preserves
+# them, plus inode birth time so a recycled inode created later cannot inherit
+# the previous directory's verdict. The slug stays (st_dev, st_ino) only: it
+# names the state directory, it does not decide applicability.
+#
+# Birth is read with `stat %w`, NOT `%W`. `%W` is whole seconds, and ext4 hands
+# a delete/recreate the just-freed inode straight back, so a root replaced
+# inside one wall-clock second produced an identical (dev, ino, %W) triple and
+# inherited the previous root's approval. `%w` carries nanoseconds and separates
+# them. `%w` is a formatted local timestamp with spaces, colons and a zone
+# offset ("2026-08-19 04:24:24.952399512 +0100"), which neither the record's
+# key=value line format nor the malformed-verdict regex can carry, so it is
+# normalised through `date +%s%N` into epoch nanoseconds: pure digits, one
+# field, zone-independent, and comparable whole exactly as before.
+#
+# A missing, unparseable or zero birth time is a refusal, never a fallback to
+# the weaker pair.
+#
+# Prints "dev:ino:birthns" when identity is established, "nobirth:VALUE" when
+# the filesystem reports no usable inode birth time, and nothing when the path
+# cannot be stat'ed at all. It never refuses itself: every caller reads it
+# through a command substitution, and `exit` inside one kills only the subshell,
+# so a refusal raised here would be discarded and the run would continue.
+path_identity() {
+	local raw dev ino rest birth nanos
+	raw=$(stat -c '%d:%i:%w' -- "$1" 2>/dev/null) || true
+	if [[ -z "$raw" ]]; then
+		return 0
+	fi
+	dev=${raw%%:*}
+	rest=${raw#*:}
+	ino=${rest%%:*}
+	birth=${rest#*:}
+	if [[ -z "$birth" || "$birth" == "-" || "$birth" == "?" || "$birth" == 0* ]]; then
+		printf 'nobirth:%s' "${birth:-empty}"
+		return 0
+	fi
+	nanos=$(date -d "$birth" +%s%N 2>/dev/null) || true
+	if [[ ! "$nanos" =~ ^[1-9][0-9]*$ ]]; then
+		printf 'nobirth:%s' "$birth"
+		return 0
+	fi
+	printf '%s:%s:%s' "$dev" "$ino" "$nanos"
+}
+
+# The refusal for a filesystem with no inode birth time. Named separately from
+# the approval-mismatch refusal because re-approving cannot help: the weaker
+# (st_dev, st_ino) pair is what inode reuse defeats, so there is nothing to
+# fall back to.
+refuse_no_birth() {
+	refuse "cannot establish filesystem identity for the workspace ($WORKSPACE) — this filesystem reports no usable inode birth time (stat %w=${1#nobirth:}). Device and inode alone are reused, so approval cannot be keyed safely here; refusing rather than comparing the weaker pair."
+}
+
+# Byte-identical to bin/yana-turn's workspace_slug and to
+# lua/yana/shadow/preview.lua, so all three name one per-root directory.
+workspace_slug() {
+	local id
+	id=$(stat -c '%d:%i' -- "$1" 2>/dev/null) || true
+	if [[ -n "$id" ]]; then
+		printf '%s' "$id" | sha256sum | awk '{print substr($1,1,16)}'
+	else
+		printf '%s' "$1" | sha256sum | awk '{print substr($1,1,16)}'
+	fi
+}
+
+root_state_dir() {
+	printf '%s/turns/%s' "${STATE_ROOT%/}" "$(workspace_slug "$WORKSPACE")"
+}
+
+root_limits_file() {
+	printf '%s/%s' "$(root_state_dir)" "$ROOT_LIMITS_FILE"
+}
+
+# The whole-root walk. It runs at approval and nowhere else; YANA_SANDBOX_WALK_TRACE
+# records every call so a gate can prove a turn performs none.
+# Prints "size", "entries", "ok <entries> <bytes>", or nothing when nothing was readable.
+walk_root_limits() {
+	if [[ -n "${YANA_SANDBOX_WALK_TRACE:-}" ]]; then
+		printf '%s %s\n' "$$" "$WORKSPACE" >>"$YANA_SANDBOX_WALK_TRACE" 2>/dev/null || true
+	fi
+	find "$WORKSPACE" -xdev -printf '%y %s\n' 2>/dev/null | awk -v max_bytes="$MAX_ROOT_SIZE" -v max_entries="$MAX_ROOT_ENTRIES" '
+		{ entries++; if ($1 == "f" || $1 == "l") bytes += $2 }
+		bytes > max_bytes { hit = 1; print "size"; exit }
+		entries > max_entries { hit = 1; print "entries"; exit }
+		END { if (!hit && entries > 0) printf "ok %d %d\n", entries, bytes + 0 }
+	' || true
+}
+
+# Approve this root: walk once, then record the verdict against the root identity.
+# An over-cap root records nothing, so it stays unapproved and every turn refuses.
+approve_root() {
+	local verdict entries bytes identity dir file tmp
+	identity=$(path_identity "$WORKSPACE")
+	if [[ "$identity" == nobirth:* ]]; then
+		refuse_no_birth "$identity"
+	fi
+	if [[ -z "$identity" ]]; then
+		refuse "cannot establish filesystem identity for the workspace ($WORKSPACE) — refusing to approve it"
+	fi
+
+	verdict=$(walk_root_limits)
+	case "$verdict" in
+		size) refuse_size_cap ;;
+		entries) refuse_entries_cap ;;
+		ok\ *)
+			entries=${verdict#ok }
+			bytes=${entries#* }
+			entries=${entries%% *}
+			;;
+		*)
+			refuse "cannot walk workspace '$WORKSPACE' — no entry was readable, so no size verdict can be recorded"
+			;;
+	esac
+
+	dir=$(root_state_dir)
+	file="$dir/$ROOT_LIMITS_FILE"
+	mkdir -p "$dir" || refuse "cannot create the root's state directory ($dir)"
+	if [[ -L "$file" ]]; then
+		refuse "root size verdict path is a symlink ($file) — remove it and approve the root again"
+	fi
+	tmp=$(mktemp "$dir/.$ROOT_LIMITS_FILE.XXXXXX") || refuse "cannot write the root's state directory ($dir)"
+	{
+		printf 'version=%s\n' "$ROOT_LIMITS_VERSION"
+		printf 'identity=%s\n' "$identity"
+		printf 'path=%s\n' "$WORKSPACE"
+		printf 'entries=%s\n' "$entries"
+		printf 'bytes=%s\n' "$bytes"
+		printf 'approved-at=%s\n' "$(date -Iseconds)"
+	} >"$tmp"
+	mv -f "$tmp" "$file"
+	echo "yana-sandbox: root approved ($WORKSPACE identity=$identity entries=$entries bytes=$bytes)"
+}
+
+# The per-turn path. Constant time: one stat and one small file read, never a walk.
+# Missing, unreadable, malformed, or identity-mismatched verdict refuses the turn.
+require_approved_root() {
+	local file identity key value
+	local c_version="" c_identity="" c_entries="" c_bytes=""
+
+	identity=$(path_identity "$WORKSPACE")
+	if [[ "$identity" == nobirth:* ]]; then
+		refuse_no_birth "$identity"
+	fi
+	if [[ -z "$identity" ]]; then
+		refuse "cannot establish filesystem identity for the workspace ($WORKSPACE)"
+	fi
+
+	file=$(root_limits_file)
+	if [[ -L "$file" || ! -f "$file" || ! -r "$file" ]]; then
+		refuse "workspace root is not approved: no size verdict at '$file' — approve it once with: yana-sandbox --approve-root --workspace '$WORKSPACE'"
+	fi
+
+	while IFS='=' read -r key value; do
+		case "$key" in
+			version) c_version=$value ;;
+			identity) c_identity=$value ;;
+			entries) c_entries=$value ;;
+			bytes) c_bytes=$value ;;
+		esac
+	done <"$file"
+
+	# Identity must carry device, inode AND a birth time in epoch NANOseconds.
+	# The width is what rejects both a pre-birth record (dev:ino only) and a
+	# record written when birth was whole seconds (10 digits): both are unusable,
+	# and refusing here makes the operator re-approve once.
+	if [[ "$c_version" != "$ROOT_LIMITS_VERSION" \
+		|| ! "$c_entries" =~ ^[0-9]+$ || ! "$c_bytes" =~ ^[0-9]+$ \
+		|| ! "$c_identity" =~ ^[0-9]+:[0-9]+:[1-9][0-9]{18}$ ]]; then
+		refuse "workspace root size verdict at '$file' is unreadable or malformed — approve the root again with: yana-sandbox --approve-root --workspace '$WORKSPACE'"
+	fi
+	if [[ "$c_identity" != "$identity" ]]; then
+		refuse "workspace root identity changed since approval (approved $c_identity, now $identity) — approve the root again with: yana-sandbox --approve-root --workspace '$WORKSPACE'"
+	fi
+
+	if (( c_bytes > MAX_ROOT_SIZE )); then
+		refuse_size_cap
+	fi
+	if (( c_entries > MAX_ROOT_ENTRIES )); then
+		refuse_entries_cap
+	fi
+}
+
+operator_home() {
+	local h
+	h=$(getent passwd "${USER:-$(id -un)}" 2>/dev/null | cut -d: -f6 || true)
+	echo "${h:-$HOME}"
+}
+
+build_bwrap_args() {
+	local -n _out=$1
+	local operator_home inner_home real_path cache_root
+	operator_home=$(operator_home)
+	inner_home="${HOME:-$operator_home}"
+	real_path="${PATH:-}"
+	if [[ -z "$real_path" || "$real_path" != *".local/bin"* ]]; then
+		real_path="$operator_home/.local/bin:/usr/local/bin:/usr/bin:/bin${real_path:+:$real_path}"
+	fi
+
+	cache_root="$operator_home/.local/state/yana/agent-caches"
+	local cursor_agent_share="$operator_home/.local/share/cursor-agent"
+	local cursor_agent_versions="$cursor_agent_share/versions"
+	mkdir -p \
+		"$cache_root/npm" \
+		"$cache_root/compile-cache" \
+		"$cache_root/cursor-agent-share" \
+		"$operator_home/.cursor" \
+		"$PRIVATE"
+
+	_out=(
+		--die-with-parent
+		--new-session
+		--ro-bind / /
+		--tmpfs /tmp
+		--bind "$SHADOW" "$WORKSPACE"
+		--bind "$PRIVATE" "$PRIVATE"
+		--bind "$operator_home/.cursor" "$operator_home/.cursor"
+		--bind "$cache_root/npm" "$operator_home/.npm"
+		--bind "$cache_root/compile-cache" "$operator_home/.cache/cursor-compile-cache"
+		--bind "$cache_root/cursor-agent-share" "$cursor_agent_share"
+		--ro-bind-try "$cursor_agent_versions" "$cursor_agent_versions"
+		--dev /dev
+		--proc /proc
+		--unshare-uts
+		--clearenv
+		--setenv HOME "$inner_home"
+		--setenv PATH "$real_path"
+		--setenv USER "${USER:-yana}"
+		--setenv PWD "$WORKSPACE"
+		--setenv TERM "${TERM:-xterm-256color}"
+		--setenv YANA_SHADOW_CANARY "$SHADOW"
+	)
+
+	local var
+	for var in LANG LC_ALL LC_CTYPE LC_MESSAGES; do
+		if [[ -n "${!var:-}" ]]; then
+			_out+=(--setenv "$var" "${!var}")
+		fi
+	done
+
+	local name
+	while IFS= read -r name; do
+		case "$name" in
+			GIT_*)
+				_out+=(--setenv "$name" "${!name}")
+				;;
+		esac
+	done < <(compgen -e)
+}
+
+run_self_check() {
+	local bwrap_args=()
+	build_bwrap_args bwrap_args
+	local probe=(
+		/bin/sh -c '
+ws="$YANA_PROBE_WORKSPACE"
+canary="$YANA_SHADOW_CANARY"
+probe="$ws/.yana-selfcheck-writable"
+if ! ( : >"$probe" ) 2>/dev/null; then
+  echo "workspace is not writable inside the sandbox ($ws)" >&2
+  exit 1
+fi
+rm -f "$probe"
+leak="$canary/.yana-selfcheck-leak"
+if ( : >"$leak" ) 2>/dev/null; then
+  rm -f "$leak"
+  echo "shadow host path is writable inside the sandbox ($canary)" >&2
+  exit 1
+fi
+if ( : >/etc/.yana-selfcheck-leak ) 2>/dev/null; then
+  rm -f /etc/.yana-selfcheck-leak
+  echo "/etc is writable inside the sandbox" >&2
+  exit 1
+fi
+exit 0
+'
+	)
+	if ! "$BWRAP" "${bwrap_args[@]}" \
+		--setenv YANA_PROBE_WORKSPACE "$WORKSPACE" \
+		--chdir "$WORKSPACE" -- "${probe[@]}"; then
+		refuse_self_check "probe bwrap exited non-zero — see stderr above"
+	fi
+}
+
+parse_args() {
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+			--workspace)
+				[[ $# -ge 2 ]] || die_usage "--workspace requires a directory"
+				WORKSPACE=$2
+				shift 2
+				;;
+			--shadow)
+				[[ $# -ge 2 ]] || die_usage "--shadow requires a directory"
+				SHADOW=$2
+				shift 2
+				;;
+			--private)
+				[[ $# -ge 2 ]] || die_usage "--private requires a directory"
+				PRIVATE=$2
+				shift 2
+				;;
+			--state-root)
+				[[ $# -ge 2 ]] || die_usage "--state-root requires a directory"
+				STATE_ROOT=$2
+				shift 2
+				;;
+			--max-root-size)
+				[[ $# -ge 2 ]] || die_usage "--max-root-size requires BYTES"
+				[[ "$2" =~ ^[0-9]+$ ]] || die_usage "--max-root-size requires BYTES as a whole number, got '$2'"
+				MAX_ROOT_SIZE=$2
+				shift 2
+				;;
+			--max-root-entries)
+				[[ $# -ge 2 ]] || die_usage "--max-root-entries requires N"
+				[[ "$2" =~ ^[0-9]+$ ]] || die_usage "--max-root-entries requires N as a whole number, got '$2'"
+				MAX_ROOT_ENTRIES=$2
+				shift 2
+				;;
+			--approve-root)
+				APPROVE_ROOT=1
+				shift
+				;;
+			--check)
+				CHECK_ONLY=1
+				shift
+				;;
+			--preflight-only)
+				PREFLIGHT_ONLY=1
+				shift
+				;;
+			--help|-h)
+				usage
+				exit 0
+				;;
+			--)
+				shift
+				CMD=("$@")
+				break
+				;;
+			-*)
+				die_usage "unknown option: $1"
+				;;
+			*)
+				die_usage "unexpected argument: $1 (options must precede --)"
+				;;
+		esac
+	done
+}
+
+main() {
+	parse_args "$@"
+
+	if (( APPROVE_ROOT )); then
+		[[ -n "$WORKSPACE" ]] || die_usage "--approve-root requires --workspace"
+		(( PREFLIGHT_ONLY == 0 && CHECK_ONLY == 0 && ${#CMD[@]} == 0 )) \
+			|| die_usage "--approve-root approves a root and runs nothing; drop --check, --preflight-only and -- CMD"
+		validate_workspace
+		approve_root
+		exit 0
+	fi
+
+	[[ -n "$WORKSPACE" && -n "$SHADOW" ]] || die_usage "--workspace and --shadow are required"
+
+	validate_workspace
+	validate_shadow_paths
+	# O(1): the size caps were decided when the root was approved. Structural
+	# refusals keep their old precedence by running first.
+	require_approved_root
+	if (( PREFLIGHT_ONLY )); then
+		exit 0
+	fi
+
+	ensure_bwrap
+	run_self_check
+
+	if (( CHECK_ONLY )); then
+		echo "yana-sandbox: check PASS (workspace=$WORKSPACE shadow=$SHADOW)"
+		exit 0
+	fi
+
+	(( ${#CMD[@]} > 0 )) || die_usage "missing command after --"
+
+	local bwrap_args=()
+	build_bwrap_args bwrap_args
+	bwrap_args+=(--chdir "$WORKSPACE" -- "${CMD[@]}")
+	exec "$BWRAP" "${bwrap_args[@]}"
+}
+
+main "$@"

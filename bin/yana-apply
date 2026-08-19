@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# yana-apply — headless CLI for the journaled applier.
+#
+# Deviation from "no Neovim": no editor session, UI, config, or event loop — the
+# nvim binary is used only as the Lua runtime, same as items 0/1 use bash. The
+# The safety contract requires exactly one door to the real disk, so a second write path in
+# shell/python is forbidden.
+set -euo pipefail
+
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO="$(cd "$DIR/.." && pwd)"
+NVIM="${YANA_APPLY_NVIM:-nvim}"
+
+if [[ ${1:-} == "--help" || ${1:-} == "-h" ]]; then
+	cat <<'EOF'
+Usage: yana-apply apply --workspace DIR --changes DIR --diary DIR [OPTIONS]
+       yana-apply recover --diary DIR --out DIR
+
+Runs the journaled applier in a clean headless Neovim process. Run a subcommand
+without enough arguments for its complete option list.
+EOF
+	exit 0
+fi
+
+exec "$NVIM" --clean -l "$REPO/lua/yana/cli/apply.lua" "$@"

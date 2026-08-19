@@ -1,0 +1,166 @@
+*yana.txt*                         Yana                         version 0.1.0-rc.1
+
+==============================================================================
+CONTENTS                                                        *yana-contents*
+
+1. Introduction ................................................. |yana|
+2. Requirements ...................................... |yana-requirements|
+3. Commands ................................................ |yana-commands|
+4. Configuration ...................................... |yana-configuration|
+5. Security ................................................ |yana-security|
+6. Health .................................................... |yana-health|
+
+==============================================================================
+1. Introduction                                                      *yana*
+
+Yana runs cursor-agent in a private Linux overlay and presents proposed edits
+as inline hunks. The real project tree remains unchanged until the user accepts
+a hunk, file, or turn.
+
+Two public entries reach the same pipeline:
+
+- the chat panel, opened with |:Yana|;
+- an inline edit over a line or visual selection, opened with |:YanaEdit|.
+
+==============================================================================
+2. Requirements                                         *yana-requirements*
+
+Required:
+
+- Linux with user namespaces, overlayfs, and /proc
+- Neovim 0.10.4 or newer
+- cursor-agent, installed and signed in
+- bash, bwrap, python3, GNU coreutils/findutils, util-linux mount tools, awk,
+  sed, grep, hostname, getent, and id
+
+Optional session discovery uses md5sum or md5. Reading titles of sessions
+started outside Neovim uses sqlite3.
+
+Run |:checkhealth| with `:checkhealth yana` after installation.
+
+==============================================================================
+3. Commands                                                 *yana-commands*
+
+                                                    *:Yana*
+:Yana               Toggle the panel.
+
+                                                    *:YanaOpen* *:YanaClose*
+:YanaOpen           Open the panel.
+:YanaClose          Close the panel without accepting or rejecting changes.
+
+                                                    *:YanaAsk*
+:[range]YanaAsk [question]
+                    Ask about the current line or supplied visual range.
+
+                                                    *:YanaEdit*
+:[range]YanaEdit [instruction]
+                    Request an inline edit of the current line or range.
+
+                                                    *:YanaTimeline*
+:YanaTimeline       Show the file's reachable review and edit timeline.
+
+                                                    *:YanaReview*
+:YanaReview         Open a pending inline review.
+
+                                                    *:YanaAccept* *:YanaReject*
+:YanaAccept         Accept the pending file change.
+:YanaReject         Reject the pending file change.
+
+                                                    *:YanaNew* *:YanaNewPanel*
+:YanaNew            Start a new chat in the current panel.
+:YanaNewPanel       Open an additional panel with its own chat.
+
+                                                    *:YanaSessions*
+:YanaSessions[!]    Resume a saved session; ! uses a new panel.
+
+                                                    *:YanaResume*
+:YanaResume [id][!] Resume the given (or most recent) session; ! uses a new
+                    panel.
+
+                                                    *:YanaMode*
+:YanaMode           Switch ask and inline while the chat is quiescent: no
+                    running turn and no pending or open review.
+
+                                                    *:YanaModel*
+:YanaModel          Select a model reported by cursor-agent.
+
+                                                    *:YanaQueue*
+:YanaQueue          Manage queued follow-up prompts.
+
+                                                    *:YanaSteer*
+:YanaSteer          Interrupt the in-flight response and resend the prompt
+                    buffer as a new turn.
+
+                                                    *:YanaAbortReview*
+:YanaAbortReview    Abort the open review: put the file back as it was before
+                    the hunks appeared.
+
+                                                    *:YanaStop*
+:YanaStop           Stop the active turn.
+
+==============================================================================
+4. Configuration                                       *yana-configuration*
+
+Minimal setup: >lua
+
+    require("yana").setup({})
+<
+
+The default mode is `inline`. Important options: >lua
+
+    require("yana").setup({
+      cmd = "cursor-agent",
+      model = nil,
+      mode = "inline",             -- "ask" or "inline"
+      approve_mcps = false,
+      global_keymaps = {
+        toggle = nil,
+        ask = nil,
+        inline_edit = nil,
+        inline_edit_normal = nil,
+      },
+    })
+<
+
+Direct mode is described separately because it changes the safety boundary.
+
+==============================================================================
+5. Security                                                   *yana-security*
+
+In `ask` and `inline`, the agent process runs in a private overlay. The agent
+cannot write the real workspace; only Yana's journaled applier can do so after
+an explicit acceptance. A failure to establish the overlay refuses the turn.
+There is no automatic fallback to direct writes.
+
+Non-interactive inline turns may require cursor-agent's permission-bypass flag
+so its tools can run without a terminal prompt. This flag weakens the vendor's
+own prompt layer. It does not weaken Yana's host boundary: Bubblewrap, the
+overlay, change classification, review, and the journaled applier remain in
+force. `:checkhealth yana` warns whenever this exposure applies.
+
+Direct `agentic` mode does not use the overlay, review, or diary. It gives
+cursor-agent ordinary write access to the real workspace and must be enabled
+explicitly: >lua
+
+    require("yana").setup({
+      enable_agentic = true,
+      mode = "agentic",
+    })
+<
+
+Nothing the agent prints can enable direct mode.
+
+==============================================================================
+6. Health                                                       *yana-health*
+
+Use: >vim
+
+    :checkhealth yana
+<
+
+Health reports the Neovim version, resolved cursor-agent path, required Linux
+tools, optional session helpers, current safety mode, and durable-log status.
+Turn startup uses the same required-dependency table and refuses before the
+agent starts when a required dependency is missing.
+
+vim:tw=78:ts=8:noet:ft=help:norl:

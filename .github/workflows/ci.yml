@@ -1,0 +1,23 @@
+{
+  "name": "CI",
+  "on": {
+    "pull_request": {},
+    "push": {"branches": ["main"]}
+  },
+  "permissions": {"contents": "read"},
+  "jobs": {
+    "release-tree": {
+      "runs-on": "ubuntu-24.04",
+      "steps": [
+        {"uses": "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"},
+        {"name": "System dependencies", "run": "sudo apt-get update && sudo apt-get install -y bubblewrap"},
+        {"name": "Verify public tree", "run": "scripts/release/verify.sh ."},
+        {"name": "Release policy mutations", "run": "tests/release/policy_mutation_gate.sh ."},
+        {"name": "Public helpers", "shell": "bash", "run": "set -euo pipefail\nbin=$(scripts/release/install-neovim.sh 0.12.4 \"$RUNNER_TEMP/nvim-helpers\" | tail -1)\ntests/release/helper_gate.sh . \"$bin\""},
+        {"name": "Fresh Neovim matrix", "shell": "bash", "run": "set -euo pipefail\nfor version in 0.10.4 0.11.2 0.12.4; do\n  bin=$(scripts/release/install-neovim.sh \"$version\" \"$RUNNER_TEMP/nvim-$version\" | tail -1)\n  tests/release/fresh_install.sh . \"$bin\"\ndone"},
+        {"name": "Dependency failure paths", "shell": "bash", "run": "set -euo pipefail\nbin=$(scripts/release/install-neovim.sh 0.12.4 \"$RUNNER_TEMP/nvim-deps\" | tail -1)\ntests/release/dependency_gate.sh . \"$bin\""},
+        {"name": "Pinned blink.cmp adapters", "shell": "bash", "run": "set -euo pipefail\ngit clone --filter=blob:none https://github.com/saghen/blink.cmp.git \"$RUNNER_TEMP/blink.cmp\"\ngit -C \"$RUNNER_TEMP/blink.cmp\" checkout --detach 78336bc89ee5365633bcf754d93df01678b5c08f\nbin=$(scripts/release/install-neovim.sh 0.12.4 \"$RUNNER_TEMP/nvim-blink\" | tail -1)\ntests/release/blink_gate.sh . \"$bin\" \"$RUNNER_TEMP/blink.cmp\""}
+      ]
+    }
+  }
+}

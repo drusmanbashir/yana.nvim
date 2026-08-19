@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# yana-jail — thin shim to yana-sandbox for lua/yana/shadow/jail.lua.
+set -euo pipefail
+
+if [[ ${1:-} == "--help" || ${1:-} == "-h" ]]; then
+	cat <<'EOF'
+Usage: yana-jail COMMAND [ARGS...]
+
+Internal confinement shim. Its workspace, shadow, private, and Bubblewrap
+settings are supplied through the Yana launcher environment.
+EOF
+	exit 0
+fi
+
+WORKSPACE="${YANA_JAIL_WORKSPACE:?YANA_JAIL_WORKSPACE required}"
+SHADOW="${YANA_JAIL_SHADOW_DIR:?YANA_JAIL_SHADOW_DIR required}"
+PRIVATE="${YANA_JAIL_PRIVATE_DIR:?YANA_JAIL_PRIVATE_DIR required}"
+BWRAP="${YANA_JAIL_BWRAP:-}"
+
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SANDBOX="$DIR/yana-sandbox"
+
+args=(--workspace "$WORKSPACE" --shadow "$SHADOW" --private "$PRIVATE")
+if [[ -n "$BWRAP" ]]; then
+	export YANA_JAIL_BWRAP="$BWRAP"
+fi
+
+# The caller builds this workspace immediately before the call (a private copy
+# for jailed git), so every invocation admits a fresh root and approval is that
+# admission. The size verdict it records is what the run below then reads in
+# constant time; the shim never walks a root a turn already approved.
+"$SANDBOX" --approve-root --workspace "$WORKSPACE" >/dev/null
+
+exec "$SANDBOX" "${args[@]}" -- "$@"

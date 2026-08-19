@@ -1,0 +1,1615 @@
+#!/usr/bin/env bash
+# yana-overlay — kernel overlayfs workspace confinement.
+set -euo pipefail
+
+readonly EXIT_USAGE=64
+readonly EXIT_REFUSE=65
+readonly EXIT_NO_SANDBOX=66
+readonly EXIT_MOUNT=67
+
+readonly NEUTRAL_LOWER=/tmp/yana/lower
+readonly NEUTRAL_LAYER=/tmp/yana/layer
+readonly MOUNT_MARKER=.yana-overlay-mounted
+readonly MOUNT_MARKER_CONTENT=mounted
+
+# The turn's liveness evidence lives in the host cgroup v2 hierarchy, not in
+# anything the confined agent can write. See "Liveness evidence" below.
+readonly CGROUP_MOUNT=/sys/fs/cgroup
+readonly CGROUP_SLICE_NAME=yana.slice
+
+# ===================== Secret mask (the fixed safety contract "Secrets wall") =====================
+#
+# CORE requires that an inline turn have NO READ ACCESS to credential stores and
+# key paths, and requires it as "a harness the agent cannot decline, per the
+# cardinal principle". Both halves are load bearing and both are met here by
+# MOUNTS, never by asking the agent to avoid a path:
+#
+#   - A masked DIRECTORY is overmounted with an empty tmpfs. The real directory
+#     is not shadowed for the host; it is simply not reachable through this
+#     mount namespace.
+#   - A masked FILE is overmounted read-only with an empty regular file, so the
+#     path still stats as a regular file and its bytes are gone. bwrap's --file
+#     cannot be used for this: it CREATES rather than overmounts, and creation
+#     fails on the read-only root (measured).
+#
+# WHY THE AGENT CANNOT DECLINE IT. bin/yana-overlay-inner execs the command
+# through `capsh --drop=all --caps=`, so the agent runs with an empty capability
+# set in every set including the bounding set. Measured inside this jail:
+# CapEff is 0000000000000000, `umount` of a mask returns 32 ("must be superuser
+# to unmount"), and mounting a fresh filesystem over one returns EPERM. Without
+# that capability drop the mask WOULD be declinable — measured too: the same
+# umount succeeds when a shell is run with the bwrap --cap-add set this launcher
+# passes, because those capabilities are for the inner mount helper and are meant
+# to die before the agent starts. So the capsh line in the inner script is part
+# of this control, not merely tidiness, and a change that keeps a capability
+# alive across the exec re-opens this door.
+#
+# WHAT THIS DOES NOT COVER, stated here rather than left to be discovered: an
+# arbitrary out-of-workspace `.env*` at a path nobody compiled, a hardlink to a
+# secret under an innocent basename, and a bind-mount alias of a secret
+# directory. A mount mask acts on the paths it is given, and finding those three
+# needs either a whole-host walk (which this product forbids) or the filtered
+# read-view broker of the capsule contract 4.3. That gap is real,
+# it is not closed by this profile, and tests/overlay_read_secret_gate.sh holds
+# it open as an EXPECTED-RED probe so nothing here reads as complete.
+readonly SECRET_PROFILE_VERSION=1
+
+# Compiled masks, relative to a secret root unless absolute. Directories first,
+# then files; the split is the mount mechanism, not a judgement about severity.
+readonly SECRET_MASK_DIRS=(
+	.ssh
+	.gnupg
+	.aws
+	.azure
+	.kube
+	.config/gcloud
+	.config/sops
+	.local/share/keyrings
+	.gnome2/keyrings
+	.password-store
+)
+readonly SECRET_MASK_FILES=(
+	.netrc
+	.pgpass
+	.docker/config.json
+	.git-credentials
+	.npmrc
+	.pypirc
+	.config/gh/hosts.yml
+)
+SECRET_MASK_ARGS=()
+SECRET_MASK_EMPTY=""
+declare -A SECRET_MASK_OTHER_IDENTITIES=()
+SECRET_MASK_CAND=()
+SECRET_MASK_REAL=()
+SECRET_MASK_ID=()
+SECRET_MASK_APPLIED=0
+SECRET_MASK_ABSENT=0
+declare -A LAUNCH_PATH_IDENTITY=()
+
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+INNER="${YANA_OVERLAY_INNER:-$DIR/yana-overlay-inner}"
+BWRAP="${YANA_OVERLAY_BWRAP:-${YANA_SANDBOX_BWRAP:-bwrap}}"
+
+WORKSPACE=""
+UPPER=""
+WORK=""
+CLAIM=""
+NONCE_OUT=""
+RELEASE_NONCE=""
+TURN_CGROUP=""
+TURN_CGROUP_PARENT=""
+CMD=()
+FORCE_REASON=""
+CURSOR_DIR=""
+OPERATOR_HOME=""
+
+usage() {
+	cat <<'EOF'
+Usage:
+  yana-overlay --workspace DIR --upper DIR --work DIR [--claim DIR]
+                    [--nonce-out FILE] -- CMD [ARGS...]
+  yana-overlay release --claim DIR [--nonce TOKEN]
+  yana-overlay force-release --claim DIR --reason TEXT
+
+Establish a kernel overlay at the workspace's real absolute path inside bwrap,
+run CMD confined with an empty capability set, and tear down. Fail closed: if
+the layer cannot be established the command never runs.
+
+The host tree is read-only with exactly one exception: ~/.cursor is bind-mounted
+read-write so cursor-agent can refresh its own credentials. Nothing else under
+the home directory is writable, and a symlink placed inside ~/.cursor resolves
+through the read-only host bind, so it is not a route out. Adding an exception
+is a spec change (the isolation contract). Set YANA_OVERLAY_CURSOR_DIR
+to relocate the exception; the gate uses it so probes never touch real
+credentials.
+
+Credential stores named by the compiled secret profile (the fixed safety contract "Secrets
+wall") are masked inside the jail: named directories become an empty tmpfs and
+named files an empty read-only file. The agent cannot remove them — the inner
+script drops every capability before exec, so umount and mount both return
+EPERM. Set YANA_OVERLAY_SECRET_EXTRA_ROOT to mask a SECOND root as well;
+it is additive and can never disable the operator-home profile, which is why
+gates can use it without touching real credentials. Set
+YANA_OVERLAY_SECRET_REPORT=1 to have the applied/absent counts printed to
+stderr. Neither variable can turn masking off.
+
+Claims are released explicitly (release / force-release), never by process exit.
+
+Each acquisition writes a fresh token to <claim>/nonce, and also to the file
+named by --nonce-out if one is given. Use --nonce-out: reading <claim>/nonce
+afterwards is a race, because by then the claim may already belong to someone
+else, whereas the file named here is written by the process that generated the
+token, at the moment it acquired. A releaser that holds that token should pass
+it back with --nonce, and
+the release is then refused unless the claim is still the same ACQUISITION. A
+path identifies a claim; the same path is claimed many times, so a path cannot
+identify which claim. Releasing without --nonce still works and is path-only:
+it cannot tell one acquisition of a workspace from the next.
+
+Exit codes:
+  64  usage error
+  65  structural refusal (claim held, path validation)
+  66  bwrap unavailable
+  67  overlay mount failed — command not run
+  other  confined command exit code
+EOF
+}
+
+die_usage() {
+	echo "yana-overlay: $*" >&2
+	echo "yana-overlay: run with --help for usage" >&2
+	exit "$EXIT_USAGE"
+}
+
+refuse() {
+	echo "yana-overlay: $*" >&2
+	exit "$EXIT_REFUSE"
+}
+
+refuse_no_sandbox() {
+	echo "yana-overlay: $*" >&2
+	exit "$EXIT_NO_SANDBOX"
+}
+
+refuse_mount() {
+	echo "yana-overlay: overlay mount failed: $*" >&2
+	exit "$EXIT_MOUNT"
+}
+
+realpath_safe() {
+	local target=$1
+	if [[ ! -e "$target" ]]; then
+		# Parameter expansion, not dirname(1)/basename(1). This function recurses
+		# once per missing path component and is called for the workspace, the
+		# upper, the work dir, the layer root, the claim and every secret mask
+		# candidate, so each fork here is paid many times per launch.
+		local dir base
+		base=${target##*/}
+		dir=${target%/*}
+		[[ -z "$dir" ]] && dir=/
+		dir=$(realpath_safe "$dir")
+		echo "${dir%/}/$base"
+		return 0
+	fi
+	readlink -f -- "$target"
+}
+
+path_is_prefix() {
+	local parent=$1 child=$2
+	[[ "$child" == "$parent" || "$child" == "$parent"/* ]]
+}
+
+# Filesystem identity, not spelling. The launch table is populated once after
+# every protected path has been canonicalised. `readlink -f` resolves symlinks;
+# it does not resolve bind mounts, so two lexically disjoint pathnames can name
+# the same directory and every string comparison above still passes. Device plus
+# inode is exactly what a bind mount preserves and a pathname does not.
+path_identity() {
+	printf '%s' "${LAUNCH_PATH_IDENTITY[$1]:-}"
+}
+
+# Identities of $1 and of every ancestor up to /, one per line, read from the
+# launch table. Ancestors matter because an alias of an ancestor exposes
+# everything beneath it: if the exception is a bind alias of the workspace's
+# parent, writes through exception/<name>/... reach the real workspace without
+# the exception and the workspace ever sharing an identity themselves.
+path_identity_chain() {
+	local p=$1
+	local identity
+	while :; do
+		identity=${LAUNCH_PATH_IDENTITY[$p]:-}
+		[[ -n "$identity" ]] || return 1
+		printf '%s\n' "$identity"
+		[[ "$p" == "/" ]] && break
+		p=${p%/*}
+		[[ -z "$p" ]] && p=/
+	done
+}
+
+# True when $1 and $2 are the same directory, or one contains the other, judged
+# by identity rather than by pathname.
+identity_overlaps() {
+	local a=$1 b=$2 ida idb p identity
+	ida=${LAUNCH_PATH_IDENTITY[$a]:-}
+	idb=${LAUNCH_PATH_IDENTITY[$b]:-}
+	[[ -n "$ida" && -n "$idb" ]] || return 2
+
+	p=$b
+	while :; do
+		identity=${LAUNCH_PATH_IDENTITY[$p]:-}
+		[[ -n "$identity" ]] || return 2
+		[[ "$identity" == "$ida" ]] && return 0
+		[[ "$p" == "/" ]] && break
+		p=${p%/*}
+		[[ -z "$p" ]] && p=/
+	done
+
+	p=$a
+	while :; do
+		identity=${LAUNCH_PATH_IDENTITY[$p]:-}
+		[[ -n "$identity" ]] || return 2
+		[[ "$identity" == "$idb" ]] && return 0
+		[[ "$p" == "/" ]] && break
+		p=${p%/*}
+		[[ -z "$p" ]] && p=/
+	done
+	return 1
+}
+
+# Build one launch-local fact table for the five protected paths and their
+# ancestor closure. The fast path is exactly one readlink batch plus one stat
+# batch. A count mismatch discards that whole batch and retries every input
+# separately; partial positional results are never trusted. Nothing survives
+# this process, so filesystem changes cannot make a later launch use stale data.
+build_launch_identity_table() {
+	LAUNCH_PATH_IDENTITY=()
+	local -a roots=("$WORKSPACE" "$UPPER" "$WORK" "$LAYER_ROOT" "$CURSOR_DIR")
+	local -a paths=() real=() ids=()
+	local -A seen=()
+	local root p r identity
+
+	for root in "${roots[@]}"; do
+		p=$root
+		while :; do
+			if [[ -z "${seen[$p]+set}" ]]; then
+				seen[$p]=1
+				paths+=("$p")
+			fi
+			[[ "$p" == "/" ]] && break
+			p=${p%/*}
+			[[ -z "$p" ]] && p=/
+		done
+	done
+
+	mapfile -t real < <(readlink -f -- "${paths[@]}" 2>/dev/null)
+	if (( ${#real[@]} != ${#paths[@]} )); then
+		real=()
+		for p in "${paths[@]}"; do real+=("$(realpath_safe "$p")"); done
+	fi
+
+	mapfile -t ids < <(stat -c '%d:%i' -- "${real[@]}" 2>/dev/null)
+	if (( ${#ids[@]} != ${#real[@]} )); then
+		ids=()
+		for r in "${real[@]}"; do
+			ids+=("$(stat -c '%d:%i' -- "$r" 2>/dev/null || true)")
+		done
+	fi
+
+	for p in "${!paths[@]}"; do
+		r=${real[$p]:-}
+		identity=${ids[$p]:-}
+		[[ -n "$r" && -n "$identity" ]] || return 1
+		LAUNCH_PATH_IDENTITY["${paths[$p]}"]=$identity
+	done
+}
+
+operator_home() {
+	local h
+	h=$(getent passwd "${USER:-$(id -un)}" 2>/dev/null | cut -d: -f6 || true)
+	printf '%s' "${h:-${HOME:-}}"
+}
+
+# The single writable host exception (the isolation contract). cursor-agent
+# has no way to hand its refreshed credentials anywhere else, so a turn with a
+# read-only ~/.cursor fails the moment a token expires. Everything else on the
+# host stays on the read-only bind.
+#
+# The exception is resolved to a real path so exactly one host directory becomes
+# writable, and it must not overlap the confined tree in either direction: a
+# workspace inside it would be writable at its real absolute path, and a layer
+# root inside it would let the agent rewrite the very upper layer the change set
+# is read from.
+resolve_cursor_dir() {
+	local dir
+	dir="${YANA_OVERLAY_CURSOR_DIR:-}"
+	if [[ -z "$dir" ]]; then
+		if [[ -z "$OPERATOR_HOME" ]]; then
+			refuse "cannot resolve the operator home directory for the ~/.cursor exception"
+		fi
+		dir="$OPERATOR_HOME/.cursor"
+	fi
+	if ! mkdir -p "$dir" 2>/dev/null; then
+		refuse "cannot create the writable-host exception directory '$dir'"
+	fi
+	dir=$(realpath_safe "$dir")
+	if [[ ! -d "$dir" ]]; then
+		refuse "writable-host exception '$dir' is not a directory"
+	fi
+	if path_is_prefix "$dir" "$WORKSPACE" || path_is_prefix "$WORKSPACE" "$dir"; then
+		refuse "writable-host exception ($dir) must be disjoint from the workspace ($WORKSPACE)"
+	fi
+	if path_is_prefix "$dir" "$LAYER_ROOT" || path_is_prefix "$LAYER_ROOT" "$dir"; then
+		refuse "writable-host exception ($dir) must be disjoint from the layer root ($LAYER_ROOT)"
+	fi
+	CURSOR_DIR="$dir"
+
+	# Disjoint pathnames are not disjoint directories. Repeat both checks by
+	# filesystem identity so a bind-mount alias cannot slip past the string
+	# comparison. Failing to obtain an identity refuses the turn, like any other
+	# failure to establish the exception.
+	local dir_id ws_id layer_id
+	if ! build_launch_identity_table; then
+		refuse "cannot establish filesystem identity for the writable-host exception ($dir), the workspace ($WORKSPACE) or the layer root ($LAYER_ROOT)"
+	fi
+	dir_id=$(path_identity "$dir")
+	ws_id=$(path_identity "$WORKSPACE")
+	layer_id=$(path_identity "$LAYER_ROOT")
+	if [[ -z "$dir_id" || -z "$ws_id" || -z "$layer_id" ]]; then
+		refuse "cannot establish filesystem identity for the writable-host exception ($dir), the workspace ($WORKSPACE) or the layer root ($LAYER_ROOT)"
+	fi
+	if identity_overlaps "$dir" "$WORKSPACE"; then
+		refuse "writable-host exception ($dir, $dir_id) aliases the workspace ($WORKSPACE, $ws_id) — same directory or one contains the other despite disjoint pathnames"
+	fi
+	if identity_overlaps "$dir" "$LAYER_ROOT"; then
+		refuse "writable-host exception ($dir, $dir_id) aliases the layer root ($LAYER_ROOT, $layer_id) — same directory or one contains the other despite disjoint pathnames"
+	fi
+}
+
+secret_mask_cleanup() {
+	[[ -n "$SECRET_MASK_EMPTY" ]] && rm -f "$SECRET_MASK_EMPTY" 2>/dev/null
+	SECRET_MASK_EMPTY=""
+	return 0
+}
+
+# secret_mask_resolve_batch — resolve and identify every existing candidate in
+# TWO subprocesses instead of two per path.
+#
+# WHY BATCHING RATHER THAN A CACHE. Measured on this box: 24 separate
+# `readlink`/`stat` spawns cost 32 ms, the same work batched costs 4 ms, and
+# process spawn is the whole of the difference. A cache would save the same
+# milliseconds and would additionally have to be INVALIDATED correctly — and the
+# thing being cached is a security list, where a stale answer is not a slow turn
+# but an unmasked credential store the day the operator first creates one. Work
+# that is not done cannot be stale. So the cost is removed rather than
+# remembered, and no persistent state is introduced for it.
+#
+# Fills SECRET_MASK_REAL and SECRET_MASK_ID, indexed alike. A batch whose output
+# does not line up with its input is DISCARDED and the per-path path is taken
+# instead: a fast answer that might be misaligned would mask the wrong inode.
+secret_mask_resolve_batch() {
+	SECRET_MASK_REAL=()
+	SECRET_MASK_ID=()
+	(( ${#SECRET_MASK_CAND[@]} > 0 )) || return 0
+
+	# The count check is the correctness guard, and it also covers the one input
+	# that would silently misalign a line-oriented batch: a root containing a
+	# newline. Any mismatch discards the batch entirely and redoes the work one
+	# path at a time — never patches up a partial result, because a mask paired
+	# with the wrong path masks the wrong inode.
+	local -a real=() ids=()
+	local c r
+	mapfile -t real < <(readlink -f -- "${SECRET_MASK_CAND[@]}" 2>/dev/null)
+	if (( ${#real[@]} != ${#SECRET_MASK_CAND[@]} )); then
+		real=()
+		for c in "${SECRET_MASK_CAND[@]}"; do real+=("$(realpath_safe "$c")"); done
+	fi
+	mapfile -t ids < <(stat -c '%d:%i' -- "${real[@]}" 2>/dev/null)
+	if (( ${#ids[@]} != ${#real[@]} )); then
+		ids=()
+		for r in "${real[@]}"; do
+			ids+=("$(stat -c '%d:%i' -- "$r" 2>/dev/null || true)")
+		done
+	fi
+	SECRET_MASK_REAL=("${real[@]}")
+	SECRET_MASK_ID=("${ids[@]}")
+}
+
+# secret_mask_add — one compiled entry, already resolved by the batch above.
+# `kind` is dir or file; `idx` indexes SECRET_MASK_REAL / SECRET_MASK_ID.
+#
+# THE OVERLAP CHECK IS AN AVAILABILITY GUARD, NOT A BOUNDARY, and it is written
+# to be cheap for that reason. Masking too MUCH cannot leak a secret; it can only
+# hide the workspace and break the turn visibly. So the expensive direction —
+# walking each mask's own ancestor chain to catch a bind alias of the workspace
+# mounted underneath a credential directory — is deliberately not walked per
+# mask. What is checked: both pathname directions on resolved paths, and the
+# mask's identity against the workspace/layer/exception ancestor chains computed
+# ONCE by the caller. The first version walked a fresh chain per entry and cost
+# 228 ms on every launch, which is over CORE's ~100 ms guard-work limit and was
+# measured breaking race_gate R8 by pushing twenty launches past the holder's
+# five-second window.
+secret_mask_add() {
+	local kind=$1 idx=$2
+	local path=${SECRET_MASK_REAL[$idx]}
+	local mask_id=${SECRET_MASK_ID[$idx]:-}
+
+	local other
+	for other in "$WORKSPACE" "$LAYER_ROOT" "$CURSOR_DIR"; do
+		[[ -n "$other" ]] || continue
+		if path_is_prefix "$path" "$other" || path_is_prefix "$other" "$path"; then
+			refuse "secret mask '$path' overlaps '$other' — a masked path may not contain or be contained by the workspace, the layer root or the writable-host exception"
+		fi
+	done
+	if [[ -n "$mask_id" && -n "${SECRET_MASK_OTHER_IDENTITIES[$mask_id]+set}" ]]; then
+		refuse "secret mask '$path' ($mask_id) contains the workspace, the layer root or the writable-host exception by filesystem identity despite disjoint pathnames"
+	fi
+
+	case "$kind" in
+		dir)
+			[[ -d "$path" ]] || { SECRET_MASK_ABSENT=$((SECRET_MASK_ABSENT + 1)); return 0; }
+			SECRET_MASK_ARGS+=(--tmpfs "$path")
+			;;
+		file)
+			[[ -f "$path" ]] || { SECRET_MASK_ABSENT=$((SECRET_MASK_ABSENT + 1)); return 0; }
+			SECRET_MASK_ARGS+=(--ro-bind "$SECRET_MASK_EMPTY" "$path")
+			;;
+		*)
+			refuse "internal: unknown secret mask kind '$kind'"
+			;;
+	esac
+	SECRET_MASK_APPLIED=$((SECRET_MASK_APPLIED + 1))
+}
+
+# build_secret_mask — compose the mount arguments that implement CORE's secrets
+# wall. Runs before the claim is taken, so a failure to establish the enforcement
+# refuses before any durable state is touched and before the executable starts,
+# which is the cardinal principle's own wording.
+#
+# YANA_OVERLAY_SECRET_EXTRA_ROOT is ADDITIVE and can only ever hide more:
+# the operator home is masked whether or not it is set. It exists so gates can
+# plant a canary with known bytes without going anywhere near real credentials,
+# the same reason YANA_OVERLAY_CURSOR_DIR exists. An env var that could
+# REPLACE the operator home would be a security posture chosen by a keystroke,
+# which this project forbids by rule; the gate asserts the additivity directly by
+# observing that the real ~/.ssh is masked in the same run that the canary is.
+build_secret_mask() {
+	SECRET_MASK_ARGS=()
+	SECRET_MASK_APPLIED=0
+	SECRET_MASK_ABSENT=0
+
+	local home=$OPERATOR_HOME
+	if [[ -z "$home" ]]; then
+		refuse "cannot resolve the operator home directory, so the secrets wall cannot be established — refusing before the agent starts"
+	fi
+
+	local -a roots=("$home")
+	if [[ -n "${YANA_OVERLAY_SECRET_EXTRA_ROOT:-}" ]]; then
+		roots+=("$YANA_OVERLAY_SECRET_EXTRA_ROOT")
+	fi
+
+	# Every ancestor identity of the three paths a mask must not swallow comes
+	# from the launch table. Membership is a Bash lookup, not a grep subprocess.
+	SECRET_MASK_OTHER_IDENTITIES=()
+	local other p identity
+	for other in "$WORKSPACE" "$LAYER_ROOT" "$CURSOR_DIR"; do
+		[[ -n "$other" && -e "$other" ]] || continue
+		p=$other
+		while :; do
+			identity=${LAUNCH_PATH_IDENTITY[$p]:-}
+			[[ -n "$identity" ]] \
+				|| refuse "cannot establish filesystem identity for the writable-host exception ($CURSOR_DIR), the workspace ($WORKSPACE) or the layer root ($LAYER_ROOT)"
+			SECRET_MASK_OTHER_IDENTITIES[$identity]=1
+			[[ "$p" == "/" ]] && break
+			p=${p%/*}
+			[[ -z "$p" ]] && p=/
+		done
+	done
+
+	SECRET_MASK_EMPTY=$(mktemp "${TMPDIR:-/tmp}/yana-secret-mask.XXXXXX") 		|| refuse "cannot create the empty file used to mask secret files"
+	: >"$SECRET_MASK_EMPTY"
+	chmod 0444 "$SECRET_MASK_EMPTY" 2>/dev/null || true
+
+	# Pass 1: which compiled entries exist at all. Pure bash, no subprocess.
+	# An absent path is COUNTED and skipped rather than masked: bwrap cannot
+	# create a mount point on the read-only root, so masking an absent path
+	# would refuse every turn on a machine that simply has no ~/.aws. Nothing
+	# leaks by skipping — there is nothing at the path to read — and the cost is
+	# recorded as a limit in the isolation contract.
+	SECRET_MASK_CAND=()
+	local -a kinds=()
+	local root entry p
+	for root in "${roots[@]}"; do
+		[[ -n "$root" && -d "$root" ]] || continue
+		for entry in "${SECRET_MASK_DIRS[@]}"; do
+			p="${root%/}/$entry"
+			if [[ -e "$p" ]]; then SECRET_MASK_CAND+=("$p"); kinds+=(dir)
+			else SECRET_MASK_ABSENT=$((SECRET_MASK_ABSENT + 1)); fi
+		done
+		for entry in "${SECRET_MASK_FILES[@]}"; do
+			p="${root%/}/$entry"
+			if [[ -e "$p" ]]; then SECRET_MASK_CAND+=("$p"); kinds+=(file)
+			else SECRET_MASK_ABSENT=$((SECRET_MASK_ABSENT + 1)); fi
+		done
+	done
+
+	# Pass 2: resolve and identify them all at once, then decide per entry.
+	secret_mask_resolve_batch
+	local i
+	for i in "${!SECRET_MASK_CAND[@]}"; do
+		secret_mask_add "${kinds[$i]}" "$i"
+	done
+
+	# An observability seam, not a dial: it prints what was masked and cannot
+	# turn anything off. The gate reads it to distinguish "masked" from
+	# "there was nothing there", which is exactly the distinction that makes an
+	# absent canary meaningful.
+	if [[ -n "${YANA_OVERLAY_SECRET_REPORT:-}" ]]; then
+		echo "yana-overlay: secret mask profile=v$SECRET_PROFILE_VERSION applied=$SECRET_MASK_APPLIED absent=$SECRET_MASK_ABSENT" >&2
+	fi
+}
+
+ensure_bwrap() {
+	if [[ ! -x "$BWRAP" ]] && ! command -v "$BWRAP" >/dev/null 2>&1; then
+		refuse_no_sandbox "bwrap not found at '$BWRAP'"
+	fi
+	if [[ ! -x "$BWRAP" ]]; then
+		BWRAP=$(command -v "$BWRAP")
+	fi
+}
+
+validate_paths() {
+	local ws upper work upper_parent work_parent layer_root
+
+	ws=$(realpath_safe "$WORKSPACE")
+	upper=$(realpath_safe "$UPPER")
+	work=$(realpath_safe "$WORK")
+
+	if [[ ! -d "$ws" ]]; then
+		refuse "workspace '$WORKSPACE' does not exist or is not a directory"
+	fi
+	if [[ -e "$upper" && ! -d "$upper" ]]; then
+		refuse "upper '$UPPER' exists and is not a directory"
+	fi
+	if [[ -e "$work" && ! -d "$work" ]]; then
+		refuse "work '$WORK' exists and is not a directory"
+	fi
+	mkdir -p "$upper" "$work"
+
+	# Both parents come off with parameter expansion; the paths are already
+	# resolved so the trailing component is all that has to go.
+	upper_parent=$(realpath_safe "${upper%/*}")
+	work_parent=$(realpath_safe "${work%/*}")
+	if [[ "$upper_parent" != "$work_parent" ]]; then
+		refuse "upper and work must share a parent directory (overlay requires one mount)"
+	fi
+	layer_root="$upper_parent"
+	if [[ "${upper##*/}" != "upper" || "${work##*/}" != "work" ]]; then
+		: "nonstandard names allowed; parent mount is what matters"
+	fi
+
+	local entry base extra=0
+	shopt -s nullglob
+	for entry in "$layer_root"/*; do
+		base=${entry##*/}
+		case "$base" in
+			upper | work | "$MOUNT_MARKER") ;;
+			*) extra=1; break ;;
+		esac
+	done
+	shopt -u nullglob
+	if (( extra )); then
+		refuse "layer root '$layer_root' must contain only upper/, work/, and $MOUNT_MARKER (nested turn layers must use separate roots)"
+	fi
+
+	WORKSPACE="$ws"
+	UPPER="$upper"
+	WORK="$work"
+	LAYER_ROOT="$layer_root"
+}
+
+# Memoised, and read with a builtin rather than `tr`. The boot id cannot change
+# inside one process, and this was being read three times per acquisition — once
+# for the lock owner, once for the holder, once for the liveness record — at a
+# fork each. `read` strips the trailing newline itself, so the `tr` was doing
+# work bash already does.
+BOOT_ID_CACHED=""
+read_boot_id() {
+	if [[ -z "$BOOT_ID_CACHED" ]]; then
+		read -r BOOT_ID_CACHED </proc/sys/kernel/random/boot_id 2>/dev/null || BOOT_ID_CACHED=""
+	fi
+	printf '%s' "$BOOT_ID_CACHED"
+}
+
+holder_start_ticks() {
+	local pid=$1
+	local line after_comm
+	[[ "$pid" =~ ^[0-9]+$ ]] || return 1
+	[[ -r "/proc/$pid/stat" ]] || return 1
+	# `read` instead of `tr`: one fewer fork on a path that runs several times
+	# per acquisition. /proc/<pid>/stat is a single line, so read gets all of it
+	# and drops the newline, which is exactly what the substitution did.
+	read -r line <"/proc/$pid/stat" 2>/dev/null || return 1
+	after_comm=${line#*) }
+	after_comm=${after_comm# }
+	local -a fields
+	read -r -a fields <<<"$after_comm"
+	[[ ${#fields[@]} -ge 20 ]] || return 1
+	printf '%s' "${fields[19]}"
+}
+
+# ============================ Liveness evidence ============================
+#
+# WHY NOT THE LAYER. The obvious "is the previous turn still working" signal is
+# the private layer's mtime. It cannot be used. The layer is bind-mounted
+# read-write into the jail because that is the whole point of it, so the agent
+# owns every file in it, and utimensat(2) on a file you own needs no privilege
+# at all — not CAP_DAC_OVERRIDE, not root. A hostile agent backdates its own
+# writes and the claim is handed over mid-turn. Measured on this tree before
+# this mechanism existed: an agent writing continuously while touching its
+# files to "1 hour ago" was reclaimed 0.5s after a real write. Any statistic
+# derived from the layer is a value the agent chooses, and the fixed safety contract's
+# cardinal principle forbids promoting such a value to a boundary.
+#
+# WHAT IS USED INSTEAD. Membership of a cgroup v2 directory that the harness
+# creates and only the harness can write. At acquire the turn creates
+# <delegated base>/yana.slice/turn-<claim hash>-<pid> and puts itself in
+# it; every descendant, confined or not, inherits membership and cannot leave
+# it — inside the jail /sys/fs/cgroup is mounted read-only, and the agent has
+# an empty effective capability set, so it can neither write cgroup.procs nor
+# mount a fresh hierarchy.
+#
+# THE CHECK IS A SINGLE rmdir. rmdir(2) on a cgroup directory succeeds if and
+# only if the cgroup holds no processes and no child cgroups, and once it has
+# succeeded nothing can ever join that cgroup again. So the question "is the
+# previous turn gone?" and the act of sealing it are one kernel-atomic step:
+# there is no window between deciding and acting for a process to appear in,
+# and no interval to define, justify or tune. A failed rmdir is never a
+# reclaim: it is read afterwards only to word the refusal.
+#
+# NO INTERVAL. This is the point of the design. The previous attempt at this
+# condition needed a quiet window with a number in it, and the number had no
+# defensible value; here the kernel answers exactly the question that matters.
+
+# cgroup_delegated_base — the directory this user may create cgroups under.
+# Prints the base and returns 0 on success; on failure prints the REASON and
+# returns 1, so every caller can name the missing dependency. The reason
+# travels through stdout rather than a global because callers read this in a
+# command substitution, and a global set inside a subshell would be lost.
+CGROUP_UNAVAILABLE_REASON=""
+cgroup_delegated_base() {
+	local fstype uid own
+	fstype=$(stat -fc %T "$CGROUP_MOUNT" 2>/dev/null || true)
+	if [[ "$fstype" != "cgroup2fs" ]]; then
+		printf 'cgroup v2 is not mounted at %s (found: %s)' "$CGROUP_MOUNT" "${fstype:-nothing}"
+		return 1
+	fi
+	uid=$EUID
+	# The systemd user manager's own cgroup is delegated to the user and
+	# outlives any single shell or scope, so a claim taken in one terminal is
+	# still checkable from another.
+	own="$CGROUP_MOUNT/user.slice/user-$uid.slice/user@$uid.service"
+	if [[ -d "$own" && -w "$own" ]]; then
+		printf '%s/%s' "$own" "$CGROUP_SLICE_NAME"
+		return 0
+	fi
+	# Fall back to whatever cgroup this process is already in, if the user has
+	# been delegated it.
+	# Builtin scan rather than grep(1). /proc/self/cgroup is a handful of lines
+	# and this runs on every acquisition.
+	local line rel candidate
+	line=""
+	while read -r candidate; do
+		if [[ "$candidate" == '0::'* ]]; then
+			line="$candidate"
+			break
+		fi
+	done </proc/self/cgroup 2>/dev/null || true
+	if [[ -z "$line" ]]; then
+		printf 'this process is in no cgroup v2 hierarchy (/proc/self/cgroup has no unified entry)'
+		return 1
+	fi
+	rel=${line#0::}
+	if [[ -d "$CGROUP_MOUNT$rel" && -w "$CGROUP_MOUNT$rel" ]]; then
+		printf '%s/%s' "$CGROUP_MOUNT$rel" "$CGROUP_SLICE_NAME"
+		return 0
+	fi
+	printf 'no delegated cgroup v2 directory is writable (tried %s and %s)' "$own" "$CGROUP_MOUNT$rel"
+	return 1
+}
+
+# claim_cgroup_tag — identity of THIS claim, so a liveness record naming some
+# other claim's cgroup is not accepted as evidence about this one.
+# Memoised: two forks per call, and it was called twice per acquisition (the
+# same-tag stale sweep, then the target directory). CLAIM is fixed by the time
+# anything asks, so the answer cannot differ between calls.
+CLAIM_CGROUP_TAG_CACHED=""
+claim_cgroup_tag() {
+	if [[ -z "$CLAIM_CGROUP_TAG_CACHED" ]]; then
+		CLAIM_CGROUP_TAG_CACHED=$(printf '%s' "$CLAIM" | sha256sum | cut -c1-16)
+	fi
+	printf '%s' "$CLAIM_CGROUP_TAG_CACHED"
+}
+
+# cgroup_enter — create this turn's cgroup and join it. Sets TURN_CGROUP on
+# success. Never fatal: a machine with no delegated cgroup still runs turns,
+# it just cannot be automatically reclaimed later, which is the behaviour that
+# shipped before this mechanism existed.
+cgroup_enter() {
+	local base target
+	TURN_CGROUP=""
+	TURN_CGROUP_PARENT=""
+	if ! base=$(cgroup_delegated_base); then
+		CGROUP_UNAVAILABLE_REASON="$base"
+		return 1
+	fi
+	if ! mkdir -p "$base" 2>/dev/null; then
+		CGROUP_UNAVAILABLE_REASON="cannot create $base"
+		return 1
+	fi
+	target="$base/turn-$(claim_cgroup_tag)-$$"
+	# Tidy any earlier cgroup of THIS claim before making ours. We hold the
+	# claim at this point, so a same-tag cgroup belongs to a turn that no
+	# longer does. This cannot remove a live turn's evidence: rmdir fails on a
+	# cgroup that still holds a process, which is the same property the seal
+	# relies on. Same-tag only — a blanket sweep could delete a dead-but-not-
+	# yet-reclaimed turn's cgroup and turn an automatic reclaim into a
+	# force-release, which would leave the workspace permanently blocked.
+	local stale
+	for stale in "$base/turn-$(claim_cgroup_tag)-"*; do
+		[[ -d "$stale" ]] || continue
+		rmdir "$stale" 2>/dev/null || true
+	done
+	if ! mkdir "$target" 2>/dev/null; then
+		CGROUP_UNAVAILABLE_REASON="cannot create the turn cgroup $target"
+		return 1
+	fi
+	if ! printf '%s\n' "$$" >"$target/cgroup.procs" 2>/dev/null; then
+		rmdir "$target" 2>/dev/null || true
+		CGROUP_UNAVAILABLE_REASON="cannot join the turn cgroup $target"
+		return 1
+	fi
+	# Verify membership rather than assume the write took. Read with a builtin
+	# rather than grep(1): this is the third /proc/self/cgroup scan on the
+	# acquisition path and each one was costing a fork (~3 ms measured) for a
+	# file of a handful of lines.
+	local now candidate
+	now=""
+	while read -r candidate; do
+		if [[ "$candidate" == '0::'* ]]; then
+			now="$candidate"
+			break
+		fi
+	done </proc/self/cgroup 2>/dev/null || true
+	if [[ "$CGROUP_MOUNT${now#0::}" != "$target" ]]; then
+		CGROUP_UNAVAILABLE_REASON="joined $target but /proc/self/cgroup does not agree"
+		return 1
+	fi
+	TURN_CGROUP="$target"
+	TURN_CGROUP_PARENT="$base"
+	return 0
+}
+
+# There is deliberately no cgroup_leave(). An earlier draft removed this turn's
+# cgroup on normal exit to keep the hierarchy tidy, and that was a defect: the
+# claim outlives the turn by design (claims are released explicitly, never by
+# process exit), so a turn that exited normally left a claim whose liveness
+# record pointed at a directory that no longer existed — classified unknown,
+# refused, and unreclaimable without a force-release. This mechanism exists to
+# prevent that lockout. A paired regression check covers both outcomes.
+# control requires a dead no-review claim to auto-release.
+#
+# So the cgroup outlives the turn too. The kernel removes the leader from it on
+# exit; what remains is an EMPTY cgroup, which is precisely the positive
+# evidence a challenger needs — its rmdir both confirms the turn is over and
+# seals the cgroup in the same step. Tidy-up therefore belongs to whoever ends
+# the claim: the challenger's seal, the same-claim sweep in cgroup_enter, or
+# release_recorded_cgroup on an explicit release.
+
+write_liveness_record() {
+	local boot_id
+	boot_id=$(read_boot_id)
+	{
+		printf 'version 1\n'
+		printf 'claim %s\n' "$CLAIM"
+		printf 'boot %s\n' "$boot_id"
+		printf 'pid %s\n' "$$"
+		if [[ -n "$TURN_CGROUP" ]]; then
+			printf 'base %s\n' "$TURN_CGROUP_PARENT"
+			printf 'cgroup %s\n' "$TURN_CGROUP"
+		else
+			printf 'cgroup -\n'
+			printf 'unavailable %s\n' "${CGROUP_UNAVAILABLE_REASON:-no reason recorded}"
+		fi
+	} >"$CLAIM/liveness"
+}
+
+# classify_turn_liveness — THE classifier. Prints exactly one line whose first
+# word is the verdict and whose remainder is detail for the refusal:
+#
+#   dead <detail>      the turn is gone AND has been sealed; reclaim may proceed
+#   alive <detail>     processes of that turn still exist
+#   unknown <detail>   anything else, without exception
+#
+# The verdict travels as a WORD, not as an exit status, and the caller matches
+# it with a case whose default arm is unknown. That is deliberate: an exit
+# status can be 127 when a helper is missing, or 2 from a shell error, and a
+# caller that tests specific numbers lets those through. Here every outcome
+# this function did not explicitly name — including printing nothing at all
+# because it died — lands on the caller's default arm and refuses.
+classify_turn_liveness() {
+	local record="$CLAIM/liveness"
+	local key value version="" rec_claim="" rec_boot="" rec_pid="" rec_base="" rec_cgroup="" rec_reason=""
+	[[ -f "$record" ]] || { printf 'unknown no liveness record for this claim'; return 0; }
+	while read -r key value; do
+		case "$key" in
+			version) version=$value ;;
+			claim) rec_claim=$value ;;
+			boot) rec_boot=$value ;;
+			pid) rec_pid=$value ;;
+			base) rec_base=$value ;;
+			cgroup) rec_cgroup=$value ;;
+			unavailable) rec_reason=$value ;;
+			*) : ;;
+		esac
+	done <"$record"
+	if [[ "$version" != "1" ]]; then
+		printf 'unknown liveness record version %s is not understood' "${version:-missing}"
+		return 0
+	fi
+	if [[ "$rec_claim" != "$CLAIM" ]]; then
+		printf 'unknown liveness record names a different claim (%s)' "${rec_claim:-none}"
+		return 0
+	fi
+	local boot_now
+	boot_now=$(read_boot_id)
+	if [[ -z "$boot_now" || -z "$rec_boot" ]]; then
+		printf 'unknown boot identity is unreadable'
+		return 0
+	fi
+	if [[ "$boot_now" != "$rec_boot" ]]; then
+		# Every process of the recorded boot died with the reboot, and so did
+		# every cgroup. This is the one case where absence is proof.
+		printf 'dead the machine rebooted since the claim was taken'
+		return 0
+	fi
+	if [[ "$rec_cgroup" == "-" || -z "$rec_cgroup" ]]; then
+		printf 'unknown the holder recorded no liveness cgroup: %s' "${rec_reason:-no reason recorded}"
+		return 0
+	fi
+	# Identity binding: the recorded cgroup must be the one THIS claim's holder
+	# would have made, under the base this machine delegates now. A substituted
+	# or reused path is unknown, never quiet.
+	local base_now expected
+	if ! base_now=$(cgroup_delegated_base); then
+		printf 'unknown %s' "$base_now"
+		return 0
+	fi
+	if [[ "$rec_base" != "$base_now" ]]; then
+		printf 'unknown liveness cgroup is outside the delegated slice %s' "$base_now"
+		return 0
+	fi
+	if [[ ! "$rec_pid" =~ ^[0-9]+$ ]]; then
+		printf 'unknown liveness record has no usable holder pid'
+		return 0
+	fi
+	expected="$base_now/turn-$(claim_cgroup_tag)-$rec_pid"
+	if [[ "$rec_cgroup" != "$expected" ]]; then
+		printf 'unknown liveness cgroup %s is not the one this claim would have created' "$rec_cgroup"
+		return 0
+	fi
+	if [[ ! -d "$rec_cgroup" ]]; then
+		printf 'unknown liveness cgroup %s no longer exists' "$rec_cgroup"
+		return 0
+	fi
+	# ---- Terminate, then seal -------------------------------------------
+	#
+	# ORDER IS THE WHOLE ARGUMENT. take_claim establishes conditions 1-3 —
+	# holder process gone, no open review, holder identity unambiguous — and
+	# only then calls this function. Nothing below is ever used to decide that
+	# the turn is dead: the kill acts on a turn ALREADY classified dead by
+	# evidence that does not depend on the kill. Killing to establish deadness
+	# would be the classic mistake, and it is not what this does.
+	#
+	# WHY KILL AT ALL. A confined tree can outlive its leader. Measured on this
+	# tree: with the leader SIGKILLed as the product kills it — one pid, not
+	# the process group — bwrap and its confined child survive in state S,
+	# indefinitely, because --die-with-parent did not fire. Such a process is
+	# precisely CORE's cardinal-principle adversary: agent-controlled, past the
+	# end of its turn, still able to write the layer. Detecting it and refusing
+	# forever hands the operator a workspace they cannot use
+	# moved rather than fixed; reclaiming around it hands a new turn a layer a
+	# live stranger is writing into. Terminate is the only answer left.
+	#
+	# We address the CGROUP, never a pid list. cgroup.kill signals every member
+	# atomically, so nothing can fork out from under the kill and no pid can be
+	# reused between reading a list and acting on it.
+	local killed=1
+	if [[ -e "$rec_cgroup/cgroup.kill" ]]; then
+		if ! printf '1\n' >"$rec_cgroup/cgroup.kill" 2>/dev/null; then
+			# Fail closed and do NOT seal: a partial kill followed by a
+			# successful seal is the worst outcome available, because the claim
+			# would transfer while a survivor kept writing.
+			printf 'unknown the previous turn could not be terminated (writing %s failed)' "$rec_cgroup/cgroup.kill"
+			return 0
+		fi
+	else
+		killed=0
+	fi
+	# The seal. rmdir succeeds only on a cgroup holding no process and no
+	# child, and once it succeeds nothing can ever join that cgroup again, so
+	# the check and the seal remain one kernel-atomic step. It is attempted
+	# only after a kill that reported success, or on a kernel with no kill at
+	# all — never after a kill that failed.
+	if rmdir "$rec_cgroup" 2>/dev/null; then
+		if (( killed )); then
+			printf 'dead the previous turn was terminated and its cgroup sealed'
+		else
+			printf 'dead liveness cgroup was empty and is now sealed'
+		fi
+		return 0
+	fi
+	# Nothing below can reclaim. Reading cgroup.procs words the refusal and
+	# never decides the verdict.
+	local procs=""
+	procs=$(tr '\n' ' ' <"$rec_cgroup/cgroup.procs" 2>/dev/null || true)
+	procs=${procs% }
+	if (( killed == 0 )); then
+		if [[ -n "$procs" ]]; then
+			printf 'alive processes of the previous turn are still running (pids: %s) and this kernel has no cgroup.kill (needs Linux 5.14 or newer) to terminate them' "$procs"
+		else
+			printf 'unknown liveness cgroup %s could not be sealed and this kernel has no cgroup.kill (needs Linux 5.14 or newer)' "$rec_cgroup"
+		fi
+		return 0
+	fi
+	if [[ -n "$procs" ]]; then
+		printf 'unknown the previous turn survived cgroup.kill (pids: %s)' "$procs"
+		return 0
+	fi
+	printf 'unknown liveness cgroup %s could not be sealed after termination' "$rec_cgroup"
+	return 0
+}
+
+# abandon_acquisition — undo a claim we created but never committed. write_holder
+# builds the claim in stages and the holder file is the commit point, so a
+# refusal partway through would otherwise leave a directory with no holder:
+# take_claim reads that as "acquisition in progress" and refuses forever, which
+# wedges the workspace exactly as a stale claim does. Nothing here can destroy a
+# committed claim -- it runs only on the path where our own holder file was
+# never written.
+abandon_acquisition() {
+	[[ -n "$CLAIM" && -d "$CLAIM" ]] || return 0
+	[[ ! -f "$CLAIM/holder" ]] || return 0
+	release_recorded_cgroup
+	rm -f "$CLAIM/nonce" "$CLAIM/liveness" 2>/dev/null || true
+	rmdir "$CLAIM" 2>/dev/null || true
+	return 0
+}
+
+refuse_acquisition() {
+	abandon_acquisition
+	refuse "$@"
+}
+
+write_holder() {
+	local boot_id start_ticks
+	boot_id=$(read_boot_id)
+	start_ticks=$(holder_start_ticks $$)
+	[[ -n "$boot_id" && -n "$start_ticks" ]] || refuse_acquisition "could not record holder process identity"
+	# Liveness evidence first, holder file last. take_claim treats a claim
+	# directory with no holder file as "acquisition in progress" and refuses,
+	# so the holder file is the commit point: once it is visible the record a
+	# challenger needs is already there. The other order leaves a window in
+	# which a challenger sees a holder, finds no record, and refuses a claim it
+	# could have classified.
+	cgroup_enter || true
+	write_acquisition_nonce
+	write_liveness_record
+	# `printf %()T` is a bash builtin; `date -Iseconds` is a fork. The two differ
+	# only in the zone separator (+0100 vs +01:00), so the colon is inserted
+	# here and the recorded text is byte-identical to what shipped before.
+	local stamp
+	printf -v stamp '%(%Y-%m-%dT%H:%M:%S%z)T' -1
+	stamp="${stamp:0:${#stamp}-2}:${stamp: -2}"
+	printf '%s %s %s %s %s\n' "$$" "$boot_id" "$start_ticks" "${HOSTNAME:-$(hostname)}" "$stamp" >"$CLAIM/holder"
+}
+
+# ---- Acquisition identity ---------------------------------------------------
+#
+# A claim is identified by its path. An ACQUISITION is not: the same workspace
+# is claimed over and over, and nothing in the path, the holder file or the
+# liveness record distinguishes the second claim from the first once the first
+# holder is dead. That gap is reachable. A turn whose release failed can be
+# retained and retried much later; by then the operator may have force-released
+# and a new turn may hold the workspace, with its own holder legitimately dead
+# (it finished, or it crashed). The retained release then finds a claim at the
+# path it remembers, with a dead holder, judges it releasable, and deletes a
+# claim it never owned.
+#
+# So each acquisition stamps a fresh token. A releaser that read the token
+# while it still held the claim passes it back, and a release whose token does
+# not match the claim in front of it is declined. This is a different question
+# from the lock: the lock says "nobody else is mutating this claim right now",
+# the nonce says "this is still the claim I was talking about". Both are
+# checked, neither substitutes for the other.
+write_acquisition_nonce() {
+	local nonce=""
+	# SRANDOM (bash 5.1+) is drawn from the system CSPRNG — the same
+	# getrandom(2) source /dev/urandom exposes — and costs no fork, where
+	# `od | tr` costs two on every acquisition. Four draws give the same 128
+	# bits the od form read. The regex below still validates the result, and a
+	# bash without SRANDOM falls back to the original pipeline rather than to
+	# anything weaker.
+	if [[ -n "${SRANDOM+x}" ]]; then
+		printf -v nonce '%08x%08x%08x%08x' "$SRANDOM" "$SRANDOM" "$SRANDOM" "$SRANDOM"
+	else
+		nonce=$(od -An -N16 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n' || true)
+	fi
+	if [[ ! "$nonce" =~ ^[0-9a-f]{32}$ ]]; then
+		# Never leave an acquisition unstamped: an unstamped claim can only be
+		# released path-only, which is the hole this exists to close. This
+		# fallback is unique for the same reason holder identity is —
+		# pid+boot+start ticks cannot repeat within a boot.
+		nonce="fallback-$$-$(read_boot_id)-$(holder_start_ticks $$ || echo 0)-$(date +%s%N)"
+	fi
+	printf '%s\n' "$nonce" >"$CLAIM/nonce"
+	# Hand the token to the caller, at the moment it is generated. Reading
+	# <claim>/nonce afterwards is a race the caller cannot win: it can only
+	# look once its turn has ended, and by then the claim may already have been
+	# reclaimed, so it would capture somebody else's token or none at all. A
+	# caller that asked for the token and did not get it must not proceed
+	# believing it has one, so a failure here refuses rather than warns.
+	if [[ -n "$NONCE_OUT" ]]; then
+		local tmp="${NONCE_OUT}.tmp.$$"
+		# The braces matter: a failing redirection is reported by the shell, not
+		# by printf, so redirecting printf's own stderr would not suppress it.
+		if ! { printf '%s\n' "$nonce" >"$tmp"; } 2>/dev/null || ! mv -f "$tmp" "$NONCE_OUT" 2>/dev/null; then
+			rm -f "$tmp" 2>/dev/null || true
+			refuse_acquisition "could not write the acquisition token to '$NONCE_OUT'"
+		fi
+	fi
+}
+
+# claim_nonce_matches — 0 when the supplied token names the acquisition now in
+# the claim. Absent or unreadable on either side is a mismatch: never guess
+# that an unidentified release is the right one.
+claim_nonce_matches() {
+	local supplied=$1 recorded=""
+	[[ -n "$supplied" ]] || return 1
+	[[ -f "$CLAIM/nonce" ]] || return 1
+	IFS= read -r recorded <"$CLAIM/nonce" 2>/dev/null || return 1
+	[[ -n "$recorded" && "$recorded" == "$supplied" ]]
+}
+
+# holder_is_live: 0 live, 1 dead, 2 unknown
+holder_is_live() {
+	local holder_file=$1
+	local holder_pid boot_id start_ticks
+	[[ -f "$holder_file" ]] || return 2
+	{
+		read -r holder_pid boot_id start_ticks _ _
+	} <"$holder_file"
+	if [[ ! "$holder_pid" =~ ^[0-9]+$ || -z "$boot_id" || -z "$start_ticks" ]]; then
+		return 2
+	fi
+	if [[ ! -r "/proc/$holder_pid/stat" ]]; then
+		return 1
+	fi
+	local current_boot current_ticks
+	current_boot=$(read_boot_id)
+	current_ticks=$(holder_start_ticks "$holder_pid")
+	if [[ -z "$current_boot" || -z "$current_ticks" ]]; then
+		return 2
+	fi
+	if [[ "$current_boot" != "$boot_id" || "$current_ticks" != "$start_ticks" ]]; then
+		return 1
+	fi
+	return 0
+}
+
+# ---- Claim mutual exclusion -------------------------------------------------
+#
+# The lock covers EVERY mutation of the claim directory, acquisition included.
+# It used to cover only the contended path, so the fast path was
+#
+#     mkdir "$CLAIM"   # the claim now exists
+#     write_holder     # ...and only now says whose it is
+#
+# with nothing between the two. A release for the previous turn landing in that
+# gap removed the directory the new turn had just created, write_holder's
+# redirect failed against a directory that no longer existed, set -e killed the
+# starting turn, and no agent ever spawned. That is the interlock failing at
+# the one moment it exists for, so acquisition is now inside the lock and the
+# claim's existence and its holder become visible as one step.
+#
+# Ordering is preserved inside that step: cgroup, liveness record, then holder
+# file as the commit point (see write_holder).
+CLAIM_LOCK_HELD=0
+
+write_lock_owner() {
+	local lock=$1 boot_id start_ticks
+	boot_id=$(read_boot_id)
+	start_ticks=$(holder_start_ticks $$)
+	[[ -n "$boot_id" && -n "$start_ticks" ]] || return 0
+	printf '%s %s %s\n' "$$" "$boot_id" "$start_ticks" >"$lock/owner" 2>/dev/null || true
+	return 0
+}
+
+# lock_owner_is_dead — 0 only when the lock names an owner that provably no
+# longer exists. A missing or unreadable owner file is NOT dead: a lock is
+# created by mkdir and stamped a moment later, so an unstamped lock may be one
+# being taken right now.
+lock_owner_is_dead() {
+	local lock=$1 rc
+	[[ -f "$lock/owner" ]] || return 1
+	set +e
+	holder_is_live "$lock/owner"
+	rc=$?
+	set -e
+	(( rc == 1 ))
+}
+
+claim_reclaim_lock() {
+	local lock="${CLAIM}.reclaim" stolen
+	if mkdir "$lock" 2>/dev/null; then
+		write_lock_owner "$lock"
+		CLAIM_LOCK_HELD=1
+		return 0
+	fi
+	# A lock left behind by a killed process would otherwise wedge this claim
+	# forever, which is the lockout this whole area exists to end. Break one
+	# ONLY when its owner is provably dead — never when it is merely unreadable
+	# — and break it by rename, so exactly one breaker can win and the losers
+	# see the lock already gone. While the owner is dead nobody holds the lock
+	# legitimately, so the instant of absence during the steal cannot hand two
+	# processes the same claim: whoever wins the following mkdir owns it, and
+	# everyone else fails and refuses.
+	lock_owner_is_dead "$lock" || return 1
+	stolen="${lock}.stale.$$"
+	mv "$lock" "$stolen" 2>/dev/null || return 1
+	if ! lock_owner_is_dead "$stolen"; then
+		# It came alive between the two looks; put it back untouched.
+		mv "$stolen" "$lock" 2>/dev/null || true
+		return 1
+	fi
+	rm -f "$stolen/owner" 2>/dev/null || true
+	rmdir "$stolen" 2>/dev/null || true
+	if mkdir "$lock" 2>/dev/null; then
+		write_lock_owner "$lock"
+		CLAIM_LOCK_HELD=1
+		return 0
+	fi
+	return 1
+}
+
+claim_reclaim_unlock() {
+	local lock="${CLAIM}.reclaim"
+	rm -f "$lock/owner" 2>/dev/null || true
+	rmdir "$lock" 2>/dev/null || true
+	CLAIM_LOCK_HELD=0
+}
+
+take_claim() {
+	local holder holder_pid live verdict detail
+	[[ -n "$CLAIM" ]] || return 0
+	CLAIM=$(realpath_safe "$CLAIM")
+	# Parameter expansion, not dirname(1). realpath_safe has already returned an
+	# absolute path, so the trailing component is all that has to come off.
+	mkdir -p "${CLAIM%/*}"
+	if ! claim_reclaim_lock; then
+		refuse "workspace claim classification is in progress"
+	fi
+	trap 'claim_reclaim_unlock' EXIT
+	if mkdir "$CLAIM" 2>/dev/null; then
+		write_holder
+		claim_reclaim_unlock
+		trap - EXIT
+		return 0
+	fi
+	if [[ ! -f "$CLAIM/holder" ]]; then
+		claim_reclaim_unlock
+		trap - EXIT
+		refuse "workspace claim acquisition is in progress (no holder evidence yet)"
+	fi
+	holder="unknown"
+	holder_pid=""
+	holder=$(tr '\n' ' ' <"$CLAIM/holder")
+	holder_pid="${holder%% *}"
+	set +e
+	holder_is_live "$CLAIM/holder"
+	live=$?
+	set -e
+	if (( live == 0 )); then
+		claim_reclaim_unlock
+		trap - EXIT
+		refuse "workspace already has a live overlay turn (holder: ${holder%% })"
+	fi
+	# AN OPEN REVIEW BELONGS TO AN EDITOR, AND THE EDITOR MAY BE GONE.
+	#
+	# `holder` names the TURN process, which legitimately exits when the agent
+	# finishes while the review legitimately stays open in the editor. So the
+	# holder being dead says nothing about the review, and this marker is the
+	# only thing that can. Until 2026-08-19 it was an empty file: when an editor
+	# died with a review open, nothing was left behind that could prove it had
+	# gone, and every later turn refused until the operator ran force-release.
+	# Reported from real use — "an owner that dies but lock stays" — after
+	# closing nvim and reopening.
+	#
+	# The marker now carries the editor's `pid boot_id start_ticks`, the same
+	# triple the holder uses and read by the same classifier, so this asks the
+	# question that actually matters. A LIVE editor still refuses: that is the
+	# pending change set being protected, not an obstacle. A DEAD editor's marker
+	# is residue and is cleared here, and the turn goes on to the ordinary
+	# liveness path below rather than being admitted by this branch — a dead
+	# editor is not evidence that the previous TURN has finished, and those are
+	# two separate questions.
+	#
+	# An unreadable or identity-less marker is UNCLASSIFIABLE and still refuses.
+	# That is the old behaviour, kept deliberately: markers written before this
+	# change carry no identity, and a host without /proc writes none, so neither
+	# is silently reclaimed. Fail closed, and say what clears it.
+	if [[ -f "$CLAIM/review-open" ]]; then
+		local review_live
+		set +e
+		holder_is_live "$CLAIM/review-open"
+		review_live=$?
+		set -e
+		if (( review_live == 0 )); then
+			claim_reclaim_unlock
+			trap - EXIT
+			refuse "workspace has an open overlay review in a running editor (holder: ${holder%% }) — finish or reject that review, or close that editor"
+		fi
+		if (( review_live == 2 )); then
+			claim_reclaim_unlock
+			trap - EXIT
+			refuse "workspace has an open overlay review whose editor cannot be identified (holder: ${holder%% }) — if no editor is reviewing this workspace, clear it with: $0 force-release --claim '$CLAIM' --reason 'stale review marker'"
+		fi
+		# review_live == 1: the editor that opened this review is gone. Read the
+		# record BEFORE removing it -- the first version of this line reported
+		# the contents of a file it had already deleted.
+		local stale_record
+		stale_record=$(tr '\n' ' ' <"$CLAIM/review-open" 2>/dev/null)
+		rm -f "$CLAIM/review-open" 2>/dev/null || true
+		echo "yana-overlay: cleared a review marker left by an editor that is no longer running (was: ${stale_record% })" >&2
+	fi
+	if (( live == 2 )); then
+		claim_reclaim_unlock
+		trap - EXIT
+		refuse "workspace claim holder identity is ambiguous (holder: ${holder%% })"
+	fi
+	verdict=$(classify_turn_liveness 2>/dev/null) || verdict=""
+	detail=${verdict#* }
+	case "${verdict%% *}" in
+		dead)
+			: # the previous turn is gone and its cgroup is sealed
+			;;
+		alive)
+			claim_reclaim_unlock
+			trap - EXIT
+			refuse "the previous overlay turn has not finished: $detail (holder: ${holder%% }) — wait for it to exit, or force-release with a reason"
+			;;
+		*)
+			claim_reclaim_unlock
+			trap - EXIT
+			refuse "the previous overlay turn's liveness cannot be established: ${detail:-the classifier produced no verdict} (holder: ${holder%% }) — reclaim requires force-release with a reason"
+			;;
+	esac
+	if ! release_claim force; then
+		claim_reclaim_unlock
+		trap - EXIT
+		refuse "workspace claim could not be reclaimed (previous holder: ${holder%% })"
+	fi
+	if ! mkdir "$CLAIM" 2>/dev/null; then
+		claim_reclaim_unlock
+		trap - EXIT
+		refuse "workspace claim could not be reclaimed (previous holder: ${holder%% })"
+	fi
+	write_holder
+	claim_reclaim_unlock
+	trap - EXIT
+}
+
+# release_recorded_cgroup — best effort tidy-up of the cgroup named by the
+# record we are about to delete, so the hierarchy does not keep a directory per
+# turn. It never decides anything: a cgroup that will not go away is left for
+# the next challenger's seal to judge.
+release_recorded_cgroup() {
+	local key value rec_cgroup=""
+	[[ -f "$CLAIM/liveness" ]] || return 0
+	while read -r key value; do
+		[[ "$key" == "cgroup" ]] && rec_cgroup=$value
+	done <"$CLAIM/liveness"
+	[[ -n "$rec_cgroup" && "$rec_cgroup" != "-" && -d "$rec_cgroup" ]] || return 0
+	[[ "$rec_cgroup" == "$CGROUP_MOUNT"/* ]] || return 0
+	rmdir "$rec_cgroup" 2>/dev/null || true
+	return 0
+}
+
+# release_claim — remove the claim, but only one we still own.
+#
+# An ordinary release runs in a DIFFERENT process from the holder (the turn has
+# ended; yana-turn or the editor issues it), and it can arrive late. By
+# then the workspace may have been claimed by a newer turn, and deleting THAT
+# claim is the interlock failing. Ownership is therefore decided by the state
+# of the claim rather than by the releaser's own pid, which tells us nothing:
+#
+#   no holder file      an acquisition is in progress inside the lock — the
+#                       claim is being born and is certainly not ours
+#   holder is live      a running turn owns this claim; ours has ended, so
+#                       this is somebody else's
+#   holder unreadable   never guess: keep it and leave force-release to a human
+#   holder is dead      the claim we were asked to release; remove it
+#
+# Declining is reported and is not an error: the caller asked for its own claim
+# to be gone, and it is gone — replaced by someone else's. Making it exit
+# non-zero would abort yana-turn AFTER the apply had already happened.
+# Nothing is deleted before the decision, so a declined release never strands
+# the liveness record or the holder file half-removed.
+#
+# $1 = "force" bypasses every check: force-release is the deliberate human
+# override, and take_claim's reclaim path has already classified the holder
+# dead while holding this same lock.
+release_claim() {
+	local mode=${1:-owned} took_lock=0 live
+	[[ -n "$CLAIM" ]] || die_usage "release requires --claim"
+	CLAIM=$(realpath_safe "$CLAIM")
+	if [[ ! -d "$CLAIM" ]]; then
+		return 0
+	fi
+	if (( CLAIM_LOCK_HELD == 0 )); then
+		if ! claim_reclaim_lock; then
+			# Somebody is mutating this claim right now — acquiring it or
+			# classifying it. Either way the claim we were asked to release is
+			# already gone or about to be replaced, so decline rather than
+			# fight for the lock. An ordinary release must never fail here:
+			# yana-turn issues it under set -e AFTER the apply, so a
+			# non-zero exit would fail a turn whose work already landed. A
+			# force-release is a deliberate human act and does report failure,
+			# because returning 0 without clearing anything would be a lie.
+			if [[ "$mode" == "force" ]]; then
+				refuse "workspace claim classification is in progress — retry the force-release"
+			fi
+			echo "yana-overlay: claim not released: another turn is mutating this workspace's claim right now" >&2
+			return 0
+		fi
+		took_lock=1
+		trap 'claim_reclaim_unlock' EXIT
+	fi
+	if [[ "$mode" != "force" ]]; then
+		# Acquisition identity is checked before liveness. A stale releaser and
+		# a legitimately dead holder look identical to the state checks below,
+		# so the token is what tells them apart.
+		if [[ -n "$RELEASE_NONCE" ]] && ! claim_nonce_matches "$RELEASE_NONCE"; then
+			echo "yana-overlay: claim not released: this workspace has been claimed again since the token was issued, so the claim is a different acquisition" >&2
+			(( took_lock )) && { claim_reclaim_unlock; trap - EXIT; }
+			return 0
+		fi
+		if [[ ! -f "$CLAIM/holder" ]]; then
+			echo "yana-overlay: claim not released: another turn is acquiring this workspace right now" >&2
+			(( took_lock )) && { claim_reclaim_unlock; trap - EXIT; }
+			return 0
+		fi
+		set +e
+		holder_is_live "$CLAIM/holder"
+		live=$?
+		set -e
+		if (( live == 0 )); then
+			echo "yana-overlay: claim not released: it belongs to a live overlay turn (holder: $(tr '\n' ' ' <"$CLAIM/holder"))" >&2
+			(( took_lock )) && { claim_reclaim_unlock; trap - EXIT; }
+			return 0
+		fi
+		if (( live == 2 )); then
+			echo "yana-overlay: claim not released: holder identity is ambiguous — force-release with a reason to clear it" >&2
+			(( took_lock )) && { claim_reclaim_unlock; trap - EXIT; }
+			return 0
+		fi
+	fi
+	release_recorded_cgroup
+	rm -f "$CLAIM/holder" "$CLAIM/review-open" "$CLAIM/liveness" "$CLAIM/nonce" 2>/dev/null || true
+	if [[ -d "$CLAIM" ]]; then
+		if ! rmdir "$CLAIM" 2>/dev/null; then
+			(( took_lock )) && { claim_reclaim_unlock; trap - EXIT; }
+			refuse "workspace claim could not be released completely"
+		fi
+	fi
+	(( took_lock )) && { claim_reclaim_unlock; trap - EXIT; }
+	return 0
+}
+
+force_release_claim() {
+	[[ -n "$CLAIM" ]] || die_usage "force-release requires --claim"
+	[[ -n "$FORCE_REASON" ]] || die_usage "force-release requires --reason"
+	CLAIM=$(realpath_safe "$CLAIM")
+	mkdir -p "${CLAIM%/*}"
+	printf '%s force-release %s %s\n' "$(date -Iseconds)" "$$" "$FORCE_REASON" >>"${CLAIM%/}/../force-release.log" 2>/dev/null \
+		|| printf '%s force-release %s %s\n' "$(date -Iseconds)" "$$" "$FORCE_REASON" >>"$CLAIM/force-release.log" 2>/dev/null || true
+	release_claim force
+}
+
+teardown_work() {
+	local path=$1
+	[[ -d "$path" ]] || return 0
+	chmod -R u+rwx "$path" 2>/dev/null || true
+	find "$path" -mindepth 1 -delete 2>/dev/null || true
+}
+
+# --unshare-pid is the read half of the boundary (the isolation contract,
+# "Read boundary"). Without it the `--proc /proc` mount still describes the host
+# PID namespace, and the agent enumerates every host process — command lines,
+# status, open file descriptors. It pairs with the `--proc /proc` above and is
+# meaningless without it.
+#
+# --as-pid-1 is deliberately NOT passed. bubblewrap's own reaper takes PID 1 and
+# the agent runs as PID 2, so orphaned `npx` and MCP children are reaped by the
+# reaper. Handing PID 1 to a Node process that performs no init duties would
+# leave them as zombies.
+run_overlay() {
+	set +e
+	"$BWRAP" \
+		--die-with-parent \
+		--new-session \
+		--ro-bind / / \
+		--bind "$CURSOR_DIR" "$CURSOR_DIR" \
+		--tmpfs /tmp \
+		${SECRET_MASK_ARGS[@]+"${SECRET_MASK_ARGS[@]}"} \
+		--ro-bind "$WORKSPACE" "$NEUTRAL_LOWER" \
+		--bind "$LAYER_ROOT" "$NEUTRAL_LAYER" \
+		--dir "$WORKSPACE" \
+		--dev /dev \
+		--proc /proc \
+		--unshare-uts \
+		--unshare-user \
+		--unshare-pid \
+		--uid 0 \
+		--gid 0 \
+		--cap-add CAP_SYS_ADMIN \
+		--cap-add CAP_DAC_OVERRIDE \
+		--cap-add CAP_SETPCAP \
+		-- "$INNER" "$WORKSPACE" "${CMD[@]}"
+	local rc=$?
+	set -e
+	return "$rc"
+}
+
+mount_succeeded() {
+	[[ -f "$LAYER_ROOT/$MOUNT_MARKER" ]] \
+		&& grep -qx "$MOUNT_MARKER_CONTENT" "$LAYER_ROOT/$MOUNT_MARKER" 2>/dev/null
+}
+
+parse_run_args() {
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+			--workspace)
+				[[ $# -ge 2 ]] || die_usage "--workspace requires a directory"
+				WORKSPACE=$2
+				shift 2
+				;;
+			--upper)
+				[[ $# -ge 2 ]] || die_usage "--upper requires a directory"
+				UPPER=$2
+				shift 2
+				;;
+			--work)
+				[[ $# -ge 2 ]] || die_usage "--work requires a directory"
+				WORK=$2
+				shift 2
+				;;
+			--claim)
+				[[ $# -ge 2 ]] || die_usage "--claim requires a directory"
+				CLAIM=$2
+				shift 2
+				;;
+			--nonce-out)
+				[[ $# -ge 2 ]] || die_usage "--nonce-out requires a file path"
+				NONCE_OUT=$2
+				shift 2
+				;;
+			--help|-h)
+				usage
+				exit 0
+				;;
+			--)
+				shift
+				CMD=("$@")
+				break
+				;;
+			-*)
+				die_usage "unknown option: $1"
+				;;
+			*)
+				die_usage "unexpected argument: $1 (options must precede --)"
+				;;
+		esac
+	done
+}
+
+parse_claim_only_args() {
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+			--claim)
+				[[ $# -ge 2 ]] || die_usage "--claim requires a directory"
+				CLAIM=$2
+				shift 2
+				;;
+			--reason)
+				[[ $# -ge 2 ]] || die_usage "--reason requires text"
+				FORCE_REASON=$2
+				shift 2
+				;;
+			--nonce)
+				[[ $# -ge 2 ]] || die_usage "--nonce requires a token"
+				RELEASE_NONCE=$2
+				shift 2
+				;;
+			--help|-h)
+				usage
+				exit 0
+				;;
+			-*)
+				die_usage "unknown option: $1"
+				;;
+			*)
+				die_usage "unexpected argument: $1"
+				;;
+		esac
+	done
+}
+
+cmd_run() {
+	parse_run_args "$@"
+	[[ -n "$WORKSPACE" && -n "$UPPER" && -n "$WORK" ]] || die_usage "--workspace, --upper and --work are required"
+	(( ${#CMD[@]} > 0 )) || die_usage "missing command after --"
+
+	ensure_bwrap
+	OPERATOR_HOME=$(operator_home)
+	validate_paths
+	resolve_cursor_dir
+	build_secret_mask
+	if [[ -n "$NONCE_OUT" ]]; then
+		# Fail before touching the claim, not partway through building it.
+		local nonce_dir
+		nonce_dir=${NONCE_OUT%/*}
+		[[ "$nonce_dir" == "$NONCE_OUT" ]] && nonce_dir=.
+		[[ -d "$nonce_dir" && -w "$nonce_dir" ]] \
+			|| refuse "--nonce-out directory '$nonce_dir' does not exist or is not writable"
+	fi
+	take_claim
+
+	trap 'teardown_work "$WORK"; secret_mask_cleanup' EXIT
+
+	run_overlay
+	local rc=$?
+	if (( rc != 0 )); then
+		if (( rc == EXIT_MOUNT )) && ! mount_succeeded; then
+			refuse_mount "cannot establish overlay at '$WORKSPACE'"
+		fi
+		exit "$rc"
+	fi
+	exit 0
+}
+
+main() {
+	case "${1:-}" in
+		release)
+			shift
+			parse_claim_only_args "$@"
+			release_claim
+			exit 0
+			;;
+		force-release)
+			shift
+			parse_claim_only_args "$@"
+			force_release_claim
+			exit 0
+			;;
+		""|-h|--help|help)
+			usage
+			exit 0
+			;;
+		*)
+			cmd_run "$@"
+			;;
+	esac
+}
+
+main "$@"

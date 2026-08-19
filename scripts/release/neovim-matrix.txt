@@ -1,0 +1,4 @@
+# version url sha256
+0.10.4 https://github.com/neovim/neovim/releases/download/v0.10.4/nvim-linux-x86_64.tar.gz 95aaa8e89473f5421114f2787c13ae0ec6e11ebbd1a13a1bd6fcf63420f8073f
+0.11.2 https://github.com/neovim/neovim/releases/download/v0.11.2/nvim-linux-x86_64.tar.gz a9b24157672eb218ff3e33ef3f8c08db26f8931c5c04bdb0e471371dd1dfe63e
+0.12.4 https://github.com/neovim/neovim/releases/download/v0.12.4/nvim-linux-x86_64.tar.gz 012bf3fcac5ade43914df3f174668bf64d05e049a4f032a388c027b1ebd78628

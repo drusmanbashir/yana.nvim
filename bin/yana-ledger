@@ -1,0 +1,326 @@
+#!/usr/bin/env python3
+# yana-ledger — turn-start stat record and accept-time movement check.
+"""Record workspace stat metadata at turn start; at accept, re-stat agent paths
+and refuse by name when movement is detected. Hash equality never clears refusal."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import stat
+import sys
+import time
+from dataclasses import dataclass
+from typing import BinaryIO, Iterator
+
+VERSION = "yana-ledger-v1"
+EXIT_USAGE = 64
+EXIT_REFUSE = 65
+
+
+@dataclass(frozen=True)
+class StatSnap:
+    size: int
+    mode: int
+    inode: int
+    mtime_ns: int
+    ctime_ns: int
+
+    @classmethod
+    def from_lstat(cls, path: str) -> StatSnap:
+        st = os.lstat(path)
+        return cls(st.st_size, stat.S_IMODE(st.st_mode), st.st_ino, st.st_mtime_ns, st.st_ctime_ns)
+
+    def fields(self) -> list[str]:
+        return [
+            str(self.size),
+            str(self.mode),
+            str(self.inode),
+            str(self.mtime_ns),
+            str(self.ctime_ns),
+        ]
+
+    @classmethod
+    def from_fields(cls, fields: list[str]) -> StatSnap:
+        if len(fields) != 5:
+            raise ValueError(f"expected 5 stat fields, got {len(fields)}")
+        return cls(int(fields[0]), int(fields[1]), int(fields[2]), int(fields[3]), int(fields[4]))
+
+
+def die_usage(msg: str) -> None:
+    print(f"yana-ledger: {msg}", file=sys.stderr)
+    print("yana-ledger: run with --help for usage", file=sys.stderr)
+    sys.exit(EXIT_USAGE)
+
+
+def realpath(path: str) -> str:
+    return os.path.realpath(path)
+
+
+def encode_record(path: str, snap: StatSnap) -> bytes:
+    parts = [path.encode("utf-8", "surrogateescape"), *[p.encode() for p in snap.fields()]]
+    out = bytearray()
+    for i, chunk in enumerate(parts):
+        if i:
+            out.append(0)
+        out.extend(chunk)
+    out.append(0)
+    out.append(0)
+    return bytes(out)
+
+
+def decode_records(data: bytes) -> list[tuple[str, StatSnap]]:
+    records: list[tuple[str, StatSnap]] = []
+    i = 0
+    while i < len(data):
+        fields: list[bytes] = []
+        while i < len(data):
+            j = data.find(b"\0", i)
+            if j < 0:
+                break
+            chunk = data[i:j]
+            i = j + 1
+            if not chunk and not fields:
+                if i < len(data) and data[i : i + 1] == b"\0":
+                    i += 1
+                break
+            if not chunk and fields:
+                break
+            fields.append(chunk)
+        if not fields:
+            break
+        path = fields[0].decode("utf-8", "surrogateescape")
+        snap = StatSnap.from_fields([f.decode() for f in fields[1:]])
+        records.append((path, snap))
+        if i < len(data) and data[i : i + 1] == b"\0":
+            i += 1
+    return records
+
+
+def write_meta(meta_path: str, workspace: str, count: int) -> None:
+    with open(meta_path, "w", encoding="utf-8") as f:
+        f.write(f"version={VERSION}\n")
+        f.write(f"workspace={workspace}\n")
+        f.write(f"count={count}\n")
+        f.write(f"recorded_at={time.strftime('%Y-%m-%dT%H:%M:%S%z')}\n")
+
+
+def iter_workspace_paths(workspace: str) -> Iterator[str]:
+    for dirpath, dirnames, filenames in os.walk(workspace, topdown=True, followlinks=False):
+        dirnames.sort()
+        filenames.sort()
+        rel_dir = "" if dirpath == workspace else os.path.relpath(dirpath, workspace)
+        if rel_dir == ".":
+            rel_dir = ""
+        if rel_dir:
+            yield rel_dir
+        for name in dirnames:
+            rel = name if not rel_dir else f"{rel_dir}/{name}"
+            yield rel
+        for name in filenames:
+            rel = name if not rel_dir else f"{rel_dir}/{name}"
+            yield rel
+
+
+def cmd_record(workspace: str, out_path: str, meta_path: str | None) -> None:
+    ws = realpath(workspace)
+    if not os.path.isdir(ws):
+        die_usage(f"workspace {workspace!r} does not exist or is not a directory")
+
+    records: list[tuple[str, StatSnap]] = []
+    for rel in iter_workspace_paths(ws):
+        abspath = os.path.join(ws, rel)
+        try:
+            snap = StatSnap.from_lstat(abspath)
+        except OSError as exc:
+            print(f"yana-ledger: stat failed at {rel}: {exc}", file=sys.stderr)
+            sys.exit(1)
+        records.append((rel, snap))
+
+    body = b"".join(encode_record(path, snap) for path, snap in records)
+    with open(out_path, "wb") as f:
+        f.write(body)
+    if meta_path:
+        write_meta(meta_path, ws, len(records))
+
+
+def load_record(record_path: str, workspace: str) -> dict[str, StatSnap]:
+    ws = realpath(workspace)
+    with open(record_path, "rb") as f:
+        data = f.read()
+    table: dict[str, StatSnap] = {}
+    for path, snap in decode_records(data):
+        table[path] = snap
+    return table
+
+
+def read_paths(stream: BinaryIO) -> list[str]:
+    paths: list[str] = []
+    for line in stream:
+        p = line.decode("utf-8", "surrogateescape").rstrip("\n")
+        if p:
+            paths.append(p)
+    return paths
+
+
+def file_sha256(path: str) -> str | None:
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except OSError:
+        return None
+
+
+def snaps_equal(a: StatSnap, b: StatSnap) -> bool:
+    return a == b
+
+
+def cmd_check(
+    workspace: str,
+    record_path: str,
+    paths: list[str],
+    json_out: bool,
+    meta_path: str | None,
+) -> int:
+    ws = realpath(workspace)
+    table = load_record(record_path, ws)
+    results: list[dict[str, object]] = []
+    refused: list[str] = []
+
+    for rel in paths:
+        rec = table.get(rel)
+        abspath = os.path.join(ws, rel)
+        entry: dict[str, object] = {"path": rel}
+        try:
+            current = StatSnap.from_lstat(abspath)
+        except FileNotFoundError:
+            if rec is None:
+                entry["verdict"] = "unmoved"
+                entry["note"] = "absent at record and check"
+            else:
+                entry["verdict"] = "moved"
+                entry["reason"] = "missing"
+                refused.append(rel)
+            results.append(entry)
+            continue
+
+        if rec is None:
+            entry["verdict"] = "moved"
+            entry["reason"] = "not in record"
+            refused.append(rel)
+            results.append(entry)
+            continue
+
+        if snaps_equal(rec, current):
+            entry["verdict"] = "unmoved"
+            results.append(entry)
+            continue
+
+        entry["verdict"] = "moved"
+        entry["record"] = {
+            "size": rec.size,
+            "mode": rec.mode,
+            "inode": rec.inode,
+            "mtime_ns": rec.mtime_ns,
+            "ctime_ns": rec.ctime_ns,
+        }
+        entry["current"] = {
+            "size": current.size,
+            "mode": current.mode,
+            "inode": current.inode,
+            "mtime_ns": current.mtime_ns,
+            "ctime_ns": current.ctime_ns,
+        }
+        if stat.S_ISREG(current.mode):
+            digest = file_sha256(abspath)
+            if digest:
+                entry["hash"] = digest
+        refused.append(rel)
+        results.append(entry)
+
+    if json_out:
+        print(json.dumps({"results": results, "refused": refused}, indent=2))
+    else:
+        for entry in results:
+            verdict = entry["verdict"]
+            path = entry["path"]
+            if verdict == "unmoved":
+                print(f"unmoved\t{path}")
+            else:
+                extra = ""
+                if "hash" in entry:
+                    extra = f"\thash={entry['hash']}"
+                print(f"moved\t{path}{extra}")
+
+    if meta_path:
+        with open(meta_path, "w", encoding="utf-8") as f:
+            f.write(f"checked={len(paths)}\n")
+            f.write(f"refused={len(refused)}\n")
+
+    return EXIT_REFUSE if refused else 0
+
+
+def cmd_adopt(workspace: str, record_path: str, paths: list[str], meta_path: str | None) -> None:
+    ws = realpath(workspace)
+    with open(record_path, "rb") as f:
+        data = f.read()
+    records = decode_records(data)
+    table = dict(records)
+    for rel in paths:
+        abspath = os.path.join(ws, rel)
+        table[rel] = StatSnap.from_lstat(abspath)
+    ordered = sorted(table.items())
+    body = b"".join(encode_record(path, snap) for path, snap in ordered)
+    with open(record_path, "wb") as f:
+        f.write(body)
+    if meta_path:
+        write_meta(meta_path, ws, len(ordered))
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(prog="yana-ledger")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p_rec = sub.add_parser("record", help="stat-walk workspace into a ledger file")
+    p_rec.add_argument("--workspace", required=True)
+    p_rec.add_argument("--out", required=True)
+    p_rec.add_argument("--meta-out")
+
+    p_chk = sub.add_parser("check", help="re-stat agent paths against a ledger")
+    p_chk.add_argument("--workspace", required=True)
+    p_chk.add_argument("--record", required=True)
+    p_chk.add_argument("--paths", required=True, help="- for stdin")
+    p_chk.add_argument("--json", action="store_true")
+    p_chk.add_argument("--meta-out")
+
+    p_adopt = sub.add_parser("adopt", help="write post-accept stat back into the ledger")
+    p_adopt.add_argument("--workspace", required=True)
+    p_adopt.add_argument("--record", required=True)
+    p_adopt.add_argument("--paths", required=True, help="- for stdin")
+    p_adopt.add_argument("--meta-out")
+
+    args = parser.parse_args()
+
+    if args.cmd == "record":
+        cmd_record(args.workspace, args.out, args.meta_out)
+        return
+
+    paths = read_paths(sys.stdin.buffer) if args.paths == "-" else [args.paths]
+
+    if args.cmd == "check":
+        raise SystemExit(cmd_check(args.workspace, args.record, paths, args.json, args.meta_out))
+
+    if args.cmd == "adopt":
+        cmd_adopt(args.workspace, args.record, paths, args.meta_out)
+        return
+
+    die_usage(f"unknown command {args.cmd!r}")
+
+
+if __name__ == "__main__":
+    main()

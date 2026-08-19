@@ -1,0 +1,16 @@
+{
+  "name": "Draft release",
+  "on": {"push": {"tags": ["v*.*.*"]}},
+  "permissions": {"contents": "write"},
+  "jobs": {
+    "draft": {
+      "runs-on": "ubuntu-24.04",
+      "steps": [
+        {"uses": "actions/checkout@11d5960a326750d5838078e36cf38b85af677262", "with": {"fetch-depth": 0}},
+        {"name": "Verify tag and public tree", "run": "scripts/release/verify.sh . \"$GITHUB_REF_NAME\""},
+        {"name": "Build reproducibly", "shell": "bash", "run": "set -euo pipefail\nepoch=$(git show -s --format=%ct HEAD)\nSOURCE_DATE_EPOCH=$epoch scripts/release/archive.sh . \"$RUNNER_TEMP/a\"\nsleep 1\n(umask 077; TZ=Pacific/Auckland SOURCE_DATE_EPOCH=$epoch scripts/release/archive.sh . \"$RUNNER_TEMP/b\")\ncmp \"$RUNNER_TEMP/a/yana.nvim-${GITHUB_REF_NAME#v}.tar.gz\" \"$RUNNER_TEMP/b/yana.nvim-${GITHUB_REF_NAME#v}.tar.gz\""},
+        {"name": "Create draft", "shell": "bash", "env": {"GH_TOKEN": "${{ github.token }}"}, "run": "set -euo pipefail\nstatus=()\nif [[ $GITHUB_REF_NAME == *-* ]]; then status+=(--prerelease); fi\ngh release create \"$GITHUB_REF_NAME\" \"$RUNNER_TEMP/a/yana.nvim-${GITHUB_REF_NAME#v}.tar.gz\" \"$RUNNER_TEMP/a/SHA256SUMS\" --draft --verify-tag \"${status[@]}\" --title \"Yana ${GITHUB_REF_NAME#v}\" --notes-file CHANGELOG.md"}
+      ]
+    }
+  }
+}

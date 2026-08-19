@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# yana-overlay-inner — mount helper run inside bwrap (not for direct use).
+set -eu
+
+readonly EXIT_MOUNT=67
+readonly NEUTRAL_LOWER=/tmp/yana/lower
+readonly NEUTRAL_LAYER=/tmp/yana/layer
+readonly MOUNT_MARKER=.yana-overlay-mounted
+readonly MOUNT_MARKER_CONTENT=mounted
+
+if [[ ${1:-} == "--help" || ${1:-} == "-h" ]]; then
+	cat <<'EOF'
+Usage: yana-overlay-inner WORKSPACE COMMAND [ARGS...]
+
+Internal mount-namespace helper invoked only by yana-overlay.
+EOF
+	exit 0
+fi
+
+WORKSPACE=${1:?WORKSPACE required}
+shift
+
+mount -t overlay yana-ovl \
+	-o "lowerdir=${NEUTRAL_LOWER},upperdir=${NEUTRAL_LAYER}/upper,workdir=${NEUTRAL_LAYER}/work" \
+	"$WORKSPACE" || exit "$EXIT_MOUNT"
+
+touch "${NEUTRAL_LAYER}/${MOUNT_MARKER}"
+echo "$MOUNT_MARKER_CONTENT" >"${NEUTRAL_LAYER}/${MOUNT_MARKER}"
+
+cmd=( "$@" )
+exec capsh --drop=all --caps= -- -c "$(printf '%q ' "${cmd[@]}")"

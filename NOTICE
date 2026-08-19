@@ -1,0 +1,69 @@
+Yana
+
+This distribution contains software derived from the MIT-licensed project at:
+https://github.com/just-nibble/neocursor.git
+
+Recorded fork point: e85d8e077bec53237810fc848f635e4ad440284a
+Upstream licence: MIT
+Upstream copyright notice: Copyright (c) 2026 The Sigillite
+
+The upstream notice and MIT permission text are retained in LICENSE. Yana's
+later implementation, documentation, tests, and release engineering include
+work by Dr Usman Bashir and other repository contributors.
+
+Runtime provenance inventory:
+
+- post-fork original: `bin/yana-apply`
+- post-fork original: `bin/yana-changeset`
+- post-fork original: `bin/yana-jail`
+- post-fork original: `bin/yana-ledger`
+- post-fork original: `bin/yana-overlay`
+- post-fork original: `bin/yana-overlay-inner`
+- post-fork original: `bin/yana-sandbox`
+- post-fork original: `bin/yana-turn`
+- post-fork original: `lua/blink_yana/commands.lua`
+- post-fork original: `lua/blink_yana/mentions.lua`
+- upstream-derived: `lua/yana/agent.lua`
+- post-fork original: `lua/yana/claim_identity.lua`
+- post-fork original: `lua/yana/cli/apply.lua`
+- post-fork original: `lua/yana/cli/turn.lua`
+- post-fork original: `lua/yana/clipboard.lua`
+- post-fork original: `lua/yana/commands.lua`
+- upstream-derived: `lua/yana/config.lua`
+- upstream-derived: `lua/yana/context.lua`
+- post-fork original: `lua/yana/dependencies.lua`
+- upstream-derived: `lua/yana/diff.lua`
+- post-fork original: `lua/yana/diff_preview.lua`
+- post-fork original: `lua/yana/dump.lua`
+- post-fork original: `lua/yana/flow_report.lua`
+- upstream-derived: `lua/yana/health.lua`
+- upstream-derived: `lua/yana/init.lua`
+- upstream-derived: `lua/yana/inline_diff.lua`
+- post-fork original: `lua/yana/inline_edit.lua`
+- post-fork original: `lua/yana/ledger.lua`
+- post-fork original: `lua/yana/log.lua`
+- post-fork original: `lua/yana/manifest.lua`
+- post-fork original: `lua/yana/mentions.lua`
+- post-fork original: `lua/yana/notify.lua`
+- post-fork original: `lua/yana/record.lua`
+- post-fork original: `lua/yana/render_check.lua`
+- post-fork original: `lua/yana/safety/checkpoint.lua`
+- post-fork original: `lua/yana/safety/control_plane.lua`
+- post-fork original: `lua/yana/safety/diary.lua`
+- post-fork original: `lua/yana/safety/flush.lua`
+- post-fork original: `lua/yana/safety/hash.lua`
+- post-fork original: `lua/yana/selection_scope.lua`
+- upstream-derived: `lua/yana/sessions.lua`
+- post-fork original: `lua/yana/shadow/apply.lua`
+- post-fork original: `lua/yana/shadow/jail.lua`
+- post-fork original: `lua/yana/shadow/ops.lua`
+- post-fork original: `lua/yana/shadow/preview.lua`
+- post-fork original: `lua/yana/timeline/edit_capture.lua`
+- post-fork original: `lua/yana/timeline/init.lua`
+- post-fork original: `lua/yana/timeline/record.lua`
+- post-fork original: `lua/yana/timeline/ui.lua`
+- post-fork original: `lua/yana/timeline/walk.lua`
+- post-fork original: `lua/yana/timeline/walk_impl.lua`
+- post-fork original: `lua/yana/turn_lifecycle.lua`
+- upstream-derived: `lua/yana/ui.lua`
+- upstream-derived: `plugin/yana.lua`

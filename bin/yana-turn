@@ -1,0 +1,393 @@
+#!/usr/bin/env bash
+# yana-turn — one headless turn: preflight + confined agent + change set + apply.
+#
+# CORE, "No whole-repository work": there is no snapshot copy and no manifest
+# pass. The overlay's lower layer is the before-picture and its upper layer is
+# the change set, so a turn costs what the agent touched and nothing more.
+set -euo pipefail
+
+readonly EXIT_USAGE=64
+readonly EXIT_REFUSE=65
+readonly EXIT_NO_SANDBOX=66
+readonly EXIT_SELF_CHECK=67
+
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO="$(cd "$DIR/.." && pwd)"
+SANDBOX="$DIR/yana-sandbox"
+APPLY="$DIR/yana-apply"
+OVERLAY="$DIR/yana-overlay"
+TURN_LUA="$REPO/lua/yana/cli/turn.lua"
+NVIM="${YANA_TURN_NVIM:-${YANA_APPLY_NVIM:-nvim}}"
+
+STATE_ROOT="${YANA_STATE_ROOT:-$HOME/.local/state/yana}"
+WORKSPACE=""
+PROMPT=""
+DIARY=""
+STREAM="default"
+TURN_ID=""
+CHANGES_OUT=""
+MODE="preview"
+JSON=0
+NO_CLAIM=0
+NO_CLAIM_REASON=""
+AGENT=()
+
+usage() {
+	cat <<'EOF'
+Usage: yana-turn --workspace DIR --prompt TEXT
+                     [--state-root DIR] [--diary DIR] [--stream NAME]
+                     [--turn-id ID] [--preview | --accept]
+                     [--changes-out DIR] [--agent CMD...] [--json]
+                     [--no-claim-reason TEXT]
+
+Runs one confined agent turn and reads the typed change set straight from the
+overlay upper layer. Nothing is copied at turn start.
+The real workspace is written only by yana-apply on --accept.
+One live overlay turn per workspace is enforced via claim unless --no-claim-reason.
+EOF
+}
+
+die_usage() {
+	echo "yana-turn: $*" >&2
+	echo "yana-turn: run with --help for usage" >&2
+	exit "$EXIT_USAGE"
+}
+
+refuse() {
+	echo "yana-turn: $*" >&2
+	exit "$EXIT_REFUSE"
+}
+
+realpath_safe() {
+	local target=$1
+	if [[ -e "$target" ]]; then
+		readlink -f -- "$target"
+		return 0
+	fi
+	realpath -ms -- "$target"
+}
+
+path_is_prefix() {
+	local parent=$1 child=$2
+	[[ "$child" == "$parent" || "$child" == "$parent"/* ]]
+}
+
+safe_component() {
+	local name=$1 label=$2
+	if [[ ! "$name" =~ ^[A-Za-z0-9._-]+$ ]]; then
+		die_usage "$label must be a single safe path component (allowed: letters, digits, '.', '_', '-'; no '/')"
+	fi
+}
+
+workspace_slug() {
+	local path=$1
+	local root
+	root=$(canonical_workspace_path "$path")
+	local id
+	id=$(stat -c '%d:%i' -- "$root" 2>/dev/null) || true
+	if [[ -n "$id" ]]; then
+		printf '%s' "$id" | sha256sum | awk '{print substr($1,1,16)}'
+	else
+		printf '%s' "$root" | sha256sum | awk '{print substr($1,1,16)}'
+	fi
+}
+
+canonical_workspace_path() {
+	local path=$1
+	local dir
+	dir=$(realpath_safe "$path")
+	local root="$dir"
+	while [[ -n "$dir" && "$dir" != "/" ]]; do
+		if [[ -e "$dir/.git" ]]; then
+			root="$dir"
+			break
+		fi
+		dir=$(dirname -- "$dir")
+	done
+	printf '%s' "$root"
+}
+
+require_disjoint() {
+	local ws=$1 path=$2 label=$3 remedy=${4:-}
+	if path_is_prefix "$ws" "$path" || path_is_prefix "$path" "$ws"; then
+		refuse "$label ($path) must be disjoint from workspace ($ws)${remedy:+ — $remedy}"
+	fi
+}
+
+# Reject derived paths whose prefix chain includes a symlink — otherwise mkdir -p
+# follows the link and writes into the real workspace before preflight runs.
+refuse_symlink_components() {
+	local path=$1 label=$2
+	if [[ "$path" != /* ]]; then
+		die_usage "internal: $label must be an absolute path"
+	fi
+	local cur="" part rest="${path#/}"
+	while [[ -n "$rest" ]]; do
+		if [[ "$rest" == */* ]]; then
+			part="${rest%%/*}"
+			rest="${rest#*/}"
+		else
+			part="$rest"
+			rest=""
+		fi
+		if [[ -z "$cur" ]]; then
+			cur="/$part"
+		else
+			cur="$cur/$part"
+		fi
+		if [[ -L "$cur" ]]; then
+			refuse "$label: symlink component in derived path: $cur — replace $cur with a real directory, or re-point the flag this path derives from (--state-root, --diary, or --changes-out) at a symlink-free location"
+		fi
+	done
+}
+
+parse_args() {
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+			--workspace)
+				[[ $# -ge 2 ]] || die_usage "--workspace requires a directory"
+				WORKSPACE=$2
+				shift 2
+				;;
+			--prompt)
+				[[ $# -ge 2 ]] || die_usage "--prompt requires text"
+				PROMPT=$2
+				shift 2
+				;;
+			--state-root)
+				[[ $# -ge 2 ]] || die_usage "--state-root requires a directory"
+				STATE_ROOT=$2
+				shift 2
+				;;
+			--diary)
+				[[ $# -ge 2 ]] || die_usage "--diary requires a directory"
+				DIARY=$2
+				shift 2
+				;;
+			--stream)
+				[[ $# -ge 2 ]] || die_usage "--stream requires a name"
+				STREAM=$2
+				shift 2
+				;;
+			--turn-id)
+				[[ $# -ge 2 ]] || die_usage "--turn-id requires an id"
+				TURN_ID=$2
+				shift 2
+				;;
+			--changes-out)
+				[[ $# -ge 2 ]] || die_usage "--changes-out requires a directory"
+				CHANGES_OUT=$2
+				shift 2
+				;;
+			--agent)
+				shift
+				if [[ $# -eq 0 ]]; then
+					die_usage "--agent requires a command"
+				fi
+				AGENT=("$@")
+				break
+				;;
+			--preview)
+				MODE="preview"
+				shift
+				;;
+			--accept)
+				MODE="accept"
+				shift
+				;;
+			--json)
+				JSON=1
+				shift
+				;;
+			--no-claim-reason)
+				[[ $# -ge 2 ]] || die_usage "--no-claim-reason requires text"
+				NO_CLAIM=1
+				NO_CLAIM_REASON=$2
+				shift 2
+				;;
+			--help|-h)
+				usage
+				exit 0
+				;;
+			-*)
+				die_usage "unknown option: $1"
+				;;
+			*)
+				die_usage "unexpected argument: $1"
+				;;
+		esac
+	done
+}
+
+main() {
+	parse_args "$@"
+	[[ -n "$WORKSPACE" && -n "$PROMPT" ]] || die_usage "--workspace and --prompt are required"
+
+	if (( NO_CLAIM == 1 )) && [[ -n "$NO_CLAIM_REASON" ]]; then
+		printf 'claim skipped: %s\n' "$NO_CLAIM_REASON" >&2
+	fi
+
+	WORKSPACE=$(realpath_safe "$WORKSPACE")
+	STATE_ROOT=$(realpath_safe "$STATE_ROOT")
+	safe_component "$STREAM" "--stream"
+	TURN_ID="${TURN_ID:-$(date +%s%N)-$$}"
+	safe_component "$TURN_ID" "--turn-id"
+
+	if [[ -z "$DIARY" ]]; then
+		DIARY="$STATE_ROOT/diary"
+	fi
+	DIARY=$(realpath_safe "$DIARY")
+
+	local slug turn_dir private turn_diary claim_dir layer_dir
+	slug=$(workspace_slug "$WORKSPACE")
+	turn_dir="$STATE_ROOT/turns/$slug/$STREAM/$TURN_ID"
+	private="$turn_dir/private"
+	claim_dir="$STATE_ROOT/claims/$slug"
+	layer_dir="$turn_dir/layer"
+	if [[ -z "$CHANGES_OUT" ]]; then
+		CHANGES_OUT="$turn_dir/changes"
+	fi
+	turn_diary="$DIARY/$STREAM/$TURN_ID"
+
+	turn_dir=$(realpath_safe "$turn_dir")
+	private=$(realpath_safe "$private")
+	CHANGES_OUT=$(realpath_safe "$CHANGES_OUT")
+	turn_diary=$(realpath_safe "$turn_diary")
+	turn_parent=$(dirname -- "$turn_dir")
+
+	require_disjoint "$WORKSPACE" "$STATE_ROOT" "--state root" \
+		"pass --state-root DIR (or set YANA_STATE_ROOT) naming a directory outside the workspace"
+	require_disjoint "$WORKSPACE" "$DIARY" "--diary root" \
+		"pass --diary DIR naming a directory outside the workspace"
+	require_disjoint "$WORKSPACE" "$turn_dir" "turn state" \
+		"turn state lives under the state root — pass --state-root DIR naming a directory outside the workspace"
+	require_disjoint "$WORKSPACE" "$CHANGES_OUT" "--changes-out" \
+		"pass --changes-out DIR naming a directory outside the workspace"
+
+	refuse_symlink_components "$turn_parent" "turn state parent path"
+	refuse_symlink_components "$turn_dir" "turn state path"
+	refuse_symlink_components "$private" "private path"
+	refuse_symlink_components "$turn_diary" "turn diary path"
+	refuse_symlink_components "$CHANGES_OUT" "changes-out path"
+
+	mkdir -p "$turn_parent"
+	if [[ -e "$turn_dir" ]]; then
+		refuse "turn directory already exists: $turn_dir — pass a fresh --turn-id (or omit --turn-id for a generated one), or remove that directory if its turn is finished"
+	fi
+	mkdir "$turn_dir"
+	mkdir -p "$turn_dir/changes" "$layer_dir/upper" "$layer_dir/work" "$private"
+
+	# 1. Preflight the workspace. `--shadow` names the per-turn private state
+	#    directory the preflight validates disjointness against; nothing is
+	#    copied into it, and there is no shadow tree any more.
+	#
+	#    The preflight is O(1) and walks nothing: the root's size verdict was
+	#    decided once, when the root was approved, and is read from the root's own
+	#    state directory under `--state-root`. An unapproved root, or a root whose
+	#    filesystem identity no longer matches the recorded one, refuses the turn
+	#    here by the confinement-failure route below and names the approval
+	#    command. There is deliberately no fallback walk (CORE, "No
+	#    whole-repository work"; the isolation contract).
+	local preflight_err="$turn_dir/preflight-stderr"
+	set +e
+	"$SANDBOX" --preflight-only --workspace "$WORKSPACE" --shadow "$private" --state-root "$STATE_ROOT" 2>"$preflight_err"
+	local preflight_rc=$?
+	set -e
+	# The sandbox's own words usually name the exact clearing action (e.g. the
+	# --approve-root command), so they are re-emitted verbatim and the last of
+	# them is appended to this file's summary line: a caller that keeps only
+	# the yana-turn: lines still learns the remedy, not just a number.
+	if [[ -s "$preflight_err" ]]; then
+		cat "$preflight_err" >&2
+	fi
+	local preflight_msg=""
+	if [[ -s "$preflight_err" ]]; then
+		preflight_msg=$(tail -n 1 "$preflight_err")
+	fi
+	if (( preflight_rc == EXIT_REFUSE || preflight_rc == EXIT_NO_SANDBOX || preflight_rc == EXIT_SELF_CHECK )); then
+		echo "yana-turn: sandbox preflight refused (exit $preflight_rc)${preflight_msg:+ — $preflight_msg}" >&2
+		exit "$preflight_rc"
+	fi
+	if (( preflight_rc != 0 )); then
+		echo "yana-turn: sandbox preflight failed (exit $preflight_rc)${preflight_msg:+ — $preflight_msg}" >&2
+		exit "$preflight_rc"
+	fi
+
+	# 2. Confined agent via overlay (claim keyed on workspace unless opted out).
+	local agent_cmd=() ovl_args=(--workspace "$WORKSPACE" --upper "$layer_dir/upper" --work "$layer_dir/work")
+	local claim_nonce_file="$turn_dir/claim-nonce"
+	if (( NO_CLAIM == 0 )); then
+		# --nonce-out, not a later read of <claim>/nonce. The release below runs
+		# after the turn has ended, and by then the claim may already belong to
+		# a newer turn, so reading the token then would capture somebody else's
+		# or none at all. The acquiring process writes it here instead, at the
+		# moment it acquires, which is a capture that cannot race.
+		ovl_args+=(--claim "$claim_dir" --nonce-out "$claim_nonce_file")
+	fi
+	if (( ${#AGENT[@]} > 0 )); then
+		agent_cmd=("${AGENT[@]}")
+	else
+		agent_cmd=(cursor-agent -p "$PROMPT" --trust --force)
+	fi
+	set +e
+	"$OVERLAY" "${ovl_args[@]}" -- sh -c 'cd "$1" && shift && exec "$@"' _ "$WORKSPACE" "${agent_cmd[@]}"
+	local agent_rc=$?
+	set -e
+	if (( agent_rc == EXIT_NO_SANDBOX || agent_rc == EXIT_SELF_CHECK )); then
+		echo "yana-turn: overlay launch failed (exit $agent_rc)" >&2
+		exit "$agent_rc"
+	fi
+	if (( agent_rc == EXIT_REFUSE )); then
+		echo "yana-turn: overlay refused (exit $agent_rc)" >&2
+		exit "$agent_rc"
+	fi
+	if (( agent_rc != 0 )); then
+		echo "yana-turn: agent exited $agent_rc" >&2
+		exit "$agent_rc"
+	fi
+	# 3. Read the change set from the upper layer + stage it.
+	local finish_args=(finish --workspace "$WORKSPACE" --upper "$layer_dir/upper" --changes-out "$CHANGES_OUT")
+	if (( JSON )); then
+		finish_args+=(--json)
+	fi
+	"$NVIM" --clean -l "$TURN_LUA" "${finish_args[@]}"
+
+	if [[ "$MODE" == "preview" ]]; then
+		if (( NO_CLAIM == 0 )); then
+			mkdir -p "$claim_dir" 2>/dev/null || true
+			touch "$claim_dir/review-open" 2>/dev/null || true
+			# CORE: claims survive agent process exit while a review is open.
+			# That is correct behaviour, so say it: the operator now holds
+			# state that blocks the next overlay turn until resolved.
+			echo "yana-turn: review open — this preview holds the workspace claim ($claim_dir, turn $TURN_ID)" >&2
+			echo "yana-turn: accepting or rejecting the review resolves it; to discard it instead, release with: yana-overlay release --claim '$claim_dir'" >&2
+		fi
+		exit 0
+	fi
+
+	# 4. Accept through the sole door. The before-fingerprints travel inside the
+	#    change set, so the applier needs no separate base file.
+	"$NVIM" --clean -l "$TURN_LUA" check-deletes --workspace "$WORKSPACE" --upper "$layer_dir/upper"
+	mkdir -p "$turn_diary"
+	"$APPLY" apply --changes "$CHANGES_OUT" --target "$WORKSPACE" --diary "$turn_diary" --stream "$STREAM"
+	if (( NO_CLAIM == 0 )); then
+		local claim_nonce=""
+		if [[ -r "$claim_nonce_file" ]]; then
+			IFS= read -r claim_nonce <"$claim_nonce_file" || claim_nonce=""
+		fi
+		if [[ -n "$claim_nonce" ]]; then
+			"$OVERLAY" release --claim "$claim_dir" --nonce "$claim_nonce"
+		else
+			# The overlay refuses at acquire if it cannot write the token, so
+			# reaching here means something removed it afterwards. Say so and
+			# still release: this runs after the apply, and failing the turn now
+			# would fail work that has already landed. The release is path-only,
+			# which is what the token exists to stop, so it is named as an
+			# anomaly rather than passed over.
+			echo "yana-turn: acquisition token missing ($claim_nonce_file); releasing the claim by path only" >&2
+			"$OVERLAY" release --claim "$claim_dir"
+		fi
+	fi
+}
+
+main "$@"
