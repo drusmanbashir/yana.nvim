@@ -86,7 +86,11 @@ local function section_facts(L, out)
     out[#out + 1] = string.format("- Turn dir: %s", nn(t.turn_dir))
   end
   if L.recording then
-    out[#out + 1] = string.format("- Recording: `%s` (+ meta.json)", nn(L.recording.stream_path))
+    out[#out + 1] = string.format(
+      "- Recording: `%s` + `%s` (+ meta.json)",
+      nn(L.recording.stream_path),
+      nn(L.recording.events_path)
+    )
   end
   out[#out + 1] = ""
 end
@@ -189,6 +193,7 @@ local function section_events(L, out)
     { "reviews enqueued", c.reviews_enqueued },
     { "reviews opened", c.reviews_opened },
     { "reviews refused", c.reviews_refused },
+    { "artifact ops system-refused", c.ops_system_refused },
     { "review retries", c.review_retries },
     { "agent retry announcements", c.retry_announcements },
     { "scope rejections", c.scope_rejections },

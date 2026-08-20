@@ -461,6 +461,21 @@ secret_mask_add() {
 	SECRET_MASK_APPLIED=$((SECRET_MASK_APPLIED + 1))
 }
 
+# resolve_state_root — same precedence as bin/yana-turn's $STATE_ROOT and
+# lua/yana/shadow/preview.lua's M.state_root(): YANA_STATE_ROOT, then
+# XDG_STATE_HOME/yana, then $HOME/.local/state/yana. Used only to place the
+# secret mask's own runtime scratch outside the confined tree; the turn's
+# chosen state root (upper/work) is already passed in by the caller.
+resolve_state_root() {
+	if [[ -n "${YANA_STATE_ROOT:-}" ]]; then
+		printf '%s' "$YANA_STATE_ROOT"
+	elif [[ -n "${XDG_STATE_HOME:-}" ]]; then
+		printf '%s' "$XDG_STATE_HOME/yana"
+	else
+		printf '%s' "$HOME/.local/state/yana"
+	fi
+}
+
 # build_secret_mask — compose the mount arguments that implement CORE's secrets
 # wall. Runs before the claim is taken, so a failure to establish the enforcement
 # refuses before any durable state is touched and before the executable starts,
@@ -506,7 +521,27 @@ build_secret_mask() {
 		done
 	done
 
-	SECRET_MASK_EMPTY=$(mktemp "${TMPDIR:-/tmp}/yana-secret-mask.XXXXXX") 		|| refuse "cannot create the empty file used to mask secret files"
+	# The empty file that masks secret FILES is created on the HOST, before bwrap
+	# starts (this whole function runs before the claim is taken). TMPDIR is
+	# operator/project-controlled and project-local scratch dirs under the
+	# workspace are common, so an arbitrary TMPDIR would mutate the real tree
+	# pre-confinement. Refuse closed rather than trust it, and use the resolved
+	# yana state root's own runtime scratch instead of $TMPDIR either way.
+	if [[ -n "${TMPDIR:-}" ]]; then
+		local tmpdir_real
+		tmpdir_real=$(realpath_safe "$TMPDIR")
+		if path_is_prefix "$WORKSPACE" "$tmpdir_real" \
+			|| path_is_prefix "$LAYER_ROOT" "$tmpdir_real" \
+			|| { [[ -n "$CURSOR_DIR" ]] && path_is_prefix "$CURSOR_DIR" "$tmpdir_real"; }; then
+			refuse "TMPDIR ($TMPDIR) resolves inside the workspace, the layer root or the writable-host exception — unset TMPDIR or point it outside the confined tree before starting a turn"
+		fi
+	fi
+	local mask_run_dir
+	mask_run_dir="$(resolve_state_root)/run"
+	mkdir -p "$mask_run_dir" 2>/dev/null \
+		|| refuse "cannot create the state-root runtime directory '$mask_run_dir' used to mask secret files"
+	SECRET_MASK_EMPTY=$(mktemp "$mask_run_dir/yana-secret-mask.XXXXXX") \
+		|| refuse "cannot create the empty file used to mask secret files"
 	: >"$SECRET_MASK_EMPTY"
 	chmod 0444 "$SECRET_MASK_EMPTY" 2>/dev/null || true
 
@@ -1222,7 +1257,7 @@ take_claim() {
 	if (( live == 0 )); then
 		claim_reclaim_unlock
 		trap - EXIT
-		refuse "workspace already has a live overlay turn (holder: ${holder%% })"
+		refuse "workspace already has a live overlay turn (holder: ${holder%% }) — wait for it to finish; if it is stuck, stop it with :YanaStop in its editor, or as a last resort clear it with: $0 force-release --claim '$CLAIM' --reason 'stuck live turn'"
 	fi
 	# AN OPEN REVIEW BELONGS TO AN EDITOR, AND THE EDITOR MAY BE GONE.
 	#
@@ -1257,7 +1292,7 @@ take_claim() {
 		if (( review_live == 0 )); then
 			claim_reclaim_unlock
 			trap - EXIT
-			refuse "workspace has an open overlay review in a running editor (holder: ${holder%% }) — finish or reject that review, or close that editor"
+			refuse "workspace has an open overlay review in a running editor (holder: ${holder%% }) — finish or reject that review (:YanaReview then ct/co/cb, or :YanaAbortReview) or close that editor; if that editor cannot be found, clear it with: $0 force-release --claim '$CLAIM' --reason 'lost review editor'"
 		fi
 		if (( review_live == 2 )); then
 			claim_reclaim_unlock
@@ -1349,6 +1384,20 @@ release_recorded_cgroup() {
 # $1 = "force" bypasses every check: force-release is the deliberate human
 # override, and take_claim's reclaim path has already classified the holder
 # dead while holding this same lock.
+#
+# $1 = "self" is the third case, distinct from both: cmd_run's own pre-agent
+# mount-failure path (see there) calls this from INSIDE the very process that
+# take_claim just committed the claim to, to give it back before this
+# invocation exits. holder_is_live would find that process alive (it is --
+# it is the one calling) and "owned" mode would therefore always decline, so
+# liveness is not the question "self" asks. The question is whether the
+# claim in front of us is still the acquisition we committed, and the nonce
+# check shared with every non-force mode above already answers that: a
+# concurrent force-release-and-reacquire is the only way our own live
+# holder record could have been replaced while we are still running, and
+# that changes the recorded nonce. "self" additionally requires a nonce to
+# have been supplied at all -- unlike "owned", which tolerates a caller with
+# no token for backward compatibility -- because this call always has one.
 release_claim() {
 	local mode=${1:-owned} took_lock=0 live
 	[[ -n "$CLAIM" ]] || die_usage "release requires --claim"
@@ -1389,19 +1438,27 @@ release_claim() {
 			(( took_lock )) && { claim_reclaim_unlock; trap - EXIT; }
 			return 0
 		fi
-		set +e
-		holder_is_live "$CLAIM/holder"
-		live=$?
-		set -e
-		if (( live == 0 )); then
-			echo "yana-overlay: claim not released: it belongs to a live overlay turn (holder: $(tr '\n' ' ' <"$CLAIM/holder"))" >&2
-			(( took_lock )) && { claim_reclaim_unlock; trap - EXIT; }
-			return 0
-		fi
-		if (( live == 2 )); then
-			echo "yana-overlay: claim not released: holder identity is ambiguous — force-release with a reason to clear it" >&2
-			(( took_lock )) && { claim_reclaim_unlock; trap - EXIT; }
-			return 0
+		if [[ "$mode" == "self" ]]; then
+			if [[ -z "$RELEASE_NONCE" ]]; then
+				echo "yana-overlay: claim not released: no acquisition token to release with" >&2
+				(( took_lock )) && { claim_reclaim_unlock; trap - EXIT; }
+				return 0
+			fi
+		else
+			set +e
+			holder_is_live "$CLAIM/holder"
+			live=$?
+			set -e
+			if (( live == 0 )); then
+				echo "yana-overlay: claim not released: it belongs to a live overlay turn (holder: $(tr '\n' ' ' <"$CLAIM/holder"))" >&2
+				(( took_lock )) && { claim_reclaim_unlock; trap - EXIT; }
+				return 0
+			fi
+			if (( live == 2 )); then
+				echo "yana-overlay: claim not released: holder identity is ambiguous — force-release with a reason to clear it" >&2
+				(( took_lock )) && { claim_reclaim_unlock; trap - EXIT; }
+				return 0
+			fi
 		fi
 	fi
 	release_recorded_cgroup
@@ -1575,12 +1632,64 @@ cmd_run() {
 	fi
 	take_claim
 
+	# Capture the token THIS invocation's acquisition just wrote. take_claim
+	# always ends a successful acquisition with write_holder, which always
+	# regenerates $CLAIM/nonce (write_acquisition_nonce), so this is our own
+	# fresh token, not a stale read -- nothing else can have touched this
+	# claim between take_claim returning and this line, because we are its
+	# live holder. Used only by the pre-agent mount-failure path below.
+	local acquired_nonce=""
+	if [[ -n "$CLAIM" ]]; then
+		IFS= read -r acquired_nonce <"$CLAIM/nonce" 2>/dev/null || acquired_nonce=""
+	fi
+
 	trap 'teardown_work "$WORK"; secret_mask_cleanup' EXIT
 
-	run_overlay
-	local rc=$?
+	# `run_overlay; local rc=$?` looks like it captures the exit status, but
+	# under `set -e` it never gets the chance to: a bare simple command that
+	# returns non-zero triggers errexit immediately, so the shell exits
+	# right there and `local rc=$?` -- and everything after it, including
+	# refuse_mount's classification and the claim release below -- never
+	# runs. Measured: a forced mount failure produced only the EXIT trap's
+	# teardown_work/secret_mask_cleanup, the raw kernel mount(2) error on
+	# stderr, and no "overlay mount failed" text, for any run_overlay
+	# failure at all, mount or otherwise. `if run_overlay; then ... fi` is
+	# a context `set -e` exempts (the test part of an if), so this is the
+	# minimal change that lets rc actually reach the classification below.
+	local rc
+	if run_overlay; then
+		rc=0
+	else
+		rc=$?
+	fi
 	if (( rc != 0 )); then
 		if (( rc == EXIT_MOUNT )) && ! mount_succeeded; then
+			# PRE-AGENT, PRE-MOUNT FAILURE. take_claim above already committed a
+			# claim for this invocation (holder file written, holder = this
+			# process). yana-overlay-inner exits via EXIT_MOUNT strictly before
+			# its capsh exec (bin/yana-overlay-inner:23-31): the agent command
+			# never ran, so nothing under this claim can have started work.
+			# Claims are released explicitly, never by process exit, so without
+			# this call the
+			# committed claim outlives this process and every later turn on the
+			# workspace refuses until a manual force-release -- a
+			# foreign-filesystem user's first turn would permanently wedge
+			# their workspace. Release exactly the claim this invocation
+			# committed: release_claim's "self" mode matches RELEASE_NONCE,
+			# under the reclaim lock, against the token take_claim generated
+			# moments ago -- a claim a concurrent editor has since
+			# force-released and reacquired carries a different token and is
+			# left untouched (see release_claim's "self" mode comment).
+			#
+			# Danger-rail scope: this is the ONLY failure branch that releases
+			# anything here. A non-EXIT_MOUNT rc, or an EXIT_MOUNT rc where
+			# mount_succeeded is true (the agent's own command happened to
+			# exit 67 after a real mount), falls through to plain `exit "$rc"`
+			# below and never reaches this call -- both mean the agent may
+			# have started, which this path must never touch.
+			if [[ -n "$CLAIM" && -n "$acquired_nonce" ]]; then
+				RELEASE_NONCE=$acquired_nonce release_claim self
+			fi
 			refuse_mount "cannot establish overlay at '$WORKSPACE'"
 		fi
 		exit "$rc"

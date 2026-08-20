@@ -4,7 +4,7 @@ set -euo pipefail
 [[ $# == 2 ]] || { echo "Usage: $0 EXPORTED_TREE NVIM" >&2; exit 64; }
 tree=$(realpath "$1")
 nvim=$(realpath "$2")
-tmp=${TMPDIR:-/s/agent_rw/tmp}
+tmp=${TMPDIR:-/tmp}
 scratch=$(mktemp -d "$tmp/yana-fresh.XXXXXX")
 trap 'rm -rf "$scratch"' EXIT
 

@@ -4,7 +4,7 @@ set -euo pipefail
 [[ $# == 2 ]] || { echo "Usage: $0 EXPORTED_TREE NVIM" >&2; exit 64; }
 tree=$(realpath "$1")
 nvim=$(realpath "$2")
-scratch=$(mktemp -d "${TMPDIR:-/s/agent_rw/tmp}/yana-deps.XXXXXX")
+scratch=$(mktemp -d "${TMPDIR:-/tmp}/yana-deps.XXXXXX")
 trap 'rm -rf "$scratch"' EXIT
 
 mapfile -t required < <(

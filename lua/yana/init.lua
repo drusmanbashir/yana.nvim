@@ -10,11 +10,52 @@ local function ui()
   return require("yana.ui")
 end
 
+-- Wraps a plain message so Neovim's own top-level uncaught-error formatter
+-- (interactive :lua, init.lua sourcing, `-l` script execution -- all of
+-- them route an uncaught error through it) renders a clean one-liner
+-- instead of a full Lua stack traceback. Lua's debug.traceback, which that
+-- formatter calls internally, only appends "stack traceback:" when the
+-- thrown value IS a plain string; a non-string, non-nil value is returned
+-- untouched. __tostring/__concat keep the object reading as `msg`
+-- everywhere a caller -- including a plugin manager's own pcall-and-report
+-- wrapper around setup() -- coerces it to text.
+local function clean_error(msg)
+  return setmetatable({ message = msg }, {
+    __tostring = function(self)
+      return self.message
+    end,
+    __concat = function(a, b)
+      local function text(v)
+        if type(v) == "table" and v.message then
+          return v.message
+        end
+        return tostring(v)
+      end
+      return text(a) .. text(b)
+    end,
+  })
+end
+
 -- Optional. Plugin works with defaults without calling setup().
 function M.setup(opts)
   local deps = require("yana.dependencies")
   if vim.fn.has("nvim-" .. deps.minimum_neovim) == 0 then
-    error("yana requires Neovim " .. deps.minimum_neovim .. "+", 0)
+    -- Below the floor: refuse cleanly, not with a crash dump. The error()
+    -- call below is the single source of truth for the documented message
+    -- (tests/matrix_gate.sh's negative row greps it verbatim from this
+    -- file) but is caught right here instead of left to propagate:
+    -- Neovim always appends a full stack traceback to an uncaught PLAIN
+    -- STRING error reaching its own top-level handler, in every calling
+    -- context. Catch it, surface it once on the real error channel, then
+    -- re-raise via clean_error() so nothing downstream decorates it --
+    -- setup() still genuinely does not return to an unprotected caller, it
+    -- just does so without the traceback. Nothing past this block runs.
+    local _, raw = pcall(function()
+      error("yana requires Neovim " .. deps.minimum_neovim .. "+", 0)
+    end)
+    local msg = tostring(raw)
+    pcall(vim.api.nvim_err_writeln, msg)
+    error(clean_error(msg))
   end
 
   config.setup(opts)

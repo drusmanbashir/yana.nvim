@@ -12,7 +12,7 @@ local M = {}
 local function build_cmd(req)
   local o = config.options
   local cmd = {
-    o.cmd,
+    config.cmd(),
     "-p",
     "--output-format", "stream-json",
     "--stream-partial-output",
@@ -97,7 +97,7 @@ function M.run(req)
     if req.panel_id then
       local L0 = ledger.ensure(req.panel_id, req.turn_gen)
       ledger.record_spawn(L0, {
-        cmd = config.options.cmd,
+        cmd = config.cmd(),
         cwd = req.cwd,
         mode = req.mode,
         reason = req.spawn_reason or "submit",
@@ -120,6 +120,14 @@ function M.run(req)
     return nil
   end
   local cmd = build_cmd(req)
+  -- The resolved agent binary, captured once here (cmd[1], exactly what
+  -- config.cmd() produced inside build_cmd) before `cmd` is potentially
+  -- reassigned to a jail-wrapped argv below (bwrap/sh, not cursor-agent).
+  -- Every ledger/error-message site past this point reports THIS, not a
+  -- fresh config.cmd() call, so provenance always names the binary that was
+  -- actually resolved for this spawn rather than whatever a second
+  -- resolution (env var mutated mid-flight, however unlikely) might answer.
+  local resolved_cmd = cmd[1]
   -- Provenance, record 1 of 3: every jobstart is logged into the turn ledger
   -- with its argv, pid, panel, gen, resume id and reason. A repeated panel
   -- sentence is attributable only if "did Yana start a second process?"
@@ -134,7 +142,7 @@ function M.run(req)
       if L then
         ledger.record_spawn(L, {
           argv = cmd,
-          cmd = config.options.cmd,
+          cmd = resolved_cmd,
           cwd = req.cwd,
           mode = req.mode,
           model = req.model,
@@ -163,6 +171,7 @@ function M.run(req)
     session = req.jail_session,
     panel_id = req.panel_id,
     gen = req.turn_gen,
+    turn_id = req.turn_id,
     argv = cmd,
     cwd = req.cwd,
     mode = req.mode,
@@ -171,7 +180,11 @@ function M.run(req)
     jailed = req.jail_session ~= nil,
   })
   if rec and L then
-    ledger.set_recording(L, { stream_path = rec.stream_path, meta_path = rec.meta_path })
+    ledger.set_recording(L, {
+      stream_path = rec.stream_path,
+      events_path = rec.events_path,
+      meta_path = rec.meta_path,
+    }, rec)
   end
 
   local function emit(line)
@@ -187,6 +200,9 @@ function M.run(req)
       -- "the agent reported N, the panel shows M" resolves to a named leak
       -- instead of an argument.
       ledger.note_decode_failure(L, #line)
+      if rec then
+        rec:note_decode_failure(#line)
+      end
     end
   end
 
@@ -247,6 +263,7 @@ function M.run(req)
             rec:finish({ code = code, stderr = stderr_text, pid = spawn and spawn.pid or nil })
             if L then
               ledger.bump(L, "recorded_lines", rec.lines)
+              ledger.clear_recording_writer(L)
             end
           end
           if spawn then
@@ -271,7 +288,7 @@ function M.run(req)
     if L then
       ledger.record_spawn(L, {
         argv = cmd,
-        cmd = config.options.cmd,
+        cmd = resolved_cmd,
         cwd = req.cwd,
         mode = req.mode,
         model = req.model,
@@ -284,7 +301,7 @@ function M.run(req)
       })
     end
     if req.on_done then
-      req.on_done(-1, "failed to start '" .. tostring(config.options.cmd) .. "' (is cursor-agent installed and on PATH?)")
+      req.on_done(-1, "failed to start '" .. tostring(resolved_cmd) .. "' (is cursor-agent installed and on PATH?)")
     end
     return nil
   end
@@ -292,7 +309,7 @@ function M.run(req)
   if L then
     spawn = ledger.record_spawn(L, {
       argv = cmd,
-      cmd = config.options.cmd,
+      cmd = resolved_cmd,
       job = job,
       pid = M.pid(job),
       cwd = req.cwd,
@@ -343,9 +360,22 @@ end
 -- List available models via `cursor-agent --list-models`.
 -- cb(models, code) where models = { { id, label, current, default }, ... }.
 -- Always includes an "auto" entry first.
+--
+-- The parse below requires literal English: `ID - label`, with optional
+-- literal `(current)` / `(default)` markers. cursor-agent inherits Neovim's
+-- (i.e. the operator's shell's) locale, and under a non-English LANG/LC_ALL
+-- it may emit localized labels or a different separator, silently emptying
+-- the model list or losing current/default status (PORT-12, portability
+-- review). There is no documented machine-readable --list-models format to
+-- switch to, so the fix is scoped to exactly this call: force the classic
+-- "C" locale on the spawned process only (jobstart's `env` MERGES onto the
+-- inherited environment rather than replacing it, so PATH/HOME etc. are
+-- untouched) rather than requiring the operator's whole session to run
+-- un-localized.
 function M.list_models(cb)
   local out = {}
-  local job = vim.fn.jobstart({ config.options.cmd, "--list-models" }, {
+  local job = vim.fn.jobstart({ config.cmd(), "--list-models" }, {
+    env = { LC_ALL = "C" },
     stdout_buffered = true,
     on_stdout = function(_, data)
       if data then

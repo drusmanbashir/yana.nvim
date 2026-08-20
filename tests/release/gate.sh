@@ -3,7 +3,7 @@ set -euo pipefail
 
 root=$(git -C "$(dirname "$0")/../.." rev-parse --show-toplevel)
 commit=${1:-HEAD}
-tmp=${TMPDIR:-/s/agent_rw/tmp}
+tmp=${TMPDIR:-/tmp}
 work=$(mktemp -d "$tmp/yana-release-gate.XXXXXX")
 trap 'rm -rf "$work"' EXIT
 

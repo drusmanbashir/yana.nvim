@@ -3,7 +3,7 @@ set -euo pipefail
 
 [[ $# == 1 ]] || { echo "Usage: $0 EXPORTED_TREE" >&2; exit 64; }
 tree=$(realpath "$1")
-scratch=$(mktemp -d "${TMPDIR:-/s/agent_rw/tmp}/yana-policy-mutations.XXXXXX")
+scratch=$(mktemp -d "${TMPDIR:-/tmp}/yana-policy-mutations.XXXXXX")
 trap 'rm -rf "$scratch"' EXIT
 version=$(tr -d '\r\n' <"$tree/VERSION")
 
@@ -34,7 +34,7 @@ legacy_upper+=CURSOR
 
 stable_tree=$(copy_case stable-control)
 printf '%s\n' '0.1.0' >"$stable_tree/VERSION"
-sed -i 's/0\.1\.0-rc\.1/0.1.0/g' "$stable_tree/CHANGELOG.md" "$stable_tree/doc/yana.txt"
+sed -i 's/0\.1\.0-alpha\.1/0.1.0/g' "$stable_tree/CHANGELOG.md" "$stable_tree/doc/yana.txt"
 "$stable_tree/scripts/release/verify.sh" "$stable_tree" 'v0.1.0' >/dev/null
 echo "CONTROL PASS: stable tag and stable tree agree"
 
@@ -54,9 +54,9 @@ expect_red legacy-bytes "forbidden bytes in README.md" \
 	"$case_tree/scripts/release/verify.sh" "$case_tree" "v$version"
 
 case_tree=$(copy_case version-drift)
-printf '%s\n' '0.1.0-rc.2' >"$case_tree/VERSION"
+printf '%s\n' '0.1.0-alpha.2' >"$case_tree/VERSION"
 expect_red version-drift "CHANGELOG has no dated release heading" \
-	"$case_tree/scripts/release/verify.sh" "$case_tree" 'v0.1.0-rc.2'
+	"$case_tree/scripts/release/verify.sh" "$case_tree" 'v0.1.0-alpha.2'
 
 case_tree=$(copy_case mutable-action)
 sed -i 's/actions\/checkout@[0-9a-f]\{40\}/actions\/checkout@main/' "$case_tree/.github/workflows/ci.yml"

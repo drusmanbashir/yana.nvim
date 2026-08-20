@@ -336,16 +336,6 @@ end
 
 --- Accept composed file content (post-hunk review) through the diary.
 function M.accept_composed(pass, change, composed)
-	if change.aggregated_members and #change.aggregated_members > 0 then
-		local last_ok, last_err, last_applied
-		for _, member in ipairs(change.aggregated_members) do
-			last_ok, last_err, last_applied = M.accept_composed(pass, member, member.after)
-			if not last_ok then
-				return last_ok, last_err, last_applied
-			end
-		end
-		return last_ok, last_err, last_applied
-	end
 	-- Any structured refusal detail is from a PREVIOUS attempt on this change;
 	-- clearing it here means a refusal is only ever labelled by evidence this
 	-- attempt actually gathered.

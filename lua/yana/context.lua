@@ -133,7 +133,9 @@ function M.build(question, origin, selection, opts)
   local label = nil
   local mode = opts.mode or config.resolve_mode(nil)
 
-  if mode == "agent" and o.agent_instructions and o.agent_instructions ~= "" then
+  -- Inline needs review/scope guidance. Raw agentic mode deliberately does
+  -- not: it is the direct cursor-agent surface, with no inline review.
+  if (mode == "inline" or mode == "agent") and o.agent_instructions and o.agent_instructions ~= "" then
     table.insert(parts, o.agent_instructions)
     local scope_text = scope_instructions()
     if scope_text then

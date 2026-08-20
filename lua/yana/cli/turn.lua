@@ -13,7 +13,6 @@ end
 local diff = require("yana.diff")
 local manifest = require("yana.manifest")
 local ops = require("yana.shadow.ops")
-local uv = vim.uv or vim.loop
 
 local EXIT_USAGE = 64
 local EXIT_REFUSE = 65
@@ -101,44 +100,6 @@ local function staged_fingerprint(op)
 		return nil, "producer emitted no before-fingerprint for this operation"
 	end
 	return fp
-end
-
---- Mutation seam for `tests/turn_gate.sh`, and nothing else.
----
---- Set, this restores the pre-fix behaviour below: the workspace is observed
---- AGAIN, here, after classification and after staging, and that later look
---- becomes the recorded before-state. The gate drives a human save into that
---- window and proves the accept overwrites it. Production never sets it.
-local MUTATE_REOBSERVE = os.getenv("YANA_TURN_MUTATE_REOBSERVE") == "1"
-
-local function reobserved_evidence(workspace, rel, fp)
-	local path = workspace .. "/" .. rel
-	local st = uv.fs_lstat(path)
-	if not st then
-		return { rel = rel, hash = fp, base_state = "absent" }
-	end
-	if st.type == "link" then
-		local target = uv.fs_readlink(path)
-		if not target then
-			return nil, "could not read symlink target for " .. rel
-		end
-		return {
-			rel = rel,
-			hash = fp,
-			base_state = "link",
-			base_mode = st.mode,
-			base_link_target = target,
-		}
-	end
-	if st.type ~= "file" then
-		return nil, "unsupported lower kind for " .. rel .. ": " .. tostring(st.type)
-	end
-	return {
-		rel = rel,
-		hash = fp,
-		base_state = "file",
-		base_mode = st.mode,
-	}
 end
 
 --- The producer's before-EVIDENCE for one touched path, read out of the record.
@@ -293,12 +254,7 @@ local function cmd_finish(args)
 			end
 			-- The whole evidence record, off the operation, BEFORE anything is
 			-- copied — one observation, taken by the producer, carried verbatim.
-			local ev, everr
-			if MUTATE_REOBSERVE then
-				ev, everr = reobserved_evidence(opts.workspace, op.rel, fp)
-			else
-				ev, everr = evidence_from_op(op, fp)
-			end
+			local ev, everr = evidence_from_op(op, fp)
 			if not ev then
 				remove_tree(staging)
 				io.stderr:write("yana-turn: base evidence failed for " .. op.rel .. ": " .. tostring(everr) .. "\n")

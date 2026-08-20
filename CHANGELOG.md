@@ -5,7 +5,17 @@ Versioning.
 
 ## Unreleased
 
-## 0.1.0-rc.1 - 2026-08-19
+### Security
+
+- Removed the ambient-environment toggle that let `yana-turn finish` re-observe
+  the workspace after classification instead of trusting the producer's own
+  read, reopening the human-save race the fix it replaced had closed. An
+  unsafe posture selectable by whatever an environment happens to export is a
+  defect wearing a keystroke; the safe path is now the only path,
+  unconditionally. A disposable mutation test preserves proof that restoring
+  the unsafe behaviour turns the protection red; it is never live code.
+
+## 0.1.0-alpha.1 - 2026-08-19
 
 ### Added
 

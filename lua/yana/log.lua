@@ -122,18 +122,22 @@ local function rotate_if_large()
   end
 end
 
--- Append a single record. Multi-line messages are indented so each record
--- stays visually grouped in the log. `level` is checked against the
--- configured minimum before the line is even formatted (mirrors
--- vim.lsp.log's create_logger: cost is skipped entirely below threshold).
-function M.write(level, msg)
-  local nr = NAME_TO_LEVEL[level] or vim.log.levels.ERROR
-  if nr < current_level then
+local function normalize_level(level)
+  if type(level) == "number" then
+    return level, LEVEL_NAME[level] or tostring(level)
+  end
+  local name = tostring(level or "ERROR"):upper()
+  return NAME_TO_LEVEL[name] or vim.log.levels.ERROR, name
+end
+
+local function append_record(level, msg, bypass_level)
+  local nr, name = normalize_level(level)
+  if not bypass_level and nr < current_level then
     return true
   end
   rotate_if_large()
   local body = tostring(msg):gsub("\n", "\n    ")
-  local line = string.format("%s [%-5s] %s\n", os.date("%Y-%m-%d %H:%M:%S"), level, body)
+  local line = string.format("%s [%-5s] %s\n", os.date("%Y-%m-%d %H:%M:%S"), name, body)
   local fd = uv.fs_open(M.path, "a", tonumber("644", 8))
   if not fd then
     mark_durable_unhealthy("could not open durable log at " .. tostring(M.path))
@@ -146,16 +150,75 @@ function M.write(level, msg)
     mark_durable_unhealthy("durable log write failed: " .. tostring(write_err))
     return false
   end
-  -- Off the operator's event loop, same flush, same place in the sequence
-  -- (`safety/flush.lua`). This one sits inside `log.guard`, which wraps every
-  -- review keymap, so an accept that warns or refuses used to freeze the editor
-  -- for a whole fsync on top of whatever else it had already paid.
   local sync_ok, sync_err = flush.fsync(fd)
   uv.fs_close(fd)
   if not sync_ok or sync_err then
     mark_durable_unhealthy("durable log fsync failed: " .. tostring(sync_err))
     return false
   end
+  return true
+end
+
+-- Append a single record. Multi-line messages are indented so each record
+-- stays visually grouped in the log. `level` is checked against the
+-- configured minimum before the line is even formatted (mirrors
+-- vim.lsp.log's create_logger: cost is skipped entirely below threshold).
+function M.write(level, msg)
+  -- Off the operator's event loop, same flush, same place in the sequence
+  -- (`safety/flush.lua`). This one sits inside `log.guard`, which wraps every
+  -- review keymap, so an accept that warns or refuses used to freeze the editor
+  -- for a whole fsync on top of whatever else it had already paid.
+  return append_record(level, msg, false)
+end
+
+local function lifecycle_line(kind, fields)
+  local payload = {
+    kind = tostring(kind or "unknown"),
+    at = os.date("!%Y-%m-%dT%H:%M:%SZ"),
+  }
+  for k, v in pairs(fields or {}) do
+    if v ~= nil then
+      payload[k] = v
+    end
+  end
+  local ok, encoded = pcall(vim.json.encode, payload)
+  if not ok then
+    return nil, tostring(encoded)
+  end
+  return "yana.lifecycle " .. encoded
+end
+
+local function lifecycle_enabled()
+  local raw = vim.env.YANA_LIFECYCLE_LOG
+  if raw == nil then
+    return false
+  end
+  raw = tostring(raw):lower()
+  return raw == "1" or raw == "true" or raw == "yes" or raw == "on"
+end
+
+function M.lifecycle(kind, fields)
+  if not lifecycle_enabled() then
+    return true
+  end
+  local line, err = lifecycle_line(kind, fields)
+  if not line then
+    return append_record("WARN", "yana.lifecycle encode failed: " .. tostring(err), false)
+  end
+  return append_record("INFO", line, true)
+end
+
+function M.lifecycle_later(kind, fields)
+  if not lifecycle_enabled() then
+    return true
+  end
+  local line, err = lifecycle_line(kind, fields)
+  if not line then
+    return append_record("WARN", "yana.lifecycle encode failed: " .. tostring(err), false)
+  end
+  vim.schedule(function()
+    append_record("INFO", line, true)
+  end)
   return true
 end
 

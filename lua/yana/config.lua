@@ -2,13 +2,36 @@
 local M = {}
 
 M.defaults = {
-  -- Path to (or name of) the cursor-agent binary.
-  cmd = "cursor-agent",
+  -- WHERE cursor-agent IS RESOLVED FROM. Nothing below bakes in a username,
+  -- an absolute path, or an env var this product invented for itself.
+  -- Resolution is decided ONCE, by M.resolve_cmd() below, and every consumer
+  -- (agent spawn, model list, health/dependency rows) asks it -- never reads
+  -- config.options.cmd directly to spawn or probe. Precedence:
+  --   1. This value, if you set it: setup({ cmd = "/path/to/cursor-agent" }).
+  --   2. The environment variable NAMED by `cmd_env` below, read lazily at
+  --      resolve time -- the same indirection avante.nvim uses for provider
+  --      API keys (lua/avante/config.lua's `api_key_name` field; read by
+  --      lua/avante/providers/init.lua's E.parse_envvar): you name the env
+  --      var your shell already exports, yana reads it lazily, and no
+  --      secret or machine-specific value is ever a default.
+  --   3. `cursor-agent` resolved on PATH.
+  -- `~` is expanded (vim.fn.expand) on whichever candidate wins.
+  -- nil here (the default) means "not set in setup()", which is exactly what
+  -- lets step 2 run at all -- setting a string always wins outright.
+  cmd = nil,
+
+  -- Name of the environment variable read for step 2 above. Point this at
+  -- whatever your shell profile already exports -- e.g.
+  -- cmd_env = "CURSOR_CLI_BIN" if that is the name you already use -- yana
+  -- ships no opinion beyond this default name and reads it lazily (never
+  -- baked into a default value). Set to false to skip step 2 and go
+  -- straight from explicit `cmd` to the PATH fallback.
+  cmd_env = "YANA_AGENT_BIN",
 
   -- Model to use. nil/"" => let cursor-agent pick (Auto). e.g. "claude-opus-5".
   model = nil,
 
-  -- THE dial. One setting, three results, named for what the operator gets
+  -- THE dial. One setting, three results, named for what you get
   -- rather than for the machinery underneath (the mode contract):
   --
   --   "ask"      the agent reads the workspace and answers. Proposes no edits,
@@ -31,6 +54,10 @@ M.defaults = {
   -- Pass --approve-mcps so MCP servers do not block on interactive consent.
   approve_mcps = false,
 
+  -- Additional artifact directory component names/globs. These affect
+  -- grouping and retention strength only; they never grant safety.
+  artifact_dir_prefixes = {},
+
   -- Buffer-local keys during inline hunk review (Avante replace_in_file parity).
   diff_keymaps = {
     ours = "co",
@@ -48,6 +75,17 @@ M.defaults = {
     deleted = { link = "DiffDelete" },
     hint = { link = "Comment" },
   },
+
+  -- Winbar mode chip: git-style palette aligned with diff_highlights above.
+  -- Each mode maps to a YanaMode* highlight group applied in the panel winbar.
+  mode_highlights = {
+    ask = { link = "Comment" },
+    inline = { link = "DiffAdd" },
+    agentic = { link = "DiffChange" },
+  },
+
+  -- Winbar model chip (`model: auto` or the chosen model id).
+  model_highlight = { link = "Special" },
 
   -- Prepended to agent-mode prompts. Nil disables.
   agent_instructions = [[
@@ -125,7 +163,8 @@ Agent mode: you have write access. When the user asks to populate, add, change, 
     submit_normal = "<CR>",  -- submit prompt (normal mode only)
     new_chat = "<C-n>",      -- start a fresh chat (clears session)
     toggle_mode = "<M-t>",   -- Alt+t: cycle mode (avoid <C-t> — Vim tag pop / E73)
-    -- Alt+r: resend-last-prompt PREFIX. Three leaves, which-key labelled:
+    -- Alt+r: resend-last-prompt PREFIX. Three leaves, each with a `desc`
+    -- (shown by :map and by which-key if you use it):
     --   <M-r>r  here  — same chat, same session, same mode
     --   <M-r>n  new   — new chat (fresh session), this chat's mode
     --   <M-r>a  agent — new chat forced to agent mode (ask -> "now do it")
@@ -152,23 +191,19 @@ Agent mode: you have write access. When the user asks to populate, add, change, 
     -- empty prompt line or mid-sentence, without a trigger character.
     -- Insert mode, prompt buffer only.
     --
-    -- Bound to <C-Space> (user decision, overriding an earlier fallback to
-    -- <C-M-Space>): blink.cmp re-applies its OWN buffer-local <C-Space> ->
-    -- cmp.show() on every InsertEnter (blink.cmp/lua/blink/cmp/keymap/init.lua
-    -- keymap.setup's InsertEnter autocmd calls apply.keymap_to_current_buffer
-    -- unconditionally whenever config.enabled() is true for the buffer). This
-    -- is NOT a competing action to yana's own mapping below — it is the
-    -- SAME action: ~/scripts/nvim/lua/user/blink.lua's `completion_providers()`
-    -- already special-cases `vim.b.yana_prompt == true` and returns
-    -- exactly { "yana_commands", "yana_mentions" }, so blink's own
-    -- <C-Space> -> cmp.show({ providers = completion_providers() }) already
-    -- opens the yana-scoped menu in the prompt buffer, re-applied fresh
-    -- on every single insert-mode entry (so it survives repeated insert
-    -- cycles by construction, not by luck). yana's own buffer-local
+    -- Coexistence constraint with blink.cmp, if installed: blink re-applies
+    -- its OWN buffer-local <C-Space> -> cmp.show() on every InsertEnter
+    -- (blink.cmp/lua/blink/cmp/keymap/init.lua keymap.setup's InsertEnter
+    -- autocmd calls apply.keymap_to_current_buffer unconditionally whenever
+    -- config.enabled() is true for the buffer). So yana's own buffer-local
     -- <C-Space> mapping (apply_panel_keymaps, set once at panel-open time) is
-    -- therefore only ever live for the FIRST InsertEnter before blink's
-    -- autocmd overwrites it — kept as a harmless same-behavior fallback for
-    -- the case blink.cmp is absent or disabled, not as a competing keymap.
+    -- only ever live until blink's next InsertEnter overwrites it — kept as a
+    -- same-behavior fallback for when blink.cmp is absent or disabled, not as
+    -- a competing keymap. If your blink.cmp config scopes providers for
+    -- yana's prompt buffer (check `vim.b.yana_prompt == true` and return
+    -- yana's sources), blink's own <C-Space> opens the yana-scoped menu and
+    -- the two mappings perform the SAME action; without that scoping, blink
+    -- opens its default providers instead (:checkhealth yana reports this).
     completion_menu = "<C-Space>",
   },
 
@@ -266,6 +301,14 @@ M.options = vim.deepcopy(M.defaults)
 
 local MODES = { ask = true, inline = true, agentic = true }
 
+--- Highlight group names for the winbar mode chip (one per named mode).
+M.mode_hl_groups = {
+  ask = "YanaModeAsk",
+  inline = "YanaModeInline",
+  agentic = "YanaModeAgentic",
+}
+M.model_hl_group = "YanaModel"
+
 function M.normalize_mode(value, enable_agentic)
 	if value == nil then
 		return M.defaults.mode
@@ -299,8 +342,30 @@ end
 --- flag, and such an executable does not stop writing because the mode it was
 --- launched under is called `ask`. Confinement costs a read-only turn nothing,
 --- so the exception was closed rather than documented.
-function M.overlay_mode()
-	return M.options.mode == "inline" or M.options.mode == "ask"
+function M.resolve_mode(mode)
+	local m = mode
+	if m == nil or m == "" then
+		m = M.options.mode
+	end
+	if m == "agent" then
+		m = "agentic"
+	elseif m == "plan" then
+		m = "ask"
+	elseif m == "review" then
+		m = "inline"
+	end
+	if MODES[m] ~= nil then
+		if m == "agentic" and M.options.enable_agentic ~= true then
+			return "inline"
+		end
+		return m
+	end
+	return M.options.mode
+end
+
+function M.overlay_mode(mode)
+	local m = M.resolve_mode(mode)
+	return m == "inline" or m == "ask"
 end
 
 --- WHO WRITES. Does this mode open hunk reviews and accept through the
@@ -310,14 +375,14 @@ end
 --- give the same answer: `ask` runs confined (overlay_mode) and proposes
 --- nothing (no review). Welding them together is what made confinement
 --- conditional on there being something to review.
-function M.review_mode_active()
-	return M.options.mode == "inline"
+function M.review_mode_active(mode)
+	return M.resolve_mode(mode) == "inline"
 end
 
 --- The cursor-agent permission mode. An internal consequence of the dial, never
---- an operator-facing option.
-function M.agent_permission_mode()
-	if M.options.mode == "ask" then
+--- a user-facing option.
+function M.agent_permission_mode(mode)
+	if M.resolve_mode(mode) == "ask" then
 		return "ask"
 	end
 	return "agent"
@@ -339,8 +404,8 @@ end
 --- When that lands, this returns false and nothing else changes. Every caller
 --- asks this function rather than reading a flag, precisely so the reversal is
 --- one line here.
-function M.agent_needs_permission_flag()
-	return M.options.mode ~= "ask"
+function M.agent_needs_permission_flag(mode)
+	return M.resolve_mode(mode) ~= "ask"
 end
 
 local ENFORCE_MODES = { reject = true, warn = true, off = true }
@@ -471,6 +536,99 @@ function M.normalize_inline_edit(ie)
   return out
 end
 
+--- `cmd_env` is either a non-empty string (the env var name) or `false`
+--- (step 2 disabled). Anything else falls back to the shipped default name
+--- rather than silently disabling env indirection on a typo.
+function M.normalize_cmd_env(value)
+  if value == false then
+    return false
+  end
+  if type(value) == "string" and value ~= "" then
+    return value
+  end
+  return M.defaults.cmd_env
+end
+
+--- Read an environment variable the way `resolve_cmd` needs to: Neovim's
+--- `getenv()` answers an unset variable with `vim.NIL` (or plain `nil`,
+--- depending on version) rather than Lua `nil`, so callers that only check
+--- `~= nil` get fooled. Every other case (unset, set-but-empty) is folded to
+--- Lua `nil` here so callers have exactly one falsy shape to handle.
+local function getenv(name)
+  local v = vim.fn.getenv(name)
+  if v == nil or v == vim.NIL or v == "" then
+    return nil
+  end
+  return v
+end
+
+--- THE machine-specific resolution contract for the agent binary (avante.nvim's
+--- `api_key_name` indirection, applied to a binary path instead of a secret --
+--- see the `cmd`/`cmd_env` comments in M.defaults above for the citation).
+--- Every consumer that needs to spawn or probe cursor-agent asks THIS
+--- function -- never `config.options.cmd` directly -- so there is exactly one
+--- place precedence is decided and exactly one place `~` gets expanded.
+---
+--- Precedence, first match wins:
+---   "config"  -- config.options.cmd, when set (explicit setup({ cmd = .. })).
+---   "cmd_env" -- the environment variable NAMED by config.options.cmd_env
+---               (default "YANA_AGENT_BIN"; false disables this step), when
+---               that variable is itself set and non-empty.
+---   "path"    -- the bare name "cursor-agent", left for the caller (jobstart,
+---               vim.fn.exepath, ...) to resolve on PATH.
+--- `~` is expanded (vim.fn.expand) on whichever string wins; the PATH
+--- fallback is a bare command name and is never expanded (there is nothing
+--- to expand).
+---
+--- Returns a table:
+---   step        "config" | "cmd_env" | "path" -- which step resolved.
+---   value       the resolved command string to spawn or probe.
+---   candidates  every step considered, in order, for diagnostics (health
+---               rows, error messages): each entry is
+---               { step, tried = bool, raw?, expanded?, env_name?, note? }.
+---               `tried = true` means this step produced a candidate (raw is
+---               the pre-expansion string); `tried = false` means it was
+---               skipped or empty, and `note` says why.
+function M.resolve_cmd()
+  local candidates = {}
+
+  local explicit = M.options.cmd
+  if type(explicit) == "string" and explicit ~= "" then
+    local expanded = vim.fn.expand(explicit)
+    candidates[#candidates + 1] = { step = "config", tried = true, raw = explicit, expanded = expanded }
+    return { step = "config", value = expanded, candidates = candidates }
+  end
+  candidates[#candidates + 1] = { step = "config", tried = false, note = "cmd not set in setup()" }
+
+  local env_name = M.options.cmd_env
+  if env_name == false then
+    candidates[#candidates + 1] = { step = "cmd_env", tried = false, note = "cmd_env disabled (set to false)" }
+  elseif type(env_name) == "string" and env_name ~= "" then
+    local env_val = getenv(env_name)
+    if env_val then
+      local expanded = vim.fn.expand(env_val)
+      candidates[#candidates + 1] =
+        { step = "cmd_env", tried = true, env_name = env_name, raw = env_val, expanded = expanded }
+      return { step = "cmd_env", value = expanded, candidates = candidates }
+    end
+    candidates[#candidates + 1] =
+      { step = "cmd_env", tried = false, env_name = env_name, note = "$" .. env_name .. " is not set" }
+  else
+    candidates[#candidates + 1] = { step = "cmd_env", tried = false, note = "cmd_env disabled" }
+  end
+
+  candidates[#candidates + 1] = { step = "path", tried = true, raw = "cursor-agent", expanded = "cursor-agent" }
+  return { step = "path", value = "cursor-agent", candidates = candidates }
+end
+
+--- Convenience for hot paths that only need the resolved string (agent spawn,
+--- --list-models). Diagnostics that need to explain THEMSELVES (health rows,
+--- refusal messages) call M.resolve_cmd() directly for the full candidate
+--- list.
+function M.cmd()
+  return M.resolve_cmd().value
+end
+
 function M.normalize_skill_dirs(dirs)
   local base = vim.deepcopy(M.defaults.skill_dirs)
   if type(dirs) ~= "table" then
@@ -485,6 +643,34 @@ function M.normalize_skill_dirs(dirs)
   if #out == 0 then
     return base
   end
+  return out
+end
+
+function M.normalize_artifact_dir_prefixes(prefixes)
+  if prefixes == nil then
+    return {}
+  end
+  if type(prefixes) ~= "table" then
+    error("artifact_dir_prefixes must be a list of directory component names or globs")
+  end
+  local out, seen = {}, {}
+  for _, name in ipairs(prefixes) do
+    if type(name) ~= "string"
+      or name == ""
+      or name == "."
+      or name == ".."
+      or name:find("/", 1, true)
+      or name:find("\\", 1, true)
+      or name:find("\0", 1, true)
+    then
+      error("artifact_dir_prefixes entries must be single directory component names or globs")
+    end
+    if not seen[name] then
+      seen[name] = true
+      out[#out + 1] = name
+    end
+  end
+  table.sort(out)
   return out
 end
 
@@ -507,7 +693,7 @@ end
 --- would mean a turn could run with no mode at all, which is the same defect
 --- wearing a different hat.
 ---
---- The error is re-raised unchanged (it simply propagates), so the operator
+--- The error is re-raised unchanged (it simply propagates), so the user
 --- still sees which key was wrong and what the accepted values are.
 function M.setup(opts)
   opts = opts or {}
@@ -520,6 +706,15 @@ function M.setup(opts)
       next_options.diff_highlights[role] = vim.deepcopy(spec)
     end
   end
+  if opts.mode_highlights then
+    next_options.mode_highlights = vim.deepcopy(M.defaults.mode_highlights)
+    for role, spec in pairs(opts.mode_highlights) do
+      next_options.mode_highlights[role] = vim.deepcopy(spec)
+    end
+  end
+  if opts.model_highlight then
+    next_options.model_highlight = vim.deepcopy(opts.model_highlight)
+  end
   -- Every validator runs against the candidate. Any of them may raise; none of
   -- them can leave a half-installed configuration behind.
   next_options.selection_scope = M.normalize_selection_scope(next_options.selection_scope)
@@ -527,23 +722,45 @@ function M.setup(opts)
   next_options.redirect = M.normalize_redirect(next_options.redirect)
   next_options.inline_edit = M.normalize_inline_edit(next_options.inline_edit)
   next_options.skill_dirs = M.normalize_skill_dirs(next_options.skill_dirs)
+  next_options.artifact_dir_prefixes = M.normalize_artifact_dir_prefixes(next_options.artifact_dir_prefixes)
+  next_options.cmd_env = M.normalize_cmd_env(next_options.cmd_env)
   next_options.enable_agentic = next_options.enable_agentic == true
   next_options.mode = M.normalize_mode(next_options.mode, next_options.enable_agentic)
   -- Only now does anything become effective.
   M.options = next_options
+  M.apply_mode_highlights()
   return M.options
+end
+
+--- Apply winbar chip highlights from `mode_highlights` and `model_highlight`.
+function M.apply_mode_highlights()
+  local h = M.options.mode_highlights or M.defaults.mode_highlights
+  for mode, group in pairs(M.mode_hl_groups) do
+    local spec = h[mode] or {}
+    if spec.link and not spec.bg and not spec.fg then
+      vim.api.nvim_set_hl(0, group, { link = spec.link, default = true, force = true })
+    else
+      local hl = vim.tbl_extend("force", spec, { force = true })
+      hl.link = nil
+      vim.api.nvim_set_hl(0, group, hl)
+    end
+  end
+  local ms = M.options.model_highlight or M.defaults.model_highlight or {}
+  if ms.link and not ms.bg and not ms.fg then
+    vim.api.nvim_set_hl(0, M.model_hl_group, { link = ms.link, default = true, force = true })
+  else
+    local hl = vim.tbl_extend("force", ms, { force = true })
+    hl.link = nil
+    vim.api.nvim_set_hl(0, M.model_hl_group, hl)
+  end
 end
 
 -- The cursor-agent permission mode for this turn. The panel argument is kept so
 -- every existing call site still compiles, but it is no longer authoritative:
 -- mode is a product-level dial, not a per-panel one, which is what stopped two
 -- panels from disagreeing about what a turn was allowed to do.
-function M.panel_mode(_panel_mode)
-  return M.agent_permission_mode()
-end
-
-function M.resolve_mode(_panel_mode)
-  return M.agent_permission_mode()
+function M.panel_mode(panel_mode)
+  return M.resolve_mode(panel_mode)
 end
 
 return M

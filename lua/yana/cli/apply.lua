@@ -287,7 +287,9 @@ local function cmd_apply(args)
 				before_bytes = select(1, read_file(target_path))
 			end
 			if contains_nul(content) or contains_nul(before_bytes) then
-				io.stdout:write("refused " .. rel .. ": binary_content — both versions kept\n")
+				io.stdout:write(
+					"refused " .. rel .. ": binary_content — real file unchanged; proposal is not reviewable\n"
+				)
 				any_refused = true
 				goto continue_rel
 			end

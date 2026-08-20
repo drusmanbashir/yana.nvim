@@ -179,7 +179,7 @@ local function tl_observe(bufnr)
   return obs or {}
 end
 
-local function tl_record(state, kind, label, extra)
+local function tl_record(state, kind, label, extra, async)
   local change = state and state.change
   if not change then
     return
@@ -207,6 +207,17 @@ local function tl_record(state, kind, label, extra)
   else
     entry.diary_dir = extra and extra.diary_dir
     entry.op_id = extra and extra.op_id
+  end
+  if async and type(tl.intent_async) == "function" then
+    local called, id, err = pcall(tl.intent_async, entry, function(ok, async_err)
+      if not ok then
+        log.write("WARN", "timeline event was appended but not durable: " .. tostring(async_err))
+      end
+    end)
+    if not called or not id then
+      log.write("WARN", "timeline event could not be queued: " .. tostring(called and err or id))
+    end
+    return
   end
   pcall(tl.intent, entry)
 end
@@ -2032,6 +2043,12 @@ local function finish_session(state, accepted)
   local bufnr = state.bufnr
   local turn_log = change_ledger(change, state.opts)
   ledger.mark(turn_log, "review_resolved")
+  require("yana.log").lifecycle_later("review.settle", {
+    turn_id = change.turn_id or change.turn_gen,
+    generation = change.turn_gen,
+    path = change.rel or change.path,
+    accepted = accepted and true or false,
+  })
 
   -- Vim appends a trailing newline after the final line, so a buffer read back
   -- verbatim gains an EOL the agent never wrote. Mirror the agent's own
@@ -2641,8 +2658,16 @@ function M.open(change, opts)
 
   local bin_class = binary_reason(change)
   if bin_class then
+    if change.status ~= "pending" then
+      announce_state()
+      schedule_queue_advance({ opts = opts })
+      return false
+    end
     change.reason_class = bin_class
-    local detail = (change.rel or change.path) .. ": " .. bin_class .. " — both versions kept"
+    local detail = (change.rel or change.path)
+      .. ": "
+      .. bin_class
+      .. " — real file unchanged; proposal is not reviewable"
     change.review_error = detail
     ledger.record_decision(change_ledger(change, opts), {
       action = "review_refused",
@@ -2652,6 +2677,15 @@ function M.open(change, opts)
       change_id = change.id,
       rel = change.rel or change.path,
     })
+    change.status = "system_refused"
+    notify_owner(opts.on_system_refused, change, "on_system_refused")
+    if opts.on_close then
+      vim.schedule(function()
+        notify_owner(function()
+          opts.on_close(nil, false)
+        end, change, "on_close")
+      end)
+    end
     notify_one_line("yana: refused " .. detail, vim.log.levels.WARN)
     announce_state()
     schedule_queue_advance({ opts = opts })
@@ -2798,6 +2832,11 @@ function M.open(change, opts)
     local L = change_ledger(change, opts)
     ledger.mark(L, "first_review_opened")
     ledger.bump(L, "reviews_opened")
+    require("yana.log").lifecycle_later("review.open", {
+      turn_id = change.turn_id or change.turn_gen,
+      generation = change.turn_gen,
+      path = change.rel or change.path,
+    })
     local hunks = {}
     for i, b in ipairs(blocks) do
       hunks[i] = {
@@ -2820,6 +2859,7 @@ function M.open(change, opts)
       model_source = model_source,
     })
   end
+  ledger.mark(change_ledger(change, opts), "review_profile_hunks_ready")
 
   local maps = config.options.diff_keymaps or {}
   local keys = {
@@ -2871,11 +2911,14 @@ function M.open(change, opts)
     winhl_restore = {},
     augroup = vim.api.nvim_create_augroup("YanaInlineDiff" .. change.id, { clear = true }),
   }
+  ledger.mark(change_ledger(change, opts), "review_profile_state_allocated")
   stamp_review_workspace(change, opts)
+  ledger.mark(change_ledger(change, opts), "review_profile_workspace_stamped")
   -- Watch the buffer from here on: every later repaint re-derives which rows
   -- are the agent's, and this is what gives it a reason to run when the human
   -- types rather than only when a decision is taken.
   attach_buffer_watch(state)
+  ledger.mark(change_ledger(change, opts), "review_profile_buffer_watched")
   local st = pool_for(opts or {})
   st.active = state
   -- The opening row. Recorded once the state is live, so tl_record can read the
@@ -2885,26 +2928,9 @@ function M.open(change, opts)
     local obs = tl_observe(bufnr)
     state.timeline_obs = obs
     obs.regime = "buffer"
-    tl_record(state, "review_opened", "review opened: " .. (change.rel or change.path or "?"), obs)
+    tl_record(state, "review_opened", "review opened: " .. (change.rel or change.path or "?"), obs, true)
   end
-  announce_state()
-  apply_review_winhl(bufnr, state)
-
-  -- Rung 1 over the render that staged this review. Deliberately AFTER
-  -- apply_review_winhl: the palette groups and the per-window mapping are two
-  -- of the five things the check verifies, and running before they are
-  -- installed would report the engine's own setup order as a defect. The
-  -- extmarks it reads were written by highlight_blocks above and nothing
-  -- between here and there touches them.
-  render_invariant({
-    site = "open",
-    bufnr = bufnr,
-    blocks = blocks,
-    model = model,
-    model_source = model_source,
-    change = change,
-    opts = opts,
-  })
+  ledger.mark(change_ledger(change, opts), "review_profile_state_ready")
 
   local function show_hint(line, block)
     state.hint_line = line
@@ -3336,6 +3362,8 @@ function M.open(change, opts)
   --- the same idea made repaint-proof, and it also sidesteps the freed-id
   --- reuse hazard clear_extmarks documents below: this id is never freed while
   --- the decision stands, so it cannot be reissued to another hunk.
+  ledger.mark(change_ledger(change, opts), "review_profile_watchers_ready")
+
   local function park_anchor(block, start_line, end_line)
     return park_decision_anchor(bufnr, start_line, end_line)
   end
@@ -4028,6 +4056,35 @@ function M.open(change, opts)
   local function reject_all()
     tl_capture_human_edit(state)
     record_decision(state, "reject_file", { hunks_remaining = #state.diff_blocks })
+    -- A hunk already decided is a RECORDED decision and stands. This record
+    -- has only ever claimed the REMAINING hunks (hunks_remaining), so the old
+    -- whole-file restore contradicted the ledger row it had just written: an
+    -- accepted hunk's accept_hunk record survived while its bytes vanished.
+    -- With prior decisions, reject the remaining hunks through the same path
+    -- `co` takes, letting try_finalize compose base + exactly the accepted
+    -- hunks; a hunk that refuses (human edit inside it) keeps the review open,
+    -- identical to the single-hunk contract. Only a review with NO decisions
+    -- yet takes the whole-file restore -- the "reject-all writes nothing"
+    -- contract (P2), which per-hunk rejection could not honour because
+    -- try_finalize would write base bytes over an untouched file.
+    if #state.decisions > 0 then
+      -- Skip-and-continue on a refused hunk (human edit inseparable from the
+      -- agent's), exactly like the whole-file path: the refused hunk stays
+      -- pending and the review stays open for it, while every other remaining
+      -- hunk is still swept. Terminates because each pass either shrinks the
+      -- block list or advances past a refusal.
+      local i = 1
+      local all_rejected = true
+      while i <= #state.diff_blocks do
+        local before = #state.diff_blocks
+        reject_block_at(i)
+        if #state.diff_blocks >= before then
+          all_rejected = false
+          i = i + 1
+        end
+      end
+      return all_rejected
+    end
     state.timeline_bulk_reject = true
     local ok = finish_session(state, false)
     state.timeline_bulk_reject = nil
@@ -4241,6 +4298,8 @@ function M.open(change, opts)
     end
   end
 
+  ledger.mark(change_ledger(change, opts), "review_profile_actions_ready")
+
   M._test = {
     state = state,
     bufnr = bufnr,
@@ -4271,6 +4330,7 @@ function M.open(change, opts)
   }
 
   local km = { buffer = bufnr, nowait = true, silent = true }
+  ledger.mark(change_ledger(change, opts), "review_profile_test_seam_ready")
   -- Wrap only at the keymap.set call, not the underlying functions: those
   -- (reject_hunk, accept_hunk, ...) are also exposed unwrapped via M._test
   -- above, and must keep returning their real values there.
@@ -4304,6 +4364,13 @@ function M.open(change, opts)
       end)
     end, vim.tbl_extend("force", km, { desc = "yana: prev hunk" }))
   end
+  ledger.mark(change_ledger(change, opts), "review_profile_keymaps_ready")
+
+  -- A mode transition is part of the decision, not optional guidance. Show it
+  -- before the review becomes actionable so an immediate ca/cA cannot write a
+  -- mode the operator was never shown. Navigation and key hints remain safe to
+  -- defer; this disclosure does not.
+  show_compound_mode(change)
 
   -- The closest in-process proxy for "the user can now see the review": a
   -- schedule after the render drains on the next main-loop tick, which is
@@ -4314,16 +4381,48 @@ function M.open(change, opts)
     ledger.mark(change_ledger(change, opts), "review_redraw")
   end)
 
-  jump_to_block(bufnr, state.diff_blocks[1])
-  show_compound_mode(change)
-  if state.diff_blocks[1] then
-    show_hint(nav_start_line(bufnr, state.diff_blocks[1]), state.diff_blocks[1])
-  else
-    -- A hunkless review is reachable: an agent-created empty file diffs to zero
-    -- hunks but still needs an explicit accept or reject. Without a hint the
-    -- user sees an empty buffer and no affordance at all.
-    show_hint(1)
-  end
+  -- Synchronous end of the open path: the review exists, keymaps and watches
+  -- are armed, and the user can act as soon as the next loop turn paints.
+  -- Navigation to the first hunk and the hint/banner are display guidance, not
+  -- authority, so they run on the next loop turn rather than spending the
+  -- synchronous open-tail budget.
+  ledger.mark(change_ledger(change, opts), "review_setup_complete")
+
+  vim.schedule(function()
+    announce_state()
+    apply_review_winhl(bufnr, state)
+    -- Rung 1 over the render that staged this review. It observes only, so it
+    -- runs after the open-path budget closes: the diagnostic must not spend the
+    -- user's review-open tail. Its inputs are the just-rendered buffer, extmarks
+    -- and palette state captured above.
+    render_invariant({
+      site = "open",
+      bufnr = bufnr,
+      blocks = blocks,
+      model = model,
+      model_source = model_source,
+      change = change,
+      opts = opts,
+    })
+    -- The first-hunk landing does NOT happen here. This callback is queued
+    -- (via vim.schedule) strictly before the one below that calls focus_buf /
+    -- tabnew, and vim.schedule preserves registration order -- so at this
+    -- point bufnr is never yet shown in any window. jump_to_block's own
+    -- `win_for_buf(bufnr)` guard would find nothing and silently no-op every
+    -- single time (measured: every review open, first file included). The
+    -- landing is issued from the next schedule below instead, right after the
+    -- window that shows bufnr is attached, so win_for_buf(bufnr) is
+    -- guaranteed non-nil at jump time -- an ordering fix, not a timing one.
+    show_compound_mode(change)
+    if state.diff_blocks[1] then
+      show_hint(nav_start_line(bufnr, state.diff_blocks[1]), state.diff_blocks[1])
+    else
+      -- A hunkless review is reachable: an agent-created empty file diffs to
+      -- zero hunks but still needs an explicit accept or reject. Without a hint
+      -- the user sees an empty buffer and no affordance at all.
+      show_hint(1)
+    end
+  end)
 
   vim.schedule(function()
     if opts.preview then
@@ -4344,6 +4443,11 @@ function M.open(change, opts)
       -- tabnew+set_buf also skips WinEnter on some paths; re-apply now that
       -- a window actually shows the preview buffer.
       apply_review_winhl(bufnr, state)
+      -- The window now exists (nvim_win_set_buf just attached it, above), so
+      -- win_for_buf(bufnr) inside jump_to_block is guaranteed to find it.
+      -- Landing here -- after the attach, in the same tick -- rather than in
+      -- the earlier schedule is the fix; see the comment there.
+      jump_to_block(bufnr, state.diff_blocks[1])
     else
       -- Same identity guard the preview branch above carries, and it was
       -- missing here: this closure fires a tick after the open, by which time
@@ -4376,6 +4480,13 @@ function M.open(change, opts)
       -- the review, or the hunks stay unmapped (PLAIN) for a single-window
       -- user.
       apply_review_winhl(bufnr, state)
+      -- Same reason as apply_review_winhl above: focus_buf just attached the
+      -- window that shows bufnr, so win_for_buf(bufnr) inside jump_to_block
+      -- is guaranteed to find it now. This lands the cursor on the first
+      -- hunk's live-authority start line (nav_start_line / live_block_range
+      -- -- the same path ]x/[x use via jump_to_block), not a stale stored
+      -- line -- keeping the drift-precision this call already relied on.
+      jump_to_block(bufnr, state.diff_blocks[1])
       -- One screen line, always. Without noice, vim.notify is a plain echo:
       -- anything wider than `columns` raises a hit-enter prompt, which blocks
       -- the main loop and every queued vim.schedule behind it — the review

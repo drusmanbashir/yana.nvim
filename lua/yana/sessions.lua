@@ -261,11 +261,30 @@ end
 
 -- Scan ~/.cursor/chats/<md5(cwd)>/ for sessions the CLI knows about.
 -- Returns a list of { id, title, cwd, created_at, updated_at, external = true }.
+--
+-- The CLI names its chat directory after a hash of the RAW cwd string it saw
+-- when the chat started. On a case-insensitive mount (e.g. a Linux CIFS/SMB
+-- share) the exact same directory can be entered with a different letter
+-- case from a different terminal/editor and hash to a different, equally
+-- "valid" name that this scan would never look in -- the session silently
+-- vanishes from discovery even though both spellings name one real
+-- directory. Hashing fs_realpath(cwd) instead of the bare argument fixes
+-- this whenever the kernel/filesystem driver resolves path components to
+-- their on-disk stored spelling during lookup (true for many
+-- case-insensitive-mount configurations), and also fixes the same defect
+-- shape for symlinked workspace paths and a cwd carrying "..", "." or a
+-- trailing slash -- all of which broke the raw-string hash identically.
+-- fs_realpath can fail (e.g. cwd no longer exists); the raw string is kept
+-- as a fallback rather than discovering nothing. This does not, and cannot,
+-- fix the case where the CLI itself hashed an uncanonicalized cwd on ITS
+-- side too (unverified, closed-source; PORT-11,
+-- packets/env-portability-adversarial-20260820.md).
 function M.discover(cwd)
   cwd = cwd or vim.fn.getcwd()
   local base = config.options.sessions.chats_dir or "~/.cursor/chats"
   base = vim.fn.expand(base)
-  local hash = md5_hex(cwd)
+  local canonical_cwd = uv.fs_realpath(cwd) or cwd
+  local hash = md5_hex(canonical_cwd)
   if not hash then
     return {}
   end

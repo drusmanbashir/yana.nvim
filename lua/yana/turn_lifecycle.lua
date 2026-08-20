@@ -45,23 +45,111 @@ M._passes = {}
 -- turn id, and `generation` alone cannot separate two panels.
 M.TUPLE_FIELDS = { "panel", "stream", "turn", "generation", "bundle_digest" }
 
---- Git-tracked paths as of the PRE-TURN workspace, before the agent can mutate
---- `.git/index`. Used for undeclared-write badging (shortlist 2b).
-function M.capture_tracked(workspace)
-  local set = {}
+M._test = M._test or {}
+
+local function repository_marker(workspace)
+  local found = vim.fs.find(".git", { path = workspace, upward = true, limit = 1 })
+  if #found > 0 then
+    return true
+  end
+  return vim.fn.filereadable(workspace .. "/HEAD") == 1
+    and vim.fn.isdirectory(workspace .. "/objects") == 1
+end
+
+local function nul_records(data)
+  local records = {}
+  local start = 1
+  while start <= #(data or "") do
+    local stop = data:find("\0", start, true)
+    if not stop then break end
+    records[#records + 1] = data:sub(start, stop - 1)
+    start = stop + 1
+  end
+  return records
+end
+
+--- Evidence-grade Git trackedness captured before agent execution. Unlike the
+--- display badge's old empty table, this distinguishes a real non-repository
+--- from a failed query so destructive classification cannot fail open.
+function M.capture_tracked_evidence(workspace)
   if not workspace or workspace == "" then
-    return set
+    return { status = "unavailable", reason = "empty workspace", paths = {} }
   end
-  local out = vim.fn.systemlist({ "git", "-C", workspace, "ls-files" })
-  if vim.v.shell_error ~= 0 then
-    return set
+  if vim.fn.executable("git") ~= 1 then
+    return { status = "unavailable", reason = "git unavailable", paths = {} }
   end
-  for _, rel in ipairs(out) do
-    if rel ~= "" then
-      set[rel] = true
+  if not repository_marker(workspace) then
+    return { status = "no_repo", paths = {} }
+  end
+  if M._test.capture_tracked_failure then
+    return { status = "unavailable", reason = "injected trackedness failure", paths = {} }
+  end
+  local prefix_result = vim.system(
+    { "git", "-C", workspace, "rev-parse", "--show-prefix" },
+    { text = true }
+  ):wait()
+  if prefix_result.code ~= 0 then
+    return {
+      status = "unavailable",
+      reason = vim.trim(prefix_result.stderr or "git rev-parse failed"),
+      paths = {},
+    }
+  end
+  local workspace_prefix = vim.trim(prefix_result.stdout or "")
+  if workspace_prefix ~= "" and workspace_prefix:sub(-1) ~= "/" then
+    workspace_prefix = workspace_prefix .. "/"
+  end
+  local function workspace_rel(repo_rel)
+    if workspace_prefix == "" then
+      return repo_rel
+    end
+    if repo_rel:sub(1, #workspace_prefix) == workspace_prefix then
+      return repo_rel:sub(#workspace_prefix + 1)
+    end
+    return nil
+  end
+  local result = vim.system(
+    { "git", "-C", workspace, "ls-files", "-z", "--full-name" },
+    { text = false }
+  ):wait()
+  if result.code ~= 0 then
+    return {
+      status = "unavailable",
+      reason = vim.trim(result.stderr or "git ls-files failed"),
+      paths = {},
+    }
+  end
+  local set = {}
+  for _, rel in ipairs(nul_records(result.stdout)) do
+    local local_rel = workspace_rel(rel)
+    if local_rel and local_rel ~= "" then
+      set[local_rel] = true
     end
   end
-  return set
+  local staged = vim.system(
+    { "git", "-C", workspace, "ls-files", "-z", "--stage", "--full-name" },
+    { text = false }
+  ):wait()
+  if staged.code ~= 0 then
+    return {
+      status = "unavailable",
+      reason = vim.trim(staged.stderr or "git ls-files --stage failed"),
+      paths = {},
+    }
+  end
+  local submodules = {}
+  for _, record in ipairs(nul_records(staged.stdout)) do
+    local mode, repo_rel = record:match("^(%d+) [^ ]+ %d+\t(.+)$")
+    local local_rel = repo_rel and workspace_rel(repo_rel) or nil
+    if mode == "160000" and local_rel and local_rel ~= "" then
+      submodules[local_rel] = true
+    end
+  end
+  return { status = "repo", paths = set, submodules = submodules }
+end
+
+function M.capture_tracked(workspace)
+  return M.capture_tracked_evidence(workspace).paths
 end
 
 function M.note_declared(pass, rel)
@@ -96,11 +184,16 @@ local seq = 0
 --- resets: after a crash the recovered turn still has a name.
 function M.new_turn_id(panel_id, generation)
   seq = seq + 1
+  local uv = vim.uv or vim.loop
+  local pid = uv and uv.os_getpid and uv.os_getpid() or 0
+  local hr = uv and uv.hrtime and uv.hrtime() or 0
   return string.format(
-    "%s-p%s-g%s-%d",
+    "%s-p%s-g%s-pid%s-ns%s-%d",
     os.date("!%Y%m%dT%H%M%SZ"),
     tostring(panel_id or 0),
     tostring(generation or 0),
+    tostring(pid),
+    tostring(hr),
     seq
   )
 end
@@ -119,6 +212,7 @@ function M.begin_turn(opts)
   local generation = opts.generation or 0
   local turn_id = opts.turn_id and tostring(opts.turn_id)
     or M.new_turn_id(opts.panel_id, generation)
+  local tracked_evidence = opts.tracked_evidence or M.capture_tracked_evidence(opts.workspace)
   local pass = {
     panel = opts.panel_id,
     stream = opts.stream and tostring(opts.stream) or "unbound",
@@ -130,7 +224,9 @@ function M.begin_turn(opts)
     -- What the stream DECLARED. A provisional review may render from this; no
     -- action may be decided from it.
     declared = opts.declared or {},
-    tracked_preturn = opts.tracked_preturn or M.capture_tracked(opts.workspace),
+    tracked_evidence = tracked_evidence,
+    tracked_preturn = opts.tracked_preturn
+      or tracked_evidence.paths,
     -- The classified, published bundle. nil until publication, and that nil is
     -- the whole of the actionability decision.
     bundle = nil,
@@ -138,6 +234,12 @@ function M.begin_turn(opts)
   }
   M._passes[pass.panel] = pass
   M.persist(pass, "open")
+  log.lifecycle("turn.start", {
+    turn_id = pass.turn_id,
+    panel = pass.panel,
+    generation = pass.generation,
+    stream = pass.stream,
+  })
   return pass
 end
 

@@ -7,7 +7,7 @@ nvim=$(realpath "$2")
 blink=$(realpath "$3")
 [[ $(git -C "$blink" rev-parse HEAD) == 78336bc89ee5365633bcf754d93df01678b5c08f ]] \
 	|| { echo "blink gate: unexpected blink.cmp commit" >&2; exit 1; }
-scratch=$(mktemp -d "${TMPDIR:-/s/agent_rw/tmp}/yana-blink.XXXXXX")
+scratch=$(mktemp -d "${TMPDIR:-/tmp}/yana-blink.XXXXXX")
 trap 'rm -rf "$scratch"' EXIT
 
 env -i \

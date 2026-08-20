@@ -30,8 +30,17 @@ Rec.__index = Rec
 -- short-write and write-failure paths are driven rather than reasoned about.
 M._test = { fault = {} }
 
+local function env_enabled()
+  local raw = vim.env.YANA_DEBUG_EVENTS
+  if raw == nil then
+    return false
+  end
+  local val = tostring(raw):lower()
+  return val == "1" or val == "true" or val == "yes" or val == "on"
+end
+
 function M.enabled()
-  return config.options.debug_record == true
+  return config.options.debug_record == true or env_enabled()
 end
 
 local function fallback_dir(panel_id, gen)
@@ -52,6 +61,7 @@ end
 --- opts: { session, panel_id, gen, argv, cwd, mode, model, resume_session_id }
 --- `session` is the shadow turn (it owns `private_dir`); without one the
 --- recording lands under `stdpath("log")/yana-record/`, so `debug_record`
+--- or `YANA_DEBUG_EVENTS=1`
 --- still works with the shadow ladder disabled.
 function M.open(opts)
   if not M.enabled() then
@@ -71,17 +81,29 @@ function M.open(opts)
   if not fd then
     return nil
   end
+  local events_path = dir .. "/events.jsonl"
+  local events_fd, events_open_error = uv.fs_open(events_path, "a", tonumber("644", 8))
   local self = setmetatable({
     dir = dir,
     stream_path = stream_path,
+    events_path = events_path,
     meta_path = dir .. "/meta.json",
     fd = fd,
+    events_fd = events_fd,
     lines = 0,
     bytes = 0,
     write_errors = 0,
     truncated = false,
     bytes_lost = 0,
     last_write_error = nil,
+    events = 0,
+    event_bytes = 0,
+    event_write_errors = events_fd and 0 or 1,
+    event_truncated = events_fd == nil,
+    event_bytes_lost = 0,
+    event_last_write_error = events_open_error and tostring(events_open_error) or nil,
+    malformed_raw_lines = 0,
+    malformed_raw_bytes = 0,
     stderr_len = 0,
     started_wall = os.date("!%Y-%m-%dT%H:%M:%SZ"),
     started_hr = uv.hrtime(),
@@ -94,6 +116,7 @@ function M.open(opts)
       resume_session_id = opts.resume_session_id,
       panel_id = opts.panel_id,
       gen = opts.gen,
+      turn_id = opts.turn_id,
       jailed = opts.jailed and true or false,
     },
   }, Rec)
@@ -166,6 +189,50 @@ function Rec:line(raw)
   self.lines = self.lines + 1
 end
 
+--- Append one redacted decoded-event record at the UI provenance point.
+--- Raw payloads, prompts, file contents and tool arguments/results never enter
+--- this sidecar; `stream.ndjson` remains the opt-in verbatim replay source.
+function Rec:event(event_seq, obj, stale)
+  if not self.events_fd or type(obj) ~= "table" then
+    return false
+  end
+  local safe = {
+    turn_id = self.meta.turn_id,
+    at = os.date("!%Y-%m-%dT%H:%M:%SZ"),
+    event_seq = event_seq,
+    type = obj.type,
+    subtype = obj.subtype,
+    stale = stale and true or false,
+    call_id = obj.call_id,
+    model_call_id = obj.model_call_id,
+    timestamp_ms = obj.timestamp_ms,
+  }
+  local ok, encoded = pcall(vim.json.encode, safe)
+  if not ok then
+    self.event_write_errors = self.event_write_errors + 1
+    self.event_truncated = true
+    self.event_last_write_error = "event encode failed: " .. tostring(encoded)
+    return false
+  end
+  local data = encoded .. "\n"
+  local written, err = write_all(self.events_fd, data)
+  self.event_bytes = self.event_bytes + written
+  if written < #data then
+    self.event_write_errors = self.event_write_errors + 1
+    self.event_truncated = true
+    self.event_bytes_lost = self.event_bytes_lost + (#data - written)
+    self.event_last_write_error = err or "short event write"
+    return false
+  end
+  self.events = self.events + 1
+  return true
+end
+
+function Rec:note_decode_failure(bytes)
+  self.malformed_raw_lines = self.malformed_raw_lines + 1
+  self.malformed_raw_bytes = self.malformed_raw_bytes + (tonumber(bytes) or 0)
+end
+
 function Rec:note_stderr(chunk)
   if type(chunk) == "string" then
     self.stderr_len = self.stderr_len + #chunk
@@ -180,6 +247,10 @@ function Rec:finish(info)
   if self.fd then
     pcall(uv.fs_close, self.fd)
     self.fd = nil
+  end
+  if self.events_fd then
+    pcall(uv.fs_close, self.events_fd)
+    self.events_fd = nil
   end
   local meta = self.meta
   meta.started_at = self.started_wall
@@ -198,6 +269,15 @@ function Rec:finish(info)
   meta.stream_truncated = self.truncated and true or false
   meta.stream_bytes_lost = self.bytes_lost or 0
   meta.last_write_error = self.last_write_error
+  meta.event_file = "events.jsonl"
+  meta.events_written = self.events
+  meta.event_bytes = self.event_bytes
+  meta.event_write_errors = self.event_write_errors
+  meta.event_truncated = self.event_truncated and true or false
+  meta.event_bytes_lost = self.event_bytes_lost
+  meta.event_last_write_error = self.event_last_write_error
+  meta.malformed_raw_lines = self.malformed_raw_lines
+  meta.malformed_raw_bytes = self.malformed_raw_bytes
   meta.pid = info.pid
   local ok, encoded = pcall(vim.json.encode, meta)
   if not ok then

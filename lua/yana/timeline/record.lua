@@ -165,6 +165,114 @@ local function append_row(ws, rel, row)
 	return true
 end
 
+-- Async twin of append_row. The row bytes are appended before this function
+-- returns, preserving journal order; only the durability waits run through
+-- libuv callbacks. This is used by review-open recording so a slow fsync does
+-- not hold Neovim's input/paint loop before the first interaction. Every
+-- flush remains present and ordered: file, timeline directory, then parent.
+local function append_row_async(ws, rel, row, callback)
+	local dir = timeline_dir(ws)
+	local parent = vim.fn.fnamemodify(dir, ":h")
+	local path = journal_file(ws, rel)
+	local existed = uv.fs_stat(path) ~= nil
+	if not existed and vim.fn.isdirectory(dir) ~= 1 then
+		local mk_ok, mk_err = pcall(vim.fn.mkdir, dir, "p")
+		if not mk_ok or vim.fn.isdirectory(dir) ~= 1 then
+			return false, "cannot create " .. dir .. (mk_err and (": " .. tostring(mk_err)) or "")
+		end
+	end
+
+	local line = vim.json.encode(row) .. "\n"
+	local fd, err = uv.fs_open(path, "a", 438)
+	if not fd then
+		return false, err
+	end
+	local ok, werr = write_all_fd(fd, line)
+	if not ok then
+		uv.fs_close(fd)
+		return false, werr
+	end
+
+	local need_name_flush = not existed or not durable_names[path]
+	local dir_fd, parent_fd
+	if need_name_flush then
+		dir_fd, err = uv.fs_open(dir, "r", 0)
+		if not dir_fd then
+			uv.fs_close(fd)
+			return false, err
+		end
+		parent_fd, err = uv.fs_open(parent, "r", 0)
+		if not parent_fd then
+			uv.fs_close(dir_fd)
+			uv.fs_close(fd)
+			return false, err
+		end
+	end
+
+	local finished = false
+	local function finish(success, finish_err)
+		if finished then
+			return
+		end
+		finished = true
+		callback(success, finish_err)
+	end
+	local function queue_fsync(target_fd, cb)
+		local called, req = pcall(uv.fs_fsync, target_fd, cb)
+		if not called or not req then
+			return false, called and "could not queue fsync" or tostring(req)
+		end
+		return true
+	end
+
+	local queued, qerr = queue_fsync(fd, function(file_err)
+		uv.fs_close(fd)
+		if file_err then
+			if dir_fd then uv.fs_close(dir_fd) end
+			if parent_fd then uv.fs_close(parent_fd) end
+			finish(false, file_err)
+			return
+		end
+		if not need_name_flush then
+			finish(true)
+			return
+		end
+		local dir_queued, dir_qerr = queue_fsync(dir_fd, function(dir_err)
+			uv.fs_close(dir_fd)
+			if dir_err then
+				uv.fs_close(parent_fd)
+				finish(false, dir_err)
+				return
+			end
+			local parent_queued, parent_qerr = queue_fsync(parent_fd, function(parent_err)
+				uv.fs_close(parent_fd)
+				if parent_err then
+					finish(false, parent_err)
+					return
+				end
+				durable_names[path] = true
+				finish(true)
+			end)
+			if not parent_queued then
+				uv.fs_close(parent_fd)
+				finish(false, parent_qerr)
+			end
+		end)
+		if not dir_queued then
+			uv.fs_close(dir_fd)
+			uv.fs_close(parent_fd)
+			finish(false, dir_qerr)
+		end
+	end)
+	if not queued then
+		uv.fs_close(fd)
+		if dir_fd then uv.fs_close(dir_fd) end
+		if parent_fd then uv.fs_close(parent_fd) end
+		return false, qerr
+	end
+	return true
+end
+
 --- Parse a jsonl journal. A torn TAIL (no trailing newline — a crash mid
 --- append) is tolerated and ignored, as the diary tolerates it. A malformed
 --- COMPLETE line stops parsing there: the rows before it are returned with an
@@ -405,7 +513,7 @@ end
 --- Append an entry in the `pending` state; return its correlation id.
 --- A failure returns (nil, err) and the caller MUST HALT the action.
 --- `entry.workspace` routes storage (defaults to cwd); the id is minted here.
-function M.intent(entry)
+local function prepare_row(entry)
 	if type(entry) ~= "table" then
 		return nil, "timeline intent requires an entry table"
 	end
@@ -468,11 +576,54 @@ function M.intent(entry)
 		row.undo_seq = entry.undo_seq
 		row.expected_hash = entry.expected_hash
 	end
+	return row, ws, rel
+end
+
+function M.intent(entry)
+	local row, ws, rel_or_err = prepare_row(entry)
+	if not row then
+		return nil, ws
+	end
+	local rel = rel_or_err
 	local ok, err = append_row(ws, rel, row)
 	if not ok then
 		return nil, "timeline intent not durable — the action must halt: " .. tostring(err)
 	end
-	if regime == "buffer" then
+	if row.regime == "buffer" then
+		local bufnr = find_buffer(diff.abs_path(ws .. "/" .. rel))
+		if bufnr then
+			M.sync_buffer_head(bufnr, row)
+		end
+	end
+	return row.id
+end
+
+--- Append an entry immediately, then complete the same durability sequence in
+--- libuv callbacks. Returns the id once the append and flush requests exist;
+--- callback receives the final durability verdict on Neovim's main loop.
+--- This is only for an event already made true, never for a durable action
+--- whose execution depends on the intent being durable first.
+function M.intent_async(entry, callback)
+	local row, ws, rel_or_err = prepare_row(entry)
+	if not row then
+		return nil, ws
+	end
+	local rel = rel_or_err
+	local ok, err = append_row_async(ws, rel, row, function(durable, async_err)
+		vim.schedule(function()
+			if callback then
+				callback(durable, async_err, row.id)
+			end
+		end)
+	end)
+	if not ok then
+		return nil, "timeline intent not queued for durability: " .. tostring(err)
+	end
+	-- The row is already appended at this point. Advance the in-memory cursor
+	-- now, in append order, not from the later fsync callback: a later hunk
+	-- event may update the head while this flush is still in flight, and the
+	-- older callback must never move that head backwards.
+	if row.regime == "buffer" then
 		local bufnr = find_buffer(diff.abs_path(ws .. "/" .. rel))
 		if bufnr then
 			M.sync_buffer_head(bufnr, row)

@@ -252,6 +252,8 @@ function M.status_icon(change)
     return "✗"
   elseif change.status == "superseded" then
     return "⤵"
+  elseif change.status == "system_refused" then
+    return "⛔"
   elseif change.review_error then
     -- Was ⏳ like everything else, so a refused row and a queued row looked
     -- identical in the header — the operator-visible reason this bug class
@@ -270,6 +272,8 @@ function M.status_label(change)
     return "rejected"
   elseif change.status == "superseded" then
     return "superseded"
+  elseif change.status == "system_refused" then
+    return "system_refused"
   end
   return "pending"
 end

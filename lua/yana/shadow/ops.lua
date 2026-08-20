@@ -15,9 +15,11 @@ local M = {}
 local EXPECTED_PRODUCER = "yana-changeset-v1"
 
 local diff = require("yana.diff")
+local config = require("yana.config")
 local hash = require("yana.safety.hash")
 local control_plane = require("yana.safety.control_plane")
 local log = require("yana.log")
+local manifest = require("yana.manifest")
 local uv = vim.uv or vim.loop
 
 M._test = {
@@ -509,55 +511,170 @@ local function cross_check(path, ev)
 	return state
 end
 
---- Large dependency trees are counted per path in `typed` but offered as one
---- review decision under the directory prefix (shortlist 8b).
-local AGGREGATE_DIR_PREFIXES = {
+local PRODUCT_ARTIFACT_COMPONENTS = {
 	["node_modules"] = true,
+	["target"] = true,
+	["__pycache__"] = true,
+	["build"] = true,
+	["dist"] = true,
+	[".venv"] = true,
+	["CMakeFiles"] = true,
+	[".cache"] = true,
+	[".gradle"] = true,
+	["zig-out"] = true,
 }
 
-local function aggregate_directory_changes(workspace, changes)
-	local buckets = {}
-	local rest = {}
-	for _, change in ipairs(changes) do
-		local rel = change.rel or ""
-		local dir = rel:match("^([^/]+)/")
-		if dir and AGGREGATE_DIR_PREFIXES[dir] then
-			local bucket = buckets[dir]
-			if not bucket then
-				bucket = { members = {} }
-				buckets[dir] = bucket
+local function artifact_component_kind(component)
+	if PRODUCT_ARTIFACT_COMPONENTS[component] or component:match("%.egg%-info$") then
+		return "product"
+	end
+	for _, configured in ipairs(config.options.artifact_dir_prefixes or {}) do
+		local lua_pattern = { "^" }
+		for i = 1, #configured do
+			local char = configured:sub(i, i)
+			if char == "*" then
+				lua_pattern[#lua_pattern + 1] = ".*"
+			elseif char == "?" then
+				lua_pattern[#lua_pattern + 1] = "."
+			elseif char:match("[%^%$%(%)%%%.%[%]%+%-]") then
+				lua_pattern[#lua_pattern + 1] = "%" .. char
+			else
+				lua_pattern[#lua_pattern + 1] = char
 			end
-			bucket.members[#bucket.members + 1] = change
-		else
-			rest[#rest + 1] = change
+		end
+		lua_pattern[#lua_pattern + 1] = "$"
+		if component:match(table.concat(lua_pattern)) then
+			return "operator"
 		end
 	end
-	for dir, bucket in pairs(buckets) do
-		if #bucket.members > 0 then
-			local summary = string.format(
-				"%d file(s) under %s/ (aggregated for one review decision)",
-				#bucket.members,
-				dir
-			)
-			rest[#rest + 1] = {
-				id = "shadow-agg-" .. dir,
-				rel = dir,
-				path = workspace .. "/" .. dir,
-				kind = "aggregate",
-				before = summary,
-				after = summary,
-				aggregated_dir = dir,
-				aggregated_count = #bucket.members,
-				aggregated_members = bucket.members,
-				shadow_apply = true,
-				status = "pending",
-			}
+	return nil
+end
+
+local function named_artifact_root(rel)
+	local prefix = {}
+	for component in rel:gmatch("[^/]+") do
+		prefix[#prefix + 1] = component
+		local kind = artifact_component_kind(component)
+		if kind then
+			return table.concat(prefix, "/"), kind
 		end
 	end
-	table.sort(rest, function(a, b)
-		return (a.rel or "") < (b.rel or "")
+	return nil
+end
+
+local function tracked_at_or_below(tracked, rel)
+	for path in pairs((tracked and tracked.paths) or {}) do
+		if path == rel or path:sub(1, #rel + 1) == rel .. "/" then
+			return true
+		end
+	end
+	return false
+end
+
+local function inside_submodule(tracked, rel)
+	for root in pairs((tracked and tracked.submodules) or {}) do
+		if rel == root or rel:sub(1, #root + 1) == root .. "/" then
+			return true
+		end
+	end
+	return false
+end
+
+--- Pure artifact/refusal classification. Filesystem and Git evidence are
+--- captured by the caller before the agent runs; this function only combines
+--- those facts with the producer's per-op base evidence.
+function M.classify_artifacts(typed, changes, _base_evidence, tracked)
+	tracked = tracked or { status = "unavailable", paths = {} }
+	local virgin = {}
+	for _, op in ipairs(typed or {}) do
+		if op.kind == "create"
+			and op.detail == "dir"
+			and op.base_evidence
+			and op.base_evidence.state == "absent"
+		then
+			virgin[#virgin + 1] = op.rel
+		end
+	end
+	table.sort(virgin, function(a, b)
+		return #a < #b or (#a == #b and a < b)
 	end)
-	return rest
+
+	local groups_by_root, groups = {}, {}
+	local unsafe, individual, excluded = {}, {}, {}
+	local function structural_root(rel)
+		for _, root in ipairs(virgin) do
+			if rel == root or rel:sub(1, #root + 1) == root .. "/" then
+				return root
+			end
+		end
+	end
+	local function add_group(root, root_kind, op)
+		local group = groups_by_root[root]
+		if not group then
+			group = { root = root, root_kind = root_kind, count = 0, kind_counts = {}, members = {} }
+			groups_by_root[root] = group
+			groups[#groups + 1] = group
+		end
+		group.count = group.count + 1
+		group.kind_counts[op.kind] = (group.kind_counts[op.kind] or 0) + 1
+		group.members[#group.members + 1] = op
+		op.status = "system_refused"
+		op.retention_strength = "momentary"
+		op.aggregate_root = root
+		excluded[op.rel] = true
+	end
+
+	for _, op in ipairs(typed or {}) do
+		if not op.control_plane then
+			local canonical, canonical_error = manifest.validate_rel(op.rel)
+			local named_root, named_kind = named_artifact_root(op.rel)
+			local virgin_root = structural_root(op.rel)
+			local root = named_root or virgin_root
+			local root_kind = named_kind or (virgin_root and "virgin" or nil)
+			local safety_root = (named_kind == "product" and named_root) or virgin_root
+			-- A regular-file delete outside an artifact root remains an explicit
+			-- review decision. Inside an artifact root it would be silently
+			-- excluded, so trackedness must authorize that exclusion.
+			local is_destructive = op.kind == "opaque" or op.kind == "delete"
+			local safe = canonical
+			if is_destructive then
+				safe = safe
+					and safety_root ~= nil
+					and (tracked.status == "repo" or tracked.status == "no_repo")
+					and not inside_submodule(tracked, op.rel)
+					and not tracked_at_or_below(tracked, op.rel)
+			end
+			if not safe then
+				op.refusal_reason = canonical and "unsafe destructive artifact operation" or canonical_error
+				op.status = "system_refused"
+				op.retention_strength = "recovered"
+				unsafe[#unsafe + 1] = op
+			elseif root then
+				add_group(root, root_kind, op)
+			elseif not reviewable(op) then
+				op.refusal_reason = "inline review cannot represent this operation"
+				op.status = "system_refused"
+				op.retention_strength = "momentary"
+				individual[#individual + 1] = op
+				excluded[op.rel] = true
+			end
+		end
+	end
+	table.sort(groups, function(a, b)
+		return a.root < b.root
+	end)
+	local reviewable_changes = {}
+	for _, change in ipairs(changes or {}) do
+		if not excluded[change.rel] then
+			reviewable_changes[#reviewable_changes + 1] = change
+		end
+	end
+	return {
+		changes = reviewable_changes,
+		groups = groups,
+		individual = individual,
+		unsafe = unsafe,
+	}
 end
 
 --- Build inline review change objects for one turn.
@@ -570,7 +687,7 @@ end
 --- change landing later still is detected.
 ---
 --- Returns nil, err when the producer fails (never an empty list masking one).
-function M.changes_from_session(session)
+function M.changes_from_session(session, context)
 	local upper = upper_dir(session)
 	if not upper then
 		return nil, "turn has no overlay upper layer"
@@ -627,6 +744,8 @@ function M.changes_from_session(session)
 				id = "shadow-" .. tostring(session.turn_id) .. "-" .. op.rel,
 				path = op.path,
 				rel = op.rel,
+				turn_id = session.turn_id,
+				turn_gen = session.turn_gen,
 				kind = review_kind(op, ev),
 				before = op.kind == "delete" and (before or "") or before,
 				after = after,
@@ -641,18 +760,24 @@ function M.changes_from_session(session)
 				shadow_apply = true,
 				status = "pending",
 			}
-			-- Named refusal at ingestion: NUL bytes never become a review.
-			-- Both versions stay on the change (and in the upper layer); the
-			-- change is still listed so a same-turn text file can still review.
+			-- Named refusal at ingestion: NUL bytes never become a review. The
+			-- real file stays unchanged and both byte strings stay on the change
+			-- record long enough to explain the refusal.
 			if contains_nul(change.before) or contains_nul(change.after) then
 				change.reason_class = "binary_content"
-				change.review_error = op.rel .. ": binary_content — both versions kept"
+				change.review_error = op.rel
+					.. ": binary_content — real file unchanged; proposal is not reviewable"
 			end
 			changes[#changes + 1] = change
 		end
 	end
-	changes = aggregate_directory_changes(session.workspace, changes)
-	return changes, nil, typed
+	local classification = M.classify_artifacts(
+		typed,
+		changes,
+		nil,
+		context and context.tracked_evidence or nil
+	)
+	return classification.changes, nil, typed, classification
 end
 
 function M.unreviewable_ops(typed)
@@ -667,20 +792,12 @@ end
 
 function M.classified_bundle_entries(typed)
 	local entries = {}
-	local agg_dirs = {}
 	for _, op in ipairs(typed or {}) do
 		entries[#entries + 1] = {
 			rel = op.rel,
 			class = op.control_plane and "control-plane" or (op.kind or "unknown"),
 			hash = type(op.extra) == "string" and op.extra or nil,
 		}
-		local dir = (op.rel or ""):match("^([^/]+)/")
-		if dir and AGGREGATE_DIR_PREFIXES[dir] then
-			agg_dirs[dir] = true
-		end
-	end
-	for dir in pairs(agg_dirs) do
-		entries[#entries + 1] = { rel = dir, class = "aggregate" }
 	end
 	return entries
 end

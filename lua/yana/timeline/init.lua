@@ -49,6 +49,13 @@ function M.intent(entry)
 	return require("yana.timeline.record").intent(entry)
 end
 
+--- Append an already-true event and finish its fsync sequence asynchronously.
+--- Durable actions must continue to use intent(), because they cannot start
+--- until their intent is durable.
+function M.intent_async(entry, callback)
+	return require("yana.timeline.record").intent_async(entry, callback)
+end
+
 --- Entries for one file, oldest first. State is DERIVED, never stored: durable
 --- rows are resolved against the diary's markers, which is the record that
 --- survives a crash. The ledger cannot answer this -- it is in-memory with

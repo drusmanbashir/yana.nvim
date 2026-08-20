@@ -4,7 +4,26 @@ set -euo pipefail
 [[ $# == 2 ]] || { echo "Usage: $0 EXPORTED_TREE NVIM" >&2; exit 64; }
 tree=$(realpath "$1")
 nvim=$(realpath "$2")
-scratch=$(mktemp -d "${TMPDIR:-/s/agent_rw/tmp}/yana-confined.XXXXXX")
+
+# This scratch becomes the overlay's WORKSPACE and LAYER_ROOT
+# (bin/yana-overlay --workspace/--upper/--work). run_overlay applies
+# `--tmpfs /tmp` while building the bwrap sandbox, so any host path under
+# /tmp is masked by the time the later `--ro-bind $WORKSPACE ...` /
+# `--bind $LAYER_ROOT ...` args run -- a scratch placed under /tmp binds in
+# empty and the confined turn cannot run. Same requirement, same resolution
+# order as tests/headless_gate.sh: an explicit YANA_HEADLESS_TMPDIR wins,
+# then a TMPDIR that itself is not under /tmp, else refuse rather than hand
+# the overlay a root that cannot work.
+if [[ -n ${YANA_HEADLESS_TMPDIR:-} ]]; then
+	jail_tmpdir=$YANA_HEADLESS_TMPDIR
+elif [[ -n ${TMPDIR:-} && $TMPDIR != /tmp && $TMPDIR != /tmp/* ]]; then
+	jail_tmpdir=$TMPDIR
+else
+	echo "confined_turn_gate: refusing -- overlay workspace root needs YANA_HEADLESS_TMPDIR or a TMPDIR outside /tmp (the jail mounts a fresh tmpfs over /tmp)" >&2
+	exit 65
+fi
+mkdir -p "$jail_tmpdir"
+scratch=$(mktemp -d "$jail_tmpdir/yana-confined.XXXXXX")
 trap 'rm -rf "$scratch"' EXIT
 
 run_smoke() {

@@ -126,6 +126,12 @@ cmd("YanaDiff", function()
   end)
 end, { desc = "View agent file changes as a diff (read-only)" })
 
+cmd("YanaRefusals", function()
+  log.guard("YanaRefusals", function()
+    require("yana.ui").show_refusals()
+  end)
+end, { desc = "List system-refused operations for the current Yana panel" })
+
 cmd("YanaReview", function()
   log.guard("YanaReview", function()
     yana().review_changes()

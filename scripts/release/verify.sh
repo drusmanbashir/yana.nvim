@@ -58,7 +58,7 @@ for required in "${required_patterns[@]}"; do
 	grep -Fqx "$required" "$patterns" || die "required scanner pattern missing: $required"
 done
 
-tmp=${TMPDIR:-/s/agent_rw/tmp}
+tmp=${TMPDIR:-/tmp}
 expected=$(mktemp "$tmp/yana-verify.expected.XXXXXX")
 actual=$(mktemp "$tmp/yana-verify.actual.XXXXXX")
 hits=$(mktemp "$tmp/yana-verify.hits.XXXXXX")
@@ -105,8 +105,8 @@ while IFS= read -r path; do
 done <"$manifest"
 
 version=$(tr -d '\r\n' <"$tree/VERSION")
-[[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-rc\.[1-9][0-9]*)?$ ]] \
-	|| note_fail "VERSION is not an accepted SemVer candidate/stable value: $version"
+[[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-(alpha|beta|rc)\.[1-9][0-9]*)?$ ]] \
+	|| note_fail "VERSION is not an accepted SemVer prerelease/stable value: $version"
 grep -Eqx "## $(sed 's/[.[\\*^$+?{}|()]/\\&/g' <<<"$version") - [0-9]{4}-[0-9]{2}-[0-9]{2}" "$tree/CHANGELOG.md" \
 	|| note_fail "CHANGELOG has no dated release heading for $version"
 grep -Eq "version $(sed 's/[.[\\*^$+?{}|()]/\\&/g' <<<"$version")([[:space:]]|$)" "$tree/doc/yana.txt" \
@@ -117,10 +117,26 @@ fi
 
 grep -Fqx "Copyright (c) 2026 The Sigillite" "$tree/LICENSE" \
 	|| note_fail "upstream copyright holder missing from LICENSE"
+grep -Fqx "Copyright (c) 2026 Usman Bashir" "$tree/LICENSE" \
+	|| note_fail "Yana copyright holder missing from LICENSE"
+grep -Fqx "Yana copyright notice: Copyright (c) 2026 Usman Bashir" "$tree/NOTICE" \
+	|| note_fail "Yana copyright notice missing from NOTICE"
 grep -Fqx "https://github.com/just-nibble/$(printf neo)$(printf cursor).git" "$tree/NOTICE" \
 	|| note_fail "audited upstream URL missing from NOTICE"
 grep -Fqx "Recorded fork point: e85d8e077bec53237810fc848f635e4ad440284a" "$tree/NOTICE" \
 	|| note_fail "fork point missing from NOTICE"
+
+# Public diagnostic environment surface. Keep this explicit: adding a runtime
+# YANA_* dial without adding it here leaves release verification unaware of a
+# host-controlled behavior change. Fresh-install still starts under env -i;
+# this registry checks declaration/documentation, not inheritance.
+public_diagnostic_env=(YANA_DEBUG_EVENTS YANA_LIFECYCLE_LOG)
+for env_name in "${public_diagnostic_env[@]}"; do
+	grep -Fq "$env_name" "$tree/doc/yana.txt" \
+		|| note_fail "public diagnostic variable missing from help: $env_name"
+	grep -Rqs "$env_name" "$tree/lua/yana" \
+		|| note_fail "public diagnostic variable has no runtime reader: $env_name"
+done
 while IFS= read -r runtime_path; do
 	if ! grep -Fqx -- "- upstream-derived: \`$runtime_path\`" "$tree/NOTICE" \
 		&& ! grep -Fqx -- "- post-fork original: \`$runtime_path\`" "$tree/NOTICE"; then

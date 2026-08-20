@@ -19,7 +19,13 @@ OVERLAY="$DIR/yana-overlay"
 TURN_LUA="$REPO/lua/yana/cli/turn.lua"
 NVIM="${YANA_TURN_NVIM:-${YANA_APPLY_NVIM:-nvim}}"
 
-STATE_ROOT="${YANA_STATE_ROOT:-$HOME/.local/state/yana}"
+# State-root precedence, mirrored byte-compatibly in lua/yana/shadow/preview.lua's
+# M.state_root(): YANA_STATE_ROOT, then XDG_STATE_HOME/yana, then
+# $HOME/.local/state/yana. A host with a writable XDG_STATE_HOME but a
+# read-only/minimal $HOME must land the CLI and the editor on the SAME
+# directory, or a claim taken by one is invisible to the other.
+STATE_ROOT="${YANA_STATE_ROOT:-${XDG_STATE_HOME:+$XDG_STATE_HOME/yana}}"
+STATE_ROOT="${STATE_ROOT:-$HOME/.local/state/yana}"
 WORKSPACE=""
 PROMPT=""
 DIARY=""
@@ -30,6 +36,7 @@ MODE="preview"
 JSON=0
 NO_CLAIM=0
 NO_CLAIM_REASON=""
+PRINT_STATE_ROOT=0
 AGENT=()
 
 usage() {
@@ -39,11 +46,20 @@ Usage: yana-turn --workspace DIR --prompt TEXT
                      [--turn-id ID] [--preview | --accept]
                      [--changes-out DIR] [--agent CMD...] [--json]
                      [--no-claim-reason TEXT]
+       yana-turn --print-state-root
+                     (resolve and print the default state root, then exit —
+                     precedence: YANA_STATE_ROOT, XDG_STATE_HOME/yana,
+                     $HOME/.local/state/yana)
 
 Runs one confined agent turn and reads the typed change set straight from the
 overlay upper layer. Nothing is copied at turn start.
 The real workspace is written only by yana-apply on --accept.
 One live overlay turn per workspace is enforced via claim unless --no-claim-reason.
+
+Agent binary resolution (no path or username is ever baked in): --agent
+overrides outright; otherwise the YANA_AGENT_BIN environment variable is
+read, falling back to "cursor-agent" resolved on PATH. Mirrors
+lua/yana/config.lua's M.resolve_cmd() precedence for the Neovim plugin.
 EOF
 }
 
@@ -205,6 +221,10 @@ parse_args() {
 				NO_CLAIM_REASON=$2
 				shift 2
 				;;
+			--print-state-root)
+				PRINT_STATE_ROOT=1
+				shift
+				;;
 			--help|-h)
 				usage
 				exit 0
@@ -221,6 +241,12 @@ parse_args() {
 
 main() {
 	parse_args "$@"
+	# Print the resolved state root and exit, before the --workspace/--prompt
+	# requirement below — a parity check against the Lua resolver has neither.
+	if (( PRINT_STATE_ROOT == 1 )); then
+		printf '%s\n' "$(realpath_safe "$STATE_ROOT")"
+		exit 0
+	fi
 	[[ -n "$WORKSPACE" && -n "$PROMPT" ]] || die_usage "--workspace and --prompt are required"
 
 	if (( NO_CLAIM == 1 )) && [[ -n "$NO_CLAIM_REASON" ]]; then
@@ -327,7 +353,12 @@ main() {
 	if (( ${#AGENT[@]} > 0 )); then
 		agent_cmd=("${AGENT[@]}")
 	else
-		agent_cmd=(cursor-agent -p "$PROMPT" --trust --force)
+		# Same resolution contract as lua/yana/config.lua's M.resolve_cmd(),
+		# steps 2-3 (this standalone CLI has no explicit-cmd step of its own --
+		# --agent above IS that step, an explicit override always wins outright,
+		# same as setup({ cmd = ... })): YANA_AGENT_BIN if set, else the bare
+		# name resolved on PATH. No path or username is ever baked in here.
+		agent_cmd=("${YANA_AGENT_BIN:-cursor-agent}" -p "$PROMPT" --trust --force)
 	fi
 	set +e
 	"$OVERLAY" "${ovl_args[@]}" -- sh -c 'cd "$1" && shift && exec "$@"' _ "$WORKSPACE" "${agent_cmd[@]}"

@@ -45,6 +45,7 @@ M.LIMITS = {
   appends = 200,
   spawns = 32,
   decisions = 200,
+  refusal_groups = 64,
   render_checks = 24,
   hunk_files = 64,
   append_text = 120,
@@ -67,6 +68,7 @@ M.PHASES = {
   "apply_pass_began",
   "review_claim_open",
   "first_review_opened",
+  "review_setup_complete",
   "review_redraw",
   "review_resolved",
   "accept_applied",
@@ -100,6 +102,7 @@ local function new_counters()
     reviews_enqueued = 0,
     reviews_opened = 0,
     reviews_refused = 0,
+    ops_system_refused = 0,
     scope_rejections = 0,
     panel_appends = 0,
     panel_append_lines = 0,
@@ -251,6 +254,8 @@ local function make(panel_id, gen)
     hunk_files_dropped = 0,
     decisions = {},
     decisions_dropped = 0,
+    refusal_groups = {},
+    refusal_groups_dropped = 0,
     recording = nil,
     outcome = nil,
     pending_check = nil,
@@ -725,6 +730,33 @@ function M.record_decision(L, decision)
   return decision
 end
 
+function M.record_refusal_group(L, group)
+  if type(L) ~= "table" or type(group) ~= "table" then
+    return nil
+  end
+  local count = tonumber(group.count) or 0
+  L.counters.ops_system_refused = (L.counters.ops_system_refused or 0) + count
+  if #L.refusal_groups >= M.LIMITS.refusal_groups then
+    L.refusal_groups_dropped = L.refusal_groups_dropped + 1
+    return nil
+  end
+  local row = {
+    at_ms = since(L),
+    wall = M.wall_stamp(),
+    status = "system_refused",
+    root = group.root,
+    count = count,
+    kind_counts = vim.deepcopy(group.kind_counts or {}),
+    sample = vim.deepcopy(group.sample or {}),
+    members_truncated = group.members_truncated and true or false,
+    listing_path = group.listing_path,
+    layer_path = group.layer_path,
+    retention_strength = "momentary",
+  }
+  L.refusal_groups[#L.refusal_groups + 1] = row
+  return row
+end
+
 --- Enrich the decision just recorded with a structured refusal detail.
 ---
 --- The default shadow-accept route detects drift deep in the applier, where
@@ -744,6 +776,9 @@ local REFUSAL_FIELDS = {
   "actual_fp",
   "expected_state",
   "found_state",
+  "retention_strength",
+  "retained_path",
+  "retention_error",
 }
 
 function M.attach_refusal(L, detail)
@@ -812,12 +847,27 @@ function M.record_session_check(L, rec)
   return rec
 end
 
-function M.set_recording(L, rec)
+function M.set_recording(L, rec, writer)
   if type(L) ~= "table" then
     return nil
   end
   L.recording = rec
+  L._recording_writer = writer
   return rec
+end
+
+function M.record_decoded_event(L, event_seq, obj, stale)
+  local writer = type(L) == "table" and L._recording_writer or nil
+  if writer and type(writer.event) == "function" then
+    return writer:event(event_seq, obj, stale)
+  end
+  return false
+end
+
+function M.clear_recording_writer(L)
+  if type(L) == "table" then
+    L._recording_writer = nil
+  end
 end
 
 ----------------------------------------------------------------------

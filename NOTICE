@@ -7,6 +7,8 @@ Recorded fork point: e85d8e077bec53237810fc848f635e4ad440284a
 Upstream licence: MIT
 Upstream copyright notice: Copyright (c) 2026 The Sigillite
 
+Yana copyright notice: Copyright (c) 2026 Usman Bashir
+
 The upstream notice and MIT permission text are retained in LICENSE. Yana's
 later implementation, documentation, tests, and release engineering include
 work by Dr Usman Bashir and other repository contributors.

@@ -42,7 +42,7 @@ build() {
 check() {
 	local url clone scratch
 	url=$1
-	scratch=$(mktemp -d "${TMPDIR:-/s/agent_rw/tmp}/yana-candidate.XXXXXX")
+	scratch=$(mktemp -d "${TMPDIR:-/tmp}/yana-candidate.XXXXXX")
 	trap "rm -rf '$scratch'" EXIT
 	clone=$scratch/clone
 
@@ -76,7 +76,7 @@ check() {
 		refs/heads/main | refs/remotes/origin/HEAD | refs/remotes/origin/main) ;;
 		refs/tags/*)
 			local tag=${ref#refs/tags/}
-			[[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[1-9][0-9]*)?$ ]] \
+			[[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-(alpha|beta|rc)\.[1-9][0-9]*)?$ ]] \
 				|| note_fail "malformed release tag: $tag"
 			[[ "$tag" == "v$version" ]] \
 				|| note_fail "tag $tag does not equal v$version"
