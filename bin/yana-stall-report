@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+set -u
+
+root="${1:-${YANA_STATE_ROOT:-${XDG_STATE_HOME:-$HOME/.local/state}/yana}}"
+if [ ! -d "$root" ]; then
+	printf 'turn\tcause\tduration_ms\tlast_event\tcpu_pct_at_stop\terofs_count\tsub_agent_dirs\n'
+	exit 0
+fi
+
+printf 'turn\tcause\tduration_ms\tlast_event\tcpu_pct_at_stop\terofs_count\tsub_agent_dirs\n'
+find "$root" -type f -path '*/forensics/summary.txt' 2>/dev/null | sort | while IFS= read -r summary; do
+	dir="$(dirname "$summary")"
+	turn="$(awk -F= '$1=="turn_id"{print $2}' "$summary" | head -1)"
+	cause="$(awk -F= '$1=="cause"{print $2}' "$summary" | head -1)"
+	duration="$(awk -F= '$1=="duration_ms"{print $2}' "$summary" | head -1)"
+	last="$(awk -F= '$1=="last_event"{print $2}' "$summary" | head -1)"
+	cpu="$(awk -F= '$1=="cpu_pct_at_stop"{print $2}' "$summary" | head -1)"
+	erofs="$(awk -F= '$1=="erofs_count"{print $2}' "$summary" | head -1)"
+	subdirs="$(find "$dir/vendor-store" -type d 2>/dev/null | grep -Ec 'sub-?agent|task|agent' || true)"
+	printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+		"${turn:-?}" "${cause:-?}" "${duration:-?}" "${last:-?}" "${cpu:-?}" "${erofs:-0}" "${subdirs:-0}"
+done

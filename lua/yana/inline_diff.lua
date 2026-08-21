@@ -91,7 +91,7 @@ local function pool_for(opts)
   local key = workspace_key(opts or {})
   local st = pools[key]
   if not st then
-    st = { queue = {}, active = nil, batched = {} }
+    st = { queue = {}, active = nil, batched = {}, order = {}, order_seq = 0 }
     pools[key] = st
   end
   return st, key
@@ -1806,6 +1806,30 @@ local function record_decision(state, action, fields)
   d.change_id = change and change.id or nil
   d.rel = change and (change.rel or change.path) or nil
   ledger.record_decision(change_ledger(change, state and state.opts), d)
+  -- AND DURABLY (issue log row 46). The ledger above is an in-memory table that
+  -- dies with the process, so a LIVE review left no trace of any decision at
+  -- all: the lifecycle log held review.open/park/settle, the turn ledger held
+  -- agent-stream kinds, and nothing anywhere said whether `ct`, `co`, `ca`,
+  -- `cb` or `cA` had been pressed or what it covered. The headless rows read
+  -- the in-memory list and so never saw the gap. Emitted HERE, at the one
+  -- funnel every operator decision already passes through, so the keymap and
+  -- the `M._test`/seam callers cannot diverge: one row per decision, naming the
+  -- action, the file and -- for a per-hunk decision -- the hunk.
+  --
+  -- `lifecycle_later` (vim.schedule), exactly like review.open/park/settle:
+  -- the durable append fsyncs, and a decision key must not pay for it inline.
+  log.lifecycle_later("review.decision", {
+    turn_id = change and (change.turn_id or change.turn_gen),
+    generation = change and change.turn_gen,
+    action = action,
+    actor = d.actor,
+    path = d.rel,
+    change_id = d.change_id,
+    hunk = d.hunk,
+    model_index = d.model_index,
+    hunks_remaining = d.hunks_remaining,
+    reason = d.reason,
+  })
   return d
 end
 
@@ -1951,6 +1975,254 @@ local function schedule_queue_advance(state)
   end)
 end
 
+local function block_signature(blocks)
+  local sig = {}
+  for i, block in ipairs(blocks or {}) do
+    sig[i] = table.concat({
+      tostring(block.model_index or i),
+      tostring(#(block.old_lines or {})),
+      tostring(#(block.new_lines or {})),
+      tostring(block.new_start_line or ""),
+      tostring(block.new_end_line or ""),
+    }, ":")
+  end
+  return table.concat(sig, "|")
+end
+
+local function parked_pending_blocks(state)
+  local out = {}
+  for i, block in ipairs((state and state.diff_blocks) or {}) do
+    local copy = vim.deepcopy(block)
+    copy.incoming_extmark_id = nil
+    copy.incoming_extmark_ids = nil
+    copy.delete_extmark_id = nil
+    copy.authority_extmark_id = nil
+    copy.nav_fallback_stated = nil
+    out[i] = copy
+  end
+  return out
+end
+
+local function pending_hunk_count_for(change)
+  if not change or change.status ~= "pending" then
+    return 0
+  end
+  if change._parked_review then
+    return #(change._parked_review.blocks or {})
+  end
+  return 1
+end
+
+local function remember_batch_item(st, item)
+  local change = item and item.change
+  if not (st and change) then
+    return
+  end
+  if not change._review_order then
+    st.order_seq = (st.order_seq or 0) + 1
+    change._review_order = st.order_seq
+    st.order[#st.order + 1] = change
+  end
+end
+
+local function queue_remove_change(st, change)
+  for i, item in ipairs((st and st.queue) or {}) do
+    if item.change == change then
+      return table.remove(st.queue, i)
+    end
+  end
+  return nil
+end
+
+local function queue_insert_original(st, item)
+  if not (st and item and item.change) then
+    return
+  end
+  queue_remove_change(st, item.change)
+  local order = item.change._review_order or math.huge
+  local pos = #st.queue + 1
+  for i, existing in ipairs(st.queue) do
+    local eo = existing.change and existing.change._review_order or math.huge
+    if order < eo then
+      pos = i
+      break
+    end
+  end
+  table.insert(st.queue, pos, item)
+end
+
+local function ordered_target_for_state(state, direction)
+  local change = state and state.change
+  local st = pool_for((state and state.opts) or {})
+  local end_text = direction == "next"
+      and "last pending hunk in the last affected file"
+    or "first pending hunk in the first affected file"
+  local cur_order = change and change._review_order
+  if not cur_order then
+    return nil, end_text
+  end
+  local ordered = {}
+  for _, c in ipairs(st.order or {}) do
+    ordered[#ordered + 1] = c
+  end
+  table.sort(ordered, function(a, b)
+    return (a._review_order or math.huge) < (b._review_order or math.huge)
+  end)
+  local start
+  for i, c in ipairs(ordered) do
+    if c == change then
+      start = i
+      break
+    end
+  end
+  if not start then
+    return nil, end_text
+  end
+  local step = direction == "next" and 1 or -1
+  local i = start + step
+  while ordered[i] do
+    local candidate = ordered[i]
+    if pending_hunk_count_for(candidate) > 0 then
+      local item = queue_remove_change(st, candidate)
+        or candidate._parked_item
+        or { change = candidate, opts = state.opts, owner = freeze_review_owner(state.opts) }
+      candidate._parked_item = nil
+      return item, nil
+    end
+    notify_one_line(
+      "yana: " .. (candidate.rel or candidate.path or "?") .. " settled -- skipping",
+      vim.log.levels.INFO
+    )
+    i = i + step
+  end
+  return nil, end_text
+end
+
+--- `landing` (optional) says which hunk of the newly opened file to land on:
+--- "first" or "last". Default follows the direction of travel -- forwards
+--- lands on the first hunk, backwards on the last. The turn-wide reset
+--- (ruling 48) walks backwards but must land on the FIRST hunk, and it cannot
+--- do that by scheduling a second jump: this one is scheduled too, and the
+--- last jump scheduled is the one the operator sees.
+local function park_and_open_state(state, direction, target_item, landing)
+  local change = state and state.change
+  local bufnr = state and state.bufnr
+  if not (state and change and bufnr) then
+    return false
+  end
+  break_undo_block(bufnr)
+  tl_capture_human_edit(state)
+  local staged, snap_err = diff.buffer_bytes_snapshot(bufnr)
+  if staged == nil then
+    change.review_error = tostring(snap_err or "could not snapshot review buffer")
+    notify_one_line("yana: refused to park " .. (change.rel or change.path) .. " -- " .. change.review_error, vim.log.levels.WARN)
+    return false
+  end
+  local pending_blocks = parked_pending_blocks(state)
+  if #pending_blocks == 0 then
+    return false
+  end
+  local parked_item = state.queue_item or {
+    change = change,
+    opts = state.opts,
+    owner = freeze_review_owner(state.opts),
+  }
+  local st = pool_for(state.opts or {})
+  remember_batch_item(st, parked_item)
+  local sealed = vim.deepcopy(state.sealed_decisions or {})
+  for _, d in ipairs(state.decisions or {}) do
+    sealed[#sealed + 1] = vim.deepcopy(d)
+  end
+  change._parked_review = {
+    staged_text = staged,
+    blocks = pending_blocks,
+    pending_signature = block_signature(pending_blocks),
+    model_hunks = vim.deepcopy(state.model_hunks or {}),
+    model_source = state.model_source,
+    sealed_decisions = sealed,
+  }
+  change._parked_item = parked_item
+  change.status = "pending"
+
+  record_decision(state, "review_parked", {
+    direction = direction,
+    hunks_remaining = #pending_blocks,
+    target_rel = target_item and target_item.change and (target_item.change.rel or target_item.change.path) or nil,
+  })
+  require("yana.log").lifecycle_later("review.park", {
+    turn_id = change.turn_id or change.turn_gen,
+    generation = change.turn_gen,
+    path = change.rel or change.path,
+    direction = direction,
+  })
+  M.cleanup(state)
+  st.active = nil
+  queue_insert_original(st, parked_item)
+  announce_state()
+
+  local target_change = target_item and target_item.change
+  if not target_change then
+    return false
+  end
+  local ok, err = open_or_abandon(target_change, target_item.opts)
+  if ok and st.active and st.active.change == target_change then
+    st.active.queue_item = target_item
+    announce_state()
+    vim.schedule(function()
+      local active_state = st.active
+      if active_state and active_state.change == target_change then
+        local want_first = (landing == "first")
+          or (landing == nil and direction == "next")
+        local block = want_first
+            and active_state.diff_blocks[1]
+          or active_state.diff_blocks[#active_state.diff_blocks]
+        jump_to_block(active_state.bufnr, block)
+      end
+    end)
+    return true
+  end
+
+  notify_one_line(
+    "yana: refused to navigate from " .. (change.rel or change.path)
+      .. " -- could not reopen " .. (target_change.rel or target_change.path or "?")
+      .. ": " .. notify.error_headline(err),
+    vim.log.levels.WARN
+  )
+  queue_remove_change(st, change)
+  local reopen_ok = open_or_abandon(change, parked_item.opts)
+  if reopen_ok and st.active and st.active.change == change then
+    st.active.queue_item = parked_item
+    announce_state()
+    return false
+  end
+  queue_insert_original(st, parked_item)
+  announce_state()
+  return false
+end
+
+local function navigate_or_park_state(state, direction)
+  local bufnr = state and state.bufnr
+  local blocks = state and state.diff_blocks or {}
+  local block, idx = current_block(blocks, bufnr)
+  if not block then
+    jump_to_block(bufnr, nearest_block(blocks, bufnr, direction))
+    return
+  end
+  local at_edge = (direction == "next" and idx == #blocks)
+    or (direction == "prev" and idx == 1)
+  if not at_edge then
+    jump_to_block(bufnr, nearest_block(blocks, bufnr, direction))
+    return
+  end
+  local item, end_msg = ordered_target_for_state(state, direction)
+  if not item then
+    notify_one_line("yana: already at the " .. end_msg, vim.log.levels.INFO)
+    return
+  end
+  park_and_open_state(state, direction, item)
+end
+M._navigate_or_park_state = navigate_or_park_state
+
 -- Owner callbacks belong to the panel, not to this engine, and the engine's
 -- own teardown must not depend on them succeeding. Before this guard, a throw
 -- inside on_accept/on_reject skipped `M.cleanup` + `active = nil` +
@@ -1975,6 +2247,157 @@ local function notify_owner(cb, change, label)
   end
   return true
 end
+
+----------------------------------------------------------------------
+-- `U` REACHES THE WHOLE TURN -- ruling 48 (issue log row 48).
+--
+-- `u` is unchanged: the last step, per hunk, in the file under the cursor.
+-- `U` is the RESET, and there is no separate command for it: every file the
+-- turn touched goes back to the state the operator was FIRST SHOWN, and the
+-- cursor lands on the turn's first pending hunk.
+--
+-- The two hard cases are the ones the ruling names:
+--   (a) A file already settled and CLOSED has no buffer to pop and no review
+--       to unwind. It is REOPENED -- put back in the queue at its original
+--       position with its decision cleared -- so the operator gets the review
+--       they were shown, not an empty one.
+--   (b) A file already ACCEPTED is already on disk, so undoing it means
+--       WRITING to the real tree with no accept behind it. The ruling permits
+--       exactly that, and requires the panel to SAY SO as it happens. The
+--       write itself still goes through the journaled applier (the seam
+--       `on_shadow_revert`), so the sole-real-tree-writer contract holds and
+--       the undo is itself revertible.
+--
+-- What this does NOT do, said rather than hidden: an accepted file the agent
+-- CREATED has no turn-start bytes to restore, only turn-start absence, and
+-- putting absence back is a journaled delete the applier does not offer yet.
+-- Those are REFUSED BY NAME and reported in the summary as not undone, rather
+-- than being quietly counted as restored.
+----------------------------------------------------------------------
+
+--- THIS turn, and only this turn. The pool's `order` is never cleared between
+--- turns -- it is the panel's whole review history for that workspace -- so a
+--- sweep over it reaches changes the operator settled in EARLIER turns, whose
+--- bytes `U` has no business putting back. Measured that way round first: over
+--- three turns, `U` announced "6 file(s)" and wrote two of them back twice
+--- each, after which accept-all found three stale queued changes. The turn
+--- identity on the change decides.
+local function same_turn(a, b)
+  if a == b then
+    return true
+  end
+  if a.turn_id ~= nil or b.turn_id ~= nil then
+    return a.turn_id == b.turn_id
+  end
+  return a.turn_gen == b.turn_gen
+end
+
+--- Every change of this turn, in the order the operator was shown them.
+local function turn_changes(state)
+  local st = pool_for(state and state.opts or {})
+  local this = state and state.change
+  local ordered = {}
+  for _, c in ipairs(st.order or {}) do
+    if this == nil or same_turn(c, this) then
+      ordered[#ordered + 1] = c
+    end
+  end
+  table.sort(ordered, function(a, b)
+    return (a._review_order or math.huge) < (b._review_order or math.huge)
+  end)
+  return ordered, st
+end
+
+--- Put one settled/parked change back in the queue exactly where it was, with
+--- its decision cleared, so the review the operator was first shown reopens.
+local function revive_change(st, c, opts)
+  local item = queue_remove_change(st, c)
+    or c._parked_item
+    or { change = c, opts = opts, owner = freeze_review_owner(opts) }
+  c._parked_item = nil
+  c._parked_review = nil
+  c.review_error = nil
+  c.status = "pending"
+  queue_insert_original(st, item)
+end
+
+--- The sweep. Returns the rels put back, the rels whose BYTES had to be
+--- written back to disk, and the ones that refused, each with its reason.
+local function undo_rest_of_turn(state)
+  local restored, reverted, refused = {}, {}, {}
+  local ordered, st = turn_changes(state)
+  local opts = state.opts or {}
+  for _, c in ipairs(ordered) do
+    if c ~= state.change then
+      local rel = c.rel or c.path or "?"
+      local was_accepted = c.status == "accepted"
+      local ok = true
+      if was_accepted then
+        -- SAID BEFORE IT HAPPENS, and durably: this is the one write in the
+        -- product that lands on the real tree without an accept behind it.
+        local said = "yana: U writes " .. rel .. " back to disk without an accept"
+        log.write(
+          "WARN",
+          said .. " -- it had already been accepted, and undoing the turn puts its "
+            .. "turn-start bytes back through the journaled applier"
+        )
+        notify_one_line(said, vim.log.levels.WARN)
+        if opts.on_shadow_revert then
+          local err
+          ok, err = opts.on_shadow_revert(c)
+          if ok ~= true then
+            refused[#refused + 1] = rel .. ": " .. notify.error_headline(err or "revert failed")
+            ok = false
+          end
+        else
+          ok = false
+          refused[#refused + 1] = rel .. ": no journaled revert available for this review"
+        end
+      end
+      if ok then
+        revive_change(st, c, opts)
+        notify_owner(opts.on_kept_unreviewed, c, "on_kept_unreviewed")
+        restored[#restored + 1] = rel
+        if was_accepted then
+          reverted[#reverted + 1] = rel
+        end
+      end
+    end
+  end
+  announce_state()
+  return restored, reverted, refused
+end
+
+--- After a turn-wide undo the cursor belongs on the turn's FIRST pending
+--- hunk, which is the first hunk of the first file the operator was shown.
+--- If that is not the file under the cursor, the active review is PARKED --
+--- navigation, never a decision -- and the first one is opened.
+local function focus_turn_first_hunk(state)
+  local ordered, st = turn_changes(state)
+  local first = ordered[1]
+  if not first then
+    return false
+  end
+  if first == state.change then
+    jump_to_block(state.bufnr, state.diff_blocks and state.diff_blocks[1])
+    return true
+  end
+  local item = queue_remove_change(st, first)
+    or first._parked_item
+    or { change = first, opts = state.opts, owner = freeze_review_owner(state.opts) }
+  first._parked_item = nil
+  -- "first": the reset walks BACKWARDS to the turn's first file but lands on
+  -- its FIRST hunk, not its last.
+  if not park_and_open_state(state, "prev", item, "first") then
+    return false
+  end
+  return true
+end
+-- Reached through `M.` from inside `M.open`, exactly as
+-- `M._navigate_or_park_state` is: that function is already at Lua's 60-upvalue
+-- ceiling, and two more file-local names would not fit.
+M._undo_rest_of_turn = undo_rest_of_turn
+M._focus_turn_first_hunk = focus_turn_first_hunk
 
 local function mode_perm(mode)
   return mode and (mode % 4096) or nil
@@ -2615,6 +3038,14 @@ local function try_finalize(state)
       break
     end
   end
+  if not accepted_any then
+    for _, d in ipairs(state.sealed_decisions or {}) do
+      if d.action == "accept" then
+        accepted_any = true
+        break
+      end
+    end
+  end
   finish_session(state, accepted_any)
 end
 
@@ -2748,7 +3179,23 @@ function M.open(change, opts)
   -- Model FIRST, blocks second, join last: the model must not be able to
   -- inherit anything from the block list.
   local model, model_source = payload_model(change, target)
+  local parked = change._parked_review
   local blocks = stamp_model_index(M.build_diff_blocks(change.before or "", target), model)
+  if parked then
+    local parked_blocks = {}
+    for i, block in ipairs(parked.blocks or {}) do
+      local copy = vim.deepcopy(block)
+      copy.incoming_extmark_id = nil
+      copy.incoming_extmark_ids = nil
+      copy.delete_extmark_id = nil
+      copy.authority_extmark_id = nil
+      copy.nav_fallback_stated = nil
+      parked_blocks[i] = copy
+    end
+    blocks = parked_blocks
+    model = vim.deepcopy(parked.model_hunks or model)
+    model_source = parked.model_source or model_source
+  end
   -- Zero hunks means `before` equals `after`: disk already holds the accepted
   -- content, so there is nothing to write and nothing to review, and settling
   -- the change here is correct.
@@ -2783,6 +3230,9 @@ function M.open(change, opts)
   local pre_stage_lines = vim.deepcopy(vim.api.nvim_buf_get_lines(bufnr, 0, -1, false))
   local stage_ok, stage_err = pcall(function()
     insert_new_lines(bufnr, blocks)
+    if parked and type(parked.staged_text) == "string" then
+      vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, buffer_lines(parked.staged_text))
+    end
     if change.before == nil then
       local n = vim.api.nvim_buf_line_count(bufnr)
       if n > 1 and (vim.api.nvim_buf_get_lines(bufnr, n - 1, n, false)[1] or "") == "" then
@@ -2812,6 +3262,40 @@ function M.open(change, opts)
     announce_state()
     schedule_queue_advance({ opts = opts or {} })
     return false
+  end
+
+  if parked then
+    local restored = diff.buffer_bytes_snapshot(bufnr)
+    local sig = {}
+    for i, block in ipairs(blocks or {}) do
+      sig[i] = table.concat({
+        tostring(block.model_index or i),
+        tostring(#(block.old_lines or {})),
+        tostring(#(block.new_lines or {})),
+        tostring(block.new_start_line or ""),
+        tostring(block.new_end_line or ""),
+      }, ":")
+    end
+    local got_sig = table.concat(sig, "|")
+    if restored ~= parked.staged_text or got_sig ~= parked.pending_signature then
+      break_undo_block(bufnr)
+      pcall(vim.api.nvim_buf_set_lines, bufnr, 0, -1, false, pre_stage_lines)
+      vim.bo[bufnr].modified = false
+      change.review_error = "parked review restore mismatch"
+      ledger.record_decision(change_ledger(change, opts), {
+        action = "review_refused",
+        actor = "system",
+        reason = "park_restore_mismatch",
+        detail = change.review_error,
+        change_id = change.id,
+        rel = change.rel or change.path,
+      })
+      notify_one_line("yana: refused to reopen parked review for " .. (change.rel or change.path) .. " -- restore mismatch", vim.log.levels.WARN)
+      announce_state()
+      schedule_queue_advance({ opts = opts or {} })
+      return false
+    end
+    change._parked_review = nil
   end
 
   -- Seal the staging into its own undo block and bookmark where it landed.
@@ -2899,6 +3383,7 @@ function M.open(change, opts)
     latest_undo_seq = undo_open_seq,
     undo_pre_stage_seq = change.undo_pre_stage_seq,
     decisions = {},
+    sealed_decisions = parked and vim.deepcopy(parked.sealed_decisions or {}) or {},
     hint_id = nil,
     hint_line = nil,
     -- What the review buffer held the last time this engine touched it. The
@@ -3970,11 +4455,52 @@ function M.open(change, opts)
         opts = state.opts,
       })
     end
+    -- THE REST OF THE TURN. Ruling 48: `U` is the reset -- it undoes every
+    -- edit in the ENTIRE BLOCK of inline hunks, not just this file's. The
+    -- block above put the ACTIVE review back to the state it opened in; the
+    -- sweep below does the same for every other file of the turn, including
+    -- the two cases the ruling names by hand: a file already settled and
+    -- CLOSED has no buffer to pop, so it is reopened; and a file already
+    -- ACCEPTED is already on disk, so putting it back is a real-tree WRITE
+    -- with no accept behind it -- permitted here, said out loud as it
+    -- happens, and journaled like every other write.
+    local restored, reverted, refused = M._undo_rest_of_turn(state)
     record_decision(state, "undo_turn", {
       decisions_undone = n,
       to_undo_seq = state.undo_open_seq,
       hunks = #state.diff_blocks,
+      files_undone = #restored + 1,
+      files_written_back = #reverted,
+      files_refused = #refused,
     })
+
+    -- ONE message for the whole turn, naming how many files it covered.
+    -- Silence would leave the operator guessing whether the other files were
+    -- touched, which is the whole reason the ruling asks for this line.
+    local names = { change.rel or change.path }
+    for _, rel in ipairs(restored) do
+      names[#names + 1] = rel
+    end
+    local summary = string.format(
+      "yana: undid every edit in this turn -- %d file(s) back to the state you were first shown: %s",
+      #names,
+      table.concat(names, ", ")
+    )
+    log.write("WARN", summary)
+    notify_one_line(summary, vim.log.levels.INFO)
+    if #refused > 0 then
+      local rmsg = string.format(
+        "yana: %d file(s) could NOT be undone and are still as you left them: %s",
+        #refused,
+        table.concat(refused, "; ")
+      )
+      log.write("WARN", rmsg)
+      notify_one_line(rmsg, vim.log.levels.WARN)
+    end
+
+    -- ...and the cursor goes back to the turn's FIRST pending hunk, which
+    -- after a full unwind is the first hunk of the first file reviewed.
+    M._focus_turn_first_hunk(state)
   end
 
   if not opts.preview then
@@ -4120,6 +4646,52 @@ function M.open(change, opts)
       return b > 0 and vim.api.nvim_buf_is_loaded(b) and vim.bo[b].modified
     end
 
+    -- A PARKED change is the exception to that question, and the whole of
+    -- ruling 47 (issue log row 47). Parking is a NAVIGATION event, never a
+    -- decision (ruling 7), so a parked change is still PENDING and accept-all
+    -- must cover it. Its buffer is `modified` because THIS ENGINE staged the
+    -- agent's proposal into it and `]x` left it there -- reading that as
+    -- "changed outside the inline engine" made accept-all silently skip the
+    -- one change an operator is most likely to ask it about (the live E2E's
+    -- "a hunk still pending after accept-all").
+    --
+    -- The composition is the parked review's OWN bytes, not `change.after`:
+    -- a hunk the operator rejected before parking is already back to base in
+    -- them, so accepting the parked file covers what was still pending and
+    -- reverts nothing that was decided. Accept-all is not a reset (that is
+    -- `U`, row 48).
+    --
+    -- The buffer is still compared against what the park recorded, so a HUMAN
+    -- edit made after the park is a clash exactly as before.
+    local function parked_composition(change_i)
+      local parked = change_i and change_i._parked_review
+      if not parked then
+        return nil, nil
+      end
+      local staged = parked.staged_text
+      local b = vim.fn.bufnr(change_i.path, false)
+      if b > 0 and vim.api.nvim_buf_is_loaded(b) then
+        local live = diff.buffer_bytes_snapshot(b)
+        if live ~= nil then
+          if staged ~= nil and not diff.text_equal_snapshot(live, staged) then
+            return nil, "the parked review buffer was edited after it was parked"
+          end
+          return live, nil
+        end
+      end
+      if staged == nil then
+        return nil, "the parked review kept no staged content to accept"
+      end
+      return staged, nil
+    end
+
+    local parked_covered = 0
+    for _, item in ipairs(drained) do
+      if item.change and item.change._parked_review then
+        parked_covered = parked_covered + 1
+      end
+    end
+
     -- DISCLOSE BEFORE APPLY. accept_everything applies the active review AND
     -- drains the whole queued turn onto the real tree. Historically it reported
     -- only the skipped/clashed paths AFTER the loop, so an operator hitting
@@ -4176,14 +4748,35 @@ function M.open(change, opts)
       #disclose_paths,
       table.concat(disclose_paths, ", ")
     )
+
     log.write("WARN", disclose_msg)
     notify_one_line(disclose_msg, vim.log.levels.INFO)
+
+    -- Ruling 47: the panel names what accept-all covered, INCLUDING how many
+    -- of those changes were parked. Its OWN line rather than a clause appended
+    -- to the disclosure: `notify_one_line` truncates to the panel width, and
+    -- measured on the two-file case the appended clause was the half that got
+    -- cut -- a disclosure that names the parked coverage only when the path
+    -- list happens to be short is not a disclosure. Durable too, since INFO
+    -- never reaches disk (log.lua) and this is the half a live run is read
+    -- back for.
+    if parked_covered > 0 then
+      local parked_msg = string.format(
+        "yana: accept-all covers %d parked change(s) -- parking is navigation, not a decision",
+        parked_covered
+      )
+      log.write("WARN", parked_msg)
+      notify_one_line(parked_msg, vim.log.levels.INFO)
+    end
 
     for _, item in ipairs(drained) do
       local change_i = item.change
       local path = diff.abs_path(change_i.path)
       change_i.path = path
       local ok, err
+      -- What a PARKED change contributes: its own staged bytes, and the
+      -- reason it cannot be used if the human moved them after the park.
+      local parked_text, parked_err = parked_composition(change_i)
       -- Control-plane fail-safe before any accept write, covering
       -- BOTH the shadow_apply route and the legacy direct write/delete below.
       -- Classify the lexical path so a `.git` name is not resolved away.
@@ -4193,7 +4786,16 @@ function M.open(change, opts)
         table.insert(to_requeue, item)
         goto continue
       end
-      if buffer_clash(path) then
+      if parked_err then
+        change_i.review_error = parked_err
+        table.insert(clashed, change_i.rel or path)
+        table.insert(to_requeue, item)
+        goto continue
+      end
+      -- `parked_text` IS the parked review's own staging, already compared
+      -- against what the park recorded, so the modified flag says nothing
+      -- more here.
+      if parked_text == nil and buffer_clash(path) then
         change_i.review_error = "review buffer changed outside the inline engine"
         table.insert(clashed, change_i.rel or path)
         table.insert(to_requeue, item)
@@ -4224,13 +4826,13 @@ function M.open(change, opts)
         end
         local composed_i = nil
         if change_i.kind ~= "delete" then
-          if change_i.after == nil then
+          if change_i.after == nil and parked_text == nil then
             change_i.review_error = change_i.review_error or "queued change has no after content"
             table.insert(skipped, change_i.rel or path)
             table.insert(to_requeue, item)
             goto continue
           end
-          composed_i = change_i.after
+          composed_i = parked_text or change_i.after
         end
         local allowed, why = review_action_allowed({ opts = item.opts }, change_i)
         if not allowed then
@@ -4242,6 +4844,10 @@ function M.open(change, opts)
         local aok, aerr, applied_i = item.opts.on_shadow_accept(change_i, composed_i)
         if aok == true then
           change_i.status = "accepted"
+          -- The park is over: nothing may reopen this review from the parked
+          -- staging once its bytes are on disk.
+          change_i._parked_review = nil
+          change_i._parked_item = nil
           notify_owner(item.opts.on_accept, change_i, "on_accept")
           -- No `diff.reload_file(path)` here any more. shadow/apply.lua now
           -- reconciles this buffer itself, against the stat its own write left
@@ -4355,12 +4961,12 @@ function M.open(change, opts)
     vim.keymap.set({ "n", "v" }, "<C-r>", guarded("yana.inline_diff redo_key", redo_key), vim.tbl_extend("force", km, { desc = "yana: redo (repaints the review afterwards)" }))
     vim.keymap.set({ "n", "v" }, maps.next or "]x", function()
       log.guard("yana.inline_diff next hunk", function()
-        jump_to_block(bufnr, nearest_block(state.diff_blocks, bufnr, "next"))
+        M._navigate_or_park_state(state, "next")
       end)
     end, vim.tbl_extend("force", km, { desc = "yana: next hunk" }))
     vim.keymap.set({ "n", "v" }, maps.prev or "[x", function()
       log.guard("yana.inline_diff prev hunk", function()
-        jump_to_block(bufnr, nearest_block(state.diff_blocks, bufnr, "prev"))
+        M._navigate_or_park_state(state, "prev")
       end)
     end, vim.tbl_extend("force", km, { desc = "yana: prev hunk" }))
   end
@@ -4520,11 +5126,13 @@ function M.enqueue(change, opts)
   end
   change.review_error = nil
   stamp_review_workspace(change, opts)
-  table.insert(st.queue, {
+  local item = {
     change = change,
     opts = opts,
     owner = freeze_review_owner(opts),
-  })
+  }
+  remember_batch_item(st, item)
+  table.insert(st.queue, item)
   local attempted = process_next_for(opts)
   if attempted == change then
     return "opened"
@@ -4572,6 +5180,8 @@ function M.discard_pool(opts)
   end
   st.queue = {}
   st.batched = {}
+  st.order = {}
+  st.order_seq = 0
   announce_state()
 end
 

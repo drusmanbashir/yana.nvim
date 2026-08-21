@@ -78,6 +78,15 @@ readonly SECRET_MASK_FILES=(
 	.config/gh/hosts.yml
 )
 SECRET_MASK_ARGS=()
+# The same compiled masks, in the shape bin/yana-overlay-inner's --mask-dir /
+# --mask-file take instead of bwrap's own argv (WI-1's broad-root path mounts
+# them from inside the mount namespace, on top of the overlay, rather than as
+# outer bwrap args). Populated alongside SECRET_MASK_ARGS by secret_mask_add,
+# from the same resolved candidates, so the two representations can never
+# name a different set of paths.
+SECRET_MASK_DEST_DIRS=()
+SECRET_MASK_FILE_SRC=()
+SECRET_MASK_FILE_DST=()
 SECRET_MASK_EMPTY=""
 declare -A SECRET_MASK_OTHER_IDENTITIES=()
 SECRET_MASK_CAND=()
@@ -95,10 +104,41 @@ WORKSPACE=""
 UPPER=""
 WORK=""
 CLAIM=""
+# Operator-declared write roots beyond the opened workspace (the external-roots
+# contract). One parallel entry per extra root, in the canonical-path order the
+# caller passed them; index 0 here is root 2 of the turn, because the primary
+# workspace is always root 1 and is never listed. Empty in every single-root
+# launch, which is what keeps that launch byte-identical to the one this file
+# has always made.
+EXTRA_ROOTS=()
+EXTRA_UPPERS=()
+EXTRA_WORKS=()
+EXTRA_CLAIMS=()
+EXTRA_LAYER_ROOTS=()
+EXEC_ALLOW=()
+# The broad root (PLAN-R1-capture.md WI-1): an ancestor of WORKSPACE, or
+# WORKSPACE itself, at which the ONE overlay is mounted instead of at
+# WORKSPACE. Empty unless --broad-root is given, and empty is what keeps
+# every existing single-root launch byte-identical to the one this file has
+# always made -- masks, the ~/.cursor exception and the overlay's own mount
+# options only move to the new mechanism in run_overlay() when this is set.
+BROAD_ROOT=""
+# Every path of the confined tree that a mask, the writable-host exception or
+# TMPDIR must not swallow: the workspace, its layer root, then each extra root
+# and its layer root. Built once by validate_paths. Deliberately does NOT
+# include BROAD_ROOT: a mask living inside the broad root (the ordinary case,
+# e.g. $HOME/.ssh under a broad root of $HOME) is the point, not a conflict.
+PROTECTED_PATHS=()
+# The claims THIS invocation committed, with the acquisition token each one
+# wrote, so a failure part-way through the set can give back exactly those and
+# nothing else.
+ACQUIRED_CLAIMS=()
+ACQUIRED_NONCES=()
 NONCE_OUT=""
 RELEASE_NONCE=""
 TURN_CGROUP=""
 TURN_CGROUP_PARENT=""
+TURN_CGROUP_TAG=""
 CMD=()
 FORCE_REASON=""
 CURSOR_DIR=""
@@ -108,13 +148,30 @@ usage() {
 	cat <<'EOF'
 Usage:
   yana-overlay --workspace DIR --upper DIR --work DIR [--claim DIR]
-                    [--nonce-out FILE] -- CMD [ARGS...]
+                    [--nonce-out FILE] [--broad-root DIR]
+                    [--exec-allow FILE]...
+                    [--extra-root DIR --extra-upper DIR --extra-work DIR
+                     [--extra-claim DIR]]... -- CMD [ARGS...]
   yana-overlay release --claim DIR [--nonce TOKEN]
   yana-overlay force-release --claim DIR --reason TEXT
 
 Establish a kernel overlay at the workspace's real absolute path inside bwrap,
 run CMD confined with an empty capability set, and tear down. Fail closed: if
 the layer cannot be established the command never runs.
+
+--broad-root DIR mounts the ONE overlay at DIR instead of at the workspace,
+where DIR must be the workspace itself or an ancestor of it
+(PLAN-R1-capture.md WI-1). Every write anywhere under DIR then lands as a
+hunk — the open repo, a sibling repo, or a brand-new directory — with zero
+EROFS, because there is one overlay covering the whole broad root rather than
+one overlay per declared root. The overlay is mounted -o volatile (no
+per-copy-up fsync); the compiled secret masks and the ~/.cursor exception are
+mounted by yana-overlay-inner AFTER the overlay, so a mask cannot be shadowed
+by the broad-root mount covering the path it sits on. Omit --broad-root and
+this launcher's argv, mounts and messages are byte-identical to what they
+have always been: the single overlay sits at the workspace's own path, and
+masks and the exception are outer bwrap args, exactly as before this flag
+existed. --broad-root may not be combined with --extra-root.
 
 The host tree is read-only with exactly one exception: ~/.cursor is bind-mounted
 read-write so cursor-agent can refresh its own credentials. Nothing else under
@@ -133,6 +190,20 @@ it is additive and can never disable the operator-home profile, which is why
 gates can use it without touching real credentials. Set
 YANA_OVERLAY_SECRET_REPORT=1 to have the applied/absent counts printed to
 stderr. Neither variable can turn masking off.
+
+An operator-declared write root beyond the workspace is passed as a repeated
+group: --extra-root starts a group and --extra-upper/--extra-work/--extra-claim
+attach to the group before them. Each root is mounted as its own overlay at its
+own real absolute path, with its own upper layer, work dir and claim, so its
+change set is separate and reviewable on its own. Roots must be disjoint from
+each other and from every turn layer. Nothing here infers a root: the set comes
+from the caller, which takes it from operator configuration only.
+
+Claims are taken primary-first, then the extra roots in the order given. If ANY
+of them cannot be taken, every claim already taken is released by its own
+acquisition token and the launcher exits 65 naming the root that failed — the
+command never runs on a partial set, because a partial hold would wedge the
+operator's own workspace on behalf of a turn that never started.
 
 Claims are released explicitly (release / force-release), never by process exit.
 
@@ -265,6 +336,14 @@ identity_overlaps() {
 build_launch_identity_table() {
 	LAUNCH_PATH_IDENTITY=()
 	local -a roots=("$WORKSPACE" "$UPPER" "$WORK" "$LAYER_ROOT" "$CURSOR_DIR")
+	# Every declared root and its layer join the closure: the alias checks below
+	# are only as complete as this table, and a bind alias between two declared
+	# roots is exactly the case a pathname comparison cannot see.
+	roots+=(${EXTRA_ROOTS[@]+"${EXTRA_ROOTS[@]}"})
+	roots+=(${EXTRA_UPPERS[@]+"${EXTRA_UPPERS[@]}"})
+	roots+=(${EXTRA_WORKS[@]+"${EXTRA_WORKS[@]}"})
+	roots+=(${EXTRA_LAYER_ROOTS[@]+"${EXTRA_LAYER_ROOTS[@]}"})
+	[[ -n "$BROAD_ROOT" ]] && roots+=("$BROAD_ROOT")
 	local -a paths=() real=() ids=()
 	local -A seen=()
 	local root p r identity
@@ -342,6 +421,13 @@ resolve_cursor_dir() {
 	if path_is_prefix "$dir" "$LAYER_ROOT" || path_is_prefix "$LAYER_ROOT" "$dir"; then
 		refuse "writable-host exception ($dir) must be disjoint from the layer root ($LAYER_ROOT)"
 	fi
+	local protected
+	for protected in ${PROTECTED_PATHS[@]+"${PROTECTED_PATHS[@]}"}; do
+		[[ -n "$protected" ]] || continue
+		if path_is_prefix "$dir" "$protected" || path_is_prefix "$protected" "$dir"; then
+			refuse "writable-host exception ($dir) must be disjoint from every declared write root and its layer ($protected)"
+		fi
+	done
 	CURSOR_DIR="$dir"
 
 	# Disjoint pathnames are not disjoint directories. Repeat both checks by
@@ -364,6 +450,52 @@ resolve_cursor_dir() {
 	if identity_overlaps "$dir" "$LAYER_ROOT"; then
 		refuse "writable-host exception ($dir, $dir_id) aliases the layer root ($LAYER_ROOT, $layer_id) — same directory or one contains the other despite disjoint pathnames"
 	fi
+	for protected in ${PROTECTED_PATHS[@]+"${PROTECTED_PATHS[@]}"}; do
+		[[ -n "$protected" ]] || continue
+		if identity_overlaps "$dir" "$protected"; then
+			refuse "writable-host exception ($dir, $dir_id) aliases a declared write root or its layer ($protected) — same directory or one contains the other despite disjoint pathnames"
+		fi
+	done
+	validate_root_identities
+}
+
+# Declared roots must be disjoint BY IDENTITY as well as by pathname. Two roots
+# that are bind aliases of one directory would each be mounted as the writable
+# view of the same bytes, and the two change sets could not be told apart at
+# review; a root that aliases a layer root would let the agent rewrite the very
+# upper layer its own change set is read from. Runs after the launch identity
+# table exists, which is why it lives here rather than in validate_paths.
+validate_root_identities() {
+	(( ${#EXTRA_ROOTS[@]} > 0 )) || return 0
+	local i j a b rc
+	local -a all_roots=("$WORKSPACE" ${EXTRA_ROOTS[@]+"${EXTRA_ROOTS[@]}"})
+	for (( i = 0; i < ${#all_roots[@]}; i++ )); do
+		a=${all_roots[$i]}
+		for (( j = i + 1; j < ${#all_roots[@]}; j++ )); do
+			b=${all_roots[$j]}
+			set +e
+			identity_overlaps "$a" "$b"
+			rc=$?
+			set -e
+			if (( rc == 0 )); then
+				refuse "declared write root '$b' aliases '$a' — same directory or one contains the other despite disjoint pathnames"
+			fi
+			if (( rc == 2 )); then
+				refuse "cannot establish filesystem identity for the declared write roots '$a' and '$b'"
+			fi
+		done
+		for (( j = 0; j < ${#EXTRA_LAYER_ROOTS[@]}; j++ )); do
+			b=${EXTRA_LAYER_ROOTS[$j]}
+			[[ -n "$b" ]] || continue
+			set +e
+			identity_overlaps "$a" "$b"
+			rc=$?
+			set -e
+			if (( rc == 0 )); then
+				refuse "declared write root '$a' aliases a turn layer root ($b) — the agent could rewrite the change set it is reviewed from"
+			fi
+		done
+	done
 }
 
 secret_mask_cleanup() {
@@ -435,7 +567,7 @@ secret_mask_add() {
 	local mask_id=${SECRET_MASK_ID[$idx]:-}
 
 	local other
-	for other in "$WORKSPACE" "$LAYER_ROOT" "$CURSOR_DIR"; do
+	for other in ${PROTECTED_PATHS[@]+"${PROTECTED_PATHS[@]}"} "$CURSOR_DIR"; do
 		[[ -n "$other" ]] || continue
 		if path_is_prefix "$path" "$other" || path_is_prefix "$other" "$path"; then
 			refuse "secret mask '$path' overlaps '$other' — a masked path may not contain or be contained by the workspace, the layer root or the writable-host exception"
@@ -449,10 +581,13 @@ secret_mask_add() {
 		dir)
 			[[ -d "$path" ]] || { SECRET_MASK_ABSENT=$((SECRET_MASK_ABSENT + 1)); return 0; }
 			SECRET_MASK_ARGS+=(--tmpfs "$path")
+			SECRET_MASK_DEST_DIRS+=("$path")
 			;;
 		file)
 			[[ -f "$path" ]] || { SECRET_MASK_ABSENT=$((SECRET_MASK_ABSENT + 1)); return 0; }
 			SECRET_MASK_ARGS+=(--ro-bind "$SECRET_MASK_EMPTY" "$path")
+			SECRET_MASK_FILE_SRC+=("$SECRET_MASK_EMPTY")
+			SECRET_MASK_FILE_DST+=("$path")
 			;;
 		*)
 			refuse "internal: unknown secret mask kind '$kind'"
@@ -490,6 +625,9 @@ resolve_state_root() {
 # observing that the real ~/.ssh is masked in the same run that the canary is.
 build_secret_mask() {
 	SECRET_MASK_ARGS=()
+	SECRET_MASK_DEST_DIRS=()
+	SECRET_MASK_FILE_SRC=()
+	SECRET_MASK_FILE_DST=()
 	SECRET_MASK_APPLIED=0
 	SECRET_MASK_ABSENT=0
 
@@ -507,7 +645,7 @@ build_secret_mask() {
 	# from the launch table. Membership is a Bash lookup, not a grep subprocess.
 	SECRET_MASK_OTHER_IDENTITIES=()
 	local other p identity
-	for other in "$WORKSPACE" "$LAYER_ROOT" "$CURSOR_DIR"; do
+	for other in ${PROTECTED_PATHS[@]+"${PROTECTED_PATHS[@]}"} "$CURSOR_DIR"; do
 		[[ -n "$other" && -e "$other" ]] || continue
 		p=$other
 		while :; do
@@ -530,11 +668,13 @@ build_secret_mask() {
 	if [[ -n "${TMPDIR:-}" ]]; then
 		local tmpdir_real
 		tmpdir_real=$(realpath_safe "$TMPDIR")
-		if path_is_prefix "$WORKSPACE" "$tmpdir_real" \
-			|| path_is_prefix "$LAYER_ROOT" "$tmpdir_real" \
-			|| { [[ -n "$CURSOR_DIR" ]] && path_is_prefix "$CURSOR_DIR" "$tmpdir_real"; }; then
-			refuse "TMPDIR ($TMPDIR) resolves inside the workspace, the layer root or the writable-host exception — unset TMPDIR or point it outside the confined tree before starting a turn"
-		fi
+		local protected_tmp
+		for protected_tmp in ${PROTECTED_PATHS[@]+"${PROTECTED_PATHS[@]}"} "$CURSOR_DIR"; do
+			[[ -n "$protected_tmp" ]] || continue
+			if path_is_prefix "$protected_tmp" "$tmpdir_real"; then
+				refuse "TMPDIR ($TMPDIR) resolves inside the workspace, the layer root or the writable-host exception — unset TMPDIR or point it outside the confined tree before starting a turn"
+			fi
+		done
 	fi
 	local mask_run_dir
 	mask_run_dir="$(resolve_state_root)/run"
@@ -593,21 +733,36 @@ ensure_bwrap() {
 	fi
 }
 
-validate_paths() {
+# validate_root_triple — one root's (root, upper, work) triple, validated
+# exactly as the single-root launcher always validated the workspace's. The
+# message nouns are parameters so the primary root's refusals stay word for
+# word what they were, while an extra root's refusal says which root it is
+# about: an exit-65 that does not name the failing root is unactionable when a
+# turn declares several.
+#
+# Results come back in VALIDATED_* rather than on stdout: a command
+# substitution would fork per root, and refuse()'s exit would be the
+# subshell's rather than the launcher's.
+VALIDATED_ROOT=""
+VALIDATED_UPPER=""
+VALIDATED_WORK=""
+VALIDATED_LAYER_ROOT=""
+validate_root_triple() {
+	local root_in=$1 upper_in=$2 work_in=$3 root_noun=$4 upper_noun=$5 work_noun=$6
 	local ws upper work upper_parent work_parent layer_root
 
-	ws=$(realpath_safe "$WORKSPACE")
-	upper=$(realpath_safe "$UPPER")
-	work=$(realpath_safe "$WORK")
+	ws=$(realpath_safe "$root_in")
+	upper=$(realpath_safe "$upper_in")
+	work=$(realpath_safe "$work_in")
 
 	if [[ ! -d "$ws" ]]; then
-		refuse "workspace '$WORKSPACE' does not exist or is not a directory"
+		refuse "$root_noun '$root_in' does not exist or is not a directory"
 	fi
 	if [[ -e "$upper" && ! -d "$upper" ]]; then
-		refuse "upper '$UPPER' exists and is not a directory"
+		refuse "$upper_noun '$upper_in' exists and is not a directory"
 	fi
 	if [[ -e "$work" && ! -d "$work" ]]; then
-		refuse "work '$WORK' exists and is not a directory"
+		refuse "$work_noun '$work_in' exists and is not a directory"
 	fi
 	mkdir -p "$upper" "$work"
 
@@ -616,7 +771,7 @@ validate_paths() {
 	upper_parent=$(realpath_safe "${upper%/*}")
 	work_parent=$(realpath_safe "${work%/*}")
 	if [[ "$upper_parent" != "$work_parent" ]]; then
-		refuse "upper and work must share a parent directory (overlay requires one mount)"
+		refuse "$upper_noun and $work_noun must share a parent directory (overlay requires one mount)"
 	fi
 	layer_root="$upper_parent"
 	if [[ "${upper##*/}" != "upper" || "${work##*/}" != "work" ]]; then
@@ -637,10 +792,60 @@ validate_paths() {
 		refuse "layer root '$layer_root' must contain only upper/, work/, and $MOUNT_MARKER (nested turn layers must use separate roots)"
 	fi
 
-	WORKSPACE="$ws"
-	UPPER="$upper"
-	WORK="$work"
-	LAYER_ROOT="$layer_root"
+	VALIDATED_ROOT="$ws"
+	VALIDATED_UPPER="$upper"
+	VALIDATED_WORK="$work"
+	VALIDATED_LAYER_ROOT="$layer_root"
+}
+
+validate_paths() {
+	if [[ -n "$BROAD_ROOT" && ${#EXTRA_ROOTS[@]} -gt 0 ]]; then
+		die_usage "--broad-root cannot be combined with --extra-root: the broad root already covers every sibling directory beneath it"
+	fi
+
+	validate_root_triple "$WORKSPACE" "$UPPER" "$WORK" workspace upper work
+	WORKSPACE="$VALIDATED_ROOT"
+	UPPER="$VALIDATED_UPPER"
+	WORK="$VALIDATED_WORK"
+	LAYER_ROOT="$VALIDATED_LAYER_ROOT"
+	PROTECTED_PATHS=("$WORKSPACE" "$LAYER_ROOT")
+
+	# The broad root (WI-1): an ancestor of the workspace, or the workspace
+	# itself, resolved and validated here so every later stage (the identity
+	# table, build_secret_mask, run_overlay) sees a canonical absolute path or
+	# an empty string -- never the raw, unresolved --broad-root argument.
+	if [[ -n "$BROAD_ROOT" ]]; then
+		BROAD_ROOT=$(realpath_safe "$BROAD_ROOT")
+		if [[ ! -d "$BROAD_ROOT" ]]; then
+			refuse "broad root '$BROAD_ROOT' does not exist or is not a directory"
+		fi
+		if ! path_is_prefix "$BROAD_ROOT" "$WORKSPACE"; then
+			refuse "broad root '$BROAD_ROOT' must be an ancestor of the workspace '$WORKSPACE', or the workspace itself"
+		fi
+	fi
+
+	# Extra roots are validated in the order given, and each one is checked
+	# against everything already accepted. Overlap in either direction is
+	# refused: two overlays whose mountpoints nest would each claim to be the
+	# writable view of the same bytes, and a root containing a layer root would
+	# hand the agent its own change set to rewrite.
+	local i j protected
+	for (( i = 0; i < ${#EXTRA_ROOTS[@]}; i++ )); do
+		validate_root_triple "${EXTRA_ROOTS[$i]}" "${EXTRA_UPPERS[$i]}" "${EXTRA_WORKS[$i]}" \
+			"declared write root" "extra upper" "extra work"
+		for (( j = 0; j < ${#PROTECTED_PATHS[@]}; j++ )); do
+			protected=${PROTECTED_PATHS[$j]}
+			[[ -n "$protected" ]] || continue
+			if path_is_prefix "$protected" "$VALIDATED_ROOT" || path_is_prefix "$VALIDATED_ROOT" "$protected"; then
+				refuse "declared write root '$VALIDATED_ROOT' overlaps '$protected' — every declared root must be disjoint from the workspace, from the other roots and from every turn layer"
+			fi
+		done
+		EXTRA_ROOTS[$i]="$VALIDATED_ROOT"
+		EXTRA_UPPERS[$i]="$VALIDATED_UPPER"
+		EXTRA_WORKS[$i]="$VALIDATED_WORK"
+		EXTRA_LAYER_ROOTS[$i]="$VALIDATED_LAYER_ROOT"
+		PROTECTED_PATHS+=("$VALIDATED_ROOT" "$VALIDATED_LAYER_ROOT")
+	done
 }
 
 # Memoised, and read with a builtin rather than `tr`. The boot id cannot change
@@ -758,6 +963,40 @@ cgroup_delegated_base() {
 # Memoised: two forks per call, and it was called twice per acquisition (the
 # same-tag stale sweep, then the target directory). CLAIM is fixed by the time
 # anything asks, so the answer cannot differ between calls.
+# Cgroups THIS invocation has sealed. It exists so the second claim of a turn
+# that shared one cgroup across several roots can still be classified after the
+# first claim's seal removed that cgroup (see classify_turn_liveness).
+#
+# A FILE, not an array, and that is forced rather than chosen: the classifier
+# runs inside a command substitution and each extra root's acquisition runs in a
+# subshell, so a variable written there dies with it. The path is derived from
+# this process's own pid, so every subshell computes the same one without being
+# told, and cmd_run truncates it before the first acquisition, so a file left by
+# a crashed process whose pid has since been reused is never read as evidence.
+sealed_cgroups_file() {
+	printf '%s/run/yana-overlay-sealed.%s' "$(resolve_state_root)" "$$"
+}
+record_sealed_cgroup() {
+	local file
+	[[ -n "${1:-}" ]] || return 0
+	file=$(sealed_cgroups_file)
+	mkdir -p "${file%/*}" 2>/dev/null || return 0
+	printf '%s\n' "$1" >>"$file" 2>/dev/null || true
+	return 0
+}
+cgroup_sealed_here() {
+	local file
+	file=$(sealed_cgroups_file)
+	[[ -f "$file" ]] || return 1
+	grep -qxF -- "$1" "$file" 2>/dev/null
+}
+sealed_cgroups_cleanup() {
+	local file
+	file=$(sealed_cgroups_file)
+	[[ -n "$file" ]] && rm -f "$file" 2>/dev/null
+	return 0
+}
+
 CLAIM_CGROUP_TAG_CACHED=""
 claim_cgroup_tag() {
 	if [[ -z "$CLAIM_CGROUP_TAG_CACHED" ]]; then
@@ -772,8 +1011,23 @@ claim_cgroup_tag() {
 # shipped before this mechanism existed.
 cgroup_enter() {
 	local base target
+	# ONE CGROUP PER TURN, NOT PER CLAIM. A process belongs to exactly one
+	# cgroup, so a turn that claims several declared roots cannot give each
+	# claim its own: joining the second would move this process out of the
+	# first and leave an empty cgroup that a challenger would read, correctly
+	# by its own rules, as "the turn is over". The roots of one turn are one
+	# turn, and their liveness is one question with one answer, so every
+	# claim's liveness record names this same directory. The tag is recorded in
+	# each record (write_liveness_record) because a challenger whose own
+	# primary root is a different directory cannot recompute it.
+	if [[ -n "$TURN_CGROUP" && -d "$TURN_CGROUP" ]]; then
+		return 0
+	fi
 	TURN_CGROUP=""
 	TURN_CGROUP_PARENT=""
+	TURN_CGROUP_TAG=""
+	local tag
+	tag=$(claim_cgroup_tag)
 	if ! base=$(cgroup_delegated_base); then
 		CGROUP_UNAVAILABLE_REASON="$base"
 		return 1
@@ -782,7 +1036,7 @@ cgroup_enter() {
 		CGROUP_UNAVAILABLE_REASON="cannot create $base"
 		return 1
 	fi
-	target="$base/turn-$(claim_cgroup_tag)-$$"
+	target="$base/turn-$tag-$$"
 	# Tidy any earlier cgroup of THIS claim before making ours. We hold the
 	# claim at this point, so a same-tag cgroup belongs to a turn that no
 	# longer does. This cannot remove a live turn's evidence: rmdir fails on a
@@ -791,7 +1045,7 @@ cgroup_enter() {
 	# yet-reclaimed turn's cgroup and turn an automatic reclaim into a
 	# force-release, which would leave the workspace permanently blocked.
 	local stale
-	for stale in "$base/turn-$(claim_cgroup_tag)-"*; do
+	for stale in "$base/turn-$tag-"*; do
 		[[ -d "$stale" ]] || continue
 		rmdir "$stale" 2>/dev/null || true
 	done
@@ -822,6 +1076,7 @@ cgroup_enter() {
 	fi
 	TURN_CGROUP="$target"
 	TURN_CGROUP_PARENT="$base"
+	TURN_CGROUP_TAG="$tag"
 	return 0
 }
 
@@ -852,6 +1107,13 @@ write_liveness_record() {
 		if [[ -n "$TURN_CGROUP" ]]; then
 			printf 'base %s\n' "$TURN_CGROUP_PARENT"
 			printf 'cgroup %s\n' "$TURN_CGROUP"
+			# The tag the turn's cgroup was named with. A single-root turn's tag
+			# is this claim's own, so the field is redundant there and the
+			# classifier's fallback computes the same value; a multi-root turn's
+			# tag belongs to the turn, and a challenger holding only THIS claim
+			# has no way to derive it. Recorded by the same writer, under the
+			# same claim directory, as every other field of this record.
+			printf 'tag %s\n' "$TURN_CGROUP_TAG"
 		else
 			printf 'cgroup -\n'
 			printf 'unavailable %s\n' "${CGROUP_UNAVAILABLE_REASON:-no reason recorded}"
@@ -874,7 +1136,7 @@ write_liveness_record() {
 # because it died — lands on the caller's default arm and refuses.
 classify_turn_liveness() {
 	local record="$CLAIM/liveness"
-	local key value version="" rec_claim="" rec_boot="" rec_pid="" rec_base="" rec_cgroup="" rec_reason=""
+	local key value version="" rec_claim="" rec_boot="" rec_pid="" rec_base="" rec_cgroup="" rec_reason="" rec_tag=""
 	[[ -f "$record" ]] || { printf 'unknown no liveness record for this claim'; return 0; }
 	while read -r key value; do
 		case "$key" in
@@ -884,6 +1146,7 @@ classify_turn_liveness() {
 			pid) rec_pid=$value ;;
 			base) rec_base=$value ;;
 			cgroup) rec_cgroup=$value ;;
+			tag) rec_tag=$value ;;
 			unavailable) rec_reason=$value ;;
 			*) : ;;
 		esac
@@ -928,12 +1191,43 @@ classify_turn_liveness() {
 		printf 'unknown liveness record has no usable holder pid'
 		return 0
 	fi
-	expected="$base_now/turn-$(claim_cgroup_tag)-$rec_pid"
+	# The tag the holder recorded, when it recorded one. A turn that claimed
+	# several declared roots named its cgroup after the turn, not after this
+	# claim, and a challenger whose own primary root is a different directory
+	# cannot recompute that. The recorded value is still bound to a shape --
+	# sixteen hex characters, under the delegated base, ending in the recorded
+	# pid -- so a substituted path is still unknown, never quiet. Records
+	# written before this field existed fall back to this claim's own tag,
+	# which is what a single-root turn's tag has always been.
+	local tag_now
+	if [[ -n "$rec_tag" ]]; then
+		if [[ ! "$rec_tag" =~ ^[0-9a-f]{16}$ ]]; then
+			printf 'unknown liveness record carries an unusable cgroup tag (%s)' "$rec_tag"
+			return 0
+		fi
+		tag_now=$rec_tag
+	else
+		tag_now=$(claim_cgroup_tag)
+	fi
+	expected="$base_now/turn-$tag_now-$rec_pid"
 	if [[ "$rec_cgroup" != "$expected" ]]; then
 		printf 'unknown liveness cgroup %s is not the one this claim would have created' "$rec_cgroup"
 		return 0
 	fi
 	if [[ ! -d "$rec_cgroup" ]]; then
+		# ABSENCE IS NOT PROOF, WITH ONE EXCEPTION THIS PROCESS OWNS. When a turn
+		# claimed several roots, every one of its claims names the same cgroup,
+		# and the seal below removes that directory the first time any of them is
+		# classified. The remaining claims of that same dead turn would then read
+		# "no longer exists" and refuse, which would leave a multi-root turn
+		# unreclaimable without a force-release -- the exact lockout this whole
+		# mechanism exists to prevent. So this branch trusts absence ONLY when
+		# THIS process sealed THAT directory itself, moments ago, in this same
+		# acquisition: the seal is the proof, and it is first-hand.
+		if cgroup_sealed_here "$rec_cgroup"; then
+			printf 'dead this acquisition already sealed the cgroup this turn shared across its claims'
+			return 0
+		fi
 		printf 'unknown liveness cgroup %s no longer exists' "$rec_cgroup"
 		return 0
 	fi
@@ -977,6 +1271,7 @@ classify_turn_liveness() {
 	# only after a kill that reported success, or on a kernel with no kill at
 	# all — never after a kill that failed.
 	if rmdir "$rec_cgroup" 2>/dev/null; then
+		record_sealed_cgroup "$rec_cgroup"
 		if (( killed )); then
 			printf 'dead the previous turn was terminated and its cgroup sealed'
 		else
@@ -1142,6 +1437,23 @@ holder_is_live() {
 	return 0
 }
 
+# record_claim_reclaim — the durable reason a reclaim happened.
+#
+# Clearing a review marker used to leave nothing but a line on stderr, which
+# goes to the agent's stream and is gone with it: the operator's editor could
+# not tell a turn that reclaimed a dead editor's claim from one that took a free
+# workspace. Written beside the claims directory, exactly where force-release
+# already records its own deliberate override, so no file lands INSIDE $CLAIM
+# (release_claim `rm -f`s four known names and then bare-`rmdir`s, which fails
+# the moment the directory holds anything else).
+record_claim_reclaim() {
+	local reason=$1 detail=$2 stamp
+	printf -v stamp '%(%Y-%m-%dT%H:%M:%S%z)T' -1
+	printf '%s reclaim %s %s claim=%s %s\n' "$stamp" "$$" "$reason" "$CLAIM" "$detail" \
+		>>"${CLAIM%/}/../reclaim.log" 2>/dev/null || true
+	return 0
+}
+
 # ---- Claim mutual exclusion -------------------------------------------------
 #
 # The lock covers EVERY mutation of the claim directory, acquisition included.
@@ -1284,28 +1596,57 @@ take_claim() {
 	# change carry no identity, and a host without /proc writes none, so neither
 	# is silently reclaimed. Fail closed, and say what clears it.
 	if [[ -f "$CLAIM/review-open" ]]; then
-		local review_live
+		local review_live stale_record
 		set +e
 		holder_is_live "$CLAIM/review-open"
 		review_live=$?
 		set -e
+		# Read the record BEFORE anything removes it -- the first version of the
+		# cleared-marker line reported the contents of a file it had already
+		# deleted -- and word every outcome, refusal included, with it. The
+		# refusals below named only $CLAIM/holder, which is a DIFFERENT process
+		# from the editor the marker names, so their text was reporting the turn
+		# holder while deciding on the review editor; the identity that decided
+		# is now appended to both. Appended, never substituted: the leading
+		# sentence of each is what the gates and the operator's own notes match.
+		stale_record=$(tr '\n' ' ' <"$CLAIM/review-open" 2>/dev/null)
+		stale_record=${stale_record% }
 		if (( review_live == 0 )); then
 			claim_reclaim_unlock
 			trap - EXIT
-			refuse "workspace has an open overlay review in a running editor (holder: ${holder%% }) — finish or reject that review (:YanaReview then ct/co/cb, or :YanaAbortReview) or close that editor; if that editor cannot be found, clear it with: $0 force-release --claim '$CLAIM' --reason 'lost review editor'"
+			refuse "workspace has an open overlay review in a running editor (holder: ${holder%% }) — finish or reject that review (:YanaReview then ct/co/cb, or :YanaAbortReview) or close that editor; if that editor cannot be found, clear it with: $0 force-release --claim '$CLAIM' --reason 'lost review editor' [review editor: ${stale_record:-none recorded}]"
 		fi
 		if (( review_live == 2 )); then
 			claim_reclaim_unlock
 			trap - EXIT
-			refuse "workspace has an open overlay review whose editor cannot be identified (holder: ${holder%% }) — if no editor is reviewing this workspace, clear it with: $0 force-release --claim '$CLAIM' --reason 'stale review marker'"
+			refuse "workspace has an open overlay review whose editor cannot be identified (holder: ${holder%% }) — if no editor is reviewing this workspace, clear it with: $0 force-release --claim '$CLAIM' --reason 'stale review marker' [review marker: ${stale_record:-empty}]"
 		fi
-		# review_live == 1: the editor that opened this review is gone. Read the
-		# record BEFORE removing it -- the first version of this line reported
-		# the contents of a file it had already deleted.
-		local stale_record
-		stale_record=$(tr '\n' ' ' <"$CLAIM/review-open" 2>/dev/null)
+		# THE RECLAIM BRANCH: review_live == 1, the editor that opened this
+		# review is gone, so the marker is residue and not a reviewer.
+		#
+		# IT DOES NOT MATTER WHOSE EDITOR THE MARKER NAMES while that editor is
+		# alive, and a launcher that made an exception for its own editor would
+		# be wrong. Measured (issue 29, 2026-08-21): relaxing this for a marker
+		# naming an ancestor of this process turns
+		# `tests/headless/overlay_turn_wiring.lua` red, because that is the
+		# protection it asserts — one editor with a review on screen and a second
+		# turn from that SAME editor must be refused, or the turn steals the
+		# claim its own unfinished review depends on. The editor that stamped a
+		# claim it never held is the defect, and it is fixed where it happened,
+		# in `preview.arm_review_open`.
+		#
+		# The marker is cleared here and nothing else: the claim itself is not
+		# admitted by this branch. A dead editor is not evidence that the
+		# previous TURN has finished, so control falls through to the classifier
+		# below, which must independently return `dead` before any reclaim
+		# happens. The dead turn's LAYER is never touched from here -- per-turn
+		# layer directories mean the next turn cannot reuse or clobber it, and
+		# `<claim>.review-files` is a sibling of the claim, so both survive the
+		# reclaim for `preview.recover_layer` and for resume to name (an open
+		# review belongs to an editor, and that editor may be gone).
 		rm -f "$CLAIM/review-open" 2>/dev/null || true
-		echo "yana-overlay: cleared a review marker left by an editor that is no longer running (was: ${stale_record% })" >&2
+		record_claim_reclaim "dead-holder-review-open" "marker=[${stale_record:-empty}] holder=[${holder% }]"
+		echo "yana-overlay: cleared a review marker left by an editor that is no longer running (reason: dead-holder-review-open; was: ${stale_record:-empty})" >&2
 	fi
 	if (( live == 2 )); then
 		claim_reclaim_unlock
@@ -1342,6 +1683,77 @@ take_claim() {
 	write_holder
 	claim_reclaim_unlock
 	trap - EXIT
+}
+
+# remember_acquired_claim — record a claim this invocation has just committed,
+# with the token its own acquisition wrote. take_claim always ends a successful
+# acquisition with write_holder, which always regenerates <claim>/nonce, so this
+# read is our own fresh token and not a stale one: nothing else can touch a claim
+# whose live holder we are.
+remember_acquired_claim() {
+	local claim=$1 nonce=""
+	[[ -n "$claim" ]] || return 0
+	IFS= read -r nonce <"$claim/nonce" 2>/dev/null || nonce=""
+	ACQUIRED_CLAIMS+=("$claim")
+	ACQUIRED_NONCES+=("$nonce")
+}
+
+# release_acquired_claims — the all-or-nothing half of multi-root acquisition.
+#
+# Give back every claim this invocation committed, newest first, each by its own
+# acquisition token. "self" mode is the same mode the pre-agent mount failure
+# uses and for the same reason: the holder is this live process, so liveness is
+# not the question -- whether the claim is still OUR acquisition is, and the
+# token answers it. A claim a concurrent editor has since force-released and
+# reacquired carries a different token and is left untouched.
+#
+# Best effort by construction: this runs on a path that is already refusing, and
+# a claim that will not go away must not turn one refusal into two. Each release
+# runs in a subshell so the globals release_claim mutates (CLAIM, RELEASE_NONCE,
+# the reclaim lock) cannot leak into the refusal that follows.
+release_acquired_claims() {
+	local i claim nonce
+	for (( i = ${#ACQUIRED_CLAIMS[@]} - 1; i >= 0; i-- )); do
+		claim=${ACQUIRED_CLAIMS[$i]}
+		nonce=${ACQUIRED_NONCES[$i]}
+		[[ -n "$claim" ]] || continue
+		( CLAIM="$claim" RELEASE_NONCE="$nonce" CLAIM_LOCK_HELD=0 release_claim self ) >/dev/null 2>&1 || true
+	done
+	ACQUIRED_CLAIMS=()
+	ACQUIRED_NONCES=()
+}
+
+# take_claims — the whole declared set, primary first then the extra roots in
+# the order the caller passed them (canonical-path order, fixed by the caller so
+# two editors racing for an overlapping set attempt them in the same sequence
+# and neither ends up holding half of it).
+#
+# The primary is taken by take_claim itself, unchanged, so a single-root launch
+# refuses exactly as it always has. Each extra root's take_claim runs in a
+# subshell: every refusal path inside it releases the reclaim lock before it
+# refuses, so the only thing the subshell costs is the variable assignment --
+# the claim directory, holder and nonce it creates are filesystem state and
+# survive it, and $$ is still this process, so the holder record names the
+# launcher as it must.
+take_claims() {
+	take_claim
+	remember_acquired_claim "$CLAIM"
+	local i claim out
+	for (( i = 0; i < ${#EXTRA_CLAIMS[@]}; i++ )); do
+		claim=${EXTRA_CLAIMS[$i]}
+		[[ -n "$claim" ]] || continue
+		set +e
+		out=$( ( CLAIM="$claim" CLAIM_LOCK_HELD=0 take_claim ) 2>&1 )
+		rc=$?
+		set -e
+		if (( rc != 0 )); then
+			[[ -n "$out" ]] && echo "$out" >&2
+			release_acquired_claims  # all-or-nothing: a partial hold wedges the workspace
+			sealed_cgroups_cleanup
+			refuse "declared write root '${EXTRA_ROOTS[$i]}' could not be claimed — the turn takes every declared root or none, so the claims it had already taken have been released and the agent was not started"
+		fi
+		remember_acquired_claim "$claim"
+	done
 }
 
 # release_recorded_cgroup — best effort tidy-up of the cgroup named by the
@@ -1490,6 +1902,17 @@ teardown_work() {
 	find "$path" -mindepth 1 -delete 2>/dev/null || true
 }
 
+# Every root's overlay work directory, not just the primary's: an abandoned
+# overlay workdir makes the NEXT turn's mount at that root fail.
+teardown_all_work() {
+	teardown_work "$WORK"
+	local w
+	for w in ${EXTRA_WORKS[@]+"${EXTRA_WORKS[@]}"}; do
+		[[ -n "$w" ]] && teardown_work "$w"
+	done
+	return 0
+}
+
 # --unshare-pid is the read half of the boundary (the isolation contract,
 # "Read boundary"). Without it the `--proc /proc` mount still describes the host
 # PID namespace, and the agent enumerates every host process — command lines,
@@ -1501,6 +1924,88 @@ teardown_work() {
 # reaper. Handing PID 1 to a Node process that performs no init duties would
 # leave them as zombies.
 run_overlay() {
+	# BROAD-ROOT PATH (PLAN-R1-capture.md WI-1, mount table §2 steps 2-6): ONE
+	# overlay mounted at the broad root rather than at WORKSPACE, -o volatile,
+	# with the compiled secret masks and the ~/.cursor exception mounted by
+	# yana-overlay-inner AFTER that overlay rather than as outer bwrap args --
+	# the fix for the packet's own trap, that a bind stacked before the
+	# overlay at a path under the broad root is invisible the instant the
+	# overlay covers it. Only reachable when --broad-root was given;
+	# validate_paths already refused combining it with --extra-root, so this
+	# and the legacy branch below are mutually exclusive. `mount_root` is the
+	# single point that names what gets mounted, on purpose: reverting WI-1 to
+	# a narrow-root mount is then a one-line change (mount_root=$WORKSPACE),
+	# exactly the mutation tests/overlay_broadroot_gate.sh drives.
+	if [[ -n "$BROAD_ROOT" ]]; then
+		local mount_root=$BROAD_ROOT
+		local -a inner_args=("--broad-root" "$mount_root")
+		local d fi
+		for d in ${SECRET_MASK_DEST_DIRS[@]+"${SECRET_MASK_DEST_DIRS[@]}"}; do
+			inner_args+=("--mask-dir" "$d")
+		done
+		for (( fi = 0; fi < ${#SECRET_MASK_FILE_DST[@]}; fi++ )); do
+			inner_args+=("--mask-file" "${SECRET_MASK_FILE_SRC[$fi]}" "${SECRET_MASK_FILE_DST[$fi]}")
+		done
+		inner_args+=("--cursor" "$CURSOR_DIR")
+		for d in ${EXEC_ALLOW[@]+"${EXEC_ALLOW[@]}"}; do
+			inner_args+=("--exec-allow" "$d")
+		done
+		inner_args+=("--")
+
+		set +e
+		"$BWRAP" \
+			--die-with-parent \
+			--new-session \
+			--ro-bind / / \
+			--tmpfs /tmp \
+			--ro-bind "$mount_root" "$NEUTRAL_LOWER" \
+			--bind "$LAYER_ROOT" "$NEUTRAL_LAYER" \
+			--dir "$mount_root" \
+			--dev /dev \
+			--proc /proc \
+			--unshare-uts \
+			--unshare-user \
+			--unshare-pid \
+			--uid 0 \
+			--gid 0 \
+			--cap-add CAP_SYS_ADMIN \
+			--cap-add CAP_DAC_OVERRIDE \
+			--cap-add CAP_SETPCAP \
+			-- "$INNER" "${inner_args[@]}" "${CMD[@]}"
+		local rc=$?
+		set -e
+		return "$rc"
+	fi
+
+	# Everything below is UNCHANGED, byte for byte, from before --broad-root
+	# existed: one overlay per declared root, each at its own real absolute
+	# path, each from its own neutral bind pair inside bwrap's private /tmp.
+	# The primary keeps /tmp/yana/lower and /tmp/yana/layer, so a single-root
+	# launch (no --broad-root, no --extra-root) builds exactly the argv it
+	# always did; root i (2-based, the workspace being root 1) uses
+	# /tmp/yana/r<i>/lower and /tmp/yana/r<i>/layer. Masks and the ~/.cursor
+	# exception stay outer bwrap args here, exactly as before WI-1: this
+	# branch is the shape WI-2 deletes, and WI-1 must not add new per-root
+	# code to it.
+	local -a extra_binds=()
+	local -a inner_args=("$WORKSPACE")
+	local i idx
+	if (( ${#EXTRA_ROOTS[@]} > 0 )); then
+		inner_args=("--roots" "$(( ${#EXTRA_ROOTS[@]} + 1 ))" "$WORKSPACE")
+		for (( i = 0; i < ${#EXTRA_ROOTS[@]}; i++ )); do
+			idx=$(( i + 2 ))
+			extra_binds+=(--ro-bind "${EXTRA_ROOTS[$i]}" "/tmp/yana/r$idx/lower")
+			extra_binds+=(--bind "${EXTRA_LAYER_ROOTS[$i]}" "/tmp/yana/r$idx/layer")
+			extra_binds+=(--dir "${EXTRA_ROOTS[$i]}")
+			inner_args+=("${EXTRA_ROOTS[$i]}")
+		done
+	fi
+	for i in ${EXEC_ALLOW[@]+"${EXEC_ALLOW[@]}"}; do
+		inner_args+=("--exec-allow" "$i")
+	done
+	if (( ${#EXTRA_ROOTS[@]} > 0 || ${#EXEC_ALLOW[@]} > 0 )); then
+		inner_args+=("--")
+	fi
 	set +e
 	"$BWRAP" \
 		--die-with-parent \
@@ -1512,6 +2017,7 @@ run_overlay() {
 		--ro-bind "$WORKSPACE" "$NEUTRAL_LOWER" \
 		--bind "$LAYER_ROOT" "$NEUTRAL_LAYER" \
 		--dir "$WORKSPACE" \
+		${extra_binds[@]+"${extra_binds[@]}"} \
 		--dev /dev \
 		--proc /proc \
 		--unshare-uts \
@@ -1522,15 +2028,24 @@ run_overlay() {
 		--cap-add CAP_SYS_ADMIN \
 		--cap-add CAP_DAC_OVERRIDE \
 		--cap-add CAP_SETPCAP \
-		-- "$INNER" "$WORKSPACE" "${CMD[@]}"
+		-- "$INNER" "${inner_args[@]}" "${CMD[@]}"
 	local rc=$?
 	set -e
 	return "$rc"
 }
 
+# EVERY root's marker, because the inner helper writes them only once every
+# mount has succeeded. A partial mount must read as a failure here, or the
+# pre-agent classification below would decline to release the claims for a turn
+# that never started.
 mount_succeeded() {
-	[[ -f "$LAYER_ROOT/$MOUNT_MARKER" ]] \
-		&& grep -qx "$MOUNT_MARKER_CONTENT" "$LAYER_ROOT/$MOUNT_MARKER" 2>/dev/null
+	local layer
+	for layer in "$LAYER_ROOT" ${EXTRA_LAYER_ROOTS[@]+"${EXTRA_LAYER_ROOTS[@]}"}; do
+		[[ -n "$layer" ]] || continue
+		[[ -f "$layer/$MOUNT_MARKER" ]] || return 1
+		grep -qx "$MOUNT_MARKER_CONTENT" "$layer/$MOUNT_MARKER" 2>/dev/null || return 1
+	done
+	return 0
 }
 
 parse_run_args() {
@@ -1559,6 +2074,47 @@ parse_run_args() {
 			--nonce-out)
 				[[ $# -ge 2 ]] || die_usage "--nonce-out requires a file path"
 				NONCE_OUT=$2
+				shift 2
+				;;
+			--broad-root)
+				[[ $# -ge 2 ]] || die_usage "--broad-root requires a directory"
+				BROAD_ROOT=$2
+				shift 2
+				;;
+			--exec-allow)
+				[[ $# -ge 2 ]] || die_usage "--exec-allow requires a path"
+				EXEC_ALLOW+=("$2")
+				shift 2
+				;;
+			# One operator-declared write root per group. --extra-root opens the
+			# group; the three that follow attach to it. Placeholders keep the
+			# four arrays index-aligned so a missing member of a group is a
+			# usage error naming the root rather than a silent off-by-one.
+			--extra-root)
+				[[ $# -ge 2 ]] || die_usage "--extra-root requires a directory"
+				EXTRA_ROOTS+=("$2")
+				EXTRA_UPPERS+=("")
+				EXTRA_WORKS+=("")
+				EXTRA_CLAIMS+=("")
+				EXTRA_LAYER_ROOTS+=("")
+				shift 2
+				;;
+			--extra-upper)
+				[[ $# -ge 2 ]] || die_usage "--extra-upper requires a directory"
+				(( ${#EXTRA_ROOTS[@]} > 0 )) || die_usage "--extra-upper must follow an --extra-root"
+				EXTRA_UPPERS[$(( ${#EXTRA_ROOTS[@]} - 1 ))]=$2
+				shift 2
+				;;
+			--extra-work)
+				[[ $# -ge 2 ]] || die_usage "--extra-work requires a directory"
+				(( ${#EXTRA_ROOTS[@]} > 0 )) || die_usage "--extra-work must follow an --extra-root"
+				EXTRA_WORKS[$(( ${#EXTRA_ROOTS[@]} - 1 ))]=$2
+				shift 2
+				;;
+			--extra-claim)
+				[[ $# -ge 2 ]] || die_usage "--extra-claim requires a directory"
+				(( ${#EXTRA_ROOTS[@]} > 0 )) || die_usage "--extra-claim must follow an --extra-root"
+				EXTRA_CLAIMS[$(( ${#EXTRA_ROOTS[@]} - 1 ))]=$2
 				shift 2
 				;;
 			--help|-h)
@@ -1616,6 +2172,18 @@ cmd_run() {
 	parse_run_args "$@"
 	[[ -n "$WORKSPACE" && -n "$UPPER" && -n "$WORK" ]] || die_usage "--workspace, --upper and --work are required"
 	(( ${#CMD[@]} > 0 )) || die_usage "missing command after --"
+	local gi
+	for (( gi = 0; gi < ${#EXTRA_ROOTS[@]}; gi++ )); do
+		[[ -n "${EXTRA_UPPERS[$gi]}" && -n "${EXTRA_WORKS[$gi]}" ]] \
+			|| die_usage "--extra-root '${EXTRA_ROOTS[$gi]}' needs its own --extra-upper and --extra-work"
+		# A turn that claims a declared root must also claim its workspace. The
+		# turn's liveness cgroup is created by the FIRST acquisition, in this
+		# shell, and inherited by the subshells that take the rest; with no
+		# primary claim there would be no first acquisition here to create it,
+		# and each extra root would record a cgroup this process is not in.
+		[[ -z "${EXTRA_CLAIMS[$gi]}" || -n "$CLAIM" ]] \
+			|| die_usage "--extra-claim requires --claim: a turn that claims a declared root must claim its workspace too"
+	done
 
 	ensure_bwrap
 	OPERATOR_HOME=$(operator_home)
@@ -1630,20 +2198,23 @@ cmd_run() {
 		[[ -d "$nonce_dir" && -w "$nonce_dir" ]] \
 			|| refuse "--nonce-out directory '$nonce_dir' does not exist or is not writable"
 	fi
-	take_claim
+	# A file left by a crashed process whose pid has since been reused must never
+	# be read as this run's own evidence, so the record starts empty.
+	local sealed_file
+	sealed_file=$(sealed_cgroups_file)
+	mkdir -p "${sealed_file%/*}" 2>/dev/null || true
+	: >"$sealed_file" 2>/dev/null || true
 
-	# Capture the token THIS invocation's acquisition just wrote. take_claim
-	# always ends a successful acquisition with write_holder, which always
-	# regenerates $CLAIM/nonce (write_acquisition_nonce), so this is our own
-	# fresh token, not a stale read -- nothing else can have touched this
-	# claim between take_claim returning and this line, because we are its
-	# live holder. Used only by the pre-agent mount-failure path below.
-	local acquired_nonce=""
-	if [[ -n "$CLAIM" ]]; then
-		IFS= read -r acquired_nonce <"$CLAIM/nonce" 2>/dev/null || acquired_nonce=""
-	fi
+	# take_claims takes the primary claim and then every declared root's, in
+	# order, and captures the token EACH acquisition wrote. take_claim always
+	# ends a successful acquisition with write_holder, which always regenerates
+	# <claim>/nonce (write_acquisition_nonce), so each captured token is this
+	# invocation's own and not a stale read -- nothing else can have touched a
+	# claim we are the live holder of. Those tokens are what the pre-agent
+	# mount-failure path below releases with.
+	take_claims
 
-	trap 'teardown_work "$WORK"; secret_mask_cleanup' EXIT
+	trap 'teardown_all_work; secret_mask_cleanup; sealed_cgroups_cleanup' EXIT
 
 	# `run_overlay; local rc=$?` looks like it captures the exit status, but
 	# under `set -e` it never gets the chance to: a bare simple command that
@@ -1687,9 +2258,12 @@ cmd_run() {
 			# exit 67 after a real mount), falls through to plain `exit "$rc"`
 			# below and never reaches this call -- both mean the agent may
 			# have started, which this path must never touch.
-			if [[ -n "$CLAIM" && -n "$acquired_nonce" ]]; then
-				RELEASE_NONCE=$acquired_nonce release_claim self
-			fi
+			#
+			# With operator-declared write roots the same reasoning covers the
+			# whole set: the mount that failed may be any root's, and the agent
+			# never started for any of them, so every claim this invocation
+			# committed goes back -- each by its own token, newest first.
+			release_acquired_claims
 			refuse_mount "cannot establish overlay at '$WORKSPACE'"
 		fi
 		exit "$rc"

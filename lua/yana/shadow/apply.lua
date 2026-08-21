@@ -35,6 +35,296 @@ function M.workspace_rel(workspace, abs)
 	return target:sub(#prefix + 1)
 end
 
+----------------------------------------------------------------------
+-- FILE CLAIMS (PLAN-R1-capture.md §5)
+----------------------------------------------------------------------
+--
+-- A broad root cannot be claimed whole -- that would lock every repository
+-- beneath it -- so the turn claim keeps governing "may a second turn on THIS
+-- repository start", and a second, finer claim governs "may this file's hunk
+-- be reviewed and accepted". It is taken at FINALIZE, once per `(repository,
+-- relative path)` the walk actually found touched; it is never taken at
+-- launch, it never blocks a write, and it never blocks a human save. Only the
+-- accept is refused, and it is refused BY NAME.
+--
+-- LIVENESS IS ONE QUESTION WITH ONE ANSWER. The holder record is the SAME
+-- `pid boot_id start_ticks` record `shadow/jail.lua`'s `mark_review_open`
+-- writes for an open review -- written here by that same function, so there is
+-- one writer -- and it is judged by the same three verdicts, in the same order
+-- and with the same fail-closed default, as `bin/yana-overlay`'s
+-- `holder_is_live` (bin/yana-overlay:1413): the boot id makes the record
+-- meaningless after a reboot, the process start time makes it survive pid
+-- reuse, and anything that cannot be established is `unknown` and refuses.
+-- "Dead" therefore means one thing everywhere.
+
+local uv_mod = vim.uv or vim.loop
+
+--- The claim record for one `(repository, relative path)`.
+---
+--- Keyed by the repository's FILESYSTEM IDENTITY, exactly as the turn claim is
+--- (`claim_identity.workspace_slug`), so two editors reaching the same
+--- repository by two different path spellings collide as they should; and by a
+--- digest of the relative path, because a path is not a filename.
+function M.file_claim_dir(root, rel)
+	if type(root) ~= "string" or root == "" or type(rel) ~= "string" or rel == "" then
+		return nil
+	end
+	local claim_identity = require("yana.claim_identity")
+	return table.concat({
+		preview.state_root(),
+		"file-claims",
+		claim_identity.workspace_slug(root),
+		vim.fn.sha256(rel):sub(1, 32),
+	}, "/")
+end
+
+local function read_first_line(path)
+	local f = io.open(path, "r")
+	if not f then
+		return nil
+	end
+	local line = f:read("l")
+	f:close()
+	if type(line) ~= "string" then
+		return nil
+	end
+	return (line:gsub("%s+$", ""))
+end
+
+local function proc_start_ticks(pid)
+	local line = read_first_line("/proc/" .. tostring(pid) .. "/stat")
+	if not line then
+		return nil
+	end
+	-- The comm field can contain spaces and parentheses, so everything up to
+	-- the LAST ')' is skipped first -- the same parse `shadow/jail.lua` does.
+	local after = line:match("%)%s+(.*)$")
+	if not after then
+		return nil
+	end
+	local fields = {}
+	for w in after:gmatch("%S+") do
+		fields[#fields + 1] = w
+	end
+	return fields[20]
+end
+
+--- alive / dead / unknown for one holder record. Never a boolean: a host where
+--- `/proc` or the boot id cannot be read is `unknown`, and `unknown` refuses.
+function M.holder_liveness(record_path)
+	local raw = read_first_line(record_path)
+	if not raw or raw == "" then
+		return "unknown", "the holder record carries no identity"
+	end
+	local pid, boot, ticks = raw:match("^(%d+)%s+(%S+)%s+(%S+)")
+	if not pid or not boot or not ticks then
+		return "unknown", "the holder record is not a usable identity"
+	end
+	if vim.fn.filereadable("/proc/" .. pid .. "/stat") ~= 1 then
+		return "dead", "the editor that opened this review is no longer running (pid " .. pid .. ")"
+	end
+	local boot_now = read_first_line("/proc/sys/kernel/random/boot_id")
+	local ticks_now = proc_start_ticks(pid)
+	if not boot_now or boot_now == "" or not ticks_now or ticks_now == "" then
+		return "unknown", "the holder's identity could not be re-read"
+	end
+	if boot_now ~= boot or ticks_now ~= ticks then
+		return "dead", "the editor that opened this review is gone (pid " .. pid .. " was reused)"
+	end
+	return "alive", "pid " .. pid
+end
+
+local function claim_owner(dir)
+	local f = io.open(dir .. "/owner", "r")
+	if not f then
+		return nil
+	end
+	local raw = f:read("*a") or ""
+	f:close()
+	local ok, obj = pcall(vim.json.decode, raw)
+	if ok and type(obj) == "table" then
+		return obj
+	end
+	return nil
+end
+
+--- Who holds this claim, in the operator's words. Named, never anonymous: a
+--- refusal that cannot say whose review is in the way is not actionable.
+local function holder_description(dir)
+	local owner = claim_owner(dir)
+	local verdict, detail = M.holder_liveness(dir .. "/review-open")
+	local who
+	if owner and owner.turn_id and owner.workspace then
+		who = string.format("turn %s in %s", tostring(owner.turn_id), tostring(owner.workspace))
+	elseif owner and owner.turn_id then
+		who = "turn " .. tostring(owner.turn_id)
+	else
+		who = "an unidentified turn"
+	end
+	return who .. ", " .. tostring(detail), owner, verdict
+end
+
+local function remove_claim(dir)
+	pcall(vim.fn.delete, dir, "rf")
+end
+
+--- Take the claim for one touched path, reclaiming a DEAD holder's.
+---
+--- The directory creation is the atomic step (`mkdir(2)` fails EEXIST), so two
+--- editors racing for the same file cannot both win; the holder record is
+--- written immediately after, by the same function that writes an open
+--- review's identity, so the claim's existence and whose it is become one
+--- fact.
+---
+--- Returns `true, dir` when this turn holds it; `false, dir, description` when
+--- somebody else does.
+function M.take_file_claim(root, rel, owner)
+	local dir = M.file_claim_dir(root, rel)
+	if not dir then
+		return false, nil, "the change carries no repository/path to claim"
+	end
+	local jail = require("yana.shadow.jail")
+	vim.fn.mkdir(vim.fn.fnamemodify(dir, ":h"), "p")
+	for attempt = 1, 2 do
+		-- `mkdir(2)` ONCE, not `mkdir -p`: the failure on an existing directory is
+		-- what makes acquisition atomic between two editors.
+		local ok = uv_mod.fs_mkdir(dir, 493)
+		if ok then
+			jail.mark_review_open(dir)
+			-- Written with `io.open`, NOT `diff.write_file`. `diff.write_file` is
+			-- a tier-1 real-workspace write wrapper (tests/suite/round5_scan.lua's
+			-- `WORKSPACE_WRITERS`), and this file may not call one: everything
+			-- here lands under the state root, never on a reviewed path, and the
+			-- claim record is exactly the kind of thing `shadow/jail.lua` already
+			-- writes with `io.open`.
+			local f = io.open(dir .. "/owner", "w")
+			if f then
+				f:write(vim.json.encode(owner or {}))
+				f:close()
+			end
+			return true, dir
+		end
+		local description, existing, verdict = holder_description(dir)
+		if
+			existing
+			and owner
+			and tostring(existing.turn_id) == tostring(owner.turn_id)
+			and tostring(existing.workspace) == tostring(owner.workspace)
+		then
+			-- Our own claim, from an earlier finalize of the same turn.
+			return true, dir
+		end
+		if verdict == "dead" and attempt == 1 then
+			-- The same reclaim the turn claim allows, on the same evidence: the
+			-- holder is provably gone, so the record is cleared and the claim is
+			-- taken. `unknown` never reaches here -- it refuses.
+			remove_claim(dir)
+		else
+			return false, dir, description
+		end
+	end
+	return false, dir, "the file claim could not be taken"
+end
+
+--- Give one claim back. Path-keyed, exactly like turn-claim release, so a
+--- failure can never wedge a turn.
+function M.release_file_claim(dir)
+	if type(dir) ~= "string" or dir == "" then
+		return false
+	end
+	remove_claim(dir)
+	return true
+end
+
+--- Every file claim a turn took, given back. Called from `preview.release`, so
+--- every path that finishes or abandons a review releases them -- and never
+--- from agent exit alone, which the module forbids while a review is open.
+function M.release_file_claims(holder)
+	if type(holder) ~= "table" then
+		return true
+	end
+	local claims = holder.file_claims
+	if type(claims) ~= "table" then
+		return true
+	end
+	for _, dir in ipairs(claims) do
+		M.release_file_claim(dir)
+	end
+	holder.file_claims = {}
+	return true
+end
+
+--- Take one claim per touched path at FINALIZE, and mark every change with the
+--- answer. A change whose claim is held by another live turn is NOT dropped
+--- and NOT hidden: it is reviewed as usual, and only its accept is refused --
+--- so the operator sees the conflict named on the hunk it belongs to.
+local function take_file_claims(pass, changes)
+	local turn = pass.shadow_turn or {}
+	local owner = {
+		turn_id = tostring(pass.turn_id or turn.turn_id or "?"),
+		workspace = turn.workspace,
+		stream = turn.stream,
+	}
+	turn.file_claims = turn.file_claims or {}
+	pass.file_claims = turn.file_claims
+	for _, change in ipairs(changes or {}) do
+		local root = (type(change.root) == "string" and change.root ~= "") and change.root or turn.workspace
+		if root and change.rel then
+			local held, dir, description = M.take_file_claim(root, change.rel, owner)
+			if held then
+				change.file_claim = dir
+				change.file_claim_conflict = nil
+				turn.file_claims[#turn.file_claims + 1] = dir
+			else
+				change.file_claim = nil
+				change.file_claim_conflict = {
+					dir = dir,
+					root = root,
+					rel = change.rel,
+					holder = description,
+				}
+			end
+		end
+	end
+end
+
+--- The accept-time half of the file claim, paired with the `base_hash` guard
+--- at the same step and named in the same voice.
+---
+--- Re-asked at the moment of the accept rather than trusted from finalize: the
+--- holder may have settled since the review opened, and the honest answer then
+--- is "take it and proceed", not "refuse because it was busy a minute ago".
+function M.file_claim_refusal(pass, change)
+	local conflict = change and change.file_claim_conflict
+	if type(conflict) ~= "table" then
+		return nil
+	end
+	local turn = (pass and pass.shadow_turn) or {}
+	local owner = {
+		turn_id = tostring((pass and pass.turn_id) or turn.turn_id or "?"),
+		workspace = turn.workspace,
+		stream = turn.stream,
+	}
+	local held, dir, description = M.take_file_claim(conflict.root, conflict.rel, owner)
+	if held then
+		change.file_claim = dir
+		change.file_claim_conflict = nil
+		turn.file_claims = turn.file_claims or {}
+		turn.file_claims[#turn.file_claims + 1] = dir
+		if pass then
+			pass.file_claims = turn.file_claims
+		end
+		return nil
+	end
+	return string.format(
+		"refusing to accept %s: %s is under review in another turn (holder: %s) — finish or reject that review "
+			.. "first, or force-release it",
+		tostring(change.path),
+		conflict.root .. "/" .. conflict.rel,
+		tostring(description or conflict.holder)
+	)
+end
+
 --- Start an accept pass for a completed shadow turn.
 ---
 --- The pass does NOT open the durable journal. `diary.begin` writes a `begin`
@@ -60,22 +350,46 @@ function M.begin_pass(shadow_turn, changes)
 	if not M.enabled() then
 		return nil, "apply mode disabled"
 	end
+	-- ONE JOURNAL PER ROOT, and the root is read off the change, never guessed.
+	-- `safety/diary.lua` refuses a target outside its session's workspace
+	-- ("path escapes workspace") and `safety/checkpoint.lua` refuses to capture
+	-- one, which is exactly the boundary that makes a journal trustworthy. A
+	-- declared write root is a workspace in its own right, so it gets its own
+	-- journal rooted at itself rather than a widened check on the workspace's.
+	-- A turn with no declared root produces one journal with the same paths in
+	-- the same order it always did.
+	local primary = shadow_turn.workspace
 	local paths = {}
+	local paths_by_root = {}
 	for _, change in ipairs(changes or {}) do
 		if change.path then
 			paths[#paths + 1] = change.path
+			local root = (type(change.root) == "string" and change.root ~= "") and change.root or primary
+			local list = paths_by_root[root]
+			if not list then
+				list = {}
+				paths_by_root[root] = list
+			end
+			list[#list + 1] = change.path
 		end
 	end
-	return {
+	local pass = {
 		shadow_turn = shadow_turn,
 		diary_begin = {
-			workspace = shadow_turn.workspace,
+			workspace = primary,
 			stream = shadow_turn.stream,
 		},
 		turn_id = tostring(shadow_turn.turn_id),
 		paths = paths,
+		paths_by_root = paths_by_root,
 		checkpoint_started = false,
-	}, nil
+	}
+	-- THE FILE CLAIMS, taken here and nowhere earlier: this is the moment the
+	-- walk's touched set is known and the review opens (PLAN-R1-capture.md §5).
+	-- Best effort per path and never fatal -- a store that cannot be reached
+	-- must not stop a review from opening, and the accept-time check re-asks.
+	pcall(take_file_claims, pass, changes)
+	return pass, nil
 end
 
 --- The pass's durable journal, opened on demand.
@@ -114,23 +428,98 @@ function M.opened_session(pass)
 	return pass and pass.diary_session or nil
 end
 
-local function ensure_checkpoint(pass)
-	if pass.checkpoint_started then
-		return true
+--- The workspace of the root a change belongs to, or the pass's primary.
+local function change_root(pass, change)
+	local primary = pass.diary_begin and pass.diary_begin.workspace or nil
+	local root = change and change.root
+	if type(root) ~= "string" or root == "" then
+		return primary
 	end
-	local session, serr = ensure_session(pass)
+	return root
+end
+
+--- The journal for ONE root, opened on demand.
+---
+--- The primary root goes through `ensure_session` untouched, so a single-root
+--- pass -- and every pass built by hand, which carries `diary_session` and no
+--- `diary_begin` at all -- behaves exactly as before. A declared write root
+--- opens its own journal, rooted at itself, the first time an accept on that
+--- root reaches this point; a turn whose extra-root changes are all rejected
+--- never creates one.
+local function session_for_root(pass, root)
+	local primary = pass.diary_begin and pass.diary_begin.workspace or nil
+	if not root or root == "" or primary == nil or root == primary then
+		return ensure_session(pass)
+	end
+	pass.diary_sessions = pass.diary_sessions or {}
+	if pass.diary_sessions[root] then
+		return pass.diary_sessions[root]
+	end
+	local session, berr = diary.begin({
+		workspace = root,
+		stream = pass.diary_begin.stream,
+	})
+	if not session then
+		local err = berr or ("opening the durable journal for " .. root .. " failed")
+		pass.diary_begin_halted = err
+		return nil, err
+	end
+	pass.diary_begin_halted = nil
+	pass.diary_sessions[root] = session
+	return session
+end
+
+--- Every journal this pass has actually opened, primary first. Read-only:
+--- asking what the pass has written must never be the thing that makes it write.
+local function opened_sessions(pass)
+	local out = {}
+	if pass and pass.diary_session then
+		out[#out + 1] = pass.diary_session
+	end
+	for _, session in pairs((pass and pass.diary_sessions) or {}) do
+		out[#out + 1] = session
+	end
+	return out
+end
+
+local function ensure_checkpoint(pass, root)
+	root = root or (pass.diary_begin and pass.diary_begin.workspace) or nil
+	local primary = pass.diary_begin and pass.diary_begin.workspace or nil
+	local is_primary = (primary == nil) or (root == primary)
+	if is_primary then
+		if pass.checkpoint_started then
+			return true
+		end
+	else
+		pass.checkpoints_started = pass.checkpoints_started or {}
+		if pass.checkpoints_started[root] then
+			return true
+		end
+	end
+	local session, serr = session_for_root(pass, root)
 	if not session then
 		return false, serr
+	end
+	-- Only THIS root's paths. checkpoint.begin_turn resolves every path inside
+	-- its session's workspace and refuses one that is not, so handing it the
+	-- whole turn's paths would fail the moment a turn spans two roots.
+	local paths = pass.paths
+	if root and pass.paths_by_root and pass.paths_by_root[root] then
+		paths = pass.paths_by_root[root]
 	end
 	local cp, err = checkpoint.begin_turn({
 		session = session,
 		turn_id = pass.turn_id,
-		paths = pass.paths,
+		paths = paths,
 	})
 	if not cp then
 		return false, err
 	end
-	pass.checkpoint_started = true
+	if is_primary then
+		pass.checkpoint_started = true
+	else
+		pass.checkpoints_started[root] = true
+	end
 	return true
 end
 
@@ -364,16 +753,27 @@ function M.accept_composed(pass, change, composed)
 				.. ": the change set carries no before-fingerprint for it, so drift cannot be judged"
 	end
 
+	-- THE FILE CLAIM, paired with the drift guard above at the SAME accept step:
+	-- the fingerprint answers "is the file the one this review was prepared
+	-- against", and this answers "is anybody else already reviewing it".
+	-- Removing this one line is the mutation
+	-- tests/suite/p108_second_editor_clobber.lua drives.
+	local claim_refusal = M.file_claim_refusal(pass, change)
+	if claim_refusal then
+		return false, claim_refusal
+	end
+
 	-- THE ACTION WAITING FOR ITS DURABLE STATE. The journal is opened here, on
 	-- the accept, rather than when the review opened. It is opened BEFORE the
 	-- checkpoint, because the checkpoint writes inside the diary directory the
 	-- `begin` row names; a failure here returns without touching anything, so
 	-- the change stays offered and the accept stays retryable.
-	local session, serr = ensure_session(pass)
+	local root = change_root(pass, change)
+	local session, serr = session_for_root(pass, root)
 	if not session then
 		return false, serr
 	end
-	local ok, err = ensure_checkpoint(pass)
+	local ok, err = ensure_checkpoint(pass, root)
 	if not ok then
 		return false, err
 	end
@@ -455,6 +855,45 @@ function M.accept_composed(pass, change, composed)
 	return true, nil, applied
 end
 
+--- The panel-local journal a standalone accept or scope revert writes through.
+---
+--- Primary-root changes keep `panel._standalone_diary`, opened at the review
+--- workspace exactly as before. A change from a declared write root cannot be
+--- journalled there -- the diary refuses a target outside its own workspace --
+--- so it gets its own panel-local journal rooted at that root, kept beside the
+--- first one and reused for every later change from the same root.
+local function standalone_session(panel, change, label)
+	local primary_root = change and change.root_is_primary ~= false
+	if primary_root then
+		if not panel._standalone_diary then
+			local ws = change.review_workspace or panel.cwd or vim.fn.getcwd()
+			local session, err = diary.begin({
+				workspace = ws,
+				stream = panel.session_id or ("panel-" .. tostring(panel.id or label)),
+			})
+			if not session then
+				return nil, err
+			end
+			panel._standalone_diary = session
+		end
+		return panel._standalone_diary
+	end
+	panel._standalone_diary_roots = panel._standalone_diary_roots or {}
+	local root = change.root
+	if panel._standalone_diary_roots[root] then
+		return panel._standalone_diary_roots[root]
+	end
+	local session, err = diary.begin({
+		workspace = root,
+		stream = panel.session_id or ("panel-" .. tostring(panel.id or label)),
+	})
+	if not session then
+		return nil, err
+	end
+	panel._standalone_diary_roots[root] = session
+	return session
+end
+
 --- Journaled accept when no apply-mode shadow_pass exists (preview-mode inline
 --- review). Checkpoint is omitted: preview turns discard the overlay without a
 --- pass, but a real-tree accept during review still routes through the diary.
@@ -468,18 +907,21 @@ function M.accept_standalone(panel, change, composed)
 				.. tostring(change.path)
 				.. ": the change set carries no before-fingerprint for it, so drift cannot be judged"
 	end
-	if not panel._standalone_diary then
-		local ws = change.review_workspace or panel.cwd or vim.fn.getcwd()
-		local session, err = diary.begin({
-			workspace = ws,
-			stream = panel.session_id or ("panel-" .. tostring(panel.id or "inline")),
-		})
-		if not session then
-			return false, err
-		end
-		panel._standalone_diary = session
+
+	-- The same accept-step pairing as `accept_composed`, on the preview-mode
+	-- route that has no apply pass.
+	local standalone_claim_refusal = M.file_claim_refusal(nil, change)
+	if standalone_claim_refusal then
+		return false, standalone_claim_refusal
 	end
-	local session = panel._standalone_diary
+	-- A change from a declared write root journals at THAT root: the diary's
+	-- own "path escapes workspace" refusal is a boundary worth keeping, so the
+	-- root becomes the journal's workspace rather than the check being widened.
+	-- A primary-root change keeps the panel journal it has always used.
+	local session, serr = standalone_session(panel, change, "inline")
+	if not session then
+		return false, serr
+	end
 	local is_delete = change.kind == "delete"
 	local predicted_op_id = string.format("%s:%d", session.stream, (session.op_seq or 0) + 1)
 	local ok, err = diary.intent({
@@ -528,19 +970,12 @@ function M.scope_revert(panel, change)
 	if not panel or not change or not change.path or change.before == nil then
 		return false, "scope revert requires a before snapshot"
 	end
-	if not panel._standalone_diary then
-		local ws = change.review_workspace or panel.cwd or vim.fn.getcwd()
-		local session, err = diary.begin({
-			workspace = ws,
-			stream = panel.session_id or ("panel-" .. tostring(panel.id or "scope")),
-		})
-		if not session then
-			return false, err
-		end
-		panel._standalone_diary = session
+	local session, serr = standalone_session(panel, change, "scope")
+	if not session then
+		return false, serr
 	end
 	return diary.restore_workspace_bytes({
-		session = panel._standalone_diary,
+		session = session,
 		path = change.path,
 		content = change.before,
 		base_hash = change.base_hash,
@@ -550,10 +985,67 @@ function M.scope_revert(panel, change)
 	})
 end
 
+--- Put ONE path back to the bytes the turn started from, through the
+--- journaled applier. Ruling 48 (issue log row 48): `U` undoes every edit of
+--- the whole turn, and a file the operator already ACCEPTED is already on
+--- disk -- so undoing it is a real-tree WRITE with no accept behind it. That
+--- is permitted by the ruling, but it is still a write, so it goes through the
+--- diary like every other one: intent row, displaced copy, verification, and
+--- something for crash recovery to work from. The sole-real-tree-writer
+--- contract is not bent for it.
+---
+--- `base_hash` is deliberately NOT passed. The accept moved the file, so the
+--- pre-turn fingerprint is exactly what disk must NOT be expected to hold;
+--- `diary.restore_workspace_bytes` observes the CURRENT state instead and
+--- displaces it, which is what makes this undo reversible in its turn.
+function M.revert_to_turn_start(panel, change)
+	if not panel or not change or not change.path then
+		return false, "revert needs a panel and a path"
+	end
+	if change.before == nil then
+		-- An agent-CREATED file has no turn-start bytes, only turn-start
+		-- absence, and putting absence back is a journaled delete rather than a
+		-- restore. Refused by name rather than guessed at: an undo that leaves
+		-- a file the operator never accepted is worse than one that says what
+		-- it could not do.
+		return false,
+			"cannot undo an accepted agent-created file (" .. tostring(change.rel or change.path)
+				.. "): restoring its turn-start absence is a journaled delete, not implemented"
+	end
+	local session, serr
+	local pass = panel.shadow_pass
+	if pass then
+		session, serr = session_for_root(pass, change_root(pass, change))
+	else
+		session, serr = standalone_session(panel, change, "undo_turn")
+	end
+	if not session then
+		return false, serr
+	end
+	return diary.restore_workspace_bytes({
+		session = session,
+		path = change.path,
+		content = change.before,
+		target_mode = change.base_mode,
+	})
+end
+
 function M.revert_pass(pass)
 	-- A pass with no journal has nothing captured and nothing to put back.
 	if not pass or not pass.diary_session then
 		return true
+	end
+	-- Every root that opened a journal is reverted, not just the workspace's: a
+	-- turn that wrote into two roots and is reverted must put both back. Each
+	-- root's checkpoint is its own durable artefact under its own diary
+	-- directory, and the same "the artefact decides" rule applies to each.
+	for _, session in pairs(pass.diary_sessions or {}) do
+		if vim.fn.filereadable(checkpoint.manifest_path(session, pass.turn_id)) == 1 then
+			local ok, err = checkpoint.revert_turn({ session = session, turn_id = pass.turn_id })
+			if not ok then
+				return ok, err
+			end
+		end
 	end
 	-- NOT `pass.checkpoint_started`: that boolean is process-local state on the
 	-- pass OBJECT, and a retried or resumed pass is a new object over the same
@@ -578,20 +1070,21 @@ function M.finish_pass(pass)
 end
 
 function M.journal_rows(pass)
-	local session = M.opened_session(pass)
-	if not session then
+	local sessions = opened_sessions(pass)
+	if #sessions == 0 then
 		-- No accept has happened on this pass, so no journal exists. Reading it
 		-- must not open one: introspection is not an action.
 		return {}
 	end
-	local path = session.diary_dir .. "/journal.jsonl"
-	if vim.fn.filereadable(path) ~= 1 then
-		return {}
-	end
 	local rows = {}
-	for _, line in ipairs(vim.fn.readfile(path)) do
-		if line ~= "" then
-			rows[#rows + 1] = vim.json.decode(line)
+	for _, session in ipairs(sessions) do
+		local path = session.diary_dir .. "/journal.jsonl"
+		if vim.fn.filereadable(path) == 1 then
+			for _, line in ipairs(vim.fn.readfile(path)) do
+				if line ~= "" then
+					rows[#rows + 1] = vim.json.decode(line)
+				end
+			end
 		end
 	end
 	return rows

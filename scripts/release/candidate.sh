@@ -27,6 +27,10 @@ build() {
 	# Never import an unverified tree: the exporter's own policy must hold on
 	# the exact bytes that become the public root commit.
 	"$tree/scripts/release/verify.sh" "$tree" >/dev/null
+	# ...and the manifest itself must be require()-closed and bin/yana-*
+	# reference-closed, or a fresh public install crashes on the first
+	# require() the manifest silently dropped (order B4 Part B2).
+	"$tree/tests/release/manifest_coverage_gate.sh" "$tree" >/dev/null
 	git init -q -b main "$tree"
 	git -C "$tree" -c user.name="Yana Release" -c user.email="release@invalid" add -A
 	git -C "$tree" -c user.name="Yana Release" -c user.email="release@invalid" \
@@ -102,6 +106,8 @@ check() {
 	# (e) content policy: the clone's own verifier scans every manifest file
 	# for forbidden bytes and re-checks identity, provenance, and workflows.
 	"$clone/scripts/release/verify.sh" "$clone" || note_fail "verify.sh failed on the fresh clone"
+	"$clone/tests/release/manifest_coverage_gate.sh" "$clone" \
+		|| note_fail "manifest_coverage_gate.sh failed on the fresh clone"
 
 	(( fail == 0 )) || exit 1
 	printf 'CANDIDATE CHECK PASS url=%s commit=%s\n' \

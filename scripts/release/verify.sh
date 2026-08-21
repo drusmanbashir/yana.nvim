@@ -31,6 +31,7 @@ allowed_path() {
 	doc/yana.txt | plugin/yana.lua) return 0 ;;
 	lua/yana/*.lua | lua/yana/*/*.lua | lua/blink_yana/*.lua) return 0 ;;
 	bin/yana-[a-z]*) return 0 ;;
+	scripts/install-deps.sh) return 0 ;;
 	scripts/release/*) return 0 ;;
 	tests/release/*) return 0 ;;
 	esac

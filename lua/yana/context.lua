@@ -2,6 +2,7 @@
 -- to attach to a prompt.
 local config = require("yana.config")
 local selection_scope = require("yana.selection_scope")
+local diff = require("yana.diff")
 
 local M = {}
 
@@ -97,6 +98,58 @@ local function at_path_from_question(question)
   return question:match("@(/[^\n:]+)")
 end
 
+local BOUNDARY_TOKEN = "{{YANA_WRITABLE_BOUNDARY}}"
+
+function M.writable_boundary_root(origin, selection, opts)
+  opts = opts or {}
+  if type(opts.writable_root) == "string" and opts.writable_root ~= "" then
+    return diff.abs_path(opts.writable_root)
+  end
+  if type(opts.claimed_workspace) == "string" and opts.claimed_workspace ~= "" then
+    return diff.abs_path(opts.claimed_workspace)
+  end
+  if selection and selection.buf and vim.api.nvim_buf_is_valid(selection.buf) then
+    local name = vim.api.nvim_buf_get_name(selection.buf)
+    if name ~= "" then
+      return vim.fn.fnamemodify(diff.abs_path(name), ":h")
+    end
+  end
+  if origin and origin.name and origin.name ~= "" then
+    local abs = origin.name:match("^/") and origin.name or diff.abs_path(origin.name)
+    if vim.fn.isdirectory(abs) == 1 then
+      return abs
+    end
+    return vim.fn.fnamemodify(abs, ":h")
+  end
+  return diff.abs_path(opts.cwd or vim.fn.getcwd())
+end
+
+function M.writable_boundary_text(root)
+  return "You can write under "
+    .. tostring(root)
+    .. "; everything else is read-only — report a refused write, do not retry it."
+end
+
+local function agent_instructions_with_boundary(text, root)
+  local boundary = M.writable_boundary_text(root)
+  text = tostring(text or "")
+  if text:find(BOUNDARY_TOKEN, 1, true) then
+    local out, rest = "", text
+    while true do
+      local s, e = rest:find(BOUNDARY_TOKEN, 1, true)
+      if not s then
+        return out .. rest
+      end
+      out = out .. rest:sub(1, s - 1) .. boundary
+      rest = rest:sub(e + 1)
+    end
+  end
+  if text == "" then
+    return boundary
+  end
+  return boundary .. "\n" .. text
+end
+
 local SEVERITY_NAME = {
   [vim.diagnostic.severity.ERROR] = "ERROR",
   [vim.diagnostic.severity.WARN] = "WARN",
@@ -136,7 +189,10 @@ function M.build(question, origin, selection, opts)
   -- Inline needs review/scope guidance. Raw agentic mode deliberately does
   -- not: it is the direct cursor-agent surface, with no inline review.
   if (mode == "inline" or mode == "agent") and o.agent_instructions and o.agent_instructions ~= "" then
-    table.insert(parts, o.agent_instructions)
+    table.insert(parts, agent_instructions_with_boundary(
+      o.agent_instructions,
+      M.writable_boundary_root(origin, selection, opts)
+    ))
     local scope_text = scope_instructions()
     if scope_text then
       table.insert(parts, scope_text)

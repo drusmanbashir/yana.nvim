@@ -1,15 +1,16 @@
-*yana.txt*                         Yana                         version 0.1.0-alpha.1
+*yana.txt*                         Yana                         version 0.1.0-alpha.2
 
 ==============================================================================
 CONTENTS                                                        *yana-contents*
 
 1. Introduction ................................................. |yana|
-2. Requirements ...................................... |yana-requirements|
-3. Commands ................................................ |yana-commands|
-4. Configuration ...................................... |yana-configuration|
-5. Machine-specific configuration ................ |yana-machine-config|
-6. Security ................................................ |yana-security|
-7. Health .................................................... |yana-health|
+2. Install ................................................ |yana-install|
+3. Requirements ...................................... |yana-requirements|
+4. Commands ................................................ |yana-commands|
+5. Configuration ...................................... |yana-configuration|
+6. Machine-specific configuration ................ |yana-machine-config|
+7. Security ................................................ |yana-security|
+8. Health .................................................... |yana-health|
 
 ==============================================================================
 1. Introduction                                                      *yana*
@@ -24,7 +25,38 @@ Two public entries reach the same pipeline:
 - an inline edit over a line or visual selection, opened with |:YanaEdit|.
 
 ==============================================================================
-2. Requirements                                         *yana-requirements*
+2. Install                                                   *yana-install*
+
+With lazy.nvim: >lua
+
+    {
+      "drusmanbashir/yana.nvim",
+      cmd = { "Yana", "YanaAsk", "YanaEdit", "YanaOpen" },
+      build = "scripts/install-deps.sh",
+    }
+<
+`build` runs `scripts/install-deps.sh` once, at install and update. It only
+checks and reports; it never installs anything on its own.
+
+Manually: >sh
+
+    git clone https://github.com/drusmanbashir/yana.nvim ~/.local/share/nvim/yana.nvim
+    ~/.local/share/nvim/yana.nvim/scripts/install-deps.sh
+<
+>lua
+    vim.opt.runtimepath:prepend("~/.local/share/nvim/yana.nvim")
+    require("yana").setup({})
+<
+
+Requirements: Linux, Neovim 0.10.4+, cursor-agent. `scripts/install-deps.sh`
+detects apt/dnf/pacman and prints one copy-paste command naming the real
+system packages for whatever's missing; with `--run` it offers to install
+them (and cursor-agent's own installer) after showing the exact command and
+asking [y/N] — it never runs anything silently. See |yana-requirements| for
+the full dependency list and |yana-health| for the same check post-install.
+
+==============================================================================
+3. Requirements                                         *yana-requirements*
 
 Required:
 
@@ -54,7 +86,7 @@ titles are unavailable (those sessions still list, shown as untitled).
 Run |:checkhealth| with `:checkhealth yana` after installation.
 
 ==============================================================================
-3. Commands                                                 *yana-commands*
+4. Commands                                                 *yana-commands*
 
                                                     *:Yana*
 :Yana               Toggle the panel.
@@ -118,7 +150,7 @@ Run |:checkhealth| with `:checkhealth yana` after installation.
 :YanaStop           Stop the active turn.
 
 ==============================================================================
-4. Configuration                                       *yana-configuration*
+5. Configuration                                       *yana-configuration*
 
 Minimal setup: >lua
 
@@ -134,6 +166,8 @@ The default mode is `inline`. Important options: >lua
       approve_mcps = false,
       -- Extra artifact-grouping names/globs; never a destructive-safety rule.
       artifact_dir_prefixes = {},
+      -- Directories outside the opened workspace a turn may write.
+      write_roots = {},
       global_keymaps = {
         toggle = nil,
         ask = nil,
@@ -156,7 +190,7 @@ Both modes write extra diagnostic state. Do not enable them when a clean
 default run with no diagnostic writes is required.
 
 ==============================================================================
-5. Machine-specific configuration                       *yana-machine-config*
+6. Machine-specific configuration                       *yana-machine-config*
 
 Yana bakes in no usernames or absolute paths, and invents no environment
 variable of its own that you have to remember: everything machine-specific is
@@ -213,7 +247,7 @@ Model selection (`model`) defaults to `nil`/auto: yana never guesses or
 bakes in a model name.
 
 ==============================================================================
-6. Security                                                   *yana-security*
+7. Security                                                   *yana-security*
 
 In `ask` and `inline`, the agent process runs in a private overlay. The agent
 cannot write the real workspace; only Yana's journaled applier can do so after
@@ -233,6 +267,57 @@ at most seven days. |:YanaRefusals| expands that metadata. Unsafe destructive
 operations apply nothing, release the workspace claim, and name a preserved
 recovery directory.
 
+                                                        *yana-write-roots*
+`write_roots` declares directories OUTSIDE the opened workspace that a turn may
+write. The opened workspace is always the first root and is never listed. Each
+declared root is confined, claimed, walked, reviewed and applied exactly like
+the workspace: its edits arrive as ordinary hunks (the panel names the root
+when a turn has more than one), and its real files change only after you accept
+them. A write into any directory that is neither the workspace nor declared
+here still fails read-only, and the refusal now names the exact line that would
+allow it. Entries are absolute (a leading `~` is expanded); a root that does
+not exist, that overlaps the workspace or another root, or that lives inside
+yana's own state directory refuses the turn by name before the agent starts.
+Nothing the agent says can add or widen a root. Each declared root costs one
+more overlay mount and one more claim per turn (measured about 180ms). >lua
+
+    require("yana").setup({
+      write_roots = { "~/code/fran", "~/code/det3d" },
+    })
+<
+
+                                                        *yana-capture-root*
+`capture_root` is the ONE directory a turn's single overlay is mounted at. Every
+write beneath it — the opened repository, a sibling repository declared nowhere,
+a directory that did not exist when the turn started — lands in the turn's
+private layer instead of failing read-only, and the review groups the hunks by
+each file's own nearest `.git` root, computed from what the turn wrote rather
+than declared before it. One mount and one claim, however many repositories the
+turn touches. Unset, yana chooses it from filesystem position: `~/code` when the
+resolved workspace is under it, else `$HOME`, else the workspace itself — never
+a directory that contains yana's own state root. Anything outside it is still
+read-only and the refusal still names the line that would allow it. The claim
+stays on the opened repository, so a second turn on a different repository under
+the same capture root starts freely; when two turns propose changes to the same
+file, the second to ACCEPT it is refused by name, naming the holder. Nothing the
+agent says can choose it. >lua
+
+    require("yana").setup({
+      capture_root = "~/code",
+    })
+<
+                                                    *yana-workspace-roots*
+`workspace_roots` names directories that are a workspace even though they hold
+no `.git`. A turn's workspace is the nearest `.git` root at or above the file
+you have open; failing that, the `workspace_roots` entry that contains it;
+failing that, the file's own folder. A repository always wins, because the
+repository is what a claim is taken on. >lua
+
+    require("yana").setup({
+      workspace_roots = { "~/notes" },
+    })
+<
+
 `artifact_dir_prefixes` adds directory-component names or globs for grouping only. It
 may change an individual binary proposal from durable recovery to momentary
 retention. It never grants destructive safety and never changes the
@@ -251,7 +336,7 @@ explicitly: >lua
 Nothing the agent prints can enable direct mode.
 
 ==============================================================================
-7. Health                                                       *yana-health*
+8. Health                                                       *yana-health*
 
 Use: >vim
 

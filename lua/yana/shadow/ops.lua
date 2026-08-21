@@ -18,6 +18,7 @@ local diff = require("yana.diff")
 local config = require("yana.config")
 local hash = require("yana.safety.hash")
 local control_plane = require("yana.safety.control_plane")
+local claim_identity = require("yana.claim_identity")
 local log = require("yana.log")
 local manifest = require("yana.manifest")
 local uv = vim.uv or vim.loop
@@ -299,6 +300,237 @@ local function upper_dir(session)
 	return nil
 end
 
+--- Every root this turn wrote, in claim order, whatever shape the session is in.
+---
+--- A session from `preview.begin_turn` carries `roots`; a session built by hand
+--- -- the headless rows, the recovery paths and every caller that predates
+--- operator-declared write roots do exactly that -- carries only the primary's
+--- aliases. Both answer here, so a single-root turn reaches the identical code
+--- path either way and no caller has to know which shape it holds.
+function M.session_roots(session)
+	if type(session) ~= "table" then
+		return {}
+	end
+	if type(session.roots) == "table" and #session.roots > 0 then
+		return session.roots
+	end
+	local layer = session.layer_dir
+	return {
+		{
+			index = 1,
+			primary = true,
+			workspace = session.workspace,
+			layer_dir = layer,
+			upper_dir = upper_dir(session),
+			work_dir = layer and (layer .. "/work") or nil,
+			claim_dir = session.claim_dir,
+			nonce = session.nonce or "",
+		},
+	}
+end
+
+--- The upper layer of one root, however the root was built.
+local function root_upper(root)
+	if not root then
+		return nil
+	end
+	if root.upper_dir and root.upper_dir ~= "" then
+		return root.upper_dir
+	end
+	if root.layer_dir and root.layer_dir ~= "" then
+		return root.layer_dir .. "/upper"
+	end
+	return nil
+end
+
+--- The base a root's upper layer is keyed by.
+---
+--- WI-4: with a BROAD ROOT the turn has ONE overlay, mounted at an ancestor of
+--- the workspace, so every relative path in its upper is relative to THAT
+--- directory -- not to the workspace. Without one it is the workspace, which
+--- is byte-for-byte what this walk has always used.
+local function walk_base(session, root)
+	local primary = root and (root.primary == true or (root.index or 1) == 1)
+	if primary and session then
+		local broad = session.broad_root
+		if type(broad) == "string" and broad ~= "" then
+			return broad
+		end
+	end
+	return root and root.workspace or nil
+end
+
+--- WHICH REPOSITORY A TOUCHED PATH BELONGS TO.
+---
+--- Computed FROM THE WALK, never declared before the turn (PLAN-R1-capture.md
+--- §1): the nearest `.git` root at or above the path, bounded by the broad
+--- root. `.git` is a directory in an ordinary clone and a file in a worktree
+--- or submodule; `claim_identity.git_root` is the single implementation both
+--- this and claim identity ask, so a hunk can never be grouped under one
+--- repository and claimed under another.
+---
+--- With no repository above it the answer is the operator-visible unit that
+--- still exists: the turn's own workspace when the path is inside it,
+--- otherwise the outermost directory below the broad root that contains it
+--- (`~/code/newthing` for `~/code/newthing/a/b.txt`) -- the same "nearest
+--- repository, else the containing project" shape `jail.declarable_write_root`
+--- already uses for a refusal remedy.
+local function repo_root_for(abs, base, workspace)
+	if type(abs) ~= "string" or abs == "" then
+		return workspace or base
+	end
+	local dir = abs
+	if vim.fn.isdirectory(abs) ~= 1 then
+		dir = vim.fn.fnamemodify(abs, ":h")
+	end
+	local git = claim_identity.git_root(dir, base)
+	if git then
+		return git
+	end
+	if workspace and workspace ~= "" and (dir == workspace or dir:sub(1, #workspace + 1) == workspace .. "/") then
+		return workspace
+	end
+	if base and base ~= "" and dir ~= base and dir:sub(1, #base + 1) == base .. "/" then
+		local first = dir:sub(#base + 2):match("^([^/]+)")
+		if first then
+			return base .. "/" .. first
+		end
+	end
+	return base or dir
+end
+
+--- ONE WALK, REGROUPED BY TOUCHED REPOSITORY.
+---
+--- Returns a list of `{ root, upper, typed }`, one entry per repository the
+--- walk actually found something in, the turn's own workspace first and the
+--- rest in path order. Each `root` is the same descriptor shape
+--- `changes_for_root` has always been handed; `root.upper_prefix` is the
+--- repository's path relative to the upper layer's own base, which is what
+--- keeps `rel` repository-relative while the bytes are still read out of the
+--- one upper.
+---
+--- A turn with no broad root produces exactly one group, containing exactly
+--- the operations `typed_ops(workspace, upper)` has always produced, with the
+--- same `rel` values and the same index -- so a single-repository turn reaches
+--- identical code with identical results.
+local function walks_for_session(session)
+	local walks = {}
+	for _, root in ipairs(M.session_roots(session)) do
+		local upper = root_upper(root)
+		if not upper then
+			return nil, "turn has no overlay upper layer"
+		end
+		local base = walk_base(session, root)
+		local typed, err = M.typed_ops(base, upper)
+		if not typed then
+			return nil, err or "reading the change set failed"
+		end
+		if base == root.workspace then
+			-- Unchanged shape: one group, the root exactly as it was built.
+			for _, op in ipairs(typed) do
+				op.upper_rel = op.rel
+				op.root = root.workspace
+				op.root_index = root.index or 1
+			end
+			walks[#walks + 1] = {
+				root = {
+					index = root.index or 1,
+					primary = root.primary,
+					workspace = root.workspace,
+					upper_prefix = "",
+					claim_dir = root.claim_dir,
+				},
+				upper = upper,
+				typed = typed,
+			}
+		else
+			local groups, order = {}, {}
+			for _, op in ipairs(typed) do
+				local repo = repo_root_for(op.path, base, root.workspace)
+				local bucket = groups[repo]
+				if not bucket then
+					bucket = {}
+					groups[repo] = bucket
+					order[#order + 1] = repo
+				end
+				op.upper_rel = op.rel
+				-- `rel` is now relative to the operation's OWN repository, which
+				-- is what makes it unambiguous on the review surface and what the
+				-- journal for that repository is keyed by.
+				if op.path == repo then
+					op.rel = vim.fn.fnamemodify(op.path, ":t")
+				elseif op.path:sub(1, #repo + 1) == repo .. "/" then
+					op.rel = op.path:sub(#repo + 2)
+				end
+				bucket[#bucket + 1] = op
+			end
+			table.sort(order)
+			-- The turn's own workspace is always index 1 when it was touched, so
+			-- every change id a single-repository turn has ever minted is
+			-- unchanged; the other repositories take 2..N in path order.
+			local indexed = {}
+			local next_index = 2
+			for _, repo in ipairs(order) do
+				if repo == root.workspace then
+					indexed[repo] = 1
+				else
+					indexed[repo] = next_index
+					next_index = next_index + 1
+				end
+			end
+			local ordered = {}
+			for _, repo in ipairs(order) do
+				ordered[#ordered + 1] = repo
+			end
+			table.sort(ordered, function(a, b)
+				return indexed[a] < indexed[b]
+			end)
+			for _, repo in ipairs(ordered) do
+				local prefix = ""
+				if repo ~= base and repo:sub(1, #base + 1) == base .. "/" then
+					prefix = repo:sub(#base + 2)
+				end
+				for _, op in ipairs(groups[repo]) do
+					op.root = repo
+					op.root_index = indexed[repo]
+				end
+				walks[#walks + 1] = {
+					root = {
+						index = indexed[repo],
+						primary = repo == root.workspace,
+						workspace = repo,
+						upper_prefix = prefix,
+						claim_dir = repo == root.workspace and root.claim_dir or nil,
+					},
+					upper = upper,
+					typed = groups[repo],
+				}
+			end
+		end
+	end
+	return walks
+end
+
+M._test.repo_root_for = repo_root_for
+
+--- The typed operations of EVERY repository a turn wrote, each tagged with the
+--- repository it belongs to. Groups come first in index order, operations
+--- within a group in the order `typed_ops` already sorts them, so the report
+--- is deterministic.
+function M.typed_ops_from_session(session)
+	local walks, err = walks_for_session(session)
+	if not walks then
+		return nil, err
+	end
+	local out = {}
+	for _, walk in ipairs(walks) do
+		for _, op in ipairs(walk.typed) do
+			out[#out + 1] = op
+		end
+	end
+	return out
+end
+
 local function read_tree_bytes(root, rel)
 	local path = root .. "/" .. rel
 	if vim.fn.filereadable(path) ~= 1 then
@@ -392,7 +624,7 @@ end
 ---     for exactly that case.
 ---   * Everything else returns nil, and the journaled applier reads the real
 ---     target immediately before the write (`safety/diary.lua`).
-local function after_mode_for(session, op)
+local function after_mode_for(upper, op)
 	local ev = op.base_evidence
 	if type(ev) == "table" and ev["new-mode"] then
 		local parsed = tonumber(ev["new-mode"], 8)
@@ -407,11 +639,12 @@ local function after_mode_for(session, op)
 	if type(ev) ~= "table" or ev.state ~= "absent" then
 		return nil
 	end
-	local upper = upper_dir(session)
 	if not upper then
 		return nil
 	end
-	local path = upper .. "/" .. op.rel
+	-- `op.rel` is relative to the operation's own REPOSITORY once the walk has
+	-- been regrouped; `op.upper_rel` is the one the upper layer is keyed by.
+	local path = upper .. "/" .. (op.upper_rel or op.rel)
 	local st = uv.fs_lstat(path)
 	if st and st.type == "file" then
 		return mode_perm(st.mode)
@@ -677,42 +910,30 @@ function M.classify_artifacts(typed, changes, _base_evidence, tracked)
 	}
 end
 
---- Build inline review change objects for one turn.
+--- Build ONE root's inline review change objects.
 ---
---- `before` comes from the LOWER layer — the real tree — and `after` from the
---- upper layer. Neither is copied anywhere: both are read on demand, at
---- O(touched). `base_hash` is the PRODUCER's fingerprint of the before-bytes,
---- cross-checked against the read above; the applier re-reads the real file and
---- compares against it immediately before the write, which is where a human
---- change landing later still is detected.
+--- `before` comes from the LOWER layer — that root's real tree — and `after`
+--- from that root's upper layer. Neither is copied anywhere: both are read on
+--- demand, at O(touched). `base_hash` is the PRODUCER's fingerprint of the
+--- before-bytes, cross-checked against the read above; the applier re-reads the
+--- real file and compares against it immediately before the write, which is
+--- where a human change landing later still is detected.
 ---
---- Returns nil, err when the producer fails (never an empty list masking one).
-function M.changes_from_session(session, context)
-	local upper = upper_dir(session)
-	if not upper then
-		return nil, "turn has no overlay upper layer"
-	end
-	local typed, err = M.typed_ops(session.workspace, upper)
-	if not typed then
-		return nil, err or "reading the change set failed"
-	end
-
-	-- The window this route exists to close, driven at exactly its instant: the
-	-- producer has classified the tree, and the human saves before the review is
-	-- built. Test-only; production never sets it.
-	if M._test.inject.human_save_after_classify then
-		for p, bytes in pairs(M._test.inject.human_save_after_classify) do
-			diff.write_file(p, bytes)
-		end
-	end
-
+--- Returns nil, err when the evidence cannot be established (never an empty
+--- list masking one).
+local function changes_for_root(session, root, upper, typed)
 	local changes = {}
+	local root_index = root.index or 1
 	for _, op in ipairs(typed) do
 		-- `create dir`, `create symlink` and a whiteout over a directory are
 		-- typed operations with no whole-file content, so they cannot become
 		-- review changes. They stay in `typed` and are reported by format_lines.
 		if reviewable(op) then
-			local lower = session.workspace .. "/" .. op.rel
+			-- The absolute path the operation is ABOUT. Once the walk is
+			-- regrouped by touched repository, `root.workspace .. "/" .. op.rel`
+			-- is the same string -- but `op.path` is the one the producer built
+			-- and the one the journal is keyed by, so it is read directly.
+			local lower = op.path
 			local ev, state, err
 			if M._test.fault.reobserve_base_evidence then
 				-- Mutation seam (gate): the pre-fix route, where the workspace was
@@ -738,12 +959,28 @@ function M.changes_from_session(session, context)
 				end
 			end
 			local before = state.bytes
-			local after = op.kind ~= "delete" and read_tree_bytes(upper, op.rel) or nil
-			local after_mode = after_mode_for(session, op)
+			-- Bytes come out of the ONE upper layer, keyed by the path that
+			-- layer is keyed by (`upper_rel`), not by the repository-relative
+			-- `rel` the review shows.
+			local after = op.kind ~= "delete" and read_tree_bytes(upper, op.upper_rel or op.rel) or nil
+			local after_mode = after_mode_for(upper, op)
 			local change = {
-				id = "shadow-" .. tostring(session.turn_id) .. "-" .. op.rel,
+				-- Root 1's ids are exactly the ids this function has always
+				-- minted. A second root may hold the same relative path, so its
+				-- ids carry the root index: an id that collided across roots
+				-- would make two different files one review.
+				id = root_index == 1
+						and ("shadow-" .. tostring(session.turn_id) .. "-" .. op.rel)
+					or ("shadow-" .. tostring(session.turn_id) .. "-r" .. tostring(root_index) .. "-" .. op.rel),
 				path = op.path,
 				rel = op.rel,
+				-- The root this change belongs to. `rel` is relative to THIS
+				-- root, never to the workspace; `path` (root .. "/" .. rel) is
+				-- the only thing the journal and the applier are keyed by, so a
+				-- bare `rel` can never reach a writer.
+				root = root.workspace,
+				root_index = root_index,
+				root_is_primary = root_index == 1,
 				turn_id = session.turn_id,
 				turn_gen = session.turn_gen,
 				kind = review_kind(op, ev),
@@ -771,13 +1008,74 @@ function M.changes_from_session(session, context)
 			changes[#changes + 1] = change
 		end
 	end
-	local classification = M.classify_artifacts(
-		typed,
-		changes,
-		nil,
-		context and context.tracked_evidence or nil
-	)
-	return classification.changes, nil, typed, classification
+	return changes
+end
+
+--- Build inline review change objects for one turn, across every root it wrote.
+---
+--- ONE WALK AND ONE CLASSIFICATION PER ROOT. Two declared roots may hold the
+--- same relative path, and `classify_artifacts` keys its exclusions by `rel`, so
+--- a single pass over the merged list would let one root's `dist/` exclusion
+--- silence the other root's file of the same name. Per root, the behaviour is
+--- byte-for-byte what a single-root turn has always done; the results are then
+--- concatenated in claim order.
+---
+--- Returns nil, err when the producer fails (never an empty list masking one).
+function M.changes_from_session(session, context)
+	local walks, werr = walks_for_session(session)
+	if not walks then
+		return nil, werr
+	end
+
+	-- The window this route exists to close, driven at exactly its instant: the
+	-- producer has classified the tree, and the human saves before the review is
+	-- built. Test-only; production never sets it.
+	if M._test.inject.human_save_after_classify then
+		for p, bytes in pairs(M._test.inject.human_save_after_classify) do
+			diff.write_file(p, bytes)
+		end
+	end
+
+	local all_typed = {}
+	local merged = { changes = {}, groups = {}, individual = {}, unsafe = {} }
+	for _, walk in ipairs(walks) do
+		local root, upper, typed = walk.root, walk.upper, walk.typed
+		local changes, cerr = changes_for_root(session, root, upper, typed)
+		if not changes then
+			return nil, cerr
+		end
+		local classification = M.classify_artifacts(
+			typed,
+			changes,
+			nil,
+			context and context.tracked_evidence or nil
+		)
+		-- A refusal group's bytes live in the layer of the root that produced
+		-- it, so the group carries that root with it: `retain_refusal_group`
+		-- reads the listing from here and would otherwise look for root 2's
+		-- `dist/` under the workspace's upper layer. `group.root` is the
+		-- artifact root's RELATIVE path and keeps that meaning.
+		for _, group in ipairs(classification.groups) do
+			group.root_workspace = root.workspace
+			group.upper_dir = upper
+			-- Where this group's bytes actually sit in the ONE upper layer:
+			-- `group.root` is relative to the REPOSITORY, and the upper is keyed
+			-- by the broad root, so the repository's own prefix travels with it.
+			group.upper_prefix = root.upper_prefix or ""
+		end
+		for _, op in ipairs(classification.unsafe) do
+			op.root = root.workspace
+		end
+		for _, op in ipairs(classification.individual) do
+			op.root = root.workspace
+		end
+		vim.list_extend(all_typed, typed)
+		vim.list_extend(merged.changes, classification.changes)
+		vim.list_extend(merged.groups, classification.groups)
+		vim.list_extend(merged.individual, classification.individual)
+		vim.list_extend(merged.unsafe, classification.unsafe)
+	end
+	return merged.changes, nil, all_typed, merged
 end
 
 function M.unreviewable_ops(typed)

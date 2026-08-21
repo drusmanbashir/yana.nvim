@@ -84,6 +84,28 @@ end
 
 -- Upsert a session entry. entry.id is required.
 -- fields: id, title, cwd, mode, model, turns
+-- Monotonic tie-breaker for M.list()'s recency sort. `os.time()` has 1s
+-- resolution; several sessions persisted inside one second (a fast synthetic
+-- replay, or just a quick real one -- issue log row 27 measured three
+-- sessions landing in the same wall-clock second) would otherwise sort in an
+-- order `table.sort` does not guarantee, since it is not stable. Lazily
+-- initialised from the highest `seq` already on disk, so a fresh process
+-- picking the registry back up after a restart keeps counting forward
+-- rather than colliding with rows an earlier process already wrote.
+local _seq = nil
+local function next_seq(reg)
+  if not _seq then
+    _seq = 0
+    for _, e in pairs(reg) do
+      if type(e.seq) == "number" and e.seq > _seq then
+        _seq = e.seq
+      end
+    end
+  end
+  _seq = _seq + 1
+  return _seq
+end
+
 function M.record(entry)
   if not entry or not entry.id or entry.id == "" then
     return
@@ -98,6 +120,7 @@ function M.record(entry)
   cur.model = entry.model or cur.model
   cur.turns = entry.turns or cur.turns
   cur.updated_at = now
+  cur.seq = next_seq(reg)
   reg[entry.id] = cur
   save_registry()
 end
@@ -352,7 +375,15 @@ function M.list(cwd)
   end
 
   table.sort(out, function(a, b)
-    return (a.updated_at or a.created_at or 0) > (b.updated_at or b.created_at or 0)
+    local au, bu = (a.updated_at or a.created_at or 0), (b.updated_at or b.created_at or 0)
+    if au ~= bu then
+      return au > bu
+    end
+    -- Same second: `seq` is the tie-break (see next_seq's docstring). A
+    -- discovered (CLI-only) entry carries no seq and sorts after anything
+    -- this process actually recorded in that same second -- we know their
+    -- relative order exactly and only guess at the discovered one's.
+    return (a.seq or 0) > (b.seq or 0)
   end)
 
   local max = config.options.sessions.max or 50
@@ -396,6 +427,14 @@ function M.format(entry)
   end
   if entry.external then
     table.insert(bits, "cli")
+  end
+  -- `entry.review_open` is a transient decoration the caller sets on the
+  -- entry table before formatting (see yana.ui M.session_history) -- never
+  -- persisted here, so it can never go stale: claims serialize, so at most
+  -- the single most-recent session for a workspace can ever be the one an
+  -- open claim belongs to, and it is read fresh from the claim every time.
+  if entry.review_open then
+    table.insert(bits, "review open")
   end
   return table.concat(bits, "  · ")
 end

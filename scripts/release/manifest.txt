@@ -14,6 +14,7 @@ bin/yana-ledger
 bin/yana-overlay
 bin/yana-overlay-inner
 bin/yana-sandbox
+bin/yana-stall-report
 bin/yana-turn
 doc/yana.txt
 lua/blink_yana/commands.lua
@@ -31,6 +32,7 @@ lua/yana/diff.lua
 lua/yana/diff_preview.lua
 lua/yana/dump.lua
 lua/yana/flow_report.lua
+lua/yana/forensics.lua
 lua/yana/health.lua
 lua/yana/init.lua
 lua/yana/inline_diff.lua
@@ -42,6 +44,7 @@ lua/yana/mentions.lua
 lua/yana/notify.lua
 lua/yana/record.lua
 lua/yana/render_check.lua
+lua/yana/renewal.lua
 lua/yana/safety/checkpoint.lua
 lua/yana/safety/control_plane.lua
 lua/yana/safety/diary.lua
@@ -62,6 +65,7 @@ lua/yana/timeline/walk_impl.lua
 lua/yana/turn_lifecycle.lua
 lua/yana/ui.lua
 plugin/yana.lua
+scripts/install-deps.sh
 scripts/release/archive.sh
 scripts/release/candidate.sh
 scripts/release/export.sh

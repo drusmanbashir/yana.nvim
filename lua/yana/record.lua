@@ -2,8 +2,8 @@
 --
 -- When recording is on, every raw stdout line from cursor-agent is teed
 -- VERBATIM to `<turn_dir>/private/stream.ndjson` and a `meta.json` sidecar
--- (argv, cwd, mode, model, timestamps, exit code, stderr) is written when the
--- process exits. Together they are a replayable turn: `tests/fake-cursor-agent`
+-- (argv, cwd, mode, model, timestamps, exit code, stderr, the last stream
+-- event and the stop reason) is written when the process exits. Together they are a replayable turn: `tests/fake-cursor-agent`
 -- plays the NDJSON back through the real `jobstart`/`emit` pipeline, and the
 -- sidecar is the argv comparison target.
 --
@@ -279,6 +279,18 @@ function Rec:finish(info)
   meta.malformed_raw_lines = self.malformed_raw_lines
   meta.malformed_raw_bytes = self.malformed_raw_bytes
   meta.pid = info.pid
+  -- LIVENESS EVIDENCE. A turn that never finished is exactly the turn whose
+  -- sidecar has to say where it stopped and why: on 2026-08-20 an inline turn
+  -- ended on a nested-task start and sat mute for 11 minutes, and nothing on
+  -- disk named either fact. `last_event` is the decoder's own description of
+  -- the last describable stream event (see agent.describe_event) and
+  -- `stop_reason` is always present — a stop that recorded its reason before
+  -- signalling, or the exit code.
+  meta.last_event = info.last_event
+  meta.stop_reason = info.stop_reason
+  meta.cpu_pct_at_stop = info.cpu_pct_at_stop
+  meta.stall_cause = info.stall_cause
+  meta.forensics_path = info.forensics_path
   local ok, encoded = pcall(vim.json.encode, meta)
   if not ok then
     return false
@@ -384,6 +396,31 @@ function M.read_turn_records(dir)
     end
   end
   return out
+end
+
+--- Append one JSON object as a line to `<private_dir>/stream.ndjson`.
+--- Confined-shell and refusal paths use this when no cursor-agent recorder
+--- is open (issue 24).
+function M.append_stream_line(private_dir, obj)
+  if not M.enabled() or type(private_dir) ~= "string" or private_dir == "" then
+    return false
+  end
+  if type(obj) ~= "table" then
+    return false
+  end
+  pcall(vim.fn.mkdir, private_dir, "p")
+  local ok_enc, encoded = pcall(vim.json.encode, obj)
+  if not ok_enc then
+    return false
+  end
+  local path = private_dir .. "/stream.ndjson"
+  local fd = uv.fs_open(path, "a", tonumber("644", 8))
+  if not fd then
+    return false
+  end
+  local written, _err = write_all(fd, encoded .. "\n")
+  pcall(uv.fs_close, fd)
+  return written == #encoded + 1
 end
 
 return M

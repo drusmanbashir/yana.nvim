@@ -14,9 +14,28 @@ mapfile -t required < <(
 		-c qa
 )
 
+# bwrap_userns_row() (lua/yana/dependencies.lua) probes the kernel by
+# actually launching bwrap with a trivial no-op payload, `true`, INSIDE the
+# sandbox it builds -- that probe's own PATH is inherited from whatever
+# spawned nvim, i.e. the narrowed PATH this harness builds below. `true` is
+# not a Yana dependency (it names no package a real install could be missing
+# -- every POSIX host ships coreutils), so it does not belong in
+# required_executables()'s list; it is an implementation detail of the
+# kernel probe, and this harness's job is to keep that probe truthful, not to
+# grow the product's own dependency surface for it. Root-caused 2026-08-21
+# (order B4 Part B3): omitting it here reproduced
+# `bwrap: execvp true: No such file or directory` on the exported tree.
+# `type -P`, not `command -v`: true is also a bash BUILTIN, and `command -v`
+# reports a builtin by its bare name with no path, which would make the
+# symlink below point at itself (ELOOP) instead of at the real external
+# binary bwrap's execve actually needs.
+true_bin=$(type -P true)
+[[ -n "$true_bin" ]] || { echo "dependency gate host lacks true" >&2; exit 2; }
+
 for missing in "${required[@]}"; do
 	path="$scratch/path-$missing"
 	mkdir -p "$path"
+	ln -s "$true_bin" "$path/true"
 	for command in "${required[@]}"; do
 		[[ "$command" == "$missing" ]] && continue
 		resolved=$(command -v "$command")
@@ -38,6 +57,7 @@ done
 
 optional_path="$scratch/path-optional"
 mkdir -p "$optional_path"
+ln -s "$true_bin" "$optional_path/true"
 for command in "${required[@]}"; do
 	resolved=$(command -v "$command")
 	[[ -n "$resolved" ]] || { echo "dependency gate host lacks $command" >&2; exit 2; }

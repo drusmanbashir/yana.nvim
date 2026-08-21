@@ -14,7 +14,13 @@ local confined_executables = {
   -- then the agent never runs at all -- name-only presence checks above
   -- (bwrap, mount) would still report the machine ready.
   "capsh",
-  "python3",
+  -- python3 is NOT here. It is a hard dependency only when
+  -- `inline_exec_allowlist` is configured (bin/yana-overlay-inner execs into
+  -- it to set up the Landlock ruleset -- see apply_exec_allowlist there);
+  -- every confined turn without that option never spawns python3 at all.
+  -- M.required_executables() below appends it conditionally, and M.check()
+  -- reports it as an optional (warn) row the rest of the time, matching
+  -- sqlite3/md5 below.
   "realpath",
   "sha256sum",
   "flock",
@@ -50,11 +56,38 @@ function M.required_executables(mode)
   if mode == "agentic" then
     return {}
   end
-  return vim.deepcopy(confined_executables)
+  local list = vim.deepcopy(confined_executables)
+  if type(config.options.inline_exec_allowlist) == "table" then
+    list[#list + 1] = "python3"
+  end
+  return list
 end
 
 local function row(id, level, message, remedy, resolved)
   return { id = id, level = level, message = message, remedy = remedy, resolved = resolved }
+end
+
+-- Real distro package names for required executables whose literal exec
+-- name is NOT itself an installable apt/dnf/pacman package -- validated
+-- against live Ubuntu 24.04 (apt) and Fedora (dnf) containers by
+-- packets/freshdep-audit-20260820.md Part 1b (the pacman column follows
+-- that packet's Part 3 proposal but was not tested against a live Arch
+-- machine). scripts/install-deps.sh carries its own copy of this same
+-- mapping, since it must run before Neovim or this file is ever loaded --
+-- keep the two in sync when either changes.
+local EXEC_PACKAGE_HINT = {
+  bwrap = "the 'bubblewrap' package",
+  capsh = "the package providing capsh -- 'libcap2-bin' on Debian/Ubuntu, 'libcap' on Fedora/Arch",
+  flock = "the 'util-linux' package (provides flock/mount/umount)",
+  mount = "the 'util-linux' package (provides flock/mount/umount)",
+  umount = "the 'util-linux' package (provides flock/mount/umount)",
+  find = "the 'findutils' package",
+  awk = "the 'gawk' package",
+  getent = "the package providing getent -- 'libc-bin' on Debian/Ubuntu, 'glibc-common' on Fedora",
+}
+
+local function package_hint(name)
+  return EXEC_PACKAGE_HINT[name] or ("the '" .. name .. "' package")
 end
 
 local function executable_row(name, required)
@@ -63,12 +96,17 @@ local function executable_row(name, required)
     return row("exec:" .. name, "ok", name .. " found: " .. resolved, nil, resolved)
   end
   local level = required and "error" or "warn"
-  return row(
-    "exec:" .. name,
-    level,
-    name .. " not found on PATH",
-    required and ("install " .. name .. " and restart Neovim") or ("install " .. name .. " to enable this optional feature")
-  )
+  local remedy
+  if required then
+    remedy = "install "
+      .. package_hint(name)
+      .. " and restart Neovim (run scripts/install-deps.sh for the exact command for your distro)"
+  else
+    remedy = "install "
+      .. package_hint(name)
+      .. " to enable this optional feature (run scripts/install-deps.sh for the exact command)"
+  end
+  return row("exec:" .. name, level, name .. " not found on PATH", remedy)
 end
 
 -- Runs `cmd` and returns (true, systemobj_result) on completion, or (false,
@@ -110,7 +148,7 @@ local function bwrap_userns_row()
       "bwrap:userns",
       "error",
       "cannot probe unprivileged user namespaces: bwrap not found on PATH",
-      "install bubblewrap and restart Neovim"
+      "install the 'bubblewrap' package and restart Neovim (run scripts/install-deps.sh for the exact command for your distro)"
     )
   end
   local ok_probe, result, probe_err = probe({
@@ -330,7 +368,8 @@ local function configured_agent_row()
     "exec:cursor-agent",
     "error",
     "cursor-agent not found for '" .. tostring(resolution.value) .. "' (" .. why .. ")",
-    "install and sign in to cursor-agent, or set require('yana').setup({ cmd = '/absolute/path/to/cursor-agent' }), "
+    "install and sign in to cursor-agent (run scripts/install-deps.sh --run, which prints the official installer "
+      .. "command and asks before running it), or set require('yana').setup({ cmd = '/absolute/path/to/cursor-agent' }), "
       .. "or export the environment variable named by cmd_env (default YANA_AGENT_BIN)"
   )
 end
@@ -539,8 +578,17 @@ function M.check(mode, opts)
 
   if mode ~= "agentic" then
     kernel_rows(rows)
-    for _, name in ipairs(M.required_executables(mode)) do
+    local required_now = M.required_executables(mode)
+    local python3_required = false
+    for _, name in ipairs(required_now) do
       rows[#rows + 1] = executable_row(name, true)
+      python3_required = python3_required or name == "python3"
+    end
+    if not python3_required then
+      -- inline_exec_allowlist is unset, so bin/yana-overlay-inner never
+      -- execs python3 for this turn -- report it the same way sqlite3/md5
+      -- are reported below: present-if-found, optional either way.
+      rows[#rows + 1] = executable_row("python3", false)
     end
     -- Presence checks above prove a name resolves; these prove the resolved
     -- binary can do what the confined launchers actually need from it.
@@ -559,7 +607,8 @@ function M.check(mode, opts)
       "exec:md5",
       "warn",
       "md5sum/md5 not found; only sessions started from Neovim can be listed",
-      "install md5sum or md5 to enable external-session discovery"
+      "install the 'coreutils' package (provides md5sum) to enable external-session discovery "
+        .. "(run scripts/install-deps.sh for the exact command)"
     )
   end
 
@@ -572,12 +621,25 @@ function M.preflight(mode)
   -- design), so skipping it here changes nothing about whether a turn is
   -- refused, only removes an unconfined spawn of the agent binary this gate
   -- never needed.
+  --
+  -- Collect EVERY error-level row, not just the first: a fresh machine
+  -- missing cursor-agent used to see only "[exec:cursor-agent] ..." on every
+  -- retry, because this loop returned on the first hit -- the confined-mode
+  -- executables behind it (bwrap, capsh, python3, ...) stayed invisible
+  -- until cursor-agent was installed and the user retried again, one
+  -- restart per dependency (packets/freshdep-audit-20260820.md Part 1). One
+  -- refusal now names all of them, and points at the one-command installer.
+  local errors = {}
   for _, item in ipairs(M.check(mode, { probe_agent_version = false })) do
     if item.level == "error" then
-      return false, string.format("[%s] %s - %s", item.id, item.message, item.remedy)
+      errors[#errors + 1] = string.format("[%s] %s - %s", item.id, item.message, item.remedy)
     end
   end
-  return true
+  if #errors == 0 then
+    return true
+  end
+  return false,
+    table.concat(errors, "\n") .. "\nrun scripts/install-deps.sh to install what it can, and see the remedies above."
 end
 
 return M

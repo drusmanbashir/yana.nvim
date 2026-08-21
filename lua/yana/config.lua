@@ -58,6 +58,62 @@ M.defaults = {
   -- grouping and retention strength only; they never grant safety.
   artifact_dir_prefixes = {},
 
+  -- ALPHA: nil keeps historical inline behaviour. A list narrows inline-mode
+  -- executable launch to these executable basenames/paths by kernel rule.
+  -- Ask and agentic modes do not receive the rule.
+  inline_exec_allowlist = nil,
+
+  -- Directories OUTSIDE the opened workspace that a turn may write, each one
+  -- confined, claimed and reviewed exactly like the workspace itself (see the
+  -- external-roots module doc). The opened workspace is always root 1
+  -- and is never listed here.
+  --
+  -- THE SET IS OPERATOR-DECLARED AND NOTHING ELSE MAY WIDEN IT. CORE's
+  -- cardinal principle is that nothing agent-influenced selects confinement
+  -- scope, so these come from setup()/config or an explicit operator command
+  -- and from nowhere else: not from agent output, not from a path found in the
+  -- workspace, not from an env var a turn could set. A write into a directory
+  -- that is not the workspace and not listed here stays EROFS, and the refusal
+  -- names the `write_roots` line that would declare it.
+  --
+  -- Entries are absolute (a leading `~` is expanded here); everything else --
+  -- existence, overlap with the workspace or with each other, resolving inside
+  -- yana's own state root -- is checked at TURN START, where a bad entry
+  -- refuses the turn by name before the agent is launched. Each declared root
+  -- costs one more overlay mount and one more claim per turn (measured ~181 ms
+  -- per root on the reference box).
+  write_roots = {},
+
+  -- THE BROAD ROOT: the ONE directory the turn's single overlay is mounted at
+  -- (PLAN-R1-capture.md §1). Everything beneath it is writable inside the jail
+  -- and every write lands in the turn's private upper layer -- the opened
+  -- repository, a sibling repository, a directory that did not exist when the
+  -- turn started. Everything outside it stays the plain read-only host bind.
+  --
+  -- `nil` means "choose it from filesystem position", which is the default and
+  -- the cardinal principle applied to breadth: `$HOME/code` when it is an
+  -- ancestor of the resolved workspace, else `$HOME`, else the workspace
+  -- itself. Set it to NARROW that choice (one monorepo instead of all of
+  -- `~/code`) or to widen it deliberately. It is an OPERATOR setting and
+  -- nothing a turn produces may reach it: not agent output, not a path found
+  -- in the workspace, not an env var a turn could set.
+  --
+  -- Validated at TURN START, where a bad value refuses the turn by name: it
+  -- must exist, must be an ancestor of (or equal to) the resolved workspace,
+  -- and must not contain yana's own state root -- the overlay may never cover
+  -- the layers it is written into.
+  capture_root = nil,
+
+  -- Directories that are a WORKSPACE even though they hold no `.git`
+  -- (PLAN-R1-capture.md §8 row 3). Workspace resolution asks, in order: the
+  -- nearest `.git` root at or above the open file; then the entry here that
+  -- contains it; then the file's own folder. A repository always wins, because
+  -- the repository is the unit a claim is taken on.
+  --
+  -- Same provenance rule as every other scope setting: operator-declared,
+  -- absolute (a leading `~` is expanded), never derived from a turn.
+  workspace_roots = {},
+
   -- Buffer-local keys during inline hunk review (Avante replace_in_file parity).
   diff_keymaps = {
     ours = "co",
@@ -76,20 +132,33 @@ M.defaults = {
     hint = { link = "Comment" },
   },
 
-  -- Winbar mode chip: git-style palette aligned with diff_highlights above.
-  -- Each mode maps to a YanaMode* highlight group applied in the panel winbar.
+  -- Winbar mode chip. The active mode is the one thing on the bar the operator
+  -- must read at a glance, so it carries the standout colour. `agentic` keeps a
+  -- warning colour of its own because it writes the real workspace with no
+  -- review. Each mode maps to a YanaMode* group applied in the panel winbar.
   mode_highlights = {
-    ask = { link = "Comment" },
-    inline = { link = "DiffAdd" },
-    agentic = { link = "DiffChange" },
+    ask = { link = "Special" },
+    inline = { link = "Special" },
+    agentic = { link = "WarningMsg" },
   },
 
-  -- Winbar model chip (`model: auto` or the chosen model id).
-  model_highlight = { link = "Special" },
+  -- Winbar model chip (`model: auto` or the chosen model id). It reads "auto"
+  -- unless the operator picked a model, so it steps back to a blue hue and
+  -- leaves the standout colour to the mode chip.
+  model_highlight = { link = "Identifier" },
 
   -- Prepended to agent-mode prompts. Nil disables.
+  --
+  -- Prompt layer only (packets/DESIGN-multiroot-inline-speed-20260820.md,
+  -- Defect B, design step 1 of 2). This is compliance-by-request, not
+  -- enforcement: a vendor model can honor it or ignore it, and a hostile or
+  -- careless agent binary is not bound by it at all. The jail layer (design
+  -- step 2 -- the overlay's shell surface refusing execution-class argv in
+  -- inline mode) is the enforcement that holds regardless of what the model
+  -- does with this text, and does not exist yet.
   agent_instructions = [[
-Agent mode: you have write access. When the user asks to populate, add, change, or give an example in a file, EDIT that file with the Edit File tool immediately — do not only reply in chat or ask whether to paste. Use minimal diffs at the referenced line numbers. When a visual selection is attached, prefer edits inside the stated edit zone; out-of-zone edits may be rejected or flagged before review. The user reviews each edit as inline hunks in the open file (co/ct/ca) before it is final.
+{{YANA_WRITABLE_BOUNDARY}}
+Agent mode: when the user asks to populate, add, change, or give an example in a file, EDIT that file with the Edit File tool immediately — do not only reply in chat or ask whether to paste. Use minimal diffs at the referenced line numbers. When a visual selection is attached, prefer edits inside the stated edit zone; out-of-zone edits may be rejected or flagged before review. The user reviews each edit as inline hunks in the open file (co/ct/ca) before it is final. Propose edits only — never run compilers, test suites, or import/smoke checks; the user's hunk-by-hunk review is the validation step here, not a shell command. If validation like that is actually needed, say so and let the user switch to agentic mode, where it belongs.
 ]],
 
   selection_scope = {
@@ -646,6 +715,113 @@ function M.normalize_skill_dirs(dirs)
   return out
 end
 
+--- Shape only. A `write_roots` entry that does not exist, overlaps another
+--- root or lands inside the state root is a TURN-START refusal naming the root
+--- (`shadow/preview.lua`'s resolve_roots), not a setup error: the directory may
+--- legitimately appear after the editor started, and a refusal that names the
+--- offending root at the moment a turn needs it is the actionable one.
+---
+--- Entries are sorted here, which is also the ACQUISITION order: claims are
+--- taken in canonical-path order so two editors racing for overlapping root
+--- sets attempt them in the same sequence and neither ends up holding half.
+function M.normalize_write_roots(roots)
+  if roots == nil then
+    return {}
+  end
+  if type(roots) ~= "table" then
+    error("write_roots must be a list of absolute directory paths")
+  end
+  local out, seen = {}, {}
+  for _, entry in ipairs(roots) do
+    if type(entry) ~= "string" or entry == "" then
+      error("write_roots entries must be non-empty absolute directory paths")
+    end
+    local expanded = vim.fn.expand(entry)
+    if type(expanded) ~= "string" or expanded == "" then
+      error("write_roots entry could not be expanded: " .. entry)
+    end
+    if expanded:sub(1, 1) ~= "/" then
+      error("write_roots entries must be absolute paths (a leading ~ is expanded): " .. entry)
+    end
+    expanded = expanded:gsub("/+$", "")
+    if expanded == "" then
+      error("write_roots may not declare the filesystem root")
+    end
+    if not seen[expanded] then
+      seen[expanded] = true
+      out[#out + 1] = expanded
+    end
+  end
+  table.sort(out)
+  return out
+end
+
+--- Shape only, exactly like `normalize_write_roots`: existence and the
+--- ancestor/state-root questions are TURN-START refusals naming the directory
+--- (`shadow/preview.lua`'s `workspace_for_turn`/`broad_root_for`), because the
+--- directory may legitimately appear after the editor started.
+function M.normalize_workspace_roots(roots)
+  if roots == nil then
+    return {}
+  end
+  if type(roots) ~= "table" then
+    error("workspace_roots must be a list of absolute directory paths")
+  end
+  local out, seen = {}, {}
+  for _, entry in ipairs(roots) do
+    if type(entry) ~= "string" or entry == "" then
+      error("workspace_roots entries must be non-empty absolute directory paths")
+    end
+    local expanded = vim.fn.expand(entry)
+    if type(expanded) ~= "string" or expanded == "" then
+      error("workspace_roots entry could not be expanded: " .. entry)
+    end
+    if expanded:sub(1, 1) ~= "/" then
+      error("workspace_roots entries must be absolute paths (a leading ~ is expanded): " .. entry)
+    end
+    expanded = expanded:gsub("/+$", "")
+    if expanded == "" then
+      error("workspace_roots may not declare the filesystem root")
+    end
+    if not seen[expanded] then
+      seen[expanded] = true
+      out[#out + 1] = expanded
+    end
+  end
+  -- Longest first: the NEAREST configured root wins when two of them nest,
+  -- which is the same "nearest wins" rule the `.git` walk already uses.
+  table.sort(out, function(a, b)
+    if #a == #b then
+      return a < b
+    end
+    return #a > #b
+  end)
+  return out
+end
+
+--- Shape only. One absolute directory or nil; everything else is a TURN-START
+--- refusal naming it.
+function M.normalize_capture_root(root)
+  if root == nil or root == "" then
+    return nil
+  end
+  if type(root) ~= "string" then
+    error("capture_root must be an absolute directory path, or nil")
+  end
+  local expanded = vim.fn.expand(root)
+  if type(expanded) ~= "string" or expanded == "" then
+    error("capture_root could not be expanded: " .. root)
+  end
+  if expanded:sub(1, 1) ~= "/" then
+    error("capture_root must be an absolute path (a leading ~ is expanded): " .. root)
+  end
+  expanded = expanded:gsub("/+$", "")
+  if expanded == "" then
+    error("capture_root may not be the filesystem root")
+  end
+  return expanded
+end
+
 function M.normalize_artifact_dir_prefixes(prefixes)
   if prefixes == nil then
     return {}
@@ -668,6 +844,40 @@ function M.normalize_artifact_dir_prefixes(prefixes)
     if not seen[name] then
       seen[name] = true
       out[#out + 1] = name
+    end
+  end
+  table.sort(out)
+  return out
+end
+
+function M.normalize_inline_exec_allowlist(list)
+  if list == nil then
+    return nil
+  end
+  if type(list) ~= "table" then
+    error("inline_exec_allowlist must be nil or a list of executable basenames/paths")
+  end
+  local out, seen = {}, {}
+  for _, entry in ipairs(list) do
+    if type(entry) ~= "string" or entry == "" or entry:find("\0", 1, true) then
+      error("inline_exec_allowlist entries must be non-empty executable basenames/paths")
+    end
+    local resolved
+    if entry:sub(1, 1) == "/" or entry:sub(1, 1) == "~" then
+      resolved = vim.fn.expand(entry)
+    else
+      resolved = vim.fn.exepath(entry)
+      if resolved == "" then
+        error("inline_exec_allowlist entry is not executable on PATH: " .. entry)
+      end
+    end
+    resolved = vim.loop.fs_realpath(resolved) or vim.fn.fnamemodify(resolved, ":p")
+    if vim.fn.executable(resolved) ~= 1 then
+      error("inline_exec_allowlist entry is not executable: " .. resolved)
+    end
+    if not seen[resolved] then
+      seen[resolved] = true
+      out[#out + 1] = resolved
     end
   end
   table.sort(out)
@@ -723,6 +933,10 @@ function M.setup(opts)
   next_options.inline_edit = M.normalize_inline_edit(next_options.inline_edit)
   next_options.skill_dirs = M.normalize_skill_dirs(next_options.skill_dirs)
   next_options.artifact_dir_prefixes = M.normalize_artifact_dir_prefixes(next_options.artifact_dir_prefixes)
+  next_options.write_roots = M.normalize_write_roots(next_options.write_roots)
+  next_options.workspace_roots = M.normalize_workspace_roots(next_options.workspace_roots)
+  next_options.capture_root = M.normalize_capture_root(next_options.capture_root)
+  next_options.inline_exec_allowlist = M.normalize_inline_exec_allowlist(next_options.inline_exec_allowlist)
   next_options.cmd_env = M.normalize_cmd_env(next_options.cmd_env)
   next_options.enable_agentic = next_options.enable_agentic == true
   next_options.mode = M.normalize_mode(next_options.mode, next_options.enable_agentic)

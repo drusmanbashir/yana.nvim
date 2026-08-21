@@ -52,6 +52,7 @@ local cancel_inflight   -- defined after submit_panel; used by scope rejection c
 local submit_panel      -- defined below; forward-declared so on_done can drain the queue
 local maybe_drain_queue -- defined below; review-close drain after release_shadow_turn
 local finalize_shadow_turn -- confirmed-exit overlay consume; also used by on_done spawn-fail
+local render_note
 
 local function buf_valid(buf)
   return buf and vim.api.nvim_buf_is_valid(buf)
@@ -413,93 +414,32 @@ end
 -- nothing to get wrong. Every precondition below is MEASURED, never assumed.
 ----------------------------------------------------------------------
 
+--- STAGE 0/1 RENEWAL LIVES IN `lua/yana/renewal.lua`.
+---
+--- It moved out of this file when the brief grew the four duties the contract
+--- actually names — build it from yana's own records, BIND it to the session
+--- and turn it continues, SHOW it, and INJECT it exactly once — because each
+--- of those is a place a handoff can silently lose something and none of them
+--- is panel plumbing. What stays here is the three call sites: the refusal
+--- before a switch, the staging at the switch, and the single consumption in
+--- the prompt assembly.
+---
+--- These three thin delegates keep the existing `ui._test` seams (and the rows
+--- that drive them) pointing at one implementation rather than two.
+local renewal = require("yana.renewal")
+
 --- Why this chat cannot renew right now, or nil if it can. Returns a message
 --- naming the failing condition AND the action that clears it: a refusal the
 --- operator cannot act on is only marginally better than a hang.
 local function renewal_blocked_reason(p)
-  if not p then
-    return "no panel"
-  end
-  -- 1. no turn in flight
-  if p.busy or p.job ~= nil or p.awaiting_exit then
-    return "a turn is still running — wait for it to finish, or :YanaStop"
-  end
-  -- 2. no open review and no pending changes for this workspace
-  local pending = require("yana.diff").pending(p.changes or {})
-  if #pending > 0 then
-    return string.format(
-      "%d change(s) are still awaiting your decision — accept or reject them first (ca / :YanaReject)",
-      #pending
-    )
-  end
-  if require("yana.inline_diff").active_state({}) ~= nil then
-    return "a review is open — finish or reject it first"
-  end
-  -- 3/4. the claim carries no review-open marker, and the previous turn
-  -- released it. Read from DISK rather than from our own memory of it: the
-  -- marker outliving the process is exactly the case this must not miss.
-  local turn = p.shadow_turn
-  local claim_dir = turn and turn.claim_dir or nil
-  if claim_dir == nil and p.cwd then
-    local okp, preview = pcall(require, "yana.shadow.preview")
-    if okp then
-      local okc, dir = pcall(preview.claim_dir, p.cwd)
-      claim_dir = okc and dir or nil
-    end
-  end
-  if claim_dir then
-    local okj, jail = pcall(require, "yana.shadow.jail")
-    if okj then
-      if jail.review_open(claim_dir) then
-        return "this workspace still has an open review recorded on disk — finish or reject it first"
-      end
-      if jail.claim_held(claim_dir) then
-        return "the previous turn has not released its workspace claim yet — wait a moment, or release it if the holder is gone"
-      end
-    end
-  end
-  -- 5. no unresolved diary bundle awaiting apply or replay.
-  --
-  -- NOT IMPLEMENTED, AND THEREFORE ENFORCED THE ONLY HONEST WAY IT CAN BE.
-  -- The spec requires all five preconditions to be MEASURED, never assumed.
-  -- `diary` exposes no "is anything unresolved for this workspace" query today
-  -- (it has open/apply_pending/list_displaced/recover_displaced, none of which
-  -- answers it), and a check written against a function that does not exist is
-  -- a check that can never fail -- the precise defect this project has spent
-  -- the day removing from its own tests.
-  --
-  -- So this precondition is satisfied STRUCTURALLY rather than by query: the
-  -- checks above already refuse while any change is pending, while a review is
-  -- open, and while the claim is held or carries a review-open marker. A diary
-  -- bundle awaiting apply cannot exist without at least one of those being
-  -- true, because a bundle is opened for a turn and resolved at accept/reject.
-  --
-  -- That argument is a DERIVATION, not a measurement, and it is written here so
-  -- it can be attacked rather than assumed. When diary grows a real query, this
-  -- becomes a direct check and the derivation goes away. Until then, the
-  -- weakest link in Stage 0 is named and it is this one.
-  return nil
+  return renewal.blocked_reason(p)
 end
 
-local function extract_answer_artifact(answer)
-  if type(answer) ~= "string" or answer == "" then
-    return nil
-  end
-  local blocks = {}
-  for block in answer:gmatch("```[%w_%-]*\n(.-)\n```") do
-    local body = vim.trim(block)
-    if body ~= "" then
-      blocks[#blocks + 1] = body
-    end
-  end
-  if #blocks > 0 then
-    return table.concat(blocks, "\n\n")
-  end
-  return answer
-end
-
+--- The `ask` answer's artifact, re-composed as an instruction the next turn can
+--- act on directly. The artifact extraction is the renewal module's, so the
+--- resend path and the brief can never disagree about what "the answer" is.
 local function build_apply_resend(question, answer)
-  local artifact = extract_answer_artifact(answer)
+  local artifact = renewal.answer_artifact(answer)
   if artifact == nil or artifact == "" then
     return question
   end
@@ -511,58 +451,14 @@ local function build_apply_resend(question, answer)
   }, "\n")
 end
 
---- The brief handed to the renewed session, and shown to the operator at the
---- same moment. Explicitly NOT the raw transcript: a brief the operator can
---- read in five lines beats a replay nobody checks, and a handoff they cannot
---- see is a handoff they cannot correct.
+--- The brief AS THE OPERATOR SEES IT at the moment of switching. Explicitly
+--- NOT the raw transcript: a brief the operator can read in five lines beats a
+--- replay nobody checks, and a handoff they cannot see is a handoff they
+--- cannot correct.
 local function renewal_brief(p, from_mode, to_mode)
-  local lines = {
-    "Continuing an existing conversation in a new mode.",
-    string.format("Workspace: %s", tostring(p.cwd or vim.fn.getcwd())),
-    string.format("Mode: %s (was %s)", tostring(to_mode), tostring(from_mode)),
-  }
-  if p.last_question and p.last_question ~= "" then
-    local q = tostring(p.last_question):gsub("%s+", " ")
-    if #q > 300 then
-      q = q:sub(1, 300) .. "…"
-    end
-    lines[#lines + 1] = "Previous instruction: " .. q
-  end
-  local artifact = extract_answer_artifact(p.last_answer_text)
-  if artifact and artifact ~= "" then
-    if #artifact > 1200 then
-      artifact = artifact:sub(1, 1200) .. "\n…"
-    end
-    lines[#lines + 1] = "Last ask artifact:"
-    lines[#lines + 1] = artifact
-  end
-  local accepted, rejected, refused = {}, {}, {}
-  for _, c in ipairs(p.changes or {}) do
-    local name = c.rel or c.path
-    if name then
-      if c.status == "accepted" then
-        accepted[#accepted + 1] = name
-      elseif c.status == "rejected" then
-        rejected[#rejected + 1] = name
-      end
-      if c.review_error and c.review_error ~= "" then
-        refused[#refused + 1] = name .. " (" .. tostring(c.review_error) .. ")"
-      end
-    end
-  end
-  if #accepted > 0 then
-    lines[#lines + 1] = "Accepted last turn: " .. table.concat(accepted, ", ")
-  end
-  if #rejected > 0 then
-    lines[#lines + 1] = "Rejected last turn: " .. table.concat(rejected, ", ")
-  end
-  -- A refusal is part of the story: a control-plane refusal in particular is
-  -- something the next session must not be told happened cleanly.
-  if #refused > 0 then
-    lines[#lines + 1] = "Refused: " .. table.concat(refused, ", ")
-  end
-  return table.concat(lines, "\n")
+  return renewal.display_text(renewal.build(p, from_mode, to_mode))
 end
+
 
 local function mode_change_refused_notify(p, reason)
   local nk = (config.options.keymaps or {}).new_chat
@@ -623,6 +519,234 @@ local function reconcile_pending(p, panel_pending)
       )
     end
   end
+end
+
+----------------------------------------------------------------------
+-- turn liveness: elapsed, last event, stall notice
+----------------------------------------------------------------------
+--
+-- A spinner says "something is happening". It does not say WHAT, or WHEN it
+-- last happened, and that difference cost a whole E2E run on 2026-08-20: an
+-- inline turn wrote 859 events in 225 s, ended on a vendor `taskToolCall`
+-- `started` (a nested subagent), and then sat alive and mute for 11 minutes
+-- until the harness gave up at 900 s. The vendor does not forward a
+-- subagent's output into the parent stream-json, so from the panel's side
+-- "working" and "hung" were the same picture, and nothing on screen named an
+-- action the operator could take.
+--
+-- What this adds is the smallest honest report: how long the turn has run,
+-- how long since the last event the agent produced, a short label for that
+-- event, and -- once the silence passes a fixed threshold -- the word
+-- `stalled` next to the command that ends it.
+--
+-- WHAT IT DELIBERATELY DOES NOT DO: kill anything. A live process is not a
+-- dead one because its output paused; a nested task can legitimately run for
+-- minutes without the parent stream saying a word. Automatic classification
+-- of a turn as dead has exactly one owner, the claims-concurrency rules, and
+-- it requires the process set to be EMPTY, never a statistic about quietness.
+-- This surface reports; :YanaStop acts.
+--
+-- The cadence is free: the spinner timer already ticks every 100 ms for the
+-- whole life of a turn and already calls update_winbar. Silence does not
+-- block the loop, so the elapsed and quiet-for counters keep moving exactly
+-- when they matter.
+
+-- PRODUCT POLICY, NOT AN OPERATOR OPTION (project ruling: constants are
+-- policy). Measured against the turn that motivated it: across its 857
+-- timestamped events the widest healthy gap between two events was 22.6 s
+-- (99th percentile 4.9 s). 90 s is about four times the widest gap that turn ever
+-- produced -- wide enough that an ordinary turn never accuses itself, narrow
+-- enough that an operator is not left guessing for minutes. The only thing
+-- that may move it is a test seam (`ui._test.set_stall_threshold_ms`), because
+-- a row that had to sit through 90 real seconds could not exist.
+local STALL_THRESHOLD_MS = 90000
+local stall_threshold_override = nil
+
+local function stall_threshold_ms()
+  return stall_threshold_override or STALL_THRESHOLD_MS
+end
+
+-- Durations an operator reads at a glance, not a precise instrument: seconds
+-- under a minute, m+s under an hour, h+m above it.
+local function fmt_duration(ms)
+  local secs = math.floor((tonumber(ms) or 0) / 1000)
+  if secs < 0 then
+    secs = 0
+  end
+  if secs < 60 then
+    return string.format("%ds", secs)
+  end
+  local mins = math.floor(secs / 60)
+  if mins < 60 then
+    return string.format("%dm%02ds", mins, secs % 60)
+  end
+  return string.format("%dh%02dm", math.floor(mins / 60), mins % 60)
+end
+
+-- The label is AGENT TEXT on a statusline-syntax option. A nested task's
+-- description is whatever the model wrote, so it gets the same treatment the
+-- session title needed after a prompt containing "%" wedged a whole session:
+-- control characters folded to spaces (one would split the line), length
+-- bounded, and every "%" doubled LAST, after truncation, so the escape cannot
+-- itself be cut in half.
+local LABEL_MAX = 40
+local function status_label(text)
+  if type(text) ~= "string" then
+    return nil
+  end
+  local s = text:gsub("%c", " "):gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
+  if s == "" then
+    return nil
+  end
+  if #s > LABEL_MAX then
+    s = s:sub(1, LABEL_MAX - 1) .. "…"
+  end
+  return (s:gsub("%%", "%%%%"))
+end
+
+-- Liveness state is per TURN, keyed by the generation, so it is created by the
+-- first thing that asks for it after a submit and can never carry a previous
+-- turn's clock into a new one. Lazy on purpose: the submit path already calls
+-- update_winbar immediately after start_spinner, so the clock starts within
+-- microseconds of the turn starting without this having to reach into the
+-- submit path at all.
+local function liveness_for(p)
+  local live = p.liveness
+  if not live or live.gen ~= p.turn_gen then
+    live = {
+      gen = p.turn_gen,
+      started_hr = uv.hrtime(),
+      last_event_hr = nil,
+      label = nil,
+      last_event = nil,
+      events = 0,
+      open_tasks = {},
+      open_task_count = 0,
+      tasks_started = 0,
+      tasks_completed = 0,
+      forensics = nil,
+    }
+    p.liveness = live
+  end
+  return live
+end
+
+-- Stamp the last event. Called for EVERY decoded event of the current turn,
+-- before any rendering gate can drop it: an event the panel chose not to
+-- render still proves the agent is producing output, and "time since the last
+-- event" would lie if it only counted the ones that reached the buffer.
+--
+-- Nested tasks pair by `call_id`, which is the only identity the vendor gives
+-- them. Pairing is what lets a completion whose own payload has lost the
+-- description still name the task the operator was watching, and what keeps
+-- an unrelated completion from closing it.
+local function note_liveness_event(p, gen, obj)
+  if not p or gen ~= p.turn_gen then
+    return
+  end
+  local live = liveness_for(p)
+  live.last_event_hr = uv.hrtime()
+  live.events = (live.events or 0) + 1
+  local info = agent.describe_event(obj)
+  if not info then
+    -- Nothing meaningful to say; the previous label stands. Blanking it would
+    -- report "the agent is doing nothing", which is a different claim.
+    return
+  end
+  if info.nested and info.call_id then
+    if info.subtype == "completed" then
+      local open = live.open_tasks[info.call_id]
+      if open then
+        live.open_tasks[info.call_id] = nil
+        live.open_task_count = math.max(0, live.open_task_count - 1)
+        live.tasks_completed = live.tasks_completed + 1
+        if open.description and not info.description then
+          info.description = open.description
+          info.label = "task done: " .. open.description
+        end
+      end
+    elseif info.subtype == "started" and live.open_tasks[info.call_id] == nil then
+      live.open_tasks[info.call_id] = {
+        description = info.description,
+        started_hr = live.last_event_hr,
+        marker_emitted = false,
+      }
+      live.open_task_count = live.open_task_count + 1
+      live.tasks_started = live.tasks_started + 1
+      -- Re-armed, not one-shot: a timer fires at or after its delay, and the
+      -- floored age could read one millisecond short of the threshold at the
+      -- boundary, which silently dropped the marker about half the time on
+      -- the merge battery (2026-08-20). If the task is still open but young,
+      -- wait the remainder and look again.
+      local function arm_open_marker(delay_ms)
+      vim.defer_fn(function()
+        log.guard("yana.ui tool_call.open marker", function()
+          local cur = p and p.liveness
+          local open = cur and cur.open_tasks and cur.open_tasks[info.call_id]
+          if not open or open.marker_emitted or cur.gen ~= gen then
+            return
+          end
+          local age_exact = (uv.hrtime() - open.started_hr) / 1e6
+          local age_ms = math.floor(age_exact)
+          if age_exact < stall_threshold_ms() then
+            arm_open_marker(math.max(1, math.ceil(stall_threshold_ms() - age_exact)))
+            return
+          end
+          open.marker_emitted = true
+          local desc = open.description or "nested task"
+          log.lifecycle("tool_call.open", {
+            panel = p.id,
+            generation = gen,
+            call_id = info.call_id,
+            age_ms = age_ms,
+            description = desc,
+          })
+          if render_note then
+            render_note(p, string.format("sub-task open for %s: %s", fmt_duration(age_ms), desc))
+          end
+        end)
+      end, delay_ms)
+      end
+      arm_open_marker(stall_threshold_ms())
+    end
+  end
+  live.last_event = info
+  live.label = status_label(info.label) or live.label
+end
+
+-- The status segment itself. Empty unless a turn is in flight: an idle panel
+-- has no elapsed time to report and a counter that keeps running after the
+-- turn ended would be the same lie a spinner that outlives its operation is.
+local function liveness_text(p)
+  if not p.busy then
+    return ""
+  end
+  local live = liveness_for(p)
+  local now = uv.hrtime()
+  local elapsed = math.floor((now - live.started_hr) / 1e6)
+  local quiet = math.floor((now - (live.last_event_hr or live.started_hr)) / 1e6)
+  local ast = agent.status(p.job)
+  local cpu = ast and tonumber(ast.cpu_pct) or 0
+  -- Before the first event there is nothing to have been silent SINCE, so the
+  -- label says what is true: the turn is starting.
+  local label = live.label or "starting"
+  if quiet >= stall_threshold_ms() and cpu > 0.1 then
+    return string.format(
+      " · %s · working silently (CPU %.1f%%) · last: %s",
+      fmt_duration(elapsed),
+      cpu,
+      label
+    )
+  end
+  if quiet >= stall_threshold_ms() then
+    return string.format(
+      " · %s · stalled %s — :YanaStop · last: %s",
+      fmt_duration(elapsed),
+      fmt_duration(quiet),
+      label
+    )
+  end
+  return string.format(" · %s · %s since %s", fmt_duration(elapsed), fmt_duration(quiet), label)
 end
 
 local function mode_chip(p)
@@ -713,8 +837,14 @@ local function winbar_text(p)
     -- owed. Saying so beats saying nothing, which reads as "no overlay".
     shadow = " · shadow:confined"
   end
-  return string.format("%%#Title#%s%%* · %s · %s%s%s%s%s%s",
+  -- The liveness segment sits immediately after the spinner/state word and
+  -- BEFORE the mode and model chips: it is the most volatile thing on the bar
+  -- and the only thing that changes while the operator is waiting. Everything
+  -- to its right keeps the exact position and text it had before, so an
+  -- ordinary turn looks as it always did apart from these few characters.
+  return string.format("%%#Title#%s%%*%s · %s · %s%s%s%s%s%s",
     left,
+    liveness_text(p),
     mode_chip(p),
     model_chip(p),
     pend,
@@ -902,7 +1032,7 @@ local function commit_stream(p)
   p.assistant_start = vim.api.nvim_buf_line_count(p.conv_buf)
 end
 
-local function render_note(p, text)
+render_note = function(p, text)
   append(p, { "_" .. text .. "_", "" }, "note")
 end
 
@@ -1283,6 +1413,13 @@ local function release_shadow_turn(p, reason)
   end
   local preview = preview_module()
   local ok, err = preview.release(turn)
+  -- Sibling of the claim directory (never inside it — see the write site in
+  -- finalize_shadow_turn_body), so nothing else removes it: a released claim
+  -- with no cleanup here would leak one file per turn that ever opened a
+  -- review, forever.
+  if ok and turn.claim_dir then
+    pcall(vim.fn.delete, turn.claim_dir .. ".review-files")
+  end
   if ok and pass then
     log.lifecycle("claim.release", {
       turn_id = pass.turn_id,
@@ -1416,6 +1553,16 @@ local function inline_review_opts(p, change)
       end
       return owner and lifecycle.bind_callback(owner, "shadow accept", accept) or accept
     end)() or nil,
+    -- Ruling 48: `U` undoes the whole turn, and a file already accepted is
+    -- already on disk. The write that puts it back is journaled like every
+    -- other real-tree write; the engine owns WHEN, the applier owns HOW.
+    on_shadow_revert = journaled and function(c)
+      local panel = current_panel()
+      if not panel then
+        return false, "no panel"
+      end
+      return shadow_apply.revert_to_turn_start(panel, c)
+    end or nil,
     on_accept = function(c)
       refresh_change_block(p, c)
       refresh_all_review_claims(p)
@@ -1571,8 +1718,25 @@ local function render_tool_change(p, change)
     change.removed = change.removed or removed
   end
   local counts = string.format("(+%s −%s)", change.added or "?", change.removed or "?")
-  local block =
-    { "", change_header_text(change, counts), "" }
+  local header = change_header_text(change, counts)
+  do
+    -- WITH MORE THAN ONE TOUCHED REPOSITORY, `rel` ALONE IS AMBIGUOUS. Two
+    -- repositories may each hold a `src/main.py`, and the header is the
+    -- operator's only chance to see which tree a hunk is about before deciding
+    -- it. Named only when the turn actually touched several, so an ordinary
+    -- one-repository turn's header is character-for-character what it was.
+    --
+    -- `repo_count` is computed once, from the finished walk, before any hunk is
+    -- rendered (`finalize_shadow_turn_body`): reading it off the changes list
+    -- as it fills would give the first hunks a different header from the last.
+    local turn = p.shadow_turn
+    local multi = type(turn) == "table"
+      and ((type(turn.roots) == "table" and #turn.roots > 1) or (turn.repo_count or 1) > 1)
+    if multi and type(change.root) == "string" and change.root ~= "" then
+      header = header .. " _in_ `" .. notify.flatten(vim.fn.fnamemodify(change.root, ":~")) .. "`"
+    end
+  end
+  local block = { "", header, "" }
   local claim_index = nil
   do
     -- Observed, not asserted. Only ONE review is open at a time; every other
@@ -1880,6 +2044,10 @@ end
 -- has since started. Pinning `gen` for the whole callback keeps the event and
 -- the output it produced in the SAME ledger.
 local function on_event(p, gen, obj)
+  -- Liveness first, and outside the render gate: the stamp is a fact about
+  -- the PROCESS ("it produced output just now"), not about what the panel
+  -- decided to draw, and it must survive every early return below.
+  note_liveness_event(p, gen, obj)
   with_render_gen(p, gen, on_event_body, p, gen, obj)
 end
 
@@ -2024,6 +2192,99 @@ local function record_artifact_refusals(p, turn, classification)
   return true
 end
 
+-- A write the confinement refused becomes an operator-visible refusal.
+--
+-- THE DEFECT THIS CLOSES (real operator session, 2026-08-20): a turn edited
+-- its claimed workspace fine, every write into a sibling repository died
+-- EROFS — correct, the jail binds only the claimed workspace writable — and
+-- NO yana surface said so. The panel, the change-set headers and the refusal
+-- records were all silent, and the only account was the agent's own
+-- narration, which is not a yana surface. The operator saw a turn that
+-- "worked" while half the requested work had silently not happened.
+--
+-- WHY HERE. The change-set producer walks the turn's upper layer
+-- (`shadow/ops.lua` `read_records`), and a write that never landed leaves
+-- nothing under any upper dir — it is invisible there by construction, not by
+-- a missing branch. The `tool_call` branch above has only
+-- `diff.tool_summary`'s prose, the agent's own self-report, which must never
+-- select what yana records. `shadow/jail.lua` is the one place holding the
+-- confinement's own result — exit status plus `strerror(EROFS)` from a
+-- process yana itself launched into the jail — so it classifies, and this
+-- forwards.
+--
+-- The record reuses the existing `system_refused` machinery (panel note,
+-- `p.system_refusals` → `:YanaRefusals`, a ledger decision, a durable WARN),
+-- not a parallel one. Reason and remedy come from `jail.lua`'s single
+-- constants, so operator-declared write roots extend the remedy in one place.
+--
+-- TOTAL AND INERT ON AN ORDINARY TURN: no refusal record on the turn means an
+-- immediate `0`, nothing rendered, nothing logged, nothing recorded.
+local function record_confinement_refusals(p, turn)
+  local rows = turn and turn.confinement_refusals
+  if type(rows) ~= "table" or #rows == 0 then
+    return 0
+  end
+  local jail = require("yana.shadow.jail")
+  local L = turn_ledger(p, shadow_turn_gen(turn, p))
+  local reason = jail.OUT_OF_WORKSPACE_REASON
+  p.system_refusals = p.system_refusals or {}
+  local recorded = 0
+  for _, row in ipairs(rows) do
+    local paths = type(row.paths) == "table" and row.paths or {}
+    -- PER REFUSAL, not once per turn: the remedy names the `write_roots` line
+    -- that would have made THIS write legal, derived from the refused path's
+    -- own ancestors on disk (jail.declarable_write_root). A refusal that named
+    -- no path gets the unspecialised sentence, exactly as before.
+    local remedy = jail.out_of_workspace_remedy(paths)
+    -- When the confinement's own message named no path, the record still says
+    -- what happened rather than inventing one.
+    local named = #paths > 0 and table.concat(paths, ", ") or "a path outside the claimed workspace"
+    ledger.record_decision(L, {
+      action = "write_refused",
+      actor = "system",
+      status = "system_refused",
+      rel = named,
+      reason = reason,
+      detail = row.evidence,
+      remedy = remedy,
+      retention_strength = "none",
+    })
+    ledger.bump(L, "writes_refused")
+    p.system_refusals[#p.system_refusals + 1] = {
+      status = "system_refused",
+      turn = row.turn or (turn and turn.turn_id),
+      kind = "blocked_write",
+      rel = named,
+      reason = reason .. " -- " .. remedy,
+      evidence = row.evidence,
+      retention_strength = "none",
+      recovery_path = "none",
+    }
+    render_note(p, string.format("⛔ write refused: %s -- %s. %s (%s)", named, reason, remedy, tostring(row.evidence)))
+    -- WARN because log.lua persists only WARN/ERROR: a silently dropped half
+    -- of a turn has to survive the session that dropped it.
+    log.write(
+      log.levels.WARN,
+      string.format(
+        "yana: turn %s attempted a write the confinement refused at %s -- %s; %s (%s)",
+        tostring(row.turn or (turn and turn.turn_id)),
+        named,
+        reason,
+        remedy,
+        tostring(row.evidence)
+      )
+    )
+    recorded = recorded + 1
+  end
+  if (turn.confinement_refusals_dropped or 0) > 0 then
+    render_note(p, string.format(
+      "⛔ %d further refused write(s) past this turn's record cap were not listed",
+      turn.confinement_refusals_dropped
+    ))
+  end
+  return recorded
+end
+
 local function release_unsafe_turn(p, turn, classification)
   local recovery, recovery_note = preview_module().recover_layer(turn)
   local names = {}
@@ -2065,6 +2326,11 @@ local function finalize_shadow_turn_body(p, turn)
   end
   turn._review_finalized = true
   p.shadow_turn = turn
+  -- Writes the confinement itself refused during the turn (EROFS outside the
+  -- claimed workspace) become operator-visible refusals here, before any
+  -- branch decides what the turn produced: a turn with none carries no rows
+  -- and this returns 0 without rendering, logging or recording anything.
+  record_confinement_refusals(p, turn)
   if not config.overlay_mode() then
     local preview = require("yana.shadow.preview")
     -- The agent wrote into the overlay's private upper layer. That layer IS the
@@ -2097,6 +2363,24 @@ local function finalize_shadow_turn_body(p, turn)
       tracked_evidence = p.turn_pass and p.turn_pass.tracked_evidence or nil,
     })
     ledger.mark(turn_ledger(p, shadow_turn_gen(turn, p)), "change_set_read")
+    -- HOW MANY REPOSITORIES THIS TURN TOUCHED, from the walk and nothing else
+    -- (PLAN-R1-capture.md §1: grouping is computed from the walk, not declared
+    -- before the turn). Recorded on the turn so every hunk header rendered
+    -- below asks the same, already-settled question.
+    do
+      local seen, count, names = {}, 0, {}
+      for _, c in ipairs(changes or {}) do
+        local root = type(c.root) == "string" and c.root or nil
+        if root and not seen[root] then
+          seen[root] = true
+          count = count + 1
+          names[#names + 1] = root
+        end
+      end
+      table.sort(names)
+      turn.repo_count = count
+      turn.touched_repos = names
+    end
     -- Durable control-plane record (same helper the preview branch calls).
     -- Counted HERE, before the display branches, so a turn whose ONLY operations
     -- are control-plane -- which lands in the `typed and #typed > 0` branch
@@ -2164,6 +2448,35 @@ local function finalize_shadow_turn_body(p, turn)
           ledger.bump(turn_ledger(p, turn_gen), "changes_parsed")
           table.insert(p.changes, change)
           render_tool_change(p, change)
+        end
+        -- Durable "what this review is about" record, written once the bundle
+        -- is known, so a resume after this editor is gone can name the
+        -- recoverable file(s) instead of silently discarding a pending
+        -- decision (an open review belongs to an editor, and that editor may
+        -- be gone). Best-effort and decides nothing; a write that fails
+        -- leaves resume() with only the claim path to report, which it
+        -- already falls back to.
+        --
+        -- SIBLING of the claim directory, deliberately never inside it:
+        -- bin/yana-overlay's release_claim does `rm -f` on its four known
+        -- files and then a bare `rmdir`, which fails (and refuses the
+        -- release) the moment the directory holds anything it did not put
+        -- there itself. A file inside `$CLAIM` would have silently wedged
+        -- every ordinary release after the first review this turn opened —
+        -- measured: it did, and broke a same-panel second turn's review from
+        -- ever opening (see tests/behaviour_suite.sh's redo-stage coverage).
+        if turn.claim_dir then
+          local rels = {}
+          for _, change in ipairs(changes) do
+            rels[#rels + 1] = change.rel or change.path or "?"
+          end
+          pcall(function()
+            local f = io.open(turn.claim_dir .. ".review-files", "w")
+            if f then
+              f:write(table.concat(rels, "\n"))
+              f:close()
+            end
+          end)
         end
         -- CORE requires control-plane writes to be walked, COUNTED and REPORTED
         -- ("the turn wrote N control-plane files — discarded with the overlay"),
@@ -2545,6 +2858,32 @@ submit_panel = function(p, opts)
     p.pending_enable_diagnostics = extracted.enable_diagnostics
   end
 
+  -- THE CHANGED-MIND PROMPT (mode contract §3, context carry). "I changed my
+  -- mind. Do my previous request in inline mode." is a POINTER: it says what to
+  -- do only by reference to something said earlier. Sent into a renewed session
+  -- that was never told what came before, it resolves to nothing and the agent
+  -- confidently answers a question nobody asked — silent in BOTH directions,
+  -- because the operator watched their sentence go out and the agent saw a
+  -- coherent-looking instruction.
+  --
+  -- So the referent is either supplied (a resumable upstream session, or a
+  -- staged brief carrying the previous instruction/artifact) or the submit
+  -- REFUSES, naming what is missing. It is never guessed at. The typed text is
+  -- left in the prompt buffer: a refusal that also eats the sentence is worse
+  -- than the amnesia it prevents.
+  local gap = renewal.changed_mind_gap(p, question)
+  if gap then
+    notify_one_line("yana: " .. gap.condition .. " — " .. gap.action, vim.log.levels.WARN)
+    if buf_valid(p.prompt_buf) then
+      local cur = vim.trim(table.concat(vim.api.nvim_buf_get_lines(p.prompt_buf, 0, -1, false), "\n"))
+      if cur == "" then
+        vim.bo[p.prompt_buf].modifiable = true
+        vim.api.nvim_buf_set_lines(p.prompt_buf, 0, -1, false, vim.split(question, "\n", { plain = true }))
+      end
+    end
+    return
+  end
+
 
   -- opts.text arrives from drain/redirect call sites that already believed
   -- the barrier was clear; re-check defensively (I1) — a race there must
@@ -2632,12 +2971,23 @@ submit_panel = function(p, opts)
   -- worse than refusing the switch, because the operator cannot see the loss.
   -- Consumed once: a brief replayed on every later turn would drift out of date
   -- and start contradicting the live conversation.
-  if p.pending_brief and p.pending_brief ~= "" then
+  local carried, carried_brief, carried_state = renewal.consume(p)
+  if carried then
     built.prompt = "[Context carried from the earlier part of this conversation, which ran in a different mode]\n"
-      .. p.pending_brief
+      .. carried
       .. "\n\n"
       .. built.prompt
-    p.pending_brief = nil
+  elseif carried_state == "stale" then
+    -- The staged brief described a conversation that no longer exists (a
+    -- `new_chat` between the switch and this submit). Dropped, and SAID so:
+    -- a handoff that silently evaporates is the failure the operator cannot
+    -- see, which is the one the whole contract is about.
+    log.write(
+      "WARN",
+      "yana: a staged renewal brief did not belong to this conversation and was dropped (panel "
+        .. tostring(carried_brief and carried_brief.panel_id)
+        .. ")"
+    )
   end
 
   p.last_question = question
@@ -2764,6 +3114,14 @@ submit_panel = function(p, opts)
     -- Make "a review is open for this workspace" durable while the agent is
     -- still alive, so an editor crash leaves a claim that is recoverable
     -- rather than one that looks abandoned.
+    --
+    -- The launcher's pid goes with it. `jobstart` spawns bin/yana-overlay
+    -- directly, so this IS the process that writes `<claim>/holder`, and it is
+    -- how the poller tells "this turn's claim" from "a claim directory that
+    -- happens to exist" -- the difference that locked the workspace out after a
+    -- crash (issue 29).
+    local ok_pid, launcher_pid = pcall(vim.fn.jobpid, p.job)
+    p.shadow_turn.launcher_pid = ok_pid and tonumber(launcher_pid) or nil
     preview_module().arm_review_open(p.shadow_turn, function()
       ledger.mark(L, "review_claim_open")
       if p.turn_pass then
@@ -2892,9 +3250,32 @@ cancel_inflight = function(p, opts)
     end
     return false
   end
+  local live = liveness_for(p)
+  local now = uv.hrtime()
+  local quiet = math.floor((now - (live.last_event_hr or live.started_hr)) / 1e6)
+  local ast = agent.status(p.job) or {}
+  local stalled = quiet >= stall_threshold_ms() and (tonumber(ast.cpu_pct) or 0) <= 0.1
+  local stop_extra = nil
+  if stalled and p.shadow_turn and p.shadow_turn.private_dir then
+    local dir, verdict = require("yana.forensics").snapshot({
+      private_dir = p.shadow_turn.private_dir,
+      pid = ast.pid or agent.pid(p.job),
+      cwd = p.cwd,
+      turn_id = p.turn_pass and p.turn_pass.turn_id or nil,
+      duration_ms = math.floor((now - live.started_hr) / 1e6),
+      last_event = live.last_event,
+      cpu_pct_at_stop = tonumber(ast.cpu_pct) or 0,
+    })
+    live.forensics = { path = dir, verdict = verdict }
+    stop_extra = {
+      cpu_pct_at_stop = tonumber(ast.cpu_pct) or 0,
+      stall_cause = verdict and (verdict.code .. " " .. verdict.cause) or nil,
+      forensics_path = dir,
+    }
+  end
   p.cancelled = true
   p.turn_gen = p.turn_gen + 1
-  agent.stop(p.job)
+  agent.stop(p.job, nil, stop_extra)
   -- p.job is deliberately NOT cleared here — jobstop() only SENDS SIGTERM;
   -- the spawn barrier (I1) must stay up until the exit is actually OBSERVED
   -- (on_exit_confirmed), never assumed. See schedule_exit_escalation for the
@@ -3377,45 +3758,61 @@ function M.toggle_mode()
   -- Mode is one product-level dial now, not a per-panel cycle, so switching it
   -- is a SESSION RENEWAL rather than a flag flip: cursor's upstream session
   -- carries a fixed mode chain, which is why mode_change_blocked above exists.
-  -- Stage 0 of the mode contract permits ask <-> inline at a quiescent
-  -- boundary; `agentic` is refused here until Stage 1 builds the interlock that
-  -- leaving the harness requires.
-  local ORDER = { "ask", "inline" }
-  if config.options.enable_agentic == true then
-    ORDER = { "ask", "inline", "agentic" }
-  end
-  local cur = config.options.mode
-  local idx = 1
-  for i, m in ipairs(ORDER) do
-    if m == cur then
-      idx = i
-      break
-    end
-  end
-  local nextmode = ORDER[(idx % #ORDER) + 1]
+  --
+  -- `agentic` is absent from the cycle at Stage 0 by construction, and present
+  -- at Stage 1 only because the operator opted in: a mode you can reach by
+  -- pressing a key twice is not a mode anyone chose deliberately. The cycle is
+  -- the renewal module's, so the refusal, the brief and the order it moves in
+  -- cannot drift apart.
+  local nextmode = renewal.next_mode(config.options.mode)
   local ok, err = pcall(config.normalize_mode, nextmode, config.options.enable_agentic)
   if not ok then
     notify.one_line(tostring(err), vim.log.levels.ERROR)
     return
   end
-  -- `agentic` is unreachable at Stage 0 by construction: it is not in ORDER.
-  -- Leaving the harness needs the interlock Stage 1 builds, and a mode you can
-  -- reach by pressing a key twice is not a mode anyone chose deliberately.
   local from_mode = config.options.mode
-  local brief = renewing and renewal_brief(p, from_mode, nextmode) or nil
+  -- FAIL CLOSED (MODE-23). The brief is composed BEFORE anything moves, and a
+  -- throw while composing it refuses the switch outright: the alternative is a
+  -- half-renewed chat whose upstream session has been retired and whose next
+  -- prompt carries nothing, which is the orphaned-review shape the contract
+  -- forbids. Either the old session survives intact, or the switch refuses.
+  local brief = nil
+  if renewing then
+    local okb, built = pcall(renewal.build, p, from_mode, nextmode)
+    if not okb then
+      log.write("ERROR", "yana: renewal brief could not be composed: " .. tostring(built))
+      notify_one_line(
+        "yana: cannot switch mode — the handoff brief could not be composed, so nothing changed"
+          .. " — retry, or start a new chat (:YanaNew) to change mode",
+        vim.log.levels.ERROR
+      )
+      return
+    end
+    brief = built
+  end
   config.options.mode = nextmode
   p.mode = nextmode
+  log.lifecycle("mode.switch", {
+    panel = p.id,
+    from = from_mode,
+    to = nextmode,
+    session = p.session_id,
+  })
   if renewing then
     -- END the upstream session. The next submit starts a fresh one in the new
     -- mode and carries the brief as its opening context; nothing tries to
     -- mutate the old session, because that is the thing cursor does not allow.
     p.session_id = nil
-    p.pending_brief = brief
+    renewal.stage(p, brief)
     -- Shown to the operator at the moment of switching, not buried in a log:
-    -- they are the one who can tell that a handoff dropped something.
+    -- they are the one who can tell that a handoff dropped something. The
+    -- DISPLAY rendering, not the carry rendering: the operator's copy names a
+    -- long artifact and shows its head, while the next turn receives it whole.
     render_note(
       p,
-      "**Mode → " .. nextmode .. "**. This chat renewed its session. The next message carries:\n\n```\n" .. brief .. "\n```"
+      "**Mode → " .. nextmode .. "**. This chat renewed its session. The next message carries:\n\n```\n"
+        .. renewal.display_text(brief)
+        .. "\n```"
     )
   end
   update_winbar(p)
@@ -3768,6 +4165,12 @@ function M.new_chat()
   p.last_question = nil
   p.last_answer_text = nil
   p.ask_advice_resend = nil
+  -- The conversation the brief describes is being thrown away, so the brief
+  -- goes with it. `renewal.consume` would also refuse it (the binding carries
+  -- the review epoch this line's caller has just bumped) — belt and braces,
+  -- because the two protections fail in different ways: this one forgets, that
+  -- one refuses, and only the second survives a caller that skips this path.
+  renewal.clear(p)
   p.mode = config.panel_mode(nil)
   if buf_valid(p.conv_buf) then
     set_lines(p, 0, -1, {})
@@ -4439,6 +4842,28 @@ end
 -- sessions: view / resume
 ----------------------------------------------------------------------
 
+-- Sessions for `cwd`, most recent first, with the single most-recent one
+-- decorated `review_open = true` when the workspace's claim is CURRENTLY
+-- held with a review recorded open (claims-concurrency.md: "review-open
+-- state is durable before agent exit and visible after restart"). Claims
+-- serialize -- a turn cannot even start while the previous review is open --
+-- so at most the most-recent session for a workspace can ever be the one an
+-- open claim belongs to; nothing is persisted and nothing can go stale,
+-- because this reads the claim fresh every call rather than trusting a
+-- snapshot taken when the row was written.
+function M.session_history(cwd)
+  cwd = cwd or vim.fn.getcwd()
+  local list = sessions.list(cwd)
+  if #list > 0 then
+    local ok, status = pcall(preview_module().claim_status, cwd)
+    if ok and status.held and status.review_open then
+      list[1] = vim.tbl_extend("force", {}, list[1])
+      list[1].review_open = true
+    end
+  end
+  return list
+end
+
 -- Resume a session entry ({ id, title?, mode?, model?, turns? }).
 -- opts.new_panel: open in a fresh panel instead of reusing the current one.
 function M.resume(sess, opts)
@@ -4503,6 +4928,43 @@ function M.resume(sess, opts)
       "",
     })
   end
+
+  -- A claim whose review is still durably open belongs to the editor that
+  -- opened it, and that editor may be gone. Resume used to silently clear
+  -- `p.changes` here regardless, discarding a pending decision the operator
+  -- never made -- report it by name instead. Full
+  -- re-offer (re-rendering the diff review) is preferred but is not this
+  -- fix's scope; naming what is recoverable is the floor this row requires.
+  --
+  -- ONLY when `sess` is the workspace's own most-recent session: claims are
+  -- per-WORKSPACE, not per-session, and serialize (a turn cannot start while
+  -- the previous review is open), so at most the single most-recent session
+  -- for this workspace can ever be the one an open claim belongs to. Without
+  -- this guard, resuming session 2 of 3 while session 3's review sat open
+  -- would wrongly claim SESSION 2 had an unresolved review of its own.
+  local recent = sessions.list(p.cwd or vim.fn.getcwd())[1]
+  if recent and recent.id == sess.id then
+    local ok, status = pcall(preview_module().claim_status, p.cwd or vim.fn.getcwd())
+    if ok and status.held and status.review_open then
+      local named = status.workspace
+      local rf = io.open(status.claim_dir .. ".review-files", "r")
+      if rf then
+        local raw = vim.trim(rf:read("*a") or "")
+        rf:close()
+        if raw ~= "" then
+          named = raw:gsub("\n", ", ")
+        end
+      end
+      append(p, {
+        "_⚠ a review was left open when this workspace's editor last closed —",
+        "  " .. named .. " recoverable at claim `" .. status.claim_dir .. "`;",
+        "  inspect it before starting a new turn here, or force-release if it",
+        "  is no longer wanted_",
+        "",
+      })
+    end
+  end
+
   scroll_to_bottom(p)
   update_winbar(p)
   M.focus_prompt(p)
@@ -4513,7 +4975,7 @@ end
 -- opts.new_panel: resume into a new panel (parallel session).
 function M.pick_session(opts)
   opts = opts or {}
-  local list = sessions.list(vim.fn.getcwd())
+  local list = M.session_history(vim.fn.getcwd())
   if #list == 0 then
     notify_one_line("yana: no previous sessions for this directory", vim.log.levels.INFO)
     return
@@ -4733,5 +5195,18 @@ M._test.renewal_brief = renewal_brief
 M._test.winbar_text = winbar_text
 M._test.mode_chip = mode_chip
 M._test.model_chip = model_chip
+-- Liveness seams. The threshold stays product policy -- there is no operator
+-- option for it -- but a row cannot sit through 90 real seconds of silence, so
+-- the one number is movable from here and from nowhere else. `liveness`
+-- exposes the per-turn state (open nested tasks by call_id, counts, the last
+-- described event) so a row can assert the PAIRING rather than only the text
+-- that pairing produces.
+M._test.set_stall_threshold_ms = function(ms)
+  stall_threshold_override = (type(ms) == "number" and ms > 0) and ms or nil
+end
+M._test.stall_threshold_ms = stall_threshold_ms
+M._test.liveness = function(p)
+  return p and liveness_for(p) or nil
+end
 
 return M

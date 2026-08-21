@@ -34,10 +34,22 @@ local function probe_birth_time_support(dir)
   f:write("yana birth-time probe\n")
   f:close()
 
-  local out = vim.fn.system({ "stat", "-c", "%w", path })
+  -- The probe file must be removed on EVERY path out of this function, even
+  -- when `stat` itself errors rather than merely returning a non-zero shell
+  -- exit -- e.g. an interrupted headless run, where vim.fn.system() can
+  -- throw instead of returning. The old code only reached
+  -- `pcall(os.remove, path)` AFTER vim.fn.system() had already returned, so
+  -- a throw there skipped cleanup entirely and left the dotfile behind (two
+  -- such `.yana-birthcheck-*` files were found stray in this repo).
+  -- Wrapping the stat call itself in a pcall means the removal below always
+  -- runs immediately after, regardless of whether the stat succeeded.
+  local stat_ok, out = pcall(vim.fn.system, { "stat", "-c", "%w", path })
   local shell_err = vim.v.shell_error
   pcall(os.remove, path)
 
+  if not stat_ok then
+    return nil, "`stat -c %w` failed on " .. dir .. ": " .. tostring(out)
+  end
   if shell_err ~= 0 or type(out) ~= "string" then
     return nil, "`stat -c %w` failed on " .. dir
   end

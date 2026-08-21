@@ -22,6 +22,7 @@ Runtime provenance inventory:
 - post-fork original: `bin/yana-overlay`
 - post-fork original: `bin/yana-overlay-inner`
 - post-fork original: `bin/yana-sandbox`
+- post-fork original: `bin/yana-stall-report`
 - post-fork original: `bin/yana-turn`
 - post-fork original: `lua/blink_yana/commands.lua`
 - post-fork original: `lua/blink_yana/mentions.lua`
@@ -38,6 +39,7 @@ Runtime provenance inventory:
 - post-fork original: `lua/yana/diff_preview.lua`
 - post-fork original: `lua/yana/dump.lua`
 - post-fork original: `lua/yana/flow_report.lua`
+- post-fork original: `lua/yana/forensics.lua`
 - upstream-derived: `lua/yana/health.lua`
 - upstream-derived: `lua/yana/init.lua`
 - upstream-derived: `lua/yana/inline_diff.lua`
@@ -49,6 +51,7 @@ Runtime provenance inventory:
 - post-fork original: `lua/yana/notify.lua`
 - post-fork original: `lua/yana/record.lua`
 - post-fork original: `lua/yana/render_check.lua`
+- post-fork original: `lua/yana/renewal.lua`
 - post-fork original: `lua/yana/safety/checkpoint.lua`
 - post-fork original: `lua/yana/safety/control_plane.lua`
 - post-fork original: `lua/yana/safety/diary.lua`
