@@ -118,6 +118,13 @@ function M.record(entry)
   cur.cwd = entry.cwd or cur.cwd
   cur.mode = entry.mode or cur.mode
   cur.model = entry.model or cur.model
+  -- Which backend (layer 1) issued this session's upstream id. Absent on
+  -- rows written before backends existed, and on CLI-discovered rows
+  -- (M.discover tags those "cursor" explicitly, since that discovery only
+  -- ever reads cursor-agent's own chat store) -- M.resume treats an absent
+  -- backend as unknown-but-compatible rather than refusing it, since there
+  -- is no evidence it belongs to a different vendor.
+  cur.backend = entry.backend or cur.backend
   cur.turns = entry.turns or cur.turns
   cur.updated_at = now
   cur.seq = next_seq(reg)
@@ -333,6 +340,10 @@ function M.discover(cwd)
           created_at = meta.createdAtMs and math.floor(meta.createdAtMs / 1000) or nil,
           updated_at = meta.updatedAtMs and math.floor(meta.updatedAtMs / 1000) or nil,
           external = true,
+          -- This scan only ever reads cursor-agent's OWN chat store
+          -- (~/.cursor/chats), so every discovered session is a cursor
+          -- session by construction.
+          backend = "cursor",
         })
       end
     end

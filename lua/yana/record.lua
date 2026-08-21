@@ -39,6 +39,16 @@ local function env_enabled()
   return val == "1" or val == "true" or val == "yes" or val == "on"
 end
 
+--- The model the vendor actually used, taken from the stream's own
+--- system/init event. Distinct from `meta.model` (what Yana requested):
+--- comparing the two is the only way to catch a switch that silently did not
+--- take. First write wins — the turn's opening fact, not its last word.
+function Rec:note_model_actual(model)
+  if self.meta.model_actual == nil and type(model) == "string" and model ~= "" then
+    self.meta.model_actual = model
+  end
+end
+
 function M.enabled()
   return config.options.debug_record == true or env_enabled()
 end
@@ -291,6 +301,10 @@ function Rec:finish(info)
   meta.cpu_pct_at_stop = info.cpu_pct_at_stop
   meta.stall_cause = info.stall_cause
   meta.forensics_path = info.forensics_path
+  -- meta.model is the REQUESTED model (opts.model at open); meta.model_actual
+  -- is what the vendor's own system/init event named. Left nil when no such
+  -- event arrived (recording opened but the turn never got that far), which
+  -- is itself distinguishable from "matched" by a reader.
   local ok, encoded = pcall(vim.json.encode, meta)
   if not ok then
     return false

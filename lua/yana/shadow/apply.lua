@@ -6,6 +6,7 @@ local checkpoint = require("yana.safety.checkpoint")
 local preview = require("yana.shadow.preview")
 local diff = require("yana.diff")
 local log = require("yana.log")
+local hash = require("yana.safety.hash")
 
 M._test = {
 	inject = {},
@@ -607,6 +608,63 @@ function M.reconcile_applied_buffer(applied)
 
 	local tick_pinned = vim.api.nvim_buf_get_changedtick(bufnr)
 
+	-- THE UNSAVED-EDITS GUARD. `modified` alone does not tell us whether the
+	-- human typed something OUTSIDE this turn: inline-mode review composes
+	-- accepted/rejected hunks and the human's own refinements directly IN the
+	-- review buffer, so a buffer that is `modified` going into accept is the
+	-- NORMAL case there, not a red flag -- and by construction its bytes are
+	-- exactly `applied.target_hash`, the fingerprint of what this call is
+	-- about to install (the same `composed` string the applier already wrote
+	-- to disk). What actually distinguishes a genuine independent edit is
+	-- disagreeing with BOTH fingerprints this turn knows about:
+	--
+	--   * `applied.base_hash` (== `change.base_hash`, the drift guard in
+	--     accept_composed already refuses to accept without it) -- the
+	--     buffer is exactly the pre-turn file, untouched.
+	--   * `applied.target_hash` -- the buffer already IS the turn's own
+	--     result, whether because inline review put it there or because a
+	--     caller passed a buffer already carrying it.
+	--
+	-- Matching either means replacing it with the applier's bytes discards
+	-- nothing (the second case does not even change anything visible).
+	-- Matching NEITHER means the human changed this buffer independently of
+	-- this turn, and `nvim_buf_set_lines` below would silently overwrite
+	-- their work the instant it ran. Refuse instead: disk already carries the
+	-- accepted change (the diary is the sole real-tree writer and already
+	-- wrote it), but the buffer -- and the human's bytes in it -- are left
+	-- exactly as they were, still `modified`, so nothing of theirs is lost.
+	-- The changed-on-disk prompt this leaves armed is now a TRUE one:
+	-- something outside this turn (the human) really did diverge, which is
+	-- exactly the case that prompt exists for.
+	--
+	-- Neither fingerprint present at all (not "both absent because they
+	-- happen to be nil", but a CALLER that never carries this turn's
+	-- context, e.g. `timeline/walk_impl.lua`'s post-revert reconcile) is a
+	-- caller that has not opted into this guard, not a caller with something
+	-- to hide -- it gets the pre-guard behaviour, unconditional reconcile,
+	-- unchanged. Row 70 owns the ACCEPT path (`accept_composed`,
+	-- `accept_standalone`), which always supplies `base_hash`; a walk step
+	-- reconciling the buffer to a disk state it refused to change (the revert-reconcile row) is a
+	-- different contract this guard must not reach into.
+	if
+		vim.bo[bufnr].modified
+		and (applied.base_hash or applied.target_hash)
+		and not (M._test.fault and M._test.fault.skip_unsaved_guard)
+	then
+		local snap, snap_err = diff.buffer_bytes_snapshot(bufnr)
+		if snap == nil then
+			return false,
+				"the buffer has unsaved edits that could not be read to check against the accepted change: "
+					.. tostring(snap_err)
+					.. "; the buffer was left untouched"
+		end
+		local snap_hash = hash.hash_bytes(snap)
+		if snap_hash ~= applied.base_hash and snap_hash ~= applied.target_hash then
+			return false,
+				"the buffer has unsaved edits of its own; disk was updated with the accepted change but the buffer was left untouched so your edits are not lost -- save or discard them, then reload to see the accepted change"
+		end
+	end
+
 	local views = {}
 	for _, win in ipairs(vim.api.nvim_list_wins()) do
 		if vim.api.nvim_win_get_buf(win) == bufnr then
@@ -638,10 +696,6 @@ function M.reconcile_applied_buffer(applied)
 		return false, "the review buffer changed during reconcile; the buffer was left unreconciled"
 	end
 
-	if M._test.fault and M._test.fault.force_undojoin then
-		vim.cmd("keepjumps silent! undojoin")
-	end
-
 	-- Disk can move while the buffer is being replaced, which is why nothing is
 	-- decided from the bytes read above. The mutation happens first; the
 	-- observation that licenses clearing `modified` happens after it.
@@ -651,6 +705,13 @@ function M.reconcile_applied_buffer(applied)
 
 	local wants_eol = disk:match("\n$") ~= nil
 	local ok, err = pcall(vim.api.nvim_buf_call, bufnr, function()
+		-- `:undojoin` acts on the CURRENT buffer, which is why the fault
+		-- injection lives inside this `nvim_buf_call` rather than beside it:
+		-- outside, "current" could be whatever buffer the editor happened to
+		-- be on, not `bufnr`, and the join would land on the wrong undo tree.
+		if M._test.fault and M._test.fault.force_undojoin then
+			vim.cmd("keepjumps silent! undojoin")
+		end
 		local lines = vim.split(disk, "\n", { plain = true })
 		if disk:sub(-1, -1) == "\n" and #lines > 0 and lines[#lines] == "" then
 			table.remove(lines)
@@ -712,6 +773,20 @@ function M.reconcile_applied_buffer(applied)
 	-- Re-stamp the buffer's view of the file mtime without reloading or raising
 	-- changed-on-disk prompts. `edit!` did this implicitly; here the bytes
 	-- already match disk and only the timestamp cache is stale.
+	--
+	-- KNOWN RESIDUAL (documented, not fixed here -- see SYNC-70 in
+	-- tests/tests.md): 'autoread' defaults ON in Neovim, so this unmodified
+	-- buffer takes `:checktime`'s SILENT-RELOAD branch regardless of whether
+	-- the FileChangedShell autocmd fired -- it re-reads the file and replaces
+	-- the buffer wholesale. Bytes come out identical (we just wrote them
+	-- ourselves), but the replace registers as a second, redundant undo state
+	-- on top of the one this function just made. Holding `autoread` off for
+	-- this call removes that redundant state, but `lua/yana/timeline`'s
+	-- per-path walk (the timeline walk row) counts undo-tree slots between durable rows and is
+	-- calibrated against the padded numbering that redundant state produces
+	-- -- suppressing it silently shifted that walk by one row in testing.
+	-- Fixing this belongs beside that counting logic, not here, so the
+	-- padding stays for now.
 	local ei = vim.o.eventignore
 	vim.o.eventignore = "FileChangedShell,FileChangedShellPost"
 	pcall(vim.cmd, "silent! checktime " .. bufnr)
@@ -839,6 +914,14 @@ function M.accept_composed(pass, change, composed)
 		-- directory travels with it.
 		diary_dir = session.diary_dir,
 		op_id = predicted_op_id,
+		-- The two fingerprints the unsaved-edits guard in
+		-- reconcile_applied_buffer checks a modified buffer against before
+		-- overwriting anything: what the review was built FROM, and what
+		-- this call is installing (inline review composes that INTO the
+		-- buffer itself, so a modified buffer already carrying it is the
+		-- normal case, not a divergent edit).
+		base_hash = change.base_hash,
+		target_hash = hash.hash_bytes(is_delete and "" or (composed or "")),
 	}
 	local rok, rerr = M.reconcile_applied_buffer(applied)
 	if not rok then
@@ -957,6 +1040,8 @@ function M.accept_standalone(panel, change, composed)
 		stat = (not is_delete) and uv.fs_stat(change.path) or nil,
 		diary_dir = session.diary_dir,
 		op_id = predicted_op_id,
+		base_hash = change.base_hash,
+		target_hash = hash.hash_bytes(is_delete and "" or (composed or "")),
 	}
 	local rok, rerr = M.reconcile_applied_buffer(applied)
 	if not rok then
@@ -985,6 +1070,82 @@ function M.scope_revert(panel, change)
 	})
 end
 
+--- The turn whose PRIVATE evidence directory a staged removal belongs in --
+--- the one `preview.discard` deletes when the turn finishes. Ruling 52 puts
+--- the staged bytes there and NOT in the timeline:
+--- `lua/yana/timeline/init.lua` states it holds no byte snapshot because that
+--- "would create a second authority", and a staged copy is exactly such a
+--- snapshot.
+local function staging_turn(panel)
+	local turn = (panel and panel.shadow_turn)
+		or (panel and panel.shadow_pass and panel.shadow_pass.shadow_turn)
+	if type(turn) ~= "table" or type(turn.private_dir) ~= "string" or turn.private_dir == "" then
+		return nil, "this turn has no private evidence directory to stage a removal into"
+	end
+	return turn
+end
+
+--- Copy the file's CURRENT bytes into the turn's private dir, journal WHERE
+--- they went, then remove the file through the journaled applier. The removal
+--- is an ordinary `delete` op on the diary, so the sole-real-tree-writer
+--- contract is untouched; the note is the only thing that says where redo can
+--- find the bytes again.
+local function stage_and_remove(panel, session, change)
+	local turn, derr = staging_turn(panel)
+	if not turn then
+		return false, "cannot undo " .. tostring(change.rel or change.path) .. ": " .. derr
+	end
+	local content = diff.read_file_bytes(change.path)
+	if content == nil then
+		return false,
+			"cannot undo " .. tostring(change.rel or change.path) .. ": its bytes are not readable, so removing it would not be recoverable"
+	end
+	local uv = vim.uv or vim.loop
+	local st = uv.fs_stat(change.path)
+	-- The COPY is `preview`'s, not this module's: the applier holds no direct
+	-- writer of its own (the universal-negative inventory row), and preview.lua is the
+	-- module that owns the turn's private directory.
+	local staged_path, werr = preview.stage_undo_removal(turn, diff.abs_path(change.path), content)
+	if not staged_path then
+		return false,
+			"cannot undo " .. tostring(change.rel or change.path) .. ": staging its bytes failed (" .. tostring(werr) .. ")"
+	end
+	local nok, nerr = diary.note(session, {
+		kind = "undo.stage",
+		path = diff.abs_path(change.path),
+		staged_path = staged_path,
+		bytes = #content,
+		mode = st and (st.mode % 4096) or nil,
+	})
+	if not nok then
+		pcall(vim.fn.delete, staged_path)
+		return false,
+			"cannot undo " .. tostring(change.rel or change.path) .. ": the staging could not be journaled (" .. tostring(nerr) .. ")"
+	end
+	local ok, err = diary.restore_workspace_bytes({
+		session = session,
+		path = change.path,
+		content = "",
+		op_kind = "delete",
+	})
+	if not ok then
+		return false, err
+	end
+	change._undo_staged = {
+		staged_path = staged_path,
+		bytes = #content,
+		mode = st and (st.mode % 4096) or nil,
+	}
+	log.lifecycle_later("undo.stage_removed", {
+		turn_id = change.turn_id or change.turn_gen,
+		generation = change.turn_gen,
+		path = change.rel or change.path,
+		staged = staged_path,
+		bytes = #content,
+	})
+	return true, nil, { rel = change.rel or change.path, staged_path = staged_path, bytes = #content, removed = true }
+end
+
 --- Put ONE path back to the bytes the turn started from, through the
 --- journaled applier. Ruling 48 (issue log row 48): `U` undoes every edit of
 --- the whole turn, and a file the operator already ACCEPTED is already on
@@ -1002,15 +1163,58 @@ function M.revert_to_turn_start(panel, change)
 	if not panel or not change or not change.path then
 		return false, "revert needs a panel and a path"
 	end
+	local session, serr
+	local pass = panel.shadow_pass
+	if pass then
+		session, serr = session_for_root(pass, change_root(pass, change))
+	else
+		session, serr = standalone_session(panel, change, "undo_turn")
+	end
+	if not session then
+		return false, serr
+	end
 	if change.before == nil then
 		-- An agent-CREATED file has no turn-start bytes, only turn-start
-		-- absence, and putting absence back is a journaled delete rather than a
-		-- restore. Refused by name rather than guessed at: an undo that leaves
-		-- a file the operator never accepted is worse than one that says what
-		-- it could not do.
+		-- ABSENCE. Ruling 52 (issue log row 52): `U` branches on what the file
+		-- WAS at turn start rather than refusing, so putting absence back is a
+		-- journaled STAGE-AND-REMOVE -- the bytes are copied into the turn's
+		-- private evidence directory first, so stepping forward again through
+		-- redo can put them back.
+		return stage_and_remove(panel, session, change)
+	end
+	return diary.restore_workspace_bytes({
+		session = session,
+		path = change.path,
+		content = change.before,
+		target_mode = change.base_mode,
+	})
+end
+
+--- Redo's half of ruling 52: put a staged-and-removed file back, byte for
+--- byte, through the same journaled applier the removal used.
+---
+--- RETENTION IS THE TURN'S PRIVATE DIR AND NOTHING LONGER. `preview.discard`
+--- deletes it when the turn finishes, so once the turn's evidence is pruned
+--- the staged bytes are GONE. That case is detected and REFUSED BY NAME here;
+--- it is never a silent no-op, because "redo did nothing" and "redo restored
+--- your file" look identical to an operator who is not staring at the disk.
+function M.restore_staged_removal(panel, change)
+	if not panel or not change or not change.path then
+		return false, "restore needs a panel and a path"
+	end
+	local staged = change._undo_staged
+	if type(staged) ~= "table" or type(staged.staged_path) ~= "string" then
+		return false, "nothing was staged for " .. tostring(change.rel or change.path)
+	end
+	if vim.fn.filereadable(staged.staged_path) ~= 1 then
 		return false,
-			"cannot undo an accepted agent-created file (" .. tostring(change.rel or change.path)
-				.. "): restoring its turn-start absence is a journaled delete, not implemented"
+			"the staged copy of "
+				.. tostring(change.rel or change.path)
+				.. " is gone (this turn's evidence has been pruned) — redo-scoped recovery only, so its bytes cannot be restored"
+	end
+	local content = diff.read_file_bytes(staged.staged_path)
+	if content == nil then
+		return false, "could not read the staged copy of " .. tostring(change.rel or change.path)
 	end
 	local session, serr
 	local pass = panel.shadow_pass
@@ -1022,12 +1226,24 @@ function M.revert_to_turn_start(panel, change)
 	if not session then
 		return false, serr
 	end
-	return diary.restore_workspace_bytes({
+	local ok, err = diary.restore_workspace_bytes({
 		session = session,
 		path = change.path,
-		content = change.before,
-		target_mode = change.base_mode,
+		content = content,
+		target_mode = staged.mode,
 	})
+	if not ok then
+		return false, err
+	end
+	log.lifecycle_later("undo.restore", {
+		turn_id = change.turn_id or change.turn_gen,
+		generation = change.turn_gen,
+		path = change.rel or change.path,
+		staged = staged.staged_path,
+		bytes = #content,
+	})
+	change._undo_staged = nil
+	return true, nil, { rel = change.rel or change.path, staged_path = staged.staged_path, bytes = #content }
 end
 
 function M.revert_pass(pass)

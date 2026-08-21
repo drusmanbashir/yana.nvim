@@ -171,6 +171,16 @@ function M.write(level, msg)
   return append_record(level, msg, false)
 end
 
+-- The event-type key `lifecycle_line` itself writes into `payload`. A caller
+-- field of the same name must never reach the merge below unrenamed: it
+-- would silently overwrite the type this row is filed under, and a caller
+-- has no way to know that "kind" is reserved. Renaming (not dropping) is the
+-- less surprising choice of the two guards -- both facts survive: the event
+-- keeps its real type, and the caller's value is still findable, just under
+-- its own key.
+local LIFECYCLE_TYPE_KEY = "kind"
+local LIFECYCLE_TYPE_COLLISION_KEY = "row_kind"
+
 local function lifecycle_line(kind, fields)
   local payload = {
     kind = tostring(kind or "unknown"),
@@ -178,7 +188,11 @@ local function lifecycle_line(kind, fields)
   }
   for k, v in pairs(fields or {}) do
     if v ~= nil then
-      payload[k] = v
+      if k == LIFECYCLE_TYPE_KEY then
+        payload[LIFECYCLE_TYPE_COLLISION_KEY] = v
+      else
+        payload[k] = v
+      end
     end
   end
   local ok, encoded = pcall(vim.json.encode, payload)

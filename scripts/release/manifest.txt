@@ -59,11 +59,13 @@ lua/yana/shadow/preview.lua
 lua/yana/timeline/edit_capture.lua
 lua/yana/timeline/init.lua
 lua/yana/timeline/record.lua
+lua/yana/timeline/retrace.lua
 lua/yana/timeline/ui.lua
 lua/yana/timeline/walk.lua
 lua/yana/timeline/walk_impl.lua
 lua/yana/turn_lifecycle.lua
 lua/yana/ui.lua
+lua/yana/vendor_stream.lua
 plugin/yana.lua
 scripts/install-deps.sh
 scripts/release/archive.sh
@@ -71,6 +73,7 @@ scripts/release/candidate.sh
 scripts/release/export.sh
 scripts/release/forbidden-patterns.txt
 scripts/release/install-neovim.sh
+scripts/release/lib/forbidden_bytes.sh
 scripts/release/manifest.txt
 scripts/release/neovim-matrix.txt
 scripts/release/verify.sh

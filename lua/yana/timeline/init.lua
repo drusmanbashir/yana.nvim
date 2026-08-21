@@ -78,4 +78,34 @@ function M.review_open_for(workspace, rel)
 	return require("yana.timeline.record").review_open_for(workspace, rel)
 end
 
+--- ADDITIVE (FIX-UNDO lane, 2026-08-21): the single most recent
+--- not-yet-reverted row across every file in this workspace, or nil when
+--- there is nothing left to undo. This is what cross-file `u`/`<C-r>` (once
+--- a file's own review has closed) retrace against; see
+--- `lua/yana/timeline/record.lua`'s `M.next_undo` for the full account. It
+--- does not change the shape of anything already pinned above.
+--- @return table|nil {rel, id, kind, global_seq}, string|nil err
+function M.next_undo(workspace, exclude)
+	return require("yana.timeline.record").next_undo(workspace, exclude)
+end
+
+--- ADDITIVE (FIX-UNDO lane, 2026-08-21): read-only head position -- see
+--- `record.lua`'s `M.buffer_head` for the full account. Used by the
+--- post-review `u`/`<C-r>` dispatcher to decide, precisely, whether a press
+--- belongs to it or to Neovim's own undo.
+function M.buffer_head(bufnr)
+	return require("yana.timeline.record").buffer_head(bufnr)
+end
+
+--- ADDITIVE: the exact live position to compare against `buffer_head`.
+--- Wraps `record.observe_buffer`, already public, for symmetry.
+function M.observe_buffer(bufnr)
+	return require("yana.timeline.record").observe_buffer(bufnr)
+end
+
+--- ADDITIVE: every workspace root this process has recorded a row for.
+function M.known_workspaces()
+	return require("yana.timeline.record").known_workspaces()
+end
+
 return M

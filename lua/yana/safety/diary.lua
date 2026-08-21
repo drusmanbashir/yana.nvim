@@ -3157,6 +3157,31 @@ function M.empty_hash()
 	return (hash_bytes(""))
 end
 
+--- Journal a NOTE row: something durable happened beside the real-tree
+--- operations, and the journal is where this turn's write history is read
+--- from. Ruling 52 uses it for the staged copy of an agent-created file `U`
+--- removes: the removal itself is an ordinary journaled `delete` op, but WHERE
+--- the bytes went is not derivable from that row, and a redo in a later
+--- process has nothing else to read it from.
+---
+--- A note is NOT an operation: it carries no op_id, no intent/done pairing and
+--- nothing replays it. `kind` is namespaced by its caller (`undo.stage`) so a
+--- reader can never mistake one for an `intent`/`done` row.
+function M.note(session, row)
+	if type(session) ~= "table" or type(session.diary_dir) ~= "string" then
+		return false, "no diary session"
+	end
+	if type(row) ~= "table" or type(row.kind) ~= "string" or row.kind == "" then
+		return false, "a journal note needs a kind"
+	end
+	if row.kind == "intent" or row.kind == "done" or row.kind == "begin" then
+		return false, "a journal note may not impersonate an operation row: " .. row.kind
+	end
+	local note = vim.deepcopy(row)
+	note.ts = os.time()
+	return append_jsonl(journal_path(session), note)
+end
+
 function M.journal_rows(session)
 	local rows, tail, err = load_journal(session)
 	if not rows then

@@ -22,7 +22,8 @@ local M = {}
 local builtin_descriptors = {
 	{ name = "help", description = "List available commands", details = "Show every slash command" },
 	{ name = "new", description = "Start a new chat", details = "Clear this panel's history and start fresh" },
-	{ name = "model", description = "Pick a model", details = "Select the model used by this panel" },
+	{ name = "model", description = "Pick a model", details = "Layer 2: select the model used within the active backend" },
+	{ name = "backend", description = "Pick a backend", details = "Layer 1: select which binary/account/bill (cursor/claude/…); resets the model" },
 	{ name = "mode", description = "Cycle agent/ask mode", details = "Only before this chat's first turn; a chat's mode is locked once it has run a turn" },
 	{ name = "resume", description = "Resume a session", details = "Pick a previous session to resume" },
 	{ name = "resend", description = "Resend last prompt", details = "here (default) | new = new chat | agent = new chat in agent mode" },
@@ -63,6 +64,10 @@ local builtin_callbacks = {
 	end,
 	model = function(_panel, _args, cb)
 		require("yana.ui").pick_model()
+		cb(nil)
+	end,
+	backend = function(_panel, _args, cb)
+		require("yana.ui").pick_backend()
 		cb(nil)
 	end,
 	mode = function(_panel, _args, cb)

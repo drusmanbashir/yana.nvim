@@ -73,6 +73,23 @@ cmd("YanaAbortReview", function()
   end)
 end, { desc = "Abort the open review: put the file back as it was before the hunks appeared" })
 
+-- Cross-file retrace (FIX-UNDO lane, operator ruling 2026-08-21). While a
+-- file's OWN review is open, its buffer-local `u`/`U`/`<C-r>` stay exactly
+-- what they always were (inline_diff.lua, untouched). These commands cover
+-- the case those keys do not: retracing the operator's own action history
+-- ACROSS FILES, once at least one of them has closed.
+cmd("YanaUndo", function()
+  log.guard("YanaUndo", function()
+    require("yana.timeline.retrace").undo(vim.fn.getcwd())
+  end)
+end, { desc = "Undo the single most recent accept/reject/edit across every file in this workspace" })
+
+cmd("YanaRedo", function()
+  log.guard("YanaRedo", function()
+    require("yana.timeline.retrace").redo(vim.fn.getcwd())
+  end)
+end, { desc = "Step forward through the same cross-file history YanaUndo walked back" })
+
 cmd("YanaToggle", function()
   log.guard("YanaToggle", function()
     yana().toggle()
@@ -118,7 +135,17 @@ cmd("YanaModel", function()
   log.guard("YanaModel", function()
     yana().pick_model()
   end)
-end, { desc = "Pick the yana agent model" })
+end, { desc = "Pick the yana agent model (layer 2: within the active backend)" })
+
+-- Layer 1: which binary/account/bill.
+-- A separate command from YanaModel on purpose -- switching the model and
+-- switching the backend are different actions with different consequences,
+-- and must never share a keystroke or a single cycling picker.
+cmd("YanaBackend", function()
+  log.guard("YanaBackend", function()
+    yana().pick_backend()
+  end)
+end, { desc = "Pick the yana backend (layer 1: which binary/account/bill)" })
 
 cmd("YanaDiff", function()
   log.guard("YanaDiff", function()

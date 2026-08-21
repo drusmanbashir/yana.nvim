@@ -4,6 +4,7 @@ local log = require("yana.log")
 local ledger = require("yana.ledger")
 local record = require("yana.record")
 local dependencies = require("yana.dependencies")
+local notify = require("yana.notify")
 
 local M = {}
 local uv = vim.uv or vim.loop
@@ -12,23 +13,90 @@ if ffi_ok then
   ffi.cdef("typedef long ssize_t; ssize_t pread(int fd, void *buf, unsigned long count, long offset);")
 end
 
--- Build the argv used to invoke cursor-agent for a single request.
+-- Build the argv used to invoke the ACTIVE BACKEND for a single request.
 -- req: { prompt, mode, model, session_id }
+--
+-- Layer 1 (which backend/binary/account) is decided by config.cmd(), which
+-- resolves through the active `config.options.backend` entry
+-- (config.resolve_cmd). Layer 2 (which flags that backend's argv carries) is
+-- decided here. THE INVARIANTS BELOW ARE YANA'S, NOT THE ENTRY'S (operator
+-- ruling, 2026-08-21: "an entry declares spellings, never policy") -- this
+-- function places every flag at a fixed point, in a fixed order, and only
+-- ever asks the active backend's DESCRIPTOR (config.backend_descriptor) for
+-- the TOKEN that vendor uses to say it, never for whether or where. The
+-- descriptor table in config.lua's `M.defaults.backends` is the declarative
+-- "zoo" entry (avante.nvim's `providers` shape) an operator can extend
+-- without touching this file -- see its doc comment for the exact list of
+-- what an entry cannot influence and what enforces each. No field read below
+-- ever translates the STREAM (claude nests tool_use inside
+-- assistant.message.content[] where cursor emits top-level tool_call
+-- events) -- that stays out of scope here; see cp/ingest-from-disk, which
+-- removes the dependency on stream shape entirely by deriving the review
+-- list from the overlay instead of the stream.
+--
+-- The shipped "cursor" descriptor's fields reproduce exactly what this
+-- function hard-coded before backends existed, so the default argv is
+-- byte-identical: an operator who sets nothing sees no change.
 local function build_cmd(req)
   local o = config.options
-  local cmd = {
-    config.cmd(),
-    "-p",
-    "--output-format", "stream-json",
-    "--stream-partial-output",
-  }
+  local backend_name = o.backend or config.defaults.backend
+  local bd = config.backend_descriptor(backend_name) or {}
+  local cmd = { config.cmd() }
 
-  if o.trust then
-    table.insert(cmd, "--trust")
+  -- Work order VENDORS: `subcommand` tokens (codex: {"exec"}) are placed
+  -- IMMEDIATELY after `cmd`, before every flag Yana adds below.
+  if bd.subcommand then
+    vim.list_extend(cmd, bd.subcommand)
   end
 
-  if o.approve_mcps then
-    table.insert(cmd, "--approve-mcps")
+  -- Work order VENDORS, resume-as-subcommand shape ONLY: when this turn is a
+  -- resume AND the active backend resumes via a subcommand rather than a
+  -- flag (bd.resume_subcommand, e.g. codex's `exec resume <id>`), those
+  -- tokens plus the POSITIONAL session id go directly after `subcommand`,
+  -- before every other flag -- never at the tail where bd.resume_flag's
+  -- `--resume <id>` pair goes (see the tail of this function). The two
+  -- shapes are mutually exclusive at setup (M.normalize_backends), so at
+  -- most one of them ever fires for a given turn.
+  local has_session = req.session_id and req.session_id ~= ""
+  local resumes_by_subcommand = has_session and bd.resume_subcommand ~= nil
+  if resumes_by_subcommand then
+    vim.list_extend(cmd, bd.resume_subcommand)
+    table.insert(cmd, req.session_id)
+  end
+
+  -- INVARIANT: every turn runs non-interactively. Yana places the flag;
+  -- bd.noninteractive_flag only supplies this vendor's spelling of it
+  -- (required, validated non-empty at setup -- config.lua's require_flag) --
+  -- UNLESS it is the literal `false`, meaning this vendor's `subcommand`
+  -- IS its non-interactive mode already (codex's `exec`), in which case
+  -- Yana places no separate token at all.
+  if bd.noninteractive_flag then
+    table.insert(cmd, bd.noninteractive_flag)
+  end
+
+  -- INVARIANT: every turn requests the JSON event stream agent.lua's own
+  -- parser depends on. bd.stream_json_args is required and validated at
+  -- setup to literally contain this vendor's protocol request token
+  -- (M.normalize_backends) so an entry cannot silently swap the format
+  -- Yana parses.
+  vim.list_extend(cmd, bd.stream_json_args or {})
+
+  -- CURSOR-SPECIFIC SPELLING, deliberately NOT a schema field (operator
+  -- ruling, 2026-08-21): --trust/--approve-mcps are cursor's own words for
+  -- cursor's own ideas (a one-time workspace-trust prompt, MCP-server
+  -- consent) that most vendors have no concept of at all. Promoting them to
+  -- a generic per-backend field would force every future vendor entry to
+  -- declare nil for something that was never theirs. `o.trust`/
+  -- `o.approve_mcps` predate the backends feature and have only ever meant
+  -- "cursor-agent, don't prompt me for this"; if a future backend earns an
+  -- equivalent concept, it gets its own named capability then, on evidence.
+  if backend_name == "cursor" then
+    if o.trust then
+      table.insert(cmd, "--trust")
+    end
+    if o.approve_mcps then
+      table.insert(cmd, "--approve-mcps")
+    end
   end
 
   -- The vendor permission mode is a CONSEQUENCE of the dial, never an operator
@@ -36,29 +104,49 @@ local function build_cmd(req)
   -- by asking for a plan in `ask` (the mode contract).
   local mode = req.mode or config.agent_permission_mode()
   if mode == "ask" or mode == "plan" then
-    vim.list_extend(cmd, { "--mode", "ask" })
+    -- bd.ask_args == nil is a real, documented gap (see the "claude" entry's
+    -- comment in config.lua): this backend has no non-interactive ask
+    -- equivalent, so nothing is appended rather than guessing a flag that
+    -- would hang a headless turn.
+    if bd.ask_args then
+      vim.list_extend(cmd, bd.ask_args)
+    end
   elseif config.agent_needs_permission_flag() then
-    -- config.agent_needs_permission_flag() is the single place this is decided;
-    -- see its comment for the adjudicated reasoning and the revisit trigger.
-    -- Asking it here rather than reading a flag is what makes the reversal one
-    -- line when a non-force headless edit becomes demonstrable.
-    table.insert(cmd, "--force")
+    -- config.agent_needs_permission_flag() is the single place this is
+    -- decided; see its comment for the adjudicated reasoning and the
+    -- revisit trigger. bd.allow_edits_args is REQUIRED and validated non-nil
+    -- at setup (may be `{}`) -- a turn that needs edit permission always
+    -- gets it, by construction: an entry cannot leave a mode able to write
+    -- silently unable to (operator ruling, 2026-08-21).
+    vim.list_extend(cmd, bd.allow_edits_args)
   end
 
   -- Per-request model (panels can use different models); falls back to the
-  -- globally configured one. "auto" / "" mean: let cursor-agent pick.
+  -- globally configured one. "auto" / "" mean: let the backend pick -- the
+  -- literal string "auto" is NEVER sent (this is Yana's own policy, not the
+  -- entry's), and a backend whose descriptor carries no select_model_flag at
+  -- all (layer 2 does not exist for it) never gets a --model argument
+  -- regardless of what req.model says.
   local model = req.model or o.model
-  if model and model ~= "" and model ~= "auto" then
-    vim.list_extend(cmd, { "--model", model })
+  if model and model ~= "" and model ~= "auto" and bd.select_model_flag then
+    vim.list_extend(cmd, { bd.select_model_flag, model })
   end
 
-  -- Resume keeps the same conversation/session for follow-up turns.
-  if req.session_id and req.session_id ~= "" then
-    vim.list_extend(cmd, { "--resume", req.session_id })
+  -- Resume keeps the same conversation/session for follow-up turns. Session
+  -- ids are VENDOR-SPECIFIC (row 58's sharp edge): ui.lua is responsible for
+  -- never handing this function a session_id that belongs to a different
+  -- backend than the one currently active (see M.resume's refusal and
+  -- pick_backend's session-drop in ui.lua) -- this function only adds the
+  -- flag when the active backend's descriptor has one. Skipped entirely when
+  -- `resumes_by_subcommand` already placed the session id earlier (right
+  -- after `subcommand`) -- the two resume shapes never both fire.
+  if has_session and not resumes_by_subcommand and bd.resume_flag then
+    vim.list_extend(cmd, { bd.resume_flag, req.session_id })
   end
 
   -- Prompt is positional and passed as a single argv element (no shell), so
-  -- newlines and special characters are safe.
+  -- newlines and special characters are safe. Placed last by Yana itself,
+  -- always -- no capability list above can relocate or impersonate it.
   table.insert(cmd, req.prompt)
   return cmd
 end
@@ -532,6 +620,11 @@ function M.run(req)
   -- even when the panel is closed or the turn is stale.
   local last_event = nil
   local job_id = nil
+  -- Row 76: the requested/actual model comparison fires once per turn, from
+  -- the first system event that names a model — a later disagreement would
+  -- itself be a new fact, same "first write wins" rule `rec:note_model_actual`
+  -- already follows.
+  local model_mismatch_checked = false
 
   -- Opt-in raw tee (config.debug_record, default off). nil when recording is
   -- off, so every call site below is a plain nil check and the default path
@@ -556,6 +649,23 @@ function M.run(req)
     }, rec)
   end
 
+  -- LAYER 1 NARRATION. Every vendor speaks its own event dialect; the panel
+  -- reads exactly one of them (cursor's). The normalizer translates the other
+  -- protocols into that shape so `on_event` never learns there was a second
+  -- vendor. It is per-turn state because claude reports a tool's ARGUMENTS and
+  -- its RESULT in two separate events, so the pairing has to be remembered
+  -- across lines. `cursor` returns each event unchanged, which is what keeps
+  -- the default path byte-identical to pre-backends Yana.
+  --
+  -- This is narration only. The review list is still derived from the overlay
+  -- walk at turn end -- the cardinal rule in the core spec -- so a vendor that
+  -- narrates nothing still yields reviewable hunks.
+  local vendor_stream = require("yana.vendor_stream")
+  local vstate = vendor_stream.new_state({
+    protocol = (config.backend_descriptor(config.options.backend) or {}).stream_protocol or "cursor",
+    cwd = req.cwd,
+  })
+
   local function emit(line)
     if line == nil or line == "" then
       return
@@ -567,11 +677,47 @@ function M.run(req)
         described.at = os.date("!%Y-%m-%dT%H:%M:%SZ")
         last_event = described
       end
+      -- The vendor's system/init event carries the model it ACTUALLY used,
+      -- which is a fact distinct from `req.model` (what Yana requested) and
+      -- can disagree with it silently — the only way to catch a model switch
+      -- that did not take. Recorded once, from the first system event that
+      -- names one, since a later disagreement would itself be a new fact.
+      -- This runs whether or not opt-in recording (`rec`) is on: the
+      -- disagreement is a UX fact the operator needs regardless of whether
+      -- they also asked for a raw stream tee (row 76).
+      if obj.type == "system" and type(obj.model) == "string" and obj.model ~= "" then
+        if rec then
+          rec:note_model_actual(obj.model)
+        end
+        if not model_mismatch_checked then
+          model_mismatch_checked = true
+          -- "auto"/nil is NO PREFERENCE, never a mismatch (row 76): the
+          -- operator did not ask for a specific model, so any vendor answer
+          -- is agreement by definition.
+          local requested = req.model
+          if requested ~= nil and requested ~= "" and requested ~= "auto" and requested ~= obj.model then
+            log.lifecycle("model.actual_mismatch", {
+              panel = req.panel_id,
+              requested = requested,
+              actual = obj.model,
+            })
+            -- Once per turn, one plain line — not an error, not a modal.
+            -- Same helper the panel's own switch notifications use
+            -- (`notify.one_line`, aliased `notify_one_line` in ui.lua).
+            notify.one_line(
+              string.format("yana: model requested %s, vendor ran %s", requested, obj.model),
+              vim.log.levels.INFO
+            )
+          end
+        end
+      end
       local st = job_id and job_status[job_id] or nil
       if st then
         st.last_event_hr = uv.hrtime()
       end
-      log.guard("yana.agent on_event", req.on_event, obj)
+      for _, ev in ipairs(vendor_stream.normalize(vstate, obj)) do
+        log.guard("yana.agent on_event", req.on_event, ev)
+      end
     elseif L then
       -- A line the decoder could not read is a lost event. The count is free
       -- here and makes the event-conservation sum in the flow report honest:
@@ -584,7 +730,14 @@ function M.run(req)
     end
   end
 
-  local ok_start, job = pcall(vim.fn.jobstart, cmd, {
+  -- Row 66: a backend declaring `close_stdin` (claude) pays a fixed wait
+  -- for stdin data Yana never sends -- the default jobstart pipe is open
+  -- but nobody ever writes to it or closes it. `stdin = "null"` gives the
+  -- child immediate EOF instead. Omitted entirely (nil, not "pipe") for
+  -- every backend that does not declare it, which is what keeps the cursor
+  -- spawn path byte-identical to pre-row-66 Yana.
+  local spawn_bd = config.backend_descriptor() or {}
+  local jobstart_opts = {
     cwd = req.cwd,
     env = job_env,
     stdout_buffered = false,
@@ -730,7 +883,11 @@ function M.run(req)
         end)
       end)
     end,
-  })
+  }
+  if spawn_bd.close_stdin then
+    jobstart_opts.stdin = "null"
+  end
+  local ok_start, job = pcall(vim.fn.jobstart, cmd, jobstart_opts)
 
   if not ok_start or type(job) ~= "number" or job <= 0 then
     if L then
@@ -814,24 +971,93 @@ function M.kill(job)
   return true
 end
 
--- List available models via `cursor-agent --list-models`.
--- cb(models, code) where models = { { id, label, current, default }, ... }.
--- Always includes an "auto" entry first.
---
--- The parse below requires literal English: `ID - label`, with optional
--- literal `(current)` / `(default)` markers. cursor-agent inherits Neovim's
--- (i.e. the operator's shell's) locale, and under a non-English LANG/LC_ALL
--- it may emit localized labels or a different separator, silently emptying
--- the model list or losing current/default status (PORT-12, portability
--- review). There is no documented machine-readable --list-models format to
--- switch to, so the fix is scoped to exactly this call: force the classic
--- "C" locale on the spawned process only (jobstart's `env` MERGES onto the
+-- `list_models_format == "lines"` (default; cursor's shape) parser. Requires
+-- literal English: `ID - label`, with optional literal `(current)` /
+-- `(default)` markers. cursor-agent inherits Neovim's (i.e. the operator's
+-- shell's) locale, and under a non-English LANG/LC_ALL it may emit localized
+-- labels or a different separator, silently emptying the model list or
+-- losing current/default status (PORT-12, portability review). There is no
+-- documented machine-readable --list-models format to switch to, so the fix
+-- is scoped to exactly this call: M.list_models forces the classic "C"
+-- locale on the spawned process only (jobstart's `env` MERGES onto the
 -- inherited environment rather than replacing it, so PATH/HOME etc. are
 -- untouched) rather than requiring the operator's whole session to run
 -- un-localized.
+local function parse_lines_models(out)
+  local models = {}
+  local seen = {}
+  for _, line in ipairs(out) do
+    local id, label = line:match("^(%S+)%s+%-%s+(.+)$")
+    if id and not seen[id] then
+      seen[id] = true
+      local current = label:match("%(current%)") ~= nil
+      local default = label:match("%(default%)") ~= nil
+      label = label:gsub("%s*%(current%)%s*$", ""):gsub("%s*%(default%)%s*$", "")
+      table.insert(models, { id = id, label = label, current = current, default = default })
+    end
+  end
+  return models
+end
+
+-- `list_models_format == "json_models"` parser (codex's `debug models`
+-- shape, work order VENDORS): `{"models":[{slug,display_name,visibility,...}]}`.
+-- Keeps only `visibility == "list"` entries (`"hide"` entries -- e.g. codex's
+-- `gpt-reserve`, `codex-auto-review` -- are filtered out, never offered to
+-- the operator) and maps `slug` -> id, `display_name` -> label. Deliberately
+-- NEVER reads `model_messages` or any other field: that object carries a
+-- large prompt-template payload that must not enter the picker, a log, or a
+-- fixture (see tests/fixtures/codex-models.json, trimmed to exactly these
+-- three fields for the same reason). A malformed/undecodable payload yields
+-- an empty list rather than throwing -- on_exit's log.guard would already
+-- catch a throw, but an empty list is the more honest signal here (nothing
+-- USABLE was found), not "something crashed".
+local function parse_json_models(out)
+  local ok, decoded = pcall(vim.json.decode, table.concat(out, "\n"))
+  if not ok or type(decoded) ~= "table" or type(decoded.models) ~= "table" then
+    return {}
+  end
+  local models = {}
+  for _, m in ipairs(decoded.models) do
+    if type(m) == "table" and m.visibility == "list" and type(m.slug) == "string" and m.slug ~= "" then
+      local label = m.display_name
+      if type(label) ~= "string" or label == "" then
+        label = m.slug
+      end
+      table.insert(models, { id = m.slug, label = label })
+    end
+  end
+  return models
+end
+
+-- List available models via the active backend's `list_models_args`.
+-- cb(models, code, reason) where models = { { id, label, current, default }, ... }.
+--
+-- code -2 means "the active backend's descriptor declares list_models =
+-- false" -- reason names the backend. Requirement 4 (row 58): a backend that
+-- cannot list models must degrade HONESTLY (say so in the picker) rather
+-- than silently showing the PREVIOUS backend's list under the new backend's
+-- name, which would recreate the exact vendor-confusion this feature exists
+-- to remove. Checked before spawning anything, so an unsupported backend
+-- never even attempts to list models against a binary that would not
+-- understand it.
+--
+-- Work order VENDORS: the argv built below is DELIBERATELY `{cmd} ++
+-- list_models_args` and nothing else -- it never prepends `bd.subcommand`.
+-- codex's `debug models` is NOT a subcommand of `exec`; it REPLACES
+-- `subcommand` entirely, so `codex debug models` is correct and
+-- `codex exec debug models` (what prepending subcommand would produce) is
+-- not a command codex understands at all.
 function M.list_models(cb)
+  local backend = config.options.backend
+  local bd = config.backend_descriptor(backend) or {}
+  if not bd.list_models_args then
+    cb({}, -2, backend .. " does not support listing models")
+    return
+  end
   local out = {}
-  local job = vim.fn.jobstart({ config.cmd(), "--list-models" }, {
+  local argv = { config.cmd() }
+  vim.list_extend(argv, bd.list_models_args)
+  local job = vim.fn.jobstart(argv, {
     env = { LC_ALL = "C" },
     stdout_buffered = true,
     on_stdout = function(_, data)
@@ -842,17 +1068,11 @@ function M.list_models(cb)
     on_exit = function(_, code)
       vim.schedule(function()
         log.guard("yana.agent list_models on_exit", function()
-          local models = {}
-          local seen = {}
-          for _, line in ipairs(out) do
-            local id, label = line:match("^(%S+)%s+%-%s+(.+)$")
-            if id and not seen[id] then
-              seen[id] = true
-              local current = label:match("%(current%)") ~= nil
-              local default = label:match("%(default%)") ~= nil
-              label = label:gsub("%s*%(current%)%s*$", ""):gsub("%s*%(default%)%s*$", "")
-              table.insert(models, { id = id, label = label, current = current, default = default })
-            end
+          local models
+          if bd.list_models_format == "json_models" then
+            models = parse_json_models(out)
+          else
+            models = parse_lines_models(out)
           end
           cb(models, code)
         end)

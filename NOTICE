@@ -66,9 +66,11 @@ Runtime provenance inventory:
 - post-fork original: `lua/yana/timeline/edit_capture.lua`
 - post-fork original: `lua/yana/timeline/init.lua`
 - post-fork original: `lua/yana/timeline/record.lua`
+- post-fork original: `lua/yana/timeline/retrace.lua`
 - post-fork original: `lua/yana/timeline/ui.lua`
 - post-fork original: `lua/yana/timeline/walk.lua`
 - post-fork original: `lua/yana/timeline/walk_impl.lua`
 - post-fork original: `lua/yana/turn_lifecycle.lua`
+- post-fork original: `lua/yana/vendor_stream.lua`
 - upstream-derived: `lua/yana/ui.lua`
 - upstream-derived: `plugin/yana.lua`

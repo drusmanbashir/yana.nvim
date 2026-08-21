@@ -31,6 +31,249 @@ M.defaults = {
   -- Model to use. nil/"" => let cursor-agent pick (Auto). e.g. "claude-opus-5".
   model = nil,
 
+  ----------------------------------------------------------------------
+  -- BACKENDS -- the "zoo" the operator stocks (avante.nvim's `providers`
+  -- table, applied to a CLI agent instead of an HTTP provider: a named
+  -- entry per vendor, plus a top-level selector). The operator can add
+  -- their OWN entry in their own setup({}) call and select it immediately
+  -- -- no plugin change needed -- because M.setup merges `opts.backends`
+  -- onto these defaults with `vim.tbl_deep_extend("force", ...)`: a new
+  -- name is added whole, an existing name (e.g. overriding just
+  -- `claude.cmd`) is extended field-by-field, not forced to restate the
+  -- entire entry.
+  --
+  -- Row 58: model switching has TWO layers.
+  -- `model` above is layer 2 (which model inside a backend). This is layer
+  -- 1 (which binary, which account, which bill). `--model claude-4-sonnet`
+  -- picked INSIDE cursor-agent is Cursor's resale of Claude on Cursor's
+  -- meter; selecting the `claude` backend here runs the operator's own
+  -- Anthropic account instead. Two different products; never conflated.
+  --
+  -- THE GOVERNING RULE (operator ruling, 2026-08-21, echoing "if any of
+  -- those args are central to design they shouldn't be args"): AN ENTRY
+  -- DECLARES SPELLINGS, NEVER POLICY. Every field below is a vendor's TOKEN
+  -- for a capability YANA decided the turn needs -- never a free-form argv
+  -- list an entry can use to change WHAT the turn is allowed to do or HOW
+  -- Yana parses it. Concretely, what an entry CANNOT influence, and what
+  -- enforces each:
+  --   * that a turn runs non-interactively            -- Yana always
+  --     places `noninteractive_flag` itself, at a fixed position
+  --     (build_cmd); an entry cannot omit or relocate it, only spell it.
+  --   * that a turn requests the JSON event stream     -- `stream_json_args`
+  --     is REQUIRED and VALIDATED at setup to literally contain the token
+  --     "stream-json" (M.normalize_backends); an entry that requests a
+  --     different format is refused by name before the first turn, not
+  --     discovered as "the panel shows nothing" on the first real turn.
+  --   * whether an inline/agentic turn may edit          -- `allow_edits_args`
+  --     is REQUIRED (non-nil; may be an empty list `{}` when a vendor needs
+  --     no extra token, but never absent) and VALIDATED at setup; a mode
+  --     that needs edit permission always gets it appended (build_cmd) --
+  --     an entry cannot make a turn silently unable to write.
+  --   * whether "let the vendor choose the model" sends a literal token
+  --                                                    -- it never does;
+  --     nil/""/"auto" always just OMITS `select_model_flag` (build_cmd),
+  --     regardless of what an entry supplies -- an entry cannot invent a
+  --     literal "auto" model id.
+  --   * where the prompt lands, or that a resumed session id is the one
+  --     Yana was given                                -- both are placed by
+  --     build_cmd itself, never by entry content.
+  --   * cross-field collision                          -- `allow_edits_args`,
+  --     `ask_args` and `list_models_args` may not contain the literal
+  --     tokens "--resume" or "--model" (M.normalize_backends), which are
+  --     Yana's own placement for `resume_flag`/`select_model_flag`; an
+  --     entry that tries is refused at setup, naming the offending token.
+  --
+  -- What an entry DOES decide, because it genuinely varies per vendor: the
+  -- binary; the exact tokens THIS vendor uses to ask for non-interactive
+  -- mode, stream-json output, edit permission, a named model, a resumed
+  -- session, ask-mode, and model listing. `--trust`/`--approve-mcps` are
+  -- deliberately NOT a field here at all (see build_cmd): they are cursor's
+  -- own words for cursor's own ideas (a workspace-trust prompt, MCP-server
+  -- consent) that most vendors have no concept of, so they stay inline in
+  -- build_cmd's cursor-specific branch rather than becoming a schema field
+  -- every future vendor is asked to fill in with nil.
+  --
+  -- Fields:
+  --   cmd                  the binary to spawn. A bare name (no "/", no
+  --                        leading "~") resolves on PATH lazily at spawn
+  --                        time and is NOT checked at setup -- exactly like
+  --                        this product's own historical "cursor-agent on
+  --                        PATH" fallback below, which has never been
+  --                        eagerly checked either, because PATH can
+  --                        legitimately be populated after Neovim starts.
+  --                        A path containing "/" or a leading "~" IS an
+  --                        explicit location and IS checked at setup: the
+  --                        operator wrote a specific file down, and a typo
+  --                        there deserves a named refusal before the first
+  --                        turn. nil is legal ONLY for the built-in
+  --                        "cursor" entry and means "keep using the
+  --                        cmd/cmd_env/PATH chain above unchanged" -- this
+  --                        is what makes the default byte-identical to
+  --                        pre-backends Yana.
+  --   noninteractive_flag  REQUIRED. Single token this vendor needs to run
+  --                        headless/non-interactive (cursor and claude both
+  --                        spell it "-p"). Refused at setup if missing.
+  --   stream_json_args     REQUIRED. Tokens requesting per-line JSON event
+  --                        output. VALIDATED to contain the literal token
+  --                        "stream-json" -- agent.lua's parser depends on
+  --                        exactly that format, so an entry cannot swap it.
+  --   allow_edits_args      REQUIRED (may be `{}`). Tokens granting
+  --                        non-interactive edit permission
+  --                        (config.agent_needs_permission_flag()).
+  --   select_model_flag     OPTIONAL. Flag preceding a model id; nil => this
+  --                        vendor has no model-selection surface (layer 2
+  --                        does not exist for it).
+  --   resume_flag           OPTIONAL. Flag preceding a session id for
+  --                        `--resume`-style continuation. Session ids are
+  --                        VENDOR-SPECIFIC (row 58's sharp edge) -- ui.lua
+  --                        never hands one backend's id to another (see
+  --                        M.resume's refusal and pick_backend's
+  --                        session-drop).
+  --   ask_args              OPTIONAL. Tokens for Yana's own `ask`/`plan`
+  --                        mode; nil => this vendor has no non-interactive
+  --                        equivalent (a real, documented gap -- see
+  --                        build_cmd's comment).
+  --   list_models_args      OPTIONAL. Tokens appended to `{cmd}` to list
+  --                        models; false/nil => unsupported, so the picker
+  --                        degrades honestly instead of reusing the
+  --                        PREVIOUS backend's list under the new backend's
+  --                        name -- exactly the confusion row 58 is about.
+  --
+  -- Work order VENDORS (2026-08-21), fields added for codex and every future
+  -- non-cursor vendor whose CLI genuinely differs in KIND, not just spelling:
+  --   subcommand            OPTIONAL arglist. Tokens placed IMMEDIATELY after
+  --                        `cmd`, before every flag Yana adds (build_cmd).
+  --                        codex: `{"exec"}` -- non-interactive mode is a
+  --                        SUBCOMMAND for codex, not a flag.
+  --   noninteractive_flag  now also accepts the literal `false`, meaning
+  --                        "this vendor's `subcommand` IS its non-interactive
+  --                        mode" (codex: `exec` itself). `false` with an
+  --                        empty/absent `subcommand` is refused BY NAME at
+  --                        setup -- that combination would run interactively
+  --                        and hang forever with nobody there to answer it.
+  --   stream_protocol       OPTIONAL string, default "cursor". Names the
+  --                        event protocol this vendor speaks; the value must
+  --                        be one Yana's stream reader actually implements
+  --                        (`cursor`, `claude`, `codex` -- a closed set
+  --                        enumerated in the refusal message). An entry
+  --                        SELECTS from this set; it cannot invent a new one.
+  --   stream_json_args      unchanged in shape, but the token VALIDATED at
+  --                        setup now comes from `stream_protocol`, not a
+  --                        single hard-coded literal: cursor/claude must
+  --                        contain "stream-json", codex must contain "json".
+  --   resume_subcommand     OPTIONAL arglist, mutually exclusive with
+  --                        `resume_flag` (declaring both is refused at
+  --                        setup). Resume-as-subcommand vendors (codex:
+  --                        `{"resume"}`) take a POSITIONAL session id
+  --                        straight after `subcommand`+`resume_subcommand`,
+  --                        not a flag+value pair -- see build_cmd's comment
+  --                        for the exact placement.
+  --   models                OPTIONAL list of `{id=..., label=...}` tables:
+  --                        a declared sub-model catalogue for a vendor with
+  --                        no `--list-models`-equivalent surface at all
+  --                        (e.g. claude). A non-table entry or an empty id
+  --                        is refused at setup.
+  --   list_models_format     OPTIONAL string, default "lines" (cursor's
+  --                        `id - label` per line). "json_models" parses
+  --                        codex's `debug models` shape
+  --                        (`{"models":[{slug,display_name,visibility}]}`),
+  --                        keeping only `visibility == "list"` entries and
+  --                        NEVER reading the `model_messages` field it also
+  --                        carries. Unknown values are refused at setup.
+  --   close_stdin            OPTIONAL boolean, default false. Declares that
+  --                        this vendor's child process must have its stdin
+  --                        closed immediately after spawn (codex: piped
+  --                        stdin makes it wait to read a `<stdin>` block,
+  --                        which can block a turn forever; row 66 measured
+  --                        the same 3s fixed wait for claude). Schema-
+  --                        validated here; agent.lua's spawn path (jobstart
+  --                        `stdin = "null"`) honours it for every backend
+  --                        that declares it true.
+  backends = {
+    cursor = {
+      cmd = nil,
+      noninteractive_flag = "-p",
+      stream_json_args = { "--output-format", "stream-json", "--stream-partial-output" },
+      allow_edits_args = { "--force" },
+      select_model_flag = "--model",
+      resume_flag = "--resume",
+      ask_args = { "--mode", "ask" },
+      list_models_args = { "--list-models" },
+    },
+    -- Measured translation table: tests/bin/agent-shim-claude
+    -- (branch cp/claude-backend), lifted into declarative form here. That
+    -- shim was the PROBE that established these facts; it is not the
+    -- shipping mechanism -- this table is.
+    claude = {
+      cmd = "claude",
+      noninteractive_flag = "-p",
+      stream_json_args = { "--output-format", "stream-json", "--verbose" },
+      allow_edits_args = { "--permission-mode", "acceptEdits" },
+      select_model_flag = "--model",
+      resume_flag = "--resume",
+      ask_args = nil, -- UNMAPPED, documented gap: claude's closest analogues
+                       -- (--permission-mode plan|manual) block on an
+                       -- interactive answer a headless -p turn has nobody to
+                       -- give, so ask mode is not requested at all rather
+                       -- than mistranslated into a hang.
+      list_models_args = false, -- claude has no --list-models; the picker
+                                 -- says so rather than showing cursor's
+                                 -- stale list.
+      -- No listing surface exists to probe (`claude --help` gives only
+      -- illustrative alias examples -- "fable", "opus", "sonnet" -- in its
+      -- --model flag text, never an accepted-ids catalogue; there is no
+      -- `claude models` or equivalent command). Work order VENDORS ruling:
+      -- ship the single honest fallback rather than invent a catalogue from
+      -- example text.
+      models = { { id = "auto", label = "let claude choose" } },
+      close_stdin = true, -- row 66: a claude turn pays a fixed 3s wait for
+                          -- stdin data Yana never sends ("Warning: no stdin
+                          -- data received in 3s, proceeding without it");
+                          -- closing stdin at spawn skips that wait outright.
+    },
+    -- Measured 2026-08-21 against the operator's own codex CLI 0.148.0
+    -- (`codex --help`, `codex exec --help`, `codex exec resume --help`,
+    -- `codex debug models`); evidence at
+    -- /s/agent_rw/tmp/yana-vendor-probe/. Non-error event shapes beyond the
+    -- envelope are UNVERIFIED (quota-refused before any tool call) -- that
+    -- is lane V2's concern (vendor_stream.lua), not this schema.
+    codex = {
+      cmd = "codex",
+      subcommand = { "exec" }, -- non-interactive mode is the `exec`
+                                -- SUBCOMMAND, never a flag.
+      noninteractive_flag = false, -- `exec` IS the non-interactive mode.
+      stream_protocol = "codex",
+      stream_json_args = { "--json" }, -- codex's JSONL request token is
+                                        -- literally "json", never
+                                        -- "stream-json".
+      allow_edits_args = { "--sandbox", "workspace-write", "--skip-git-repo-check" },
+      select_model_flag = "--model",
+      resume_subcommand = { "resume" }, -- `codex exec resume <id> ...`; the
+                                         -- session id is POSITIONAL, not a
+                                         -- flag+value pair (verified against
+                                         -- `codex exec resume --help`).
+      ask_args = { "--sandbox", "read-only", "--skip-git-repo-check" },
+      -- `codex debug models` is NOT a subcommand of `exec` -- it replaces
+      -- `subcommand` entirely rather than nesting under it. M.list_models
+      -- builds `{cmd} ++ list_models_args` directly and MUST NOT prepend
+      -- `bd.subcommand`, or this would try (and fail) to run
+      -- `codex exec debug models`.
+      list_models_args = { "debug", "models" },
+      list_models_format = "json_models",
+      close_stdin = true, -- piped stdin makes codex wait to read a
+                           -- `<stdin>` block; a codex turn must be spawned
+                           -- with stdin closed/empty.
+    },
+  },
+
+  -- The active backend (layer 1). Session-scoped at runtime exactly like
+  -- `model` (config.options.backend is the sole authority once Neovim is
+  -- running; see ui.lua's pick_backend) -- this default is only the value a
+  -- fresh Neovim session starts with. "cursor" + every backends.cursor
+  -- field above being the pre-existing behaviour is what makes an operator
+  -- who sets nothing see no change at all.
+  backend = "cursor",
+
   -- THE dial. One setting, three results, named for what you get
   -- rather than for the machinery underneath (the mode contract):
   --
@@ -238,7 +481,14 @@ Agent mode: when the user asks to populate, add, change, or give an example in a
     --   <M-r>n  new   — new chat (fresh session), this chat's mode
     --   <M-r>a  agent — new chat forced to agent mode (ask -> "now do it")
     resend = "<M-r>",
-    model = "<C-g>",         -- open the model picker
+    model = "<C-g>",         -- open the model picker (layer 2: within the active backend)
+    -- Layer 1: open the BACKEND picker (which binary/account/bill). Deliberately
+    -- a DIFFERENT key from `model` (row 58) --
+    -- switching the model and switching the backend have different
+    -- consequences (one changes which model answers; the other changes which
+    -- account is billed and resets the model), so a mis-press must never
+    -- change the wrong dial.
+    backend = "<C-b>",
     review = "<C-y>",        -- open inline review for a pending change
     accept = "<C-a>",        -- accept a pending change (keep agent edit)
     reject = "<C-x>",        -- reject a pending change (revert file)
@@ -605,6 +855,340 @@ function M.normalize_inline_edit(ie)
   return out
 end
 
+-- Tokens Yana itself places at a fixed point via `resume_flag`/
+-- `select_model_flag`. No OTHER capability list may contain them -- an
+-- entry that tried would let its own "ask" or "allow_edits" or
+-- "list_models" spelling silently add a second, entry-controlled --resume
+-- or --model that could disagree with the one Yana placed. This is the
+-- "cross-field collision" check named in the schema's own doc comment.
+local RESERVED_TOKENS = { ["--resume"] = true, ["--model"] = true }
+
+local function check_no_reserved_tokens(list, backend_name, field)
+  for _, tok in ipairs(list) do
+    if RESERVED_TOKENS[tok] then
+      error(
+        "yana: backends." .. backend_name .. "." .. field .. " contains " .. tok
+          .. " -- that token is placed by Yana itself (resume_flag/select_model_flag), "
+          .. "never by another capability list",
+        0
+      )
+    end
+  end
+end
+
+-- REQUIRED list-of-strings capability. `nil` is always a setup refusal here
+-- (unlike the OPTIONAL capabilities below) -- every field this validates is
+-- one build_cmd cannot safely omit (see the schema's governing-rule doc
+-- comment). An empty list `{}` is legal: it says "this vendor needs no
+-- extra token for this capability", which is different from not declaring
+-- the capability at all.
+local function require_arglist(value, backend_name, field)
+  if value == nil then
+    error(
+      "yana: backends." .. backend_name .. "." .. field .. " is required (Yana needs it to know how to spell "
+        .. "this capability for this vendor) -- refused at setup, not discovered at turn time",
+      0
+    )
+  end
+  if type(value) ~= "table" then
+    error("yana: backends." .. backend_name .. "." .. field .. " must be a list of strings", 0)
+  end
+  local out = {}
+  for i, v in ipairs(value) do
+    if type(v) ~= "string" or v == "" then
+      error("yana: backends." .. backend_name .. "." .. field .. "[" .. i .. "] must be a non-empty string", 0)
+    end
+    out[#out + 1] = v
+  end
+  return out
+end
+
+-- OPTIONAL list-of-strings capability. `nil` is a legitimate, permanent
+-- answer ("this vendor has no such capability"), never a gap to patch --
+-- build_cmd omits the corresponding argv entirely when it sees nil.
+local function optional_arglist(value, backend_name, field)
+  if value == nil then
+    return nil
+  end
+  return require_arglist(value, backend_name, field)
+end
+
+-- OPTIONAL single-flag capability (`select_model_flag`, `resume_flag`):
+-- exactly one token, because both are always "flag followed by one value"
+-- shaped for both shipped vendors -- unlike the multi-token capabilities
+-- above, there is nothing here for a vendor to spell with more than one
+-- token, so this stays a plain string rather than a list.
+local function optional_flag(value, backend_name, field)
+  if value == nil then
+    return nil
+  end
+  if type(value) ~= "string" or value == "" then
+    error("yana: backends." .. backend_name .. "." .. field .. " must be a non-empty string, or nil", 0)
+  end
+  return value
+end
+
+-- REQUIRED single-flag capability (`noninteractive_flag`): every vendor
+-- must have some way to say "don't wait for an interactive answer", or a
+-- headless turn against it will hang with nobody to notice why.
+local function require_flag(value, backend_name, field)
+  if value == nil or value == "" or type(value) ~= "string" then
+    error(
+      "yana: backends." .. backend_name .. "." .. field .. " is required and must be a non-empty string "
+        .. "(Yana needs to know how this vendor spells \"run non-interactively\")",
+      0
+    )
+  end
+  return value
+end
+
+-- Work order VENDORS -- the closed set of event protocols Yana's stream
+-- reader actually implements. `stream_protocol` SELECTS from this set; it
+-- never supplies behaviour (the governing rule, see the schema doc comment).
+local STREAM_PROTOCOLS = { cursor = true, claude = true, codex = true }
+
+-- Work order VENDORS -- the literal request token VALIDATED inside
+-- `stream_json_args` for each protocol. cursor and claude both ask for
+-- "stream-json"; codex's JSON event flag is spelled "--json" and the token
+-- itself is literally "json".
+local PROTOCOL_STREAM_TOKEN = { cursor = "stream-json", claude = "stream-json", codex = "json" }
+
+-- Work order VENDORS -- the closed set of `list_models_args` output shapes
+-- M.list_models (agent.lua) knows how to parse.
+local LIST_MODELS_FORMATS = { lines = true, json_models = true }
+
+-- OPTIONAL declared sub-model catalogue (`models`): a vendor with no
+-- listing surface at all (claude) still needs SOME way to offer choices in
+-- the picker. A non-table entry or an empty id is refused at setup, not
+-- discovered as a blank picker entry at turn time.
+local function optional_model_list(value, backend_name)
+  if value == nil then
+    return nil
+  end
+  if type(value) ~= "table" then
+    error("yana: backends." .. backend_name .. ".models must be a list of {id=..., label=...} tables, or nil", 0)
+  end
+  local out = {}
+  for i, m in ipairs(value) do
+    if type(m) ~= "table" or type(m.id) ~= "string" or m.id == "" then
+      error(
+        "yana: backends." .. backend_name .. ".models[" .. i .. "] must be a table with a non-empty string id",
+        0
+      )
+    end
+    local label = m.label
+    if type(label) ~= "string" or label == "" then
+      label = m.id
+    end
+    out[#out + 1] = { id = m.id, label = label }
+  end
+  return out
+end
+
+--- The "zoo" table (avante.nvim's `providers` shape). Merges `value` onto
+--- the shipped defaults with `vim.tbl_deep_extend("force", ...)` -- an
+--- operator entry with a name already shipped here (e.g. overriding just
+--- `claude.cmd`) extends that entry field-by-field; a genuinely new name
+--- (their own vendor) is added whole. Every entry, shipped or operator-
+--- added, is validated the same way and by the same rules -- there is no
+--- privileged path for the built-ins besides "cursor" being allowed a nil
+--- `cmd` (see the M.defaults.backends doc comment for why).
+---
+--- Every capability is validated for SHAPE here (right type, non-empty,
+--- contains what Yana's own parser/placement logic depends on). This is
+--- "at minimum" validation, not a live probe of the binary: spawning an
+--- arbitrary operator-named executable during setup() -- on every Neovim
+--- start, even for a backend never selected -- would add real latency and
+--- a side-effecting process spawn to a call that today is pure data
+--- validation, and cannot be done hermetically in this product's own test
+--- suite without shipping a fake binary for every vendor. Static shape
+--- validation catches the practical failure mode this feature exists to
+--- prevent (an entry whose `stream_json_args` requests a format Yana's
+--- parser cannot read) without that cost; a live probe would catch more
+--- (a real vendor CLI silently renaming a flag) and is a genuine
+--- possible follow-up, not something this build does.
+function M.normalize_backends(value)
+  local base = vim.deepcopy(M.defaults.backends)
+  local out = base
+  if type(value) == "table" then
+    out = vim.tbl_deep_extend("force", base, value)
+  elseif value ~= nil then
+    error("yana: backends must be a table of named entries", 0)
+  end
+  for name, entry in pairs(out) do
+    if type(name) ~= "string" or name == "" then
+      error("yana: backends table keys must be non-empty backend names", 0)
+    end
+    if type(entry) ~= "table" then
+      error("yana: backends." .. name .. " must be a table", 0)
+    end
+    if entry.cmd ~= nil then
+      if type(entry.cmd) ~= "string" or entry.cmd == "" then
+        error("yana: backends." .. name .. ".cmd must be a non-empty string, or nil", 0)
+      end
+      if entry.cmd:find("/", 1, true) or entry.cmd:sub(1, 1) == "~" then
+        local resolved = vim.fn.expand(entry.cmd)
+        if vim.fn.executable(resolved) ~= 1 then
+          error("yana: backends." .. name .. ".cmd is not executable: " .. resolved, 0)
+        end
+        entry.cmd = resolved
+      end
+    elseif name ~= "cursor" then
+      error(
+        'yana: backends.' .. name .. '.cmd must be set (only the built-in "cursor" backend may omit it, '
+          .. "to keep the pre-backends cmd/cmd_env/PATH chain)",
+        0
+      )
+    end
+
+    -- Work order VENDORS: `subcommand` is validated BEFORE
+    -- `noninteractive_flag` because a `false` noninteractive_flag's own
+    -- legality depends on whether a non-empty subcommand was declared.
+    entry.subcommand = optional_arglist(entry.subcommand, name, "subcommand")
+
+    if entry.noninteractive_flag == false then
+      if not entry.subcommand or #entry.subcommand == 0 then
+        error(
+          "yana: backends." .. name .. ".noninteractive_flag = false requires a non-empty subcommand "
+            .. "(false means \"this vendor's subcommand IS its non-interactive mode\") -- refused at "
+            .. "setup: without one, a turn would run interactively and hang with nobody there to answer it",
+          0
+        )
+      end
+    else
+      entry.noninteractive_flag = require_flag(entry.noninteractive_flag, name, "noninteractive_flag")
+    end
+
+    if entry.stream_protocol == nil then
+      entry.stream_protocol = "cursor"
+    elseif type(entry.stream_protocol) ~= "string" or not STREAM_PROTOCOLS[entry.stream_protocol] then
+      local names = {}
+      for known in pairs(STREAM_PROTOCOLS) do
+        names[#names + 1] = known
+      end
+      table.sort(names)
+      error(
+        "yana: backends." .. name .. ".stream_protocol " .. vim.inspect(entry.stream_protocol)
+          .. " is not a protocol Yana implements -- must be one of: " .. table.concat(names, ", "),
+        0
+      )
+    end
+
+    entry.stream_json_args = require_arglist(entry.stream_json_args, name, "stream_json_args")
+    local want_token = PROTOCOL_STREAM_TOKEN[entry.stream_protocol]
+    local has_token = false
+    for _, tok in ipairs(entry.stream_json_args) do
+      -- Exact match against the bare token OR its "--"-flag spelling:
+      -- cursor/claude's "stream-json" is always its own standalone argv
+      -- element (a value following "--output-format"), matched bare; codex's
+      -- is a single boolean flag ("--json") with no separate value token,
+      -- matched as "--" .. want_token. A plain substring match would be too
+      -- loose here -- "stream-json" itself contains "json" as a substring,
+      -- which would let a cursor-shaped stream_json_args satisfy codex's
+      -- token by accident.
+      if tok == want_token or tok == ("--" .. want_token) then
+        has_token = true
+      end
+    end
+    if not has_token then
+      error(
+        "yana: backends." .. name .. ".stream_json_args must contain the token \"" .. want_token
+          .. "\" -- that is the " .. entry.stream_protocol .. " protocol's own request token, and an "
+          .. "entry requesting a different one would leave every turn producing no visible output",
+        0
+      )
+    end
+
+    entry.allow_edits_args = require_arglist(entry.allow_edits_args, name, "allow_edits_args")
+    check_no_reserved_tokens(entry.allow_edits_args, name, "allow_edits_args")
+
+    entry.ask_args = optional_arglist(entry.ask_args, name, "ask_args")
+    if entry.ask_args then
+      check_no_reserved_tokens(entry.ask_args, name, "ask_args")
+    end
+
+    -- `false` and `nil` are the same answer ("unsupported"); normalize the
+    -- sentinel form to nil so every other consumer only has one falsy shape
+    -- to check (M.resolve_cmd's own `getenv` helper follows the same rule).
+    if entry.list_models_args == false then
+      entry.list_models_args = nil
+    end
+    entry.list_models_args = optional_arglist(entry.list_models_args, name, "list_models_args")
+    if entry.list_models_args then
+      check_no_reserved_tokens(entry.list_models_args, name, "list_models_args")
+    end
+
+    if entry.list_models_format == nil then
+      entry.list_models_format = "lines"
+    elseif type(entry.list_models_format) ~= "string" or not LIST_MODELS_FORMATS[entry.list_models_format] then
+      local names = {}
+      for known in pairs(LIST_MODELS_FORMATS) do
+        names[#names + 1] = known
+      end
+      table.sort(names)
+      error(
+        "yana: backends." .. name .. ".list_models_format " .. vim.inspect(entry.list_models_format)
+          .. " is not a format Yana implements -- must be one of: " .. table.concat(names, ", "),
+        0
+      )
+    end
+
+    entry.models = optional_model_list(entry.models, name)
+
+    entry.select_model_flag = optional_flag(entry.select_model_flag, name, "select_model_flag")
+    entry.resume_flag = optional_flag(entry.resume_flag, name, "resume_flag")
+    entry.resume_subcommand = optional_arglist(entry.resume_subcommand, name, "resume_subcommand")
+    if entry.resume_flag and entry.resume_subcommand then
+      error(
+        "yana: backends." .. name .. " declares both resume_flag and resume_subcommand -- resume is "
+          .. "either a flag or a subcommand for one vendor, never both",
+        0
+      )
+    end
+
+    if entry.close_stdin == nil then
+      entry.close_stdin = false
+    elseif type(entry.close_stdin) ~= "boolean" then
+      error("yana: backends." .. name .. ".close_stdin must be a boolean, or nil", 0)
+    end
+  end
+  return out
+end
+
+--- The active backend name (layer 1). Must name an entry present in
+--- `backends` -- an unknown name is refused AT SETUP, by name, never at
+--- turn time (mirrors M.normalize_mode's refusal shape).
+function M.normalize_backend(value, backends)
+  if value == nil or value == "" then
+    return M.defaults.backend
+  end
+  if type(value) ~= "string" or backends[value] == nil then
+    local names = {}
+    for name in pairs(backends) do
+      names[#names + 1] = name
+    end
+    table.sort(names)
+    error(
+      "yana: invalid config.backend "
+        .. vim.inspect(value)
+        .. " — must name an entry in config.backends: "
+        .. table.concat(names, ", "),
+      0
+    )
+  end
+  return value
+end
+
+--- The active backend's descriptor table (already normalized by
+--- M.normalize_backends at setup time). Every consumer that needs to know
+--- HOW to talk to the current backend (agent.lua's build_cmd/list_models)
+--- asks this, never `M.options.backends[name]` directly, so there is one
+--- place a missing/renamed entry is handled consistently.
+function M.backend_descriptor(name)
+  name = name or M.options.backend
+  return M.options.backends and M.options.backends[name] or nil
+end
+
 --- `cmd_env` is either a non-empty string (the env var name) or `false`
 --- (step 2 disabled). Anything else falls back to the shipped default name
 --- rather than silently disabling env indirection on a typo.
@@ -660,12 +1244,30 @@ end
 ---               skipped or empty, and `note` says why.
 function M.resolve_cmd()
   local candidates = {}
+  local active = M.options.backend or M.defaults.backend
+  local entry = M.backend_descriptor(active) or {}
+
+  -- Layer 1 first: a backend whose entry names an explicit `cmd` (every
+  -- shipped entry except "cursor", and any operator override of it) wins
+  -- outright -- already validated executable (or PATH-deferred, see the
+  -- M.defaults.backends doc comment) at setup, so there is nothing left to
+  -- try. Only "cursor" with `cmd = nil` falls through to the historical
+  -- config/cmd_env/PATH chain below, which is what keeps the default
+  -- byte-identical to pre-backends Yana.
+  if type(entry.cmd) == "string" and entry.cmd ~= "" then
+    local expanded = vim.fn.expand(entry.cmd)
+    candidates[#candidates + 1] =
+      { step = "backend", backend = active, tried = true, raw = entry.cmd, expanded = expanded }
+    return { step = "backend", value = expanded, backend = active, candidates = candidates }
+  end
+  candidates[#candidates + 1] =
+    { step = "backend", backend = active, tried = false, note = "backends." .. active .. ".cmd not set; using the cmd/cmd_env/PATH chain" }
 
   local explicit = M.options.cmd
   if type(explicit) == "string" and explicit ~= "" then
     local expanded = vim.fn.expand(explicit)
     candidates[#candidates + 1] = { step = "config", tried = true, raw = explicit, expanded = expanded }
-    return { step = "config", value = expanded, candidates = candidates }
+    return { step = "config", value = expanded, backend = active, candidates = candidates }
   end
   candidates[#candidates + 1] = { step = "config", tried = false, note = "cmd not set in setup()" }
 
@@ -678,7 +1280,7 @@ function M.resolve_cmd()
       local expanded = vim.fn.expand(env_val)
       candidates[#candidates + 1] =
         { step = "cmd_env", tried = true, env_name = env_name, raw = env_val, expanded = expanded }
-      return { step = "cmd_env", value = expanded, candidates = candidates }
+      return { step = "cmd_env", value = expanded, backend = active, candidates = candidates }
     end
     candidates[#candidates + 1] =
       { step = "cmd_env", tried = false, env_name = env_name, note = "$" .. env_name .. " is not set" }
@@ -687,7 +1289,7 @@ function M.resolve_cmd()
   end
 
   candidates[#candidates + 1] = { step = "path", tried = true, raw = "cursor-agent", expanded = "cursor-agent" }
-  return { step = "path", value = "cursor-agent", candidates = candidates }
+  return { step = "path", value = "cursor-agent", backend = active, candidates = candidates }
 end
 
 --- Convenience for hot paths that only need the resolved string (agent spawn,
@@ -938,6 +1540,8 @@ function M.setup(opts)
   next_options.capture_root = M.normalize_capture_root(next_options.capture_root)
   next_options.inline_exec_allowlist = M.normalize_inline_exec_allowlist(next_options.inline_exec_allowlist)
   next_options.cmd_env = M.normalize_cmd_env(next_options.cmd_env)
+  next_options.backends = M.normalize_backends(next_options.backends)
+  next_options.backend = M.normalize_backend(next_options.backend, next_options.backends)
   next_options.enable_agentic = next_options.enable_agentic == true
   next_options.mode = M.normalize_mode(next_options.mode, next_options.enable_agentic)
   -- Only now does anything become effective.

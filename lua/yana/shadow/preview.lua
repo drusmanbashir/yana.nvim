@@ -657,6 +657,39 @@ end
 --- Preserve one individually refused agent file before the overlay settles.
 --- The fixed limits are product policy, not configuration. A repeated callback
 --- is idempotent only against the digest recorded in this live session.
+--- RULING 52 (issue log row 52) -- the staging area for a file `U` removes
+--- because the TURN created it. The bytes go into the turn's PRIVATE directory
+--- under the state root and nowhere else, which is why this lives here beside
+--- the other durable-retention copy machinery rather than in the applier:
+--- `shadow/preview.lua` is the module that owns `turn_dir`/`private_dir`, and
+--- the universal-negative inventory row pins its writes as "under session.turn_dir, never the real
+--- workspace". The APPLIER stays free of direct writers.
+---
+--- Named by a digest of the absolute path so two files with the same basename
+--- in different folders cannot collide, and so no component of the operator's
+--- own path is re-interpreted as a directory here.
+---
+--- RETENTION: `M.discard` deletes `private_dir` when the turn finishes, so a
+--- staged copy dies with the turn's evidence. That is deliberate and is what
+--- makes this redo-scoped recovery rather than an archive; the caller says so
+--- to the operator.
+function M.stage_undo_removal(session, abs_path, content)
+	if type(session) ~= "table" or type(session.private_dir) ~= "string" or session.private_dir == "" then
+		return nil, "this turn has no private evidence directory to stage a removal into"
+	end
+	if type(abs_path) ~= "string" or abs_path == "" or type(content) ~= "string" then
+		return nil, "a staged removal needs an absolute path and its bytes"
+	end
+	local base = abs_path:gsub(".*/", ""):gsub("[^%w%.%-_]", "_")
+	local staged = session.private_dir .. "/undo-staged/" .. hash.hash_bytes(abs_path):sub(1, 16) .. "-" .. base
+	vim.fn.mkdir(vim.fn.fnamemodify(staged, ":h"), "p")
+	local ok, err = diff.write_file(staged, content)
+	if not ok then
+		return nil, err
+	end
+	return staged
+end
+
 function M.retain_system_refused(session, change)
 	if type(session) ~= "table" or type(change) ~= "table" then
 		return false, "durable retention has no active turn"

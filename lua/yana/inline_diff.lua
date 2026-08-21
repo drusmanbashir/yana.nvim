@@ -717,6 +717,37 @@ local function open_review_buffer(change, preview)
   change.rel = change.rel or diff.relpath(path)
 
   local existing = vim.fn.bufnr(path, false)
+
+  -- RETRACE REINTEGRATION FAST PATH (FIX-UNDO lane, this session).
+  -- `lua/yana/timeline/retrace.lua`'s `reintegrate` builds `change.after`
+  -- from the CURRENT buffer's own bytes, precisely so the buffer it hands
+  -- back needs no rewrite. The ordinary path below stages `change.before`
+  -- into the buffer FIRST and patches it back to `target` with
+  -- `insert_new_lines` afterwards -- two real `nvim_buf_set_lines` calls,
+  -- each its own undo-tree entry, even when the net bytes end up exactly
+  -- where they started. That is fine for a fresh agent turn (the operator
+  -- has never seen this buffer's content before, so a staging boundary is
+  -- information, not noise) but wrong here: the buffer already IS the
+  -- reviewable state, and rewriting it anyway would insert a phantom
+  -- undo/redo step into the operator's OWN buffer history purely as a side
+  -- effect of `u` making a hunk decidable again. Measured 2026-08-21: it
+  -- broke the undo-survives-a-reload row's case, which counts exact
+  -- plain-`u` press counts against a closed review's LEFTOVER Neovim
+  -- history -- the phantom step is real and REAL undo has to walk past it.
+  -- So when the existing buffer already holds exactly `change.after`, this
+  -- returns it AS-IS -- no reload, no stage, no `insert_new_lines` later in
+  -- `M.open` (guarded there by the same `_retrace_reintegration` marker) --
+  -- and `M.build_diff_blocks`'s own positions still line up, because
+  -- `target` (below) never diverges from what is already on screen.
+  if change._retrace_reintegration and existing > 0 and vim.api.nvim_buf_is_loaded(existing) then
+    local cur = diff.buffer_text_normalized(existing)
+    if diff.text_equal_snapshot(cur, change.after or "") then
+      change.disk_at_open = diff.read_file_bytes(path)
+      change.undo_pre_stage_seq = buf_undo_seq(existing)
+      return existing, nil
+    end
+  end
+
   local existing_modified = existing > 0
     and vim.api.nvim_buf_is_loaded(existing)
     and vim.bo[existing].modified
@@ -2222,6 +2253,18 @@ local function navigate_or_park_state(state, direction)
   park_and_open_state(state, direction, item)
 end
 M._navigate_or_park_state = navigate_or_park_state
+-- Exposed for `lua/yana/timeline/retrace.lua`'s reintegration seam (FIX-UNDO
+-- lane, this session), same pattern as `M._navigate_or_park_state` above: a
+-- reversed hunk must come back where the operator can decide it RIGHT NOW,
+-- not merely append to the end of the queue behind whatever the queue
+-- auto-advanced to next -- ruling 7 ("parking is navigation, never a
+-- decision") names the PRIMITIVE, and this already-built one is exactly it.
+-- `target_item` here is synthesised by the caller (`{change, opts, owner}`)
+-- rather than read from this turn's own `ordered_target_for_state`, because
+-- a reintegrated hunk belongs to no turn's queue -- everything else about
+-- parking (snapshotting the current review's pending blocks, releasing its
+-- keymaps, reinserting it so a later advance still reaches it) is unchanged.
+M._park_and_open_state = park_and_open_state
 
 -- Owner callbacks belong to the panel, not to this engine, and the engine's
 -- own teardown must not depend on them succeeding. Before this guard, a throw
@@ -2324,30 +2367,42 @@ end
 --- The sweep. Returns the rels put back, the rels whose BYTES had to be
 --- written back to disk, and the ones that refused, each with its reason.
 local function undo_rest_of_turn(state)
-  local restored, reverted, refused = {}, {}, {}
+  local restored, reverted, refused, removed = {}, {}, {}, {}
   local ordered, st = turn_changes(state)
   local opts = state.opts or {}
   for _, c in ipairs(ordered) do
     if c ~= state.change then
       local rel = c.rel or c.path or "?"
       local was_accepted = c.status == "accepted"
+      -- Ruling 52: `U` branches on WHAT THE FILE WAS AT TURN START. An
+      -- existing file gets its turn-start bytes written back (ruling 48); an
+      -- agent-CREATED file had no bytes at turn start, only absence, so it is
+      -- staged and REMOVED instead. Both go through the same journaled
+      -- applier; only the announcement and the accounting differ.
+      local was_created = c.before == nil
       local ok = true
       if was_accepted then
         -- SAID BEFORE IT HAPPENS, and durably: this is the one write in the
         -- product that lands on the real tree without an accept behind it.
-        local said = "yana: U writes " .. rel .. " back to disk without an accept"
+        local said = was_created
+            and ("yana: U removes " .. rel .. ", which this turn created, and stages a recoverable copy")
+          or ("yana: U writes " .. rel .. " back to disk without an accept")
         log.write(
           "WARN",
           said .. " -- it had already been accepted, and undoing the turn puts its "
-            .. "turn-start bytes back through the journaled applier"
+            .. "turn-start "
+            .. (was_created and "absence" or "bytes")
+            .. " back through the journaled applier"
         )
         notify_one_line(said, vim.log.levels.WARN)
         if opts.on_shadow_revert then
-          local err
-          ok, err = opts.on_shadow_revert(c)
+          local err, info
+          ok, err, info = opts.on_shadow_revert(c)
           if ok ~= true then
             refused[#refused + 1] = rel .. ": " .. notify.error_headline(err or "revert failed")
             ok = false
+          elseif was_created then
+            removed[#removed + 1] = { change = c, rel = rel, staged_path = type(info) == "table" and info.staged_path or nil }
           end
         else
           ok = false
@@ -2364,8 +2419,73 @@ local function undo_rest_of_turn(state)
       end
     end
   end
+  if #removed > 0 then
+    -- REMEMBERED ON THE POOL, not in the timeline: the timeline holds no byte
+    -- snapshot by design, and this list is what `<C-r>` reads to know which
+    -- staged copies are waiting to be put back.
+    st.staged_removals = st.staged_removals or {}
+    for _, entry in ipairs(removed) do
+      st.staged_removals[#st.staged_removals + 1] = entry
+    end
+  end
   announce_state()
-  return restored, reverted, refused
+  return restored, reverted, refused, removed
+end
+
+--- Redo's half of ruling 52. `U` removed the files this turn CREATED, staging
+--- their bytes in the turn's private evidence dir; stepping forward again puts
+--- them back, byte for byte, through the journaled applier, and says which.
+---
+--- Returns true when it consumed the press. A missing staged copy (the turn's
+--- evidence was pruned) is REPORTED, never a silent no-op -- redo-scoped
+--- recovery is not an archive, and the operator has to be told which of the
+--- two happened.
+local function redo_staged_restores(state)
+  local st = pool_for(state and state.opts or {})
+  local pending = st.staged_removals
+  if type(pending) ~= "table" or #pending == 0 then
+    return false
+  end
+  st.staged_removals = nil
+  local opts = state.opts or {}
+  local restore = opts.on_shadow_restore_staged
+  local names, failed = {}, {}
+  for _, entry in ipairs(pending) do
+    local c = entry.change
+    local rel = entry.rel or (c and (c.rel or c.path)) or "?"
+    local ok, err = false, "no journaled restore available for this review"
+    if restore then
+      ok, err = restore(c)
+    end
+    if ok == true then
+      -- The exact inverse of `revive_change`: the change leaves the queue
+      -- again and stands accepted, which is what it was when `U` found it.
+      queue_remove_change(st, c)
+      c._parked_item = nil
+      c._parked_review = nil
+      c.status = "accepted"
+      notify_owner(opts.on_kept_unreviewed, c, "on_kept_unreviewed")
+      names[#names + 1] = rel
+    else
+      failed[#failed + 1] = rel .. ": " .. notify.error_headline(err or "restore failed")
+    end
+  end
+  if #names > 0 then
+    local msg = string.format("yana: restored %d file(s) removed by U: %s", #names, table.concat(names, ", "))
+    log.write("WARN", msg)
+    notify_one_line(msg, vim.log.levels.INFO)
+  end
+  if #failed > 0 then
+    local msg = string.format(
+      "yana: %d file(s) could NOT be restored -- the staged copy is redo-scoped, and this turn's evidence is gone: %s",
+      #failed,
+      table.concat(failed, "; ")
+    )
+    log.write("WARN", msg)
+    notify_one_line(msg, vim.log.levels.WARN)
+  end
+  announce_state()
+  return true
 end
 
 --- After a turn-wide undo the cursor belongs on the turn's FIRST pending
@@ -2398,6 +2518,7 @@ end
 -- ceiling, and two more file-local names would not fit.
 M._undo_rest_of_turn = undo_rest_of_turn
 M._focus_turn_first_hunk = focus_turn_first_hunk
+M._redo_staged_restores = redo_staged_restores
 
 local function mode_perm(mode)
   return mode and (mode % 4096) or nil
@@ -2979,6 +3100,22 @@ function M.cleanup(state)
       pcall(vim.keymap.del, "n", key, { buffer = bufnr })
       pcall(vim.keymap.del, "v", key, { buffer = bufnr })
     end
+    -- POST-REVIEW RETRACE (FIX-UNDO lane, operator ruling row 72,
+    -- 2026-08-21). This review's own `u`/`U`/`<C-r>` just died above with
+    -- the rest of `keys`; the buffer is otherwise Neovim's own again.
+    -- Reinstall `u`/`<C-r>` ONLY, buffer-local to exactly this buffer,
+    -- dispatching to cross-file retrace when (and only when) this
+    -- buffer's undo tree is still precisely where Yana's own last action
+    -- left it -- `lua/yana/timeline/retrace.lua`'s seam comment states
+    -- the exact condition. Any buffer whose tree has since moved (the
+    -- operator typed, or already ran plain undo/redo) gets Neovim's own
+    -- undo/redo, unchanged. Never `U`: ruling 48's turn-wide reset has no
+    -- cross-review meaning once a review has closed, and reusing the
+    -- letter for something else here would be its own defect.
+    local retrace_ok, retrace = pcall(require, "yana.timeline.retrace")
+    if retrace_ok and retrace.install_post_review_keys then
+      retrace.install_post_review_keys(bufnr)
+    end
   end
   if state.augroup then
     pcall(vim.api.nvim_del_augroup_by_id, state.augroup)
@@ -3229,17 +3366,27 @@ function M.open(change, opts)
 
   local pre_stage_lines = vim.deepcopy(vim.api.nvim_buf_get_lines(bufnr, 0, -1, false))
   local stage_ok, stage_err = pcall(function()
-    insert_new_lines(bufnr, blocks)
-    if parked and type(parked.staged_text) == "string" then
-      vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, buffer_lines(parked.staged_text))
-    end
-    if change.before == nil then
-      local n = vim.api.nvim_buf_line_count(bufnr)
-      if n > 1 and (vim.api.nvim_buf_get_lines(bufnr, n - 1, n, false)[1] or "") == "" then
-        vim.api.nvim_buf_set_lines(bufnr, n - 1, n, false, {})
+    -- See `open_review_buffer`'s own "RETRACE REINTEGRATION FAST PATH"
+    -- comment: when that fast path fired, the buffer was returned WITHOUT
+    -- being staged, and it already holds exactly `target` -- writing
+    -- `blocks` into it here would be the SAME phantom undo-tree entry that
+    -- fast path exists to avoid, on top of overwriting content that is
+    -- already correct. `highlight_blocks` alone still paints correctly:
+    -- `blocks`' positions were computed against `target`, which IS the
+    -- buffer's current content in this path.
+    if not change._retrace_reintegration then
+      insert_new_lines(bufnr, blocks)
+      if parked and type(parked.staged_text) == "string" then
+        vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, buffer_lines(parked.staged_text))
       end
+      if change.before == nil then
+        local n = vim.api.nvim_buf_line_count(bufnr)
+        if n > 1 and (vim.api.nvim_buf_get_lines(bufnr, n - 1, n, false)[1] or "") == "" then
+          vim.api.nvim_buf_set_lines(bufnr, n - 1, n, false, {})
+        end
+      end
+      vim.bo[bufnr].modified = false
     end
-    vim.bo[bufnr].modified = false
     highlight_blocks(bufnr, blocks)
   end)
   if not stage_ok then
@@ -3409,7 +3556,27 @@ function M.open(change, opts)
   -- The opening row. Recorded once the state is live, so tl_record can read the
   -- change off it, and after the buffer holds the staged content so the buffer
   -- epoch belongs to the tree the review is about to work in.
-  do
+  --
+  -- SKIPPED for a retrace reintegration (FIX-UNDO lane, this session).
+  -- `timeline.intent`/`intent_async` unconditionally call
+  -- `record.sync_buffer_head`, which advances this buffer's recorded head to
+  -- whatever row was JUST written -- correct for a genuine new turn, wrong
+  -- here: the retrace walk that opened this reintegration already left the
+  -- head exactly where it belongs (pointing at the reversed row's own
+  -- predecessor, via `walk_impl.step_buffer`'s own sync). Recording a fresh
+  -- "review_opened" row here would advance the head PAST the row retrace
+  -- just reversed, which un-reverts it in `record.entries`'s own
+  -- head-based derivation (`buffer_state`'s plain seq comparison cannot
+  -- tell an accept's reversal apart from never having reversed it at all,
+  -- since accepting moves no bytes -- the head override is what actually
+  -- carries that fact). Measured 2026-08-21: without this guard, the
+  -- operator's own worked-example fixture looped forever reversing the
+  -- SAME accepted hunk, because every reintegration re-armed it. A
+  -- reintegrated review needs no anchor of its own either way: if the
+  -- operator decides it again, that decision's own predecessor in the
+  -- journal is simply whatever row was already there (the file's own
+  -- history did not go anywhere).
+  if not change._retrace_reintegration then
     local obs = tl_observe(bufnr)
     state.timeline_obs = obs
     obs.regime = "buffer"
@@ -4176,6 +4343,13 @@ function M.open(change, opts)
   --- repaints afterwards so what is on screen still describes what is in the
   --- buffer.
   local function redo_key()
+    -- RULING 52 FIRST, and it is a LIFO question rather than a special case:
+    -- the last thing `U` did was sweep the turn, so the first thing redo owes
+    -- is that sweep's staged removals. Only once they are back does redo mean
+    -- what it has always meant inside this review.
+    if M._redo_staged_restores(state) then
+      return
+    end
     local stack = state.undone_decisions or {}
     local top = stack[#stack]
     local before = buf_undo_seq(bufnr)
@@ -4184,6 +4358,34 @@ function M.open(change, opts)
     -- the operator's own typing, say -- is the editor's own operation and is
     -- passed straight through, exactly as `u` does in the mirror case.
     local owed = top ~= nil and before ~= nil and top.pre_seq == before
+    -- REINTEGRATION REDO PRIORITY (FIX-UNDO lane, this session), decided
+    -- BEFORE trying native `:redo` at all -- unlike a genuine review, a
+    -- reintegrated one's buffer IS the exact same tree retrace's own
+    -- cross-file bookkeeping already walked backward through. Trying
+    -- native `:redo` first (the code below does, for every other review)
+    -- can succeed on its own -- Neovim's tree genuinely has forward states
+    -- retrace's own earlier `:undo` calls put there -- which moves the
+    -- buffer WITHOUT retrace's redo_stack popping or its own
+    -- `sync_buffer_head` bookkeeping updating. The two mechanisms then
+    -- disagree about where the buffer is, and retrace's NEXT press pops an
+    -- entry for a position the buffer has already passed, re-issuing a
+    -- `:redo` that lands nowhere new -- measured 2026-08-21: exactly this,
+    -- as duplicate "redid hunk_accepted" presses that never reached b.py's
+    -- own entries at all. Going straight to retrace when nothing is
+    -- locally owed keeps ONE mechanism moving this buffer, never two.
+    if not owed and change._retrace_reintegration then
+      local retrace_ok, retrace = pcall(require, "yana.timeline.retrace")
+      local ok_tl, tl = pcall(require, "yana.timeline")
+      if retrace_ok and retrace.redo and ok_tl then
+        local known = tl.known_workspaces and tl.known_workspaces() or {}
+        if #known == 0 then
+          known = { vim.fn.getcwd() }
+        end
+        if retrace.redo(known) then
+          return
+        end
+      end
+    end
     if not owed and state.reload_redo_guard and before == state.reload_restore_seq then
       undo_refuse("redo cannot reapply the transient buffer state used by reload")
       rerender_after_history_move("native_redo")
@@ -4212,6 +4414,10 @@ function M.open(change, opts)
     end
 
     if not owed and after == before then
+      -- A reintegrated review already tried retrace's own cross-file redo
+      -- BEFORE native `:redo` ran at all (see the check above, right after
+      -- `owed` -- this is the general refusal for a GENUINE review, whose
+      -- staging boundary is real and must not be reached past).
       undo_refuse("there is no newer buffer state to redo inside this review")
       rerender_after_history_move("native_redo")
       return
@@ -4404,6 +4610,36 @@ function M.open(change, opts)
       -- left three hunks over the pre-turn file. Refuse by name; the file-level
       -- keys are the way out of a review, not undo.
       if cur ~= nil and state.undo_open_seq ~= nil and cur <= state.undo_open_seq then
+        -- ROW 74 (issue log, orchestrator ruling 2026-08-21): this
+        -- review's OWN decision stack is empty and its buffer has not
+        -- moved since it opened (e.g. the queue just auto-advanced
+        -- here) -- that is not the same fact as "nothing to undo
+        -- anywhere". Ask the cross-file order index before refusing:
+        -- `u` must answer from the WHOLE turn's history, never just the
+        -- file under the cursor. This is a lookup only when THIS file's
+        -- own stack is empty; every other branch of this function
+        -- (popping a real decision) is unchanged.
+        local retrace_ok, retrace = pcall(require, "yana.timeline.retrace")
+        if retrace_ok and retrace.try_from_floor and retrace.try_from_floor() then
+          return
+        end
+        -- REINTEGRATION FLOOR EXCEPTION (FIX-UNDO lane, this session). The
+        -- refusal above protects a GENUINE agent turn's staging boundary --
+        -- real bytes retrace cannot see past. A review retrace itself
+        -- reintegrated (`change._retrace_reintegration`) staged nothing:
+        -- `open_review_buffer`'s own fast path left the buffer exactly as
+        -- it was, so there is no staging step here to strip a proposal out
+        -- of. Once cross-file retrace ALSO has nothing left, the correct
+        -- floor for a reintegrated review is the SAME one the post-review
+        -- hook (`on_u_key`) already falls through to: plain Neovim undo,
+        -- reaching whatever real history sits below where this reintegration
+        -- opened. Measured 2026-08-21: without this, the undo-survives-a-reload
+        -- row's case got stuck refusing the instant its
+        -- own first reintegration opened -- the operator's own further `u`
+        -- presses toward the true pre-turn buffer went nowhere.
+        if change._retrace_reintegration then
+          return native_undo()
+        end
         undo_refuse("that is as far back as undo goes inside this review")
         return
       end
@@ -4464,7 +4700,7 @@ function M.open(change, opts)
     -- ACCEPTED is already on disk, so putting it back is a real-tree WRITE
     -- with no accept behind it -- permitted here, said out loud as it
     -- happens, and journaled like every other write.
-    local restored, reverted, refused = M._undo_rest_of_turn(state)
+    local restored, reverted, refused, removed = M._undo_rest_of_turn(state)
     record_decision(state, "undo_turn", {
       decisions_undone = n,
       to_undo_seq = state.undo_open_seq,
@@ -4488,6 +4724,36 @@ function M.open(change, opts)
     )
     log.write("WARN", summary)
     notify_one_line(summary, vim.log.levels.INFO)
+    if #removed > 0 then
+      -- RETENTION, SAID IN THE MESSAGE ITSELF (ruling 52). The staged copy
+      -- lives in this turn's private evidence directory and nowhere else, so
+      -- it dies with the turn's evidence. This is redo-scoped recovery, not an
+      -- archive, and an operator who is told only "recoverable" will assume
+      -- the wrong one.
+      local rels = {}
+      for _, entry in ipairs(removed) do
+        rels[#rels + 1] = entry.rel
+      end
+      local mmsg = string.format(
+        "yana: removed %d file(s) created this turn (recoverable): %s",
+        #rels,
+        table.concat(rels, ", ")
+      )
+      -- TWO LINES, and the second one is short ON PURPOSE. `notify_one_line`
+      -- truncates to the panel width, so a retention clause appended to the
+      -- line above is exactly the half that gets cut (the same lesson ruling
+      -- 46's disclosure line learned). The operator has to be able to READ the
+      -- retention, so it gets its own line that fits, and the long form goes
+      -- durable.
+      local retention = "yana: redo-scoped recovery, not an archive -- pruning the turn ends it"
+      log.write(
+        "WARN",
+        mmsg .. " -- the copy lives in this turn's private evidence dir, so redo puts it back; "
+          .. "once that evidence is pruned the bytes are gone. Redo-scoped recovery, not an archive."
+      )
+      notify_one_line(mmsg, vim.log.levels.WARN)
+      notify_one_line(retention, vim.log.levels.WARN)
+    end
     if #refused > 0 then
       local rmsg = string.format(
         "yana: %d file(s) could NOT be undone and are still as you left them: %s",
@@ -4861,6 +5127,35 @@ function M.open(change, opts)
                 .. tostring(applied_i.reconcile_error),
               vim.log.levels.WARN
             )
+          end
+          -- OPERATOR RULING ROW 72(b), 2026-08-21: "undo should cover
+          -- [a file not open in Neovim] if not too complex to code."
+          -- This change NEVER had a review buffer (`M.open` never ran for
+          -- it), so `finish_session`'s own `tl_record(state, "applied",
+          -- ...)` -- the ONLY other place a durable row gets recorded --
+          -- never runs for it either, and nothing in the timeline ever
+          -- named this write. Record it here, the same way, so the
+          -- EXISTING `diary.revert_operation` walk step (already the
+          -- durable half of `walk_impl.lua`, already exercised by every
+          -- in-review accept) can find and reverse it later. A missing
+          -- `diary_dir`/`op_id` (a handler that did not go through the
+          -- journal) is a named, logged gap, never a silent one -- the
+          -- warning below is exactly ruling 72(b)'s "print a warning
+          -- naming the file" floor.
+          if type(applied_i) == "table" and applied_i.diary_dir and applied_i.op_id then
+            tl_record(
+              { change = change_i, opts = item.opts },
+              "applied",
+              "applied " .. (change_i.rel or path),
+              { regime = "durable", diary_dir = applied_i.diary_dir, op_id = applied_i.op_id }
+            )
+          else
+            local warn = "yana: "
+              .. (change_i.rel or path)
+              .. " was accepted without ever being opened, but no journaled op id came back -- "
+              .. "undo will not be able to reach it; the write itself still happened"
+            log.write("WARN", warn)
+            notify_one_line(warn, vim.log.levels.WARN)
           end
         else
           change_i.review_error = tostring(aerr or "shadow accept failed")

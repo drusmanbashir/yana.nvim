@@ -337,6 +337,27 @@ def compare_path(upper_path: str, lower_path: str, st_upper: os.stat_result) -> 
     return ops
 
 
+def dir_has_upper_children(upper_path: str) -> bool:
+    """Whether this directory holds at least one entry in the UPPER layer.
+
+    Used only to decide whether a pre-existing directory's OWN mode delta
+    against the lower layer is an observable operation at all — see the
+    docstring on its call site in `walk_upper` for the full reasoning.
+
+    Fails CLOSED: an unreadable directory returns False (no children found),
+    which means the caller does NOT suppress the mode record — an agent's own
+    directory chmod must never be silently dropped just because this listing
+    could not be read.
+    """
+    try:
+        with os.scandir(upper_path) as it:
+            for _ in it:
+                return True
+    except OSError:
+        return False
+    return False
+
+
 def on_walk_error(err: OSError) -> None:
     raise ChangesetError(f"walk failed at {err.filename}: {err.strerror}") from err
 
@@ -401,6 +422,35 @@ def walk_upper(workspace: str, upper: str) -> list[tuple[str, ...]]:
                     records.append(("opaque", rel))
                 for op_fields in compare_path(upper_path, lower_path, st):
                     if op_fields[0] == "create" and ("opaque", rel) in records:
+                        continue
+                    if op_fields[0] == "mode" and dir_has_upper_children(upper_path):
+                        # A pre-existing directory that also holds copied-up
+                        # descendants is not itself a content change: its
+                        # presence, and any mode it carries, in the upper
+                        # layer is fully explained by materialising the
+                        # descendants underneath it, which are ALREADY their
+                        # own separate records in this same walk. Whatever
+                        # process wrote those descendants (kernel copy-up on
+                        # a plain write, or a tool that copies a directory
+                        # tree by attribute-preserving means) may leave this
+                        # directory's own mode bits at whatever its own
+                        # materialisation path produced, independent of
+                        # anything the agent decided about permissions — a
+                        # measured case: a directory whose only upper content
+                        # is two edited files nested a level below it, walked
+                        # with a group-writable lower mode and a non-group-
+                        # writable upper mode with no `chmod` anywhere in the
+                        # turn. Refusing that as an unrepresentable operation
+                        # blocks review of the real edits beside it for a
+                        # delta nobody asked for and nothing can act on.
+                        #
+                        # A directory with NO upper children is a different
+                        # case entirely: nothing else explains its presence in
+                        # upper, so a mode delta there is the operation, and
+                        # it is still emitted and refused by name exactly as
+                        # before — this is the mutation that must stay red:
+                        # an agent that chmods a directory and touches
+                        # nothing beneath it.
                         continue
                     records.append(tuple([op_fields[0], rel, *op_fields[1:]]))
                 continue

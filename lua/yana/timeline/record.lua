@@ -48,6 +48,16 @@ local flush = require("yana.safety.flush")
 local diary = require("yana.safety.diary")
 local uv = vim.uv or vim.loop
 
+--- Lazily required: this module must stay usable from a bare context (a
+--- headless probe preloading a stub, per walk_impl.lua's own precedent) even
+--- if `yana.log` is not on the load path there.
+local function log_warn(msg)
+	local ok, log = pcall(require, "yana.log")
+	if ok and log and log.write then
+		log.write("WARN", "yana.timeline: " .. msg)
+	end
+end
+
 local KINDS = {
 	review_opened = true,
 	hunk_accepted = true,
@@ -71,6 +81,18 @@ local HEAD_ID_VAR = "yana_timeline_head_id"
 
 local function timeline_dir(ws)
 	return ws .. "/.yana/timeline"
+end
+
+--- The cross-file ORDER pointer (FIX-UNDO lane, operator ruling 2026-08-21).
+--- ORDER ONLY: `{seq, rel, id, kind}`, one line per timeline row, workspace-
+--- monotonic. Never bytes, never a second copy of anything a per-path journal
+--- already owns -- the per-path `.jsonl` files stay exactly as they are and
+--- stay the authority for content and state. This file exists because the
+--- per-path journals alone answer "what happened to THIS file, in order" but
+--- not "what happened LAST, anywhere in this workspace" without reading every
+--- one of them; the pointer makes that O(1) instead of O(files).
+local function order_file(ws)
+	return timeline_dir(ws) .. "/_order.jsonl"
 end
 
 --- Injective filename for a workspace-relative path: every byte outside
@@ -306,6 +328,103 @@ local function read_rows(path)
 end
 
 -- ---------------------------------------------------------------------------
+-- The cross-file order pointer: a workspace-monotonic counter, durable
+-- across restarts by recovering its high-water mark from the pointer file
+-- itself (the same "read what's already on disk" recovery the diary and the
+-- per-path journals both use elsewhere), and one append function.
+-- ---------------------------------------------------------------------------
+
+local global_seq_cache = {}
+
+-- Every workspace root that has recorded at least one row THIS SESSION --
+-- populated automatically as a side effect of `next_global_seq`, which
+-- every `prepare_row` call already runs exactly once. This is what lets
+-- the post-review `u` dispatcher (`retrace.lua`) retrace across every root
+-- a panel/turn actually touched without needing its own copy of that list
+-- from `ui.lua`'s pass/turn bookkeeping -- "every root with a row" and
+-- "every root this session touched" are the same set by construction.
+local known_workspaces = {}
+
+--- PUBLIC: every workspace this process has recorded a timeline row for,
+--- in no particular order. FIX-UNDO lane, 2026-08-21.
+function M.known_workspaces()
+	local out = {}
+	for ws in pairs(known_workspaces) do
+		out[#out + 1] = ws
+	end
+	return out
+end
+
+local function last_recorded_global_seq(ws)
+	local rows = read_rows(order_file(ws))
+	local last = 0
+	if rows then
+		for _, r in ipairs(rows) do
+			if type(r.seq) == "number" and r.seq > last then
+				last = r.seq
+			end
+		end
+	end
+	return last
+end
+
+--- The next workspace-monotonic seq. Gaps are harmless (a failed append
+--- still consumed one), and the counter is cached in-memory per workspace
+--- after its first read so a long session does not re-read the whole
+--- pointer file on every intent.
+local function next_global_seq(ws)
+	known_workspaces[ws] = true
+	local cached = global_seq_cache[ws]
+	if cached == nil then
+		cached = last_recorded_global_seq(ws)
+	end
+	cached = cached + 1
+	global_seq_cache[ws] = cached
+	return cached
+end
+
+--- Append one order-pointer row, durably: fsync the file, and (only the
+--- first time this pointer file is created) fsync the directory so its NAME
+--- is durable too -- the same shape `append_row` uses for a per-path
+--- journal, kept independent of it on purpose: the pointer is a SEPARATE,
+--- strictly secondary artefact, and its own durability failure must never be
+--- read as "the decision did not happen" when the per-path row (the real
+--- authority) already landed.
+local function append_order_row(ws, row)
+	local dir = timeline_dir(ws)
+	local path = order_file(ws)
+	local existed = uv.fs_stat(path) ~= nil
+	if not existed and vim.fn.isdirectory(dir) ~= 1 then
+		local mk_ok, mk_err = pcall(vim.fn.mkdir, dir, "p")
+		if not mk_ok or vim.fn.isdirectory(dir) ~= 1 then
+			return false, "cannot create " .. dir .. (mk_err and (": " .. tostring(mk_err)) or "")
+		end
+	end
+	local line = vim.json.encode(row) .. "\n"
+	local fd, err = uv.fs_open(path, "a", 438)
+	if not fd then
+		return false, err
+	end
+	local ok, werr = write_all_fd(fd, line)
+	if not ok then
+		uv.fs_close(fd)
+		return false, werr
+	end
+	ok, err = flush.fsync(fd)
+	uv.fs_close(fd)
+	if not ok then
+		return false, err
+	end
+	if not existed then
+		local ok2, e2 = fsync_dir(dir)
+		if not ok2 then
+			return false, e2
+		end
+	end
+	return true
+end
+
+-- ---------------------------------------------------------------------------
 -- Correlation ids and buffer observation helpers.
 -- ---------------------------------------------------------------------------
 
@@ -417,6 +536,20 @@ local function buffer_head(bufnr)
 		expected_hash = get(HEAD_HASH_VAR),
 		id = get(HEAD_ID_VAR),
 	}
+end
+
+--- PUBLIC (FIX-UNDO lane, 2026-08-21): read-only view of the same head this
+--- module's own `reachable()` buffer branch and `walk_impl.lua` compare
+--- against -- "where did YANA's own bookkeeping last leave this buffer's
+--- undo tree". This is the exact-condition primitive the post-review `u`/
+--- `<C-r>` dispatcher (`lua/yana/timeline/retrace.lua`) needs: a buffer
+--- whose CURRENT position still equals this head has had nothing (no
+--- typing, no plain `:undo`) move it since Yana's last action, so `u`
+--- retraces; any other position means the operator's own history is the
+--- newest thing there, so `u` stays Neovim's. Never bytes -- an epoch, a
+--- seq and a hash, precisely what `M.sync_buffer_head` already writes.
+function M.buffer_head(bufnr)
+	return buffer_head(bufnr)
 end
 
 local function find_buffer(abs)
@@ -546,6 +679,14 @@ local function prepare_row(entry)
 		regime = regime,
 		rel = rel,
 		ts = os.time(),
+		-- FIX-UNDO lane, 2026-08-21: workspace-monotonic, stamped on EVERY row
+		-- at this single choke point (both `M.intent` and `M.intent_async`
+		-- share `prepare_row`), so a per-file journal alone still carries
+		-- enough to rebuild the cross-file order pointer if that pointer file
+		-- were ever lost. ORDER ONLY: ordering by this integer never decides
+		-- WHETHER a row is reachable -- `reachable()`'s per-path LIFO rule is
+		-- untouched and still the one authority for that.
+		global_seq = next_global_seq(ws),
 	}
 	if regime == "durable" then
 		if entry.buffer_epoch ~= nil or entry.undo_seq ~= nil or entry.expected_hash ~= nil then
@@ -589,6 +730,17 @@ function M.intent(entry)
 	if not ok then
 		return nil, "timeline intent not durable — the action must halt: " .. tostring(err)
 	end
+	-- SECONDARY and NON-FATAL on purpose: the per-path row above is already
+	-- durable and is the real authority. A pointer-append failure costs the
+	-- cross-file ORDER INDEX one entry (recoverable in principle by rescanning
+	-- every per-path journal for this row's global_seq), never the decision
+	-- itself -- halting the caller here would turn a secondary index's fsync
+	-- failure into a refused accept/reject, which is a worse outcome than a
+	-- stale pointer.
+	local pok, perr = append_order_row(ws, { seq = row.global_seq, rel = rel, id = row.id, kind = row.kind })
+	if not pok then
+		log_warn("timeline order pointer not durable for " .. tostring(rel) .. ": " .. tostring(perr))
+	end
 	if row.regime == "buffer" then
 		local bufnr = find_buffer(diff.abs_path(ws .. "/" .. rel))
 		if bufnr then
@@ -618,6 +770,15 @@ function M.intent_async(entry, callback)
 	end)
 	if not ok then
 		return nil, "timeline intent not queued for durability: " .. tostring(err)
+	end
+	-- Same secondary, non-fatal pointer append as `M.intent`. Done
+	-- synchronously even on this async path: the pointer file is tiny (one
+	-- JSON line) and this keeps the ordering guarantee simple -- the order
+	-- pointer for THIS row is on disk before the caller's `intent_async`
+	-- returns, never racing a later row's pointer append.
+	local pok, perr = append_order_row(ws, { seq = row.global_seq, rel = rel, id = row.id, kind = row.kind })
+	if not pok then
+		log_warn("timeline order pointer not durable for " .. tostring(rel) .. ": " .. tostring(perr))
 	end
 	-- The row is already appended at this point. Advance the in-memory cursor
 	-- now, in append order, not from the later fsync callback: a later hunk
@@ -686,6 +847,109 @@ function M.entries(workspace, rel)
 		end
 	end
 	return out, err
+end
+
+--- The single most recent NOT-YET-REVERTED row across every file this
+--- workspace's timeline has, newest `global_seq` first. This is what
+--- cross-file `u` (FIX-UNDO lane, ruling 2026-08-21) retraces against once a
+--- file's own review has closed: global chronological order is a linear
+--- extension of every per-path order, so the row this returns is
+--- automatically its OWN path's newest un-reverted row too, and
+--- `reachable()`'s per-path LIFO guarantee is never violated by walking
+--- straight to it. A row whose file's review is still OPEN is skipped: that
+--- surface belongs to the review's own `u`/`U`/`<C-r>` until it closes
+--- (`review_open_for`, unchanged).
+---
+-- Only these kinds are operator-facing ACTIONS a retrace can undo.
+-- `review_opened`/`review_closed` are markers -- they carry a real undo_seq
+-- (so `walk`'s own machinery can target them as a LANDING state) but
+-- reverting "review opened" is not a thing the operator did.
+local UNDOABLE_KIND = {
+	hunk_accepted = true,
+	hunk_rejected = true,
+	human_edit = true,
+	applied = true,
+}
+
+--- Returns nil when there is nothing left to undo anywhere in the workspace
+--- -- an empty pointer file, every row already reverted, or every remaining
+--- row's file still mid-review. Callers MUST say so rather than doing
+--- nothing silently (the retrace's own "empty history" contract).
+---
+--- `walk_target` is the id `walk.plan`/`walk.execute` must be called WITH:
+--- walking "to" a row means landing on it, i.e. reverting everything NEWER
+--- than it (`walk_impl.lua`'s own contract) -- so to revert `id` itself the
+--- caller must target `id`'s own PREDECESSOR in that path's row list, which
+--- this resolves once here rather than asking every caller to re-derive it.
+--- nil when `id` is the first row for its path (the product always records a
+--- `review_opened` marker there in practice, so this should not arise live).
+---
+--- `exclude` (optional set, id -> true) skips rows the caller has already
+--- reported as refused THIS session -- operator ruling row 72 (a): a
+--- refusal must not strand every OLDER row behind it, so the caller (the
+--- retrace dispatcher) remembers what it already reported and asks for the
+--- next candidate down, one press at a time. The refused row itself is
+--- UNTOUCHED here: excluding it from this scan does not revert it, mark it,
+--- or remove it from its own file's ordinary review -- it stays exactly
+--- pending, reachable the normal way.
+--- @return table|nil {rel, id, kind, global_seq, walk_target}, string|nil err
+function M.next_undo(workspace, exclude)
+	local ws = diff.abs_path(workspace or vim.fn.getcwd())
+	local order_rows, oerr = read_rows(order_file(ws))
+	if order_rows == nil then
+		return nil, oerr
+	end
+	table.sort(order_rows, function(a, b)
+		return (a.seq or 0) > (b.seq or 0)
+	end)
+	local entries_cache = {}
+	for _, prow in ipairs(order_rows) do
+		local rel = prow.rel
+		if
+			type(rel) == "string"
+			and type(prow.id) == "string"
+			and UNDOABLE_KIND[prow.kind]
+			and not (exclude and exclude[prow.id])
+		then
+			if M.review_open_for(ws, rel) then
+				goto continue_next_undo
+			end
+			local list = entries_cache[rel]
+			if list == nil then
+				list = M.entries(ws, rel)
+				entries_cache[rel] = list
+			end
+			for i, e in ipairs(list) do
+				if e.id == prow.id then
+					if e.state == "done" then
+						local prev = list[i - 1]
+						return {
+							rel = rel,
+							id = e.id,
+							kind = e.kind,
+							global_seq = prow.seq,
+							walk_target = prev and prev.id or nil,
+							-- Carried for the ONE case `walk_target == nil` cannot
+							-- express: a durable row with no buffer-recorded
+							-- predecessor at all (ruling row 72(b) -- a file
+							-- accepted without ever being opened, so no
+							-- `review_opened` anchor was ever recorded for it).
+							-- `walk.plan`/`walk.execute`'s target-lands-on
+							-- abstraction has no id to name for "nothing came
+							-- before this"; the caller needs these three fields
+							-- to revert the op directly instead.
+							regime = e.regime,
+							diary_dir = e.diary_dir,
+							op_id = e.op_id,
+						}
+					end
+					break
+				end
+			end
+		end
+		::continue_next_undo::
+	end
+	return nil
 end
 
 --- Can this entry be walked to right now?
@@ -807,6 +1071,24 @@ function M.review_open_for(workspace, rel)
 	if not change then
 		return false
 	end
+	-- RETRACE REINTEGRATION EXEMPTION (FIX-UNDO lane, 2026-08-21).
+	-- `lua/yana/timeline/retrace.lua` reopens a review to make a reversed
+	-- hunk decidable again, and marks the change it builds
+	-- `_retrace_reintegration = true`. That review must never freeze the
+	-- OPERATOR'S OWN continued `u` presses into this same file's older,
+	-- still-un-reverted history -- ruling row 72(a)'s "a refusal must not
+	-- strand a hunk" reasoning extends here: reintegration exists to make a
+	-- hunk decidable, not to jam retrace behind its own bookkeeping.
+	-- Measured: P115's real-keypress sequence walks FIVE consecutive rows
+	-- of the same file (A.txt) across five separate presses; without this
+	-- exemption the second of those presses reads as "A.txt is mid-review"
+	-- (because the first press's reintegration just opened one) and every
+	-- older row for A.txt goes unreachable until that mini-review is
+	-- decided. A GENUINE agent-turn review (no marker) still blocks below,
+	-- exactly as before.
+	if change._retrace_reintegration then
+		return false
+	end
 	if change.path and rel and diff.abs_path(change.path) == diff.abs_path(ws .. "/" .. rel) then
 		return true
 	end
@@ -814,6 +1096,24 @@ function M.review_open_for(workspace, rel)
 		return true
 	end
 	return false
+end
+
+--- Test/introspection only (FIX-UNDO lane): forget every workspace this
+--- process has recorded a row for, and the cached global-seq high-water
+--- marks with it. Real sessions never call this -- `known_workspaces`
+--- growing for the process's whole lifetime is deliberate (retrace.lua's
+--- `on_u_key`/`try_from_floor` read it to reach every root a session has
+--- ever touched). A test harness that runs many INDEPENDENT scenarios back
+--- to back in one Neovim process (the review-state-property row's model) is not one such
+--- session, though, and without a reset a later scenario's very first `u`
+--- press can retrace into an earlier scenario's leftover, already-torn-down
+--- workspace -- measured 2026-08-21: the review-state-property row's seed 87002 shrunk to a bare `u`
+--- reds only when run after an earlier witness in the same process, and
+--- passes clean in isolation with the identical trace (see the FIX-UNDO
+--- lane report). Call this between independent scenarios, never mid-trace.
+function M._test_reset()
+	known_workspaces = {}
+	global_seq_cache = {}
 end
 
 return M

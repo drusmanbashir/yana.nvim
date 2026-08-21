@@ -81,7 +81,6 @@ local function new_panel_state()
     session_id = nil,
     title = nil,           -- short session title (from the first prompt)
     mode = nil,
-    model = nil,           -- selected model id for this panel (nil => auto)
     job = nil,
     turn_gen = 0,          -- bumped on every submit/cancel; stale on_event/on_done no-op
     job_spawn_gen = nil,   -- turn_gen at which p.job was spawned; the correlation token
@@ -762,12 +761,25 @@ local function mode_chip(p)
 end
 
 local function model_chip(p)
-  local label = p.model or "auto"
-  if #label > 24 then
-    label = label:sub(1, 23) .. "…"
+  -- Session-scoped, like mode's own chip reads through config.panel_mode:
+  -- the model picked in ANY panel is the whole nvim session's model, so
+  -- every panel's chip reads the session value directly rather than a
+  -- per-panel copy that could go stale the moment another panel picks.
+  --
+  -- Row 58: `model: claude-4-sonnet` alone
+  -- is ambiguous by construction -- it is what let the operator believe
+  -- they were on their own Anthropic account when they were on Cursor's
+  -- resale of it. The backend name is prefixed so two different products on
+  -- two different meters are never displayed identically
+  -- (`cursor:claude-4-sonnet` vs `claude:claude-sonnet-5`).
+  local backend = config.options.backend or "cursor"
+  local label = config.options.model or "auto"
+  local text = backend .. ":" .. label
+  if #text > 24 then
+    text = text:sub(1, 23) .. "…"
   end
   local hl = config.model_hl_group
-  return string.format("model: %%#%s#%s%%*", hl, label:gsub("%%", "%%%%"))
+  return string.format("model: %%#%s#%s%%*", hl, text:gsub("%%", "%%%%"))
 end
 
 local function winbar_text(p)
@@ -794,22 +806,22 @@ local function winbar_text(p)
   if #panels > 1 then
     left = left .. " [" .. panel_index(p) .. "]"
   end
+  -- ESCAPE THE PERCENTS. p.title is the raw first line of the user's prompt,
+  -- and 'winbar' is a statusline-syntax option: a bare "%" raises E539 and
+  -- "%{" raises E540. So a first prompt like "cut tokens by 50%" made every
+  -- update_winbar throw -- including the one in on_done, which sits BEFORE
+  -- persist_session and maybe_drain_queue, so queued prompts stopped
+  -- draining and the session stopped persisting for the rest of the
+  -- session. A lifecycle stall reachable by typing an ordinary sentence.
   local sess
   if p.title and p.title ~= "" then
     sess = p.title
     if #sess > 24 then
       sess = sess:sub(1, 23) .. "…"
     end
-    -- ESCAPE THE PERCENTS. p.title is the raw first line of the user's prompt,
-    -- and 'winbar' is a statusline-syntax option: a bare "%" raises E539 and
-    -- "%{" raises E540. So a first prompt like "cut tokens by 50%" made every
-    -- update_winbar throw -- including the one in on_done, which sits BEFORE
-    -- persist_session and maybe_drain_queue, so queued prompts stopped
-    -- draining and the session stopped persisting for the rest of the
-    -- session. A lifecycle stall reachable by typing an ordinary sentence.
-    sess = "  · " .. sess:gsub("%%", "%%%%")
+    sess = sess:gsub("%%", "%%%%")
   else
-    sess = p.session_id and "  · session" or "  · new"
+    sess = p.session_id and "session" or "new"
   end
   local pending = #diff.pending(p.changes)
   reconcile_pending(p, pending)
@@ -824,25 +836,55 @@ local function winbar_text(p)
       tostring(p.first_failed_shell_exit or "?")
     )
   end
-  local shadow = ""
+  -- Row 64: this used to spell the segment using the removed `shadow` option
+  -- name (as `shadow` + a colon + `apply`, or `shadow` + a colon + `confined`)
+  -- -- `shadow` is one of the ten option names MODE-30 removed (see the modes
+  -- module's migration notes), and the operator saw a dead option name in the
+  -- winbar of every turn. `overlay` is the surviving word for the confinement
+  -- layer itself; `review`/`confined` say what happens inside it.
+  local confinement = ""
   if not config.overlay_mode() then
     -- `agentic`: no overlay, no review -- the agent writes. Say so. The old
     -- label here named the removed `preview` mode (ruling R-1), advertising a
     -- diagnostic nobody can be in on the one surface every session shows.
-    shadow = " · unconfined"
+    confinement = " · unconfined"
   elseif config.review_mode_active() then
-    shadow = " · shadow:apply"
+    confinement = " · overlay:review"
   else
     -- `ask`: confined like `inline`, but nothing is proposed so no review is
     -- owed. Saying so beats saying nothing, which reads as "no overlay".
-    shadow = " · shadow:confined"
+    confinement = " · overlay:confined"
   end
   -- The liveness segment sits immediately after the spinner/state word and
   -- BEFORE the mode and model chips: it is the most volatile thing on the bar
   -- and the only thing that changes while the operator is waiting. Everything
   -- to its right keeps the exact position and text it had before, so an
   -- ordinary turn looks as it always did apart from these few characters.
-  return string.format("%%#Title#%s%%*%s · %s · %s%s%s%s%s%s",
+  --
+  -- Row 65: `winbar` is one Vim statusline-style line -- it can never wrap,
+  -- and Neovim only clips it for DISPLAY at draw time; the STRING returned
+  -- here (and stored in `vim.wo[win].winbar`) always carries every field in
+  -- full -- pending/queued/failed counts included -- because other readers
+  -- (the pending-count witness, the operator's own `:echo &winbar`) depend on
+  -- that being the truth, not a pre-shortened guess. `%<` is Neovim's own
+  -- truncation-point marker: without it, a too-long bar truncates from the
+  -- START (default), which used to eat the state word, the liveness segment
+  -- and -- worst -- the MODE, while keeping the echoed prompt at the far
+  -- right. Observed 2026-08-21 on a narrow panel: the bar read "<del:
+  -- claude-4-sonnet · [the pre-row-64 shadow segment] · can some of those be
+  -- re…", the `<del:` being the tail of `model:` after the left half was cut
+  -- away. Placing
+  -- `%<` right before the echoed session label, UNCONDITIONALLY (previously
+  -- only the titled branch carried one; a fresh/resumed chat with no title
+  -- had none, so IT still truncated from the start) protects everything to
+  -- its left -- state, liveness, mode, model, pending/queued/failed counts,
+  -- and the row-64 confinement segment -- and sacrifices only the one field
+  -- already established as "the right thing to lose": the operator's own
+  -- echoed sentence, which they already know. Neovim marks the cut itself
+  -- (a literal `<`) when it draws a truncated bar, so a shortened line still
+  -- SAYS it was shortened without this file inventing a second, divergent
+  -- truncation mechanism that could disagree with what is actually on screen.
+  return string.format("%%#Title#%s%%*%s · %s · %s%s%s%s%s%%<  · %s",
     left,
     liveness_text(p),
     mode_chip(p),
@@ -850,7 +892,7 @@ local function winbar_text(p)
     pend,
     queued,
     shell_fail,
-    shadow,
+    confinement,
     sess)
 end
 
@@ -967,13 +1009,32 @@ local function render_user(p, question, label)
   append(p, lines, "user")
 end
 
+-- Row 63: the header used to hard-code "Cursor" for every turn, so a claude
+-- turn on the operator's own Anthropic account was labelled with cursor's
+-- name while the winbar (model_chip) correctly said `claude:...`. The panel
+-- contradicted itself about which bill the turn spent. The header now names
+-- the ACTIVE BACKEND (`config.options.backend`). "cursor" keeps its
+-- pre-existing "Cursor" spelling byte-for-byte (nothing before this row ever
+-- saw another value, so nothing may change for it); every other backend is
+-- shown in ITS OWN canonical spelling -- the exact lowercase key used by
+-- `config.options.backends` and already echoed lowercase by `model_chip`
+-- (`claude:auto`, never `Claude:auto`) -- so the header and the winbar never
+-- disagree about the same word's casing.
+local function backend_label(name)
+  name = name or config.options.backend or "cursor"
+  if name == "cursor" then
+    return "Cursor"
+  end
+  return name
+end
+
 local function start_assistant_block(p)
   p.stream_text = ""
   p.stream_seq_first = nil
   p.stream_seq_last = nil
   p.stream_gen = nil
   p.rendered_any = false
-  append(p, { "## Cursor · " .. config.panel_mode(p.mode), "" }, "assistant_header")
+  append(p, { "## " .. backend_label() .. " · " .. config.panel_mode(p.mode), "" }, "assistant_header")
   p.assistant_start = vim.api.nvim_buf_line_count(p.conv_buf)
 end
 
@@ -1563,6 +1624,16 @@ local function inline_review_opts(p, change)
       end
       return shadow_apply.revert_to_turn_start(panel, c)
     end or nil,
+    -- Ruling 52: the other direction. `U` STAGED an agent-created file rather
+    -- than unlinking it, so stepping forward again writes those bytes back --
+    -- a real-tree write, so it goes through the same journaled applier.
+    on_shadow_restore_staged = journaled and function(c)
+      local panel = current_panel()
+      if not panel then
+        return false, "no panel"
+      end
+      return shadow_apply.restore_staged_removal(panel, c)
+    end or nil,
     on_accept = function(c)
       refresh_change_block(p, c)
       refresh_all_review_claims(p)
@@ -1794,8 +1865,56 @@ local function render_tool_change(p, change)
   end
 end
 
-local function render_error(p, msg)
-  append(p, { "", "> **error:** " .. (msg or "unknown error"), "" }, "error")
+-- Row 69: a terminal error used to say only "agent reported an error" -- no
+-- exit code, no vendor text, no argv, no log path, so the operator could not
+-- tell a spawn failure from a quota refusal from a bad flag. `extra` is
+-- optional and additive; every existing call site (msg only) still renders
+-- exactly as before. Callers that know more -- the process exit code, the
+-- vendor's own last stderr line, which backend answered, where this turn's
+-- evidence lives -- pass it here so it reaches the one surface the operator
+-- reads instead of staying in a log they were never told to open.
+local function render_error(p, msg, extra)
+  local lines = { "", "> **error:** " .. (msg or "unknown error") }
+  if extra then
+    if extra.exit_code ~= nil then
+      table.insert(lines, "> exit code: " .. tostring(extra.exit_code))
+    end
+    if extra.vendor_backend then
+      table.insert(lines, "> backend: " .. tostring(extra.vendor_backend))
+    end
+    if extra.evidence_dir then
+      table.insert(lines, "> evidence: `" .. tostring(extra.evidence_dir) .. "`")
+    end
+  end
+  table.insert(lines, "")
+  append(p, lines, "error")
+end
+
+-- Best-effort pointer to the turn's own evidence directory, for the error
+-- renderer above. `turn_pass.state_dir` is the lifecycle pass's directory;
+-- `shadow_turn.turn_dir` is the overlay layer dir (row 60's "state/layers/
+-- <hash>/panel-N"). Neither write is owned by this file, so this only reads
+-- what is already on the panel.
+local function turn_evidence_dir(p)
+  if p.turn_pass and p.turn_pass.state_dir then
+    return p.turn_pass.state_dir
+  end
+  local turn = p.job_shadow_turn or p.shadow_turn
+  if turn and turn.turn_dir then
+    return turn.turn_dir
+  end
+  return nil
+end
+
+-- Vendor's own last non-blank stderr line, rather than the whole (possibly
+-- multi-line, possibly huge) stream -- the operator needs the one line that
+-- names the failure, not a dump.
+local function last_stderr_line(stderr)
+  if not stderr or stderr == "" then
+    return nil
+  end
+  local ls = vim.split(stderr, "\n", { plain = true, trimempty = true })
+  return ls[#ls]
 end
 
 local function finish_assistant_block(p, result_obj)
@@ -1839,7 +1958,13 @@ local function persist_session(p)
     title = p.title,
     cwd = p.cwd or vim.fn.getcwd(),
     mode = config.panel_mode(p.mode),
-    model = p.model,
+    model = config.options.model,
+    -- Which backend issued this session's `--resume` id -- durable metadata
+    -- a restart needs, since resuming across a Neovim restart has no live
+    -- panel to ask (M.resume's vendor-specific-session refusal reads it
+    -- back from the registry, never from an in-memory session-scoped
+    -- value, for exactly that reason).
+    backend = config.options.backend,
     turns = p.turns,
   })
   local transcript_written = false
@@ -2027,11 +2152,17 @@ local function on_event_body(p, gen, obj)
     p.session_id = obj.session_id or p.session_id
     finish_assistant_block(p, obj)
     if obj.is_error then
-      render_error(p, type(obj.result) == "string" and obj.result or "agent reported an error")
+      render_error(p, type(obj.result) == "string" and obj.result ~= "" and obj.result or "agent reported an error", {
+        vendor_backend = config.options.backend,
+        evidence_dir = turn_evidence_dir(p),
+      })
       p.turn_errored = true
     end
   elseif obj.type == "error" then
-    render_error(p, obj.message or obj.error or "agent error")
+    render_error(p, obj.message or obj.error or "agent error", {
+      vendor_backend = config.options.backend,
+      evidence_dir = turn_evidence_dir(p),
+    })
     p.turn_errored = true
   end
   ledger.set_current_event(L, nil)
@@ -2587,8 +2718,12 @@ local function on_done(p, gen, code, stderr)
   -- jobstop() → exit 143 (SIGTERM). Intentional cancel already noted in the panel.
   local job_failed = (code ~= 0)
   if job_failed and not p.got_result and not cancelled then
-    local msg = stderr ~= "" and stderr or ("cursor-agent exited with code " .. tostring(code))
-    render_error(p, msg)
+    local last_line = last_stderr_line(stderr)
+    local msg = last_line or (backend_label() .. " process exited with no output")
+    render_error(p, msg, {
+      exit_code = code,
+      evidence_dir = turn_evidence_dir(p),
+    })
     p.turn_errored = true
   end
   -- p.job / awaiting_exit / job_spawn_gen: owned by on_exit_confirmed only
@@ -3021,7 +3156,8 @@ submit_panel = function(p, opts)
     panel_id = p.id,
     session_id = p.session_id,
     mode = config.panel_mode(p.mode),
-    model = p.model,
+    model = config.options.model,
+    backend = config.options.backend,
     cwd = p.cwd,
     redirect = opts.redirect and true or false,
     queued = #p.queue,
@@ -3085,7 +3221,7 @@ submit_panel = function(p, opts)
   p.job = agent.run({
     prompt = built.prompt,
     mode = config.agent_permission_mode(p.mode),
-    model = p.model,
+    model = config.options.model,
     session_id = p.session_id,
     cwd = p.cwd,
     jail_session = p.shadow_turn,
@@ -3870,20 +4006,49 @@ function M.ensure_agent_mode(p)
   update_winbar(p)
 end
 
--- Pick a model via cursor-agent --list-models + vim.ui.select.
--- Sets the model for the current panel only, so parallel panels can use
--- different models.
+-- LAYER 2: pick a model WITHIN the active backend, via `<backend> --list-
+-- models` + vim.ui.select. Distinct key/command from M.pick_backend (LAYER
+-- 1, which binary/account/bill) on purpose -- row 58 is exactly a
+-- layer-2 choice being
+-- mistaken for a layer-1 one, so a mis-press must never change the wrong
+-- dial, and every message this function prints says "model" so it is never
+-- read as a backend switch.
+-- Work order VENDORS: every list Yana shows the operator gains an explicit
+-- "auto" row ("let the backend choose"), so switching back to the vendor
+-- default never requires editing config -- unless the source already
+-- carries one (cursor's real `--list-models` output already lists its own
+-- "auto"/"Auto" row; adding a second would just duplicate it).
+local function ensure_auto_row(models)
+  for _, m in ipairs(models) do
+    if m.id == "auto" then
+      return models
+    end
+  end
+  local out = { { id = "auto", label = "let the backend choose" } }
+  vim.list_extend(out, models)
+  return out
+end
+
+-- LAYER 2 source precedence (work order VENDORS, V1-4), decided HERE in one
+-- place, in this order, so a caller reading this function sees the whole
+-- policy rather than piecing it together from agent.lua and config.lua:
+--   1. bd.list_models_args present -> run it (agent.list_models), parsed per
+--      bd.list_models_format.
+--   2. else bd.models declared -> offer that catalogue (a vendor with no
+--      listing surface at all, e.g. claude); the prompt says so.
+--   3. else -> today's honest degrade (row 58 requirement 4): say so,
+--      never silently reuse the PREVIOUS backend's list under the new
+--      backend's name.
 function M.pick_model()
   local p = current_panel()
-  notify_one_line("yana: loading models…", vim.log.levels.INFO)
-  agent.list_models(function(models, code)
-    if code ~= 0 or #models == 0 then
-      notify_one_line("yana: could not list models (is cursor-agent installed?)", vim.log.levels.ERROR)
-      return
-    end
-    local current = (p and p.model) or "auto"
+  local backend = config.options.backend or "cursor"
+  local bd = config.backend_descriptor(backend) or {}
+
+  local function present(models, source_note)
+    models = ensure_auto_row(models)
+    local current = config.options.model or "auto"
     vim.ui.select(models, {
-      prompt = "yana: select model",
+      prompt = "yana: select model (backend: " .. backend .. ")" .. (source_note and (" " .. source_note) or ""),
       format_item = function(m)
         local mark = (m.id == current) and "● " or "  "
         return mark .. m.label .. "  (" .. m.id .. ")"
@@ -3892,12 +4057,159 @@ function M.pick_model()
       if not choice then
         return
       end
-      if p then
-        p.model = (choice.id == "auto") and nil or choice.id
-        update_winbar(p)
+      -- Operator ruling, 2026-08-21: model is scoped to the NEOVIM SESSION
+      -- (one level above the panel), the same way mode is a product-level
+      -- dial -- "a panel does NOT keep a private model that disagrees with
+      -- the session". `config.options.model` is the sole authority; a panel
+      -- never owns its own copy (there is no `p.model` write anywhere in
+      -- this file any more), so every consumer -- the winbar chip, the
+      -- picker's own "current" marker above, persist_session, begin_turn,
+      -- and the spawned agent.run req -- reads it fresh and cannot disagree
+      -- with another panel by construction, not by every write site
+      -- remembering to stay in sync. Sticky for the life of the Neovim
+      -- process (operator ruling, 2026-08-21): a new chat or a new panel
+      -- does NOT reset it -- only picking again, or a backend switch
+      -- (M.pick_backend resets layer 2 because a model id is meaningless to
+      -- a different vendor), changes it.
+      --
+      -- Runtime-only, deliberately: this never touches the operator's
+      -- config file, and does not survive a Neovim restart. If a picked
+      -- model should persist across restarts, that is a separate feature.
+      local from_model = current
+      local resolved = (choice.id == "auto") and nil or choice.id
+      config.options.model = resolved
+      -- EVERY open panel's winbar reflects the new session model
+      -- immediately, not just the picking one -- the ruling's whole point.
+      for _, q in ipairs(panels) do
+        update_winbar(q)
       end
-      notify_one_line("yana: model → " .. choice.label, vim.log.levels.INFO)
+      log.lifecycle("model.switch", {
+        panel = p and p.id or nil,
+        backend = backend,
+        from = from_model,
+        to = resolved,
+        session = p and p.session_id or nil,
+      })
+      notify_one_line("yana: model (layer 2, backend " .. backend .. ") → " .. choice.label, vim.log.levels.INFO)
     end)
+  end
+
+  if bd.list_models_args then
+    notify_one_line("yana: loading models for backend " .. backend .. "…", vim.log.levels.INFO)
+    agent.list_models(function(models, code, reason)
+      if code == -2 then
+        -- Defensive only: bd.list_models_args being present means
+        -- agent.list_models cannot actually take this branch, but the
+        -- honest-degrade message stays consistent if it somehow does.
+        notify_one_line(
+          "yana: model picker unavailable — backend " .. backend .. " " .. (reason or "does not support listing models")
+            .. "; set config.options.model directly if you know the id",
+          vim.log.levels.WARN
+        )
+        return
+      end
+      if code ~= 0 or #models == 0 then
+        notify_one_line("yana: could not list models for backend " .. backend .. " (is it installed?)", vim.log.levels.ERROR)
+        return
+      end
+      present(models, "(from " .. backend .. " " .. table.concat(bd.list_models_args, " ") .. ")")
+    end)
+    return
+  end
+
+  if bd.models and #bd.models > 0 then
+    local models = {}
+    for _, m in ipairs(bd.models) do
+      table.insert(models, { id = m.id, label = m.label })
+    end
+    present(models, "(declared in config)")
+    return
+  end
+
+  -- Honest degrade (row 58 requirement 4): this backend has neither a
+  -- listing surface nor a declared catalogue -- say so, never silently
+  -- show the PREVIOUS backend's list under the new backend's name.
+  notify_one_line(
+    "yana: model picker unavailable — backend " .. backend .. " does not support listing models"
+      .. "; set config.options.model directly if you know the id",
+    vim.log.levels.WARN
+  )
+end
+
+-- LAYER 1: pick the BACKEND -- which binary, which account, which bill
+-- (row 58). Distinct key/command from
+-- M.pick_model (LAYER 2, which model WITHIN the current backend) on
+-- purpose: the two actions have different consequences (one changes which
+-- model answers inside the same account; this one changes which account is
+-- billed and, because a model id from one vendor means nothing to another,
+-- resets layer 2) and must never share a keystroke.
+--
+-- Session-scoped exactly like M.pick_model, same shape: config.options.
+-- backend is the sole authority, every open panel's winbar reflects a
+-- switch immediately, and it is sticky for the life of the Neovim process
+-- (a new chat or new panel does not reset it) but never touches the
+-- operator's config file and does not survive a restart.
+function M.pick_backend()
+  local backends_tbl = config.options.backends or {}
+  local names = {}
+  for name in pairs(backends_tbl) do
+    names[#names + 1] = name
+  end
+  table.sort(names)
+  if #names <= 1 then
+    notify_one_line(
+      "yana: only one backend configured (" .. (names[1] or "none") .. ") — add one to config.backends to switch",
+      vim.log.levels.INFO
+    )
+    return
+  end
+  local current = config.options.backend or config.defaults.backend
+  vim.ui.select(names, {
+    prompt = "yana: select backend (current: " .. current .. ")",
+    format_item = function(name)
+      return (name == current) and ("● " .. name .. "  (current)") or ("  " .. name)
+    end,
+  }, function(choice)
+    if not choice or choice == current then
+      return
+    end
+    local from_backend = current
+    local from_model = config.options.model
+    config.options.backend = choice
+    -- Layer 2 reset (operator requirement, 2026-08-21): a model id is only
+    -- meaningful to the backend it was picked under -- "claude-4-sonnet" is
+    -- a Cursor id, "claude-sonnet-5" is an Anthropic one. Carrying it across
+    -- a backend switch would pass a foreign id as --model to a vendor that
+    -- has never heard of it, and the failure would be a vendor error the
+    -- operator has to decode: exactly the confusion row 58 exists to
+    -- remove. Resets to absence ("auto"/vendor default), never resurrected
+    -- from a per-backend memory -- this build does not keep one (see the
+    -- report: a reasonable nicety, deliberately skipped rather than risking
+    -- resurrecting an id the new backend does not actually offer).
+    config.options.model = nil
+    for _, q in ipairs(panels) do
+      -- Vendor-specific session rule (row 58's sharp edge): a `--resume`
+      -- session id belongs to the backend that issued it. Handing it to a
+      -- different backend is meaningless or actively wrong, so every open
+      -- panel's upstream session is dropped on a backend switch -- the
+      -- CHAT continues (transcript kept, title kept) but as a fresh
+      -- upstream session under the new backend rather than a resumed one.
+      if q.session_id then
+        q.session_id = nil
+      end
+      update_winbar(q)
+    end
+    log.lifecycle("backend.switch", {
+      panel = current_panel() and current_panel().id or nil,
+      from = from_backend,
+      to = choice,
+      model_from = from_model,
+      model_to = nil,
+    })
+    notify_one_line(
+      "yana: backend (layer 1) → " .. choice .. " — model reset to auto; open chats continue as new sessions under " .. choice,
+      vim.log.levels.INFO
+    )
   end)
 end
 
@@ -4419,7 +4731,10 @@ local function apply_panel_keymaps(p)
     end
     map(buf, modes, k.model, function()
       M.pick_model()
-    end, "yana: pick model")
+    end, "yana: pick model (layer 2: within the active backend)")
+    map(buf, modes, k.backend, function()
+      M.pick_backend()
+    end, "yana: pick backend (layer 1: binary/account/bill)")
     map(buf, modes, k.sessions, function()
       M.pick_session()
     end, "yana: sessions")
@@ -4623,9 +4938,10 @@ local function create_panel()
   p.unsubscribe_review = require("yana.inline_diff").on_state_change(function()
     refresh_all_review_claims(p)
   end)
-  if config.options.model and config.options.model ~= "" then
-    p.model = config.options.model
-  end
+  -- No p.model seed here: model is session-scoped (config.options.model is
+  -- the sole authority, read fresh by every consumer), so a new panel
+  -- inherits it the same way it inherits every other session setting --
+  -- there is nothing panel-local left to initialise.
 
   p.conv_buf = vim.api.nvim_create_buf(false, true)
   set_panel_buf_opts(p.conv_buf, "markdown", false)
@@ -4872,6 +5188,39 @@ function M.resume(sess, opts)
     return
   end
 
+  -- VENDOR-SPECIFIC SESSION RULE (row 58's sharp edge): a `--resume`
+  -- id was minted by the
+  -- backend that ran the turn, and a different vendor's CLI does not
+  -- understand another vendor's session store -- handing it a foreign id is
+  -- meaningless at best and silently wrong at worst. Chosen rule: REFUSE
+  -- the resume outright, by name, rather than either (a) silently starting
+  -- a fresh chat under the picked session's title/transcript (the operator
+  -- would believe they resumed continuity that was actually dropped) or
+  -- (b) dropping the id and warning (same hidden discontinuity, just with a
+  -- notice easy to miss in a fast workflow). Refusing keeps the decision in
+  -- the operator's hands: switch backend first (:YanaBackend), then resume,
+  -- or start a new chat under the current backend. `sess.backend` is nil
+  -- for pre-backends rows and for anything M.discover could not attribute
+  -- confidently -- those are NOT refused, since there is no evidence they
+  -- belong to a different vendor (see sessions.lua's M.record doc comment).
+  if sess.backend and sess.backend ~= "" and sess.backend ~= config.options.backend then
+    notify_one_line(
+      "yana: session `"
+        .. sess.id
+        .. "` was created under backend `"
+        .. sess.backend
+        .. "`, but the active backend is `"
+        .. config.options.backend
+        .. "` — a `"
+        .. sess.backend
+        .. "` session id means nothing to `"
+        .. config.options.backend
+        .. "`; switch backend first (:YanaBackend) or start a new chat",
+      vim.log.levels.ERROR
+    )
+    return nil
+  end
+
   local p
   if not opts.new_panel then
     p = current_panel()
@@ -4904,7 +5253,10 @@ function M.resume(sess, opts)
     return nil
   end
   p.mode = restored
-  p.model = sess.model or p.model
+  -- sess.model is what THIS chat used when it was saved -- historical
+  -- metadata, not a live setting. Resuming does not change the session's
+  -- current model (model is session-scoped per the 2026-08-21 ruling); the
+  -- resumed chat continues under whatever the session is set to now.
   p.changes = {}
   p.turns = sess.turns or 0
   p.stream_text = ""
@@ -5193,8 +5545,12 @@ M._test.new_chat = M.new_chat
 M._test.renewal_blocked_reason = renewal_blocked_reason
 M._test.renewal_brief = renewal_brief
 M._test.winbar_text = winbar_text
+M._test.update_winbar = update_winbar
 M._test.mode_chip = mode_chip
 M._test.model_chip = model_chip
+M._test.backend_label = backend_label
+M._test.turn_evidence_dir = turn_evidence_dir
+M._test.last_stderr_line = last_stderr_line
 -- Liveness seams. The threshold stays product policy -- there is no operator
 -- option for it -- but a row cannot sit through 90 real seconds of silence, so
 -- the one number is movable from here and from nowhere else. `liveness`

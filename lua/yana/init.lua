@@ -60,6 +60,32 @@ function M.setup(opts)
 
   config.setup(opts)
 
+  -- One canonical STARTUP event: the resolved configuration this session
+  -- actually runs with, not what was declared. Reproduction needs the
+  -- operator's exact environment (which agent binary resolve_cmd() found on
+  -- THIS machine's PATH, whether the overlay sandbox is present) and that is
+  -- never available after the fact, so this is the logging-guidance case
+  -- where logging WINS over re-deriving it. Read-only: resolve_cmd/available
+  -- are queries, not decisions, so this never changes what setup() returns.
+  do
+    local ok_jail, jail_available = pcall(function()
+      return require("yana.shadow.jail").available()
+    end)
+    local ok_state, state_root = pcall(function()
+      return require("yana.shadow.preview").state_root()
+    end)
+    local ok_bin, resolved = pcall(config.resolve_cmd)
+    log.lifecycle("startup", {
+      agent_bin = ok_bin and resolved and resolved.value or nil,
+      mode = config.options.mode,
+      enable_agentic = config.options.enable_agentic and true or false,
+      capture_root = config.options.capture_root,
+      write_roots = config.options.write_roots,
+      state_root = ok_state and state_root or nil,
+      overlay_available = ok_jail and jail_available and true or false,
+    })
+  end
+
   for _, name in ipairs({
     "YanaDiffIncoming",
     "YanaDiffDeleted",
@@ -202,6 +228,10 @@ end
 
 function M.pick_model()
   ui().pick_model()
+end
+
+function M.pick_backend()
+  ui().pick_backend()
 end
 
 function M.show_changes()

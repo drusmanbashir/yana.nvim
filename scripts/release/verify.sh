@@ -20,23 +20,23 @@ note_fail() { echo "VERIFY FAIL: $*" >&2; fail=1; }
 [[ -f "$manifest" && -f "$patterns" ]] || die "release policy files missing"
 LC_ALL=C sort -cu "$manifest" || die "manifest must be sorted and unique"
 
+# Shared with tests/forbidden_bytes_gate.sh (row 62): the path-class
+# classifier and the forbidden-byte scan itself both live in
+# scripts/release/lib/forbidden_bytes.sh so the exported-tree check here and
+# the working-tree gate can never disagree about what is scanned or what is
+# forbidden. Sourced from beside this script, not from "$tree", so `verify.sh`
+# keeps working when invoked to check a tree other than its own (candidate.sh
+# runs a clone's own copy; either way the copy running carries its own lib).
+lib="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/forbidden_bytes.sh"
+[[ -f "$lib" ]] || die "shared forbidden-bytes lib missing: $lib"
+# shellcheck source=lib/forbidden_bytes.sh
+source "$lib"
+
 # The manifest may narrow the public file set but may not add a class of file
 # the release module excludes: every entry must match one of these hard-coded
 # classes, so editing the manifest cannot smuggle a new path class into the
 # export.
-allowed_path() {
-	case $1 in
-	.github/workflows/ci.yml | .github/workflows/release.yml) return 0 ;;
-	.gitignore | .stylua.toml | CHANGELOG.md | LICENSE | NOTICE | README.md | VERSION) return 0 ;;
-	doc/yana.txt | plugin/yana.lua) return 0 ;;
-	lua/yana/*.lua | lua/yana/*/*.lua | lua/blink_yana/*.lua) return 0 ;;
-	bin/yana-[a-z]*) return 0 ;;
-	scripts/install-deps.sh) return 0 ;;
-	scripts/release/*) return 0 ;;
-	tests/release/*) return 0 ;;
-	esac
-	return 1
-}
+allowed_path() { forbidden_bytes_allowed_path "$1"; }
 while IFS= read -r path; do
 	allowed_path "$path" || note_fail "manifest path outside the allowed public classes: $path"
 done <"$manifest"
@@ -92,13 +92,7 @@ while IFS= read -r path; do
 	fi
 	[[ "$path" == "scripts/release/forbidden-patterns.txt" ]] && continue
 	: >"$hits"
-	LC_ALL=C grep -aEin -f "$patterns" "$tree/$path" >"$hits" || true
-	if [[ "$path" == "NOTICE" ]]; then
-		legacy=neo
-		legacy+=cursor
-		grep -Ev "^4:https://github\\.com/just-nibble/${legacy}\\.git$" "$hits" >"$hits.filtered" || true
-		mv "$hits.filtered" "$hits"
-	fi
+	forbidden_bytes_scan "$tree" "$patterns" "$path" >"$hits" || true
 	if [[ -s "$hits" ]]; then
 		note_fail "forbidden bytes in $path"
 		sed 's/^/  /' "$hits" >&2
