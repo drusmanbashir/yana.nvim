@@ -1242,9 +1242,12 @@ end
 ---               `tried = true` means this step produced a candidate (raw is
 ---               the pre-expansion string); `tried = false` means it was
 ---               skipped or empty, and `note` says why.
-function M.resolve_cmd()
+--- Resolve the spawn binary for `backend_name` (default: the active backend).
+--- Prefetch / list_models for a non-active vendor MUST pass that vendor's
+--- name — otherwise argv would mix one binary with another's list flags.
+function M.resolve_cmd(backend_name)
   local candidates = {}
-  local active = M.options.backend or M.defaults.backend
+  local active = backend_name or M.options.backend or M.defaults.backend
   local entry = M.backend_descriptor(active) or {}
 
   -- Layer 1 first: a backend whose entry names an explicit `cmd` (every
@@ -1296,8 +1299,8 @@ end
 --- --list-models). Diagnostics that need to explain THEMSELVES (health rows,
 --- refusal messages) call M.resolve_cmd() directly for the full candidate
 --- list.
-function M.cmd()
-  return M.resolve_cmd().value
+function M.cmd(backend_name)
+  return M.resolve_cmd(backend_name).value
 end
 
 function M.normalize_skill_dirs(dirs)

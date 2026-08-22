@@ -460,4 +460,51 @@ function M.title_from_prompt(prompt)
   return first ~= "" and first or nil
 end
 
+----------------------------------------------------------------------
+-- delete
+----------------------------------------------------------------------
+
+--- Forget one session: registry row, transcript, and CLI chat dir when present.
+--- Returns true when something was removed.
+function M.delete(id, cwd)
+  if not id or id == "" then
+    return false
+  end
+  cwd = cwd or vim.fn.getcwd()
+  local removed = false
+  local reg = load_registry()
+  if reg[id] ~= nil then
+    reg[id] = nil
+    save_registry()
+    removed = true
+  end
+  local transcript = M.transcript_path(id)
+  if uv.fs_stat(transcript) then
+    pcall(vim.fn.delete, transcript)
+    removed = true
+  end
+  local base = config.options.sessions.chats_dir or "~/.cursor/chats"
+  base = vim.fn.expand(base)
+  local canonical_cwd = uv.fs_realpath(cwd) or cwd
+  local hash = md5_hex(canonical_cwd)
+  if hash then
+    local dir = base .. "/" .. hash .. "/" .. id
+    if uv.fs_stat(dir) then
+      pcall(vim.fn.delete, dir, "rf")
+      removed = true
+    end
+  end
+  return removed
+end
+
+--- Delete every listed session for `cwd` (registry + discovered). Returns count.
+function M.delete_all(cwd)
+  cwd = cwd or vim.fn.getcwd()
+  local list = M.list(cwd)
+  for _, entry in ipairs(list) do
+    M.delete(entry.id, cwd)
+  end
+  return #list
+end
+
 return M

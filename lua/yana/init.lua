@@ -60,6 +60,17 @@ function M.setup(opts)
 
   config.setup(opts)
 
+  -- Warm per-vendor model catalogues in the background so \am / :YanaModel
+  -- never wait on a fresh CLI spawn after the first load. Skipped under the
+  -- hermetic test env (those rows stub list_models / assert argv themselves).
+  if not (vim.env.YANA_HERMETIC_ROOT and vim.env.YANA_HERMETIC_ROOT ~= "") then
+    vim.schedule(function()
+      pcall(function()
+        require("yana.agent").prefetch_model_lists()
+      end)
+    end)
+  end
+
   -- One canonical STARTUP event: the resolved configuration this session
   -- actually runs with, not what was declared. Reproduction needs the
   -- operator's exact environment (which agent binary resolve_cmd() found on
@@ -232,6 +243,12 @@ end
 
 function M.pick_backend()
   ui().pick_backend()
+end
+
+--- Convenience cascade: vendor picker, then model picker for that vendor.
+--- Does not replace pick_backend / pick_model (those stay separate).
+function M.pick_vendor_then_model()
+  ui().pick_vendor_then_model()
 end
 
 function M.show_changes()

@@ -387,7 +387,12 @@ running `claude-sonnet-5` through your own Anthropic account, even though
 both chips once said only `model: claude-4-sonnet`. `:YanaBackend` and
 `:YanaModel` are deliberately different commands and keys so a mis-press
 never changes the wrong one; switching backend always resets the model,
-because a model id from one vendor is meaningless to another. A `--resume`
+because a model id from one vendor is meaningless to another. An operator
+map (nvim `<leader>am`) may cascade those two existing functions — vendor,
+then model — without merging the dials. Model catalogues for every configured
+vendor are prefetched into a session cache at setup so that cascade (and
+`:YanaModel`) open from memory instead of re-spawning each vendor CLI. A
+`--resume`
 session id is vendor-specific too: resuming a session recorded under a
 different backend is refused by name, naming both backends.
 

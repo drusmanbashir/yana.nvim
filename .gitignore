@@ -5,3 +5,11 @@ tests/scratch/
 # macOS Finder
 .DS_Store
 .yana/
+
+# Python bytecode from test helpers
+__pycache__/
+*.pyc
+
+# Agent scratch worktrees and side checkouts
+.claude/
+xcheck/

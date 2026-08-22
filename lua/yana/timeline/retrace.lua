@@ -391,6 +391,21 @@ local function reintegrate(ws, rel, before, after)
 			return shadow_apply.accept_standalone(reintegration_panel(ws), c, composed)
 		end,
 	}
+	-- ROW 80: `change` above is never `inline.M.enqueue`d -- the takeover
+	-- below hands it straight to `_park_and_open_state` (or, when nothing is
+	-- active, to `inline.review`, which itself skips enqueue when the pool is
+	-- otherwise empty) -- so the ordinary paths that mint `_review_order`
+	-- (`M.enqueue` inserting into the queue, `park_and_open_state` recording
+	-- the item being left behind) can both end up never running for THIS
+	-- change. Without it, `]x`/`[x` read `_review_order == nil` as "no
+	-- siblings" and refuse in both directions even with a pending sibling
+	-- file. `M._ensure_review_order` calls the exact same `remember_batch_item`
+	-- those two paths call (see its own comment) -- no second ordering
+	-- scheme -- and is idempotent, so calling it here ahead of the takeover
+	-- is always safe regardless of which branch below ends up handling it.
+	if type(inline._ensure_review_order) == "function" then
+		inline._ensure_review_order(change, opts)
+	end
 	-- TAKE OVER, do not merely queue. `inline.review` alone would append
 	-- behind whatever is currently active -- correct for two ordinary
 	-- reviews, wrong for "undo": the operator just pressed `u` and the

@@ -754,6 +754,19 @@ local function open_review_buffer(change, preview)
   if existing_modified then
     -- The buffer holds unsaved human work that is not the turn-start content.
     -- Staging over it would destroy it, so refuse by name instead.
+    --
+    -- `modified` is trusted at face value here on purpose: the guard's real
+    -- job is upstream, at every site that decides bytes on the operator's
+    -- behalf (accept moves none; per-hunk reject in reject_block_at resets
+    -- the flag it dirties -- see the comment there, MEASURED 2026-08-21,
+    -- FIX-NAV lane) -- so that by the time a `]x`/`[x` park+reopen lands
+    -- here, `modified` means exactly what this refusal says it means: bytes
+    -- this review did not put there. Comparing against a second baseline
+    -- (e.g. the parked snapshot) instead of fixing the flag at its source
+    -- was tried and reverted -- a parked snapshot is captured AFTER
+    -- whatever dirtied the buffer, agent decision or genuinely unrelated
+    -- human edit alike, so it always matches trivially and cannot tell the
+    -- two apart; it would have let a real unrelated edit back in.
     local cur = diff.buffer_text_normalized(existing)
     if not diff.text_equal_snapshot(cur, change.before or "") then
       return nil, "buffer has unsaved edits unrelated to this review"
@@ -1917,12 +1930,23 @@ end
 -- holding a `state` whose finish_session would later clear `active` out from
 -- under a NEWER review. That is the "it keeps falling off days later" shape.
 -- Every entry into M.open goes through here so a failed open leaves no trace.
--- Returns (ok, ...) exactly as pcall does. M.open's success return is
--- (true, state) and the preview caller reads that state, so both values are
--- forwarded rather than collapsed.
+-- Normalises to exactly (ok, err): `ok` is true only when M.open itself
+-- reported success (its own first return value, `true`) -- never merely
+-- "pcall did not throw". Before this normalisation, M.open's own clean
+-- refusal (`return false, reason`) read back through pcall as
+-- `pcall_ok=true` (pcall did not throw), `a=false` (M.open's own boolean),
+-- `b=reason` (M.open's real second value) -- and a caller doing the ordinary
+-- `local ok, err = open_or_abandon(...)` two-value read bound `ok=true` and
+-- `err=false`, discarding the real reason in the third slot nobody read.
+-- That produced the "refused to navigate ... false" defect: `ok` looked
+-- truthy so the caller fell through to its failure-message branch anyway
+-- (gated on session identity, not on `ok`) and stringified the boolean.
+-- `err` is a reason string either way now: the thrown error's own text when
+-- pcall itself failed, or M.open's own second return value on a clean
+-- refusal -- never a bare boolean.
 local function open_or_abandon(change, opts)
-  local ok, a, b = pcall(M.open, change, opts)
-  if not ok then
+  local pcall_ok, a, b = pcall(M.open, change, opts)
+  if not pcall_ok then
     local st = pool_for(opts or {})
     if st.active and st.active.change == change then
       pcall(M.cleanup, st.active)
@@ -1935,8 +1959,9 @@ local function open_or_abandon(change, opts)
     -- sites instead was too late: the direct M.review path re-raises straight
     -- after stamping and never announces again. This is the one place that
     -- sees both the failure and the change, so it owns both halves.
+    local err_text = tostring(a)
     if change and change.review_error == nil then
-      change.review_error = tostring(a)
+      change.review_error = err_text
     end
     -- M.open announces "open" the instant it sets `active`, BEFORE it can
     -- still throw. Without an announce here the panel keeps a claim line
@@ -1944,8 +1969,16 @@ local function open_or_abandon(change, opts)
     -- opened but I see nothing in the file" -- until some unrelated engine
     -- transition happens to repaint it. Announcing here covers every entry.
     announce_state()
+    return false, err_text
   end
-  return ok, a, b
+  if a == true then
+    return true, nil
+  end
+  -- M.open refused cleanly (no throw): `b` is its own reason string where it
+  -- named one; `change.review_error` (stamped by the refusing branch itself)
+  -- is the fallback for the rare site that has not been given one, so the
+  -- caller never renders the bare boolean `a` again.
+  return false, (b ~= nil and tostring(b)) or (change and change.review_error) or "review did not open"
 end
 
 -- The guarded entry for callers outside the queue (the diff-theme preview).
@@ -1954,13 +1987,18 @@ end
 -- review refuse with "close active inline review first" -- a ghost review
 -- nobody can close.
 function M.open_guarded(change, opts)
-  local ok, a, b = open_or_abandon(change, opts)
+  local ok, err = open_or_abandon(change, opts)
   if not ok then
     -- review_error is already stamped by open_or_abandon, before its announce.
-    notify_one_line("yana: inline review failed: " .. notify.error_headline(a), vim.log.levels.ERROR)
+    notify_one_line("yana: inline review failed: " .. notify.error_headline(err), vim.log.levels.ERROR)
     return false, nil
   end
-  return a, b
+  -- M.open sets `active` on the pool synchronously, before it can still
+  -- throw (see the comment above M.cleanup) -- open_or_abandon's own (ok,
+  -- err) collapsed the state out of its return, but it is still right there.
+  local st = pool_for(opts or {})
+  local state = (st.active and st.active.change == change) and st.active or nil
+  return true, state
 end
 
 local process_next_for
@@ -2197,6 +2235,7 @@ local function park_and_open_state(state, direction, target_item, landing)
   end
   local ok, err = open_or_abandon(target_change, target_item.opts)
   if ok and st.active and st.active.change == target_change then
+    target_change._nav_refusal_announced = nil
     st.active.queue_item = target_item
     announce_state()
     vim.schedule(function()
@@ -2213,14 +2252,25 @@ local function park_and_open_state(state, direction, target_item, landing)
     return true
   end
 
-  notify_one_line(
-    "yana: refused to navigate from " .. (change.rel or change.path)
-      .. " -- could not reopen " .. (target_change.rel or target_change.path or "?")
-      .. ": " .. notify.error_headline(err),
-    vim.log.levels.WARN
-  )
+  -- BURST GUARD (DEFECT C): the same refused target is retried on every
+  -- `]x`/`[x` press (each press parks the current file and reopens the
+  -- target from scratch), so a target that keeps refusing for the SAME
+  -- reason used to re-print this exact line every press -- the "repeating
+  -- in bursts" symptom. Announce once per distinct reason; a later attempt
+  -- that fails for a genuinely different reason, or that succeeds (cleared
+  -- above), is still reported.
+  local nav_err_text = tostring(err)
+  if target_change._nav_refusal_announced ~= nav_err_text then
+    target_change._nav_refusal_announced = nav_err_text
+    notify_one_line(
+      "yana: refused to navigate from " .. (change.rel or change.path)
+        .. " -- could not reopen " .. (target_change.rel or target_change.path or "?")
+        .. ": " .. notify.error_headline(err),
+      vim.log.levels.WARN
+    )
+  end
   queue_remove_change(st, change)
-  local reopen_ok = open_or_abandon(change, parked_item.opts)
+  local reopen_ok, _reopen_err = open_or_abandon(change, parked_item.opts)
   if reopen_ok and st.active and st.active.change == change then
     st.active.queue_item = parked_item
     announce_state()
@@ -2265,6 +2315,31 @@ M._navigate_or_park_state = navigate_or_park_state
 -- parking (snapshotting the current review's pending blocks, releasing its
 -- keymaps, reinserting it so a later advance still reaches it) is unchanged.
 M._park_and_open_state = park_and_open_state
+
+--- Mint `_review_order` for `change` the SAME WAY `M.enqueue` and
+--- `park_and_open_state` do -- both call `remember_batch_item` (above) on
+--- the workspace pool's own `st.order`/`st.order_seq`, and nowhere else in
+--- this module assigns the field. Exposed for
+--- `lua/yana/timeline/retrace.lua`'s reintegration seam: `reintegrate`
+--- there hands `_park_and_open_state` a `target_item` built from a change
+--- that was never `M.enqueue`d (it belongs to no turn's queue -- see that
+--- function's own comment), so the ordinary paths that mint the field
+--- (enqueue inserting into the queue, park recording the item being left
+--- behind) never run for it, and `]x`/`[x` read `_review_order == nil` as
+--- "no siblings" and refuse in both directions even with a pending sibling.
+--- No second ordering scheme: this calls the exact same `remember_batch_item`
+--- the other two paths call, so a reintegrated change sorts into `st.order`
+--- exactly where a fresh `M.enqueue` of it would have placed it. Idempotent
+--- (`remember_batch_item` no-ops once `_review_order` is set), so calling
+--- this ahead of `_park_and_open_state`/`M.review` is always safe -- neither
+--- announces, opens, nor parks anything; it only reserves the change's place
+--- in the order.
+function M._ensure_review_order(change, opts)
+  if not change then
+    return
+  end
+  remember_batch_item(pool_for(opts or {}), { change = change })
+end
 
 -- Owner callbacks belong to the panel, not to this engine, and the engine's
 -- own teardown must not depend on them succeeding. Before this guard, a throw
@@ -2993,10 +3068,60 @@ local function attach_buffer_watch(state)
   if not bufnr or not vim.api.nvim_buf_is_valid(bufnr) then
     return
   end
+  local function absorb_human_edits(changes)
+    for _, block in ipairs(state.diff_blocks or {}) do
+      local start_line, end_line = live_block_range(bufnr, block)
+      local extends_block = false
+      local extra_lines = 0
+      for _, change in ipairs(changes) do
+        -- `first` names the first old buffer row that changed. A newline
+        -- entered on the hunk's last row therefore belongs to that hunk;
+        -- typing on the following row does not.
+        if start_line and change.first >= start_line - 1 and change.first <= end_line then
+          extends_block = true
+          extra_lines = extra_lines + math.max(0, change.last_new - change.last_orig)
+        end
+      end
+      if start_line and extends_block then
+        end_line = end_line + extra_lines
+        local live = {}
+        if end_line >= start_line then
+          live = vim.api.nvim_buf_get_lines(bufnr, start_line - 1, end_line, false)
+        end
+        if not lines_equal(live, block.new_lines or {}) then
+          -- Decision 57: once the human changes text inside a pending hunk,
+          -- that text is the proposal. The same source then drives paint,
+          -- accept, reject, and decision undo; no path may retain the old
+          -- agent-only model and disagree with the buffer.
+          block.new_lines = live
+          block.new_start_line = start_line
+          block.new_end_line = math.max(end_line, start_line - 1)
+          -- Drop the pre-absorb authority mark. highlight_blocks would otherwise
+          -- re-capture a one-line live range from it and leave absorbed rows
+          -- outside the band (row 82 split; reject then fails to withdraw them).
+          if block.authority_extmark_id then
+            pcall(vim.api.nvim_buf_del_extmark, bufnr, AUTH_NS, block.authority_extmark_id)
+            block.authority_extmark_id = nil
+          end
+          if state.model_hunks and block.model_index and state.model_hunks[block.model_index] then
+            local mh = state.model_hunks[block.model_index]
+            mh.new_count = #live
+            mh.new_end_line = block.new_end_line
+          end
+        end
+      end
+    end
+  end
   state.watch_pending = false
   state.watch_detached = false
   vim.api.nvim_buf_attach(bufnr, false, {
-    on_lines = function()
+    on_lines = function(_, _, _, first, last_orig, last_new)
+      state.watch_changes = state.watch_changes or {}
+      state.watch_changes[#state.watch_changes + 1] = {
+        first = first,
+        last_orig = last_orig,
+        last_new = last_new,
+      }
       if not state.restoring_reload then
         state.reload_redo_guard = nil
         state.reload_restore_seq = nil
@@ -3037,6 +3162,8 @@ local function attach_buffer_watch(state)
       state.watch_pending = true
       vim.schedule(function()
         state.watch_pending = false
+        local changes = state.watch_changes or {}
+        state.watch_changes = {}
         if state.watch_detached or state.closed then
           return
         end
@@ -3046,6 +3173,12 @@ local function attach_buffer_watch(state)
         if not state.diff_blocks or #state.diff_blocks == 0 then
           return
         end
+        absorb_human_edits(changes)
+        -- Do NOT timeline-capture here. In-hunk typing is absorbed into
+        -- block.new_lines (decision 57); the human_edit row is sealed at the
+        -- next decision boundary (accept/reject) as before. Emitting a row
+        -- per absorb would leave an orphan after reject ("word goes with it")
+        -- whose undo_seq hash no longer matches the buffer.
         render_blocks(state.bufnr, state.diff_blocks, {
           site = "buffer_watch",
           model = state.model_hunks,
@@ -3220,7 +3353,7 @@ function M.open(change, opts)
     -- change, not the session.
     announce_state()
     schedule_queue_advance(state)
-    return false
+    return false, "invalid change: missing path"
   end
   opts = opts or {}
 
@@ -3229,7 +3362,7 @@ function M.open(change, opts)
     if change.status ~= "pending" then
       announce_state()
       schedule_queue_advance({ opts = opts })
-      return false
+      return false, "change is no longer pending"
     end
     change.reason_class = bin_class
     local detail = (change.rel or change.path)
@@ -3257,7 +3390,7 @@ function M.open(change, opts)
     notify_one_line("yana: refused " .. detail, vim.log.levels.WARN)
     announce_state()
     schedule_queue_advance({ opts = opts })
-    return false
+    return false, detail
   end
 
   local bufnr, open_err, refusal = open_review_buffer(change, opts.preview)
@@ -3293,17 +3426,29 @@ function M.open(change, opts)
     if change.review_error == nil then
       change.review_error = open_err
     end
-    notify_one_line("yana: could not open review buffer: " .. tostring(open_err), vim.log.levels.WARN)
+    -- BURST GUARD (DEFECT C): a refused target keeps getting retried --
+    -- `]x`/`[x` parks the current file and reopens the target on EVERY
+    -- press, and a target whose refusal reason has not changed since the
+    -- last attempt would otherwise re-announce the identical line every
+    -- single press. Announce once per distinct reason; a later attempt that
+    -- fails for a DIFFERENT reason (or succeeds, which clears this field
+    -- below) is still reported.
+    local open_err_text = tostring(open_err)
+    if change._open_refusal_announced ~= open_err_text then
+      change._open_refusal_announced = open_err_text
+      notify_one_line("yana: could not open review buffer: " .. open_err_text, vim.log.levels.WARN)
+    end
     -- A refused review must not strand every change still queued behind it.
     announce_state()
     schedule_queue_advance({ opts = opts or {} })
-    return false
+    return false, open_err
   end
 
   -- A review buffer for this change did open successfully — clear any stale
   -- reason from an earlier refused attempt so a later look at the change
   -- does not report a problem that no longer applies.
   change.review_error = nil
+  change._open_refusal_announced = nil
 
   -- An empty base is ZERO lines, but Vim cannot hold a zero-line buffer: the
   -- blank line it forces is not part of the base. For a modify the phantom
@@ -3408,7 +3553,7 @@ function M.open(change, opts)
     notify_one_line("yana: could not stage review: " .. tostring(stage_err), vim.log.levels.WARN)
     announce_state()
     schedule_queue_advance({ opts = opts or {} })
-    return false
+    return false, tostring(stage_err)
   end
 
   if parked then
@@ -3440,7 +3585,7 @@ function M.open(change, opts)
       notify_one_line("yana: refused to reopen parked review for " .. (change.rel or change.path) .. " -- restore mismatch", vim.log.levels.WARN)
       announce_state()
       schedule_queue_advance({ opts = opts or {} })
-      return false
+      return false, "parked review restore mismatch"
     end
     change._parked_review = nil
   end
@@ -3463,11 +3608,6 @@ function M.open(change, opts)
     local L = change_ledger(change, opts)
     ledger.mark(L, "first_review_opened")
     ledger.bump(L, "reviews_opened")
-    require("yana.log").lifecycle_later("review.open", {
-      turn_id = change.turn_id or change.turn_gen,
-      generation = change.turn_gen,
-      path = change.rel or change.path,
-    })
     local hunks = {}
     for i, b in ipairs(blocks) do
       hunks[i] = {
@@ -3478,6 +3618,16 @@ function M.open(change, opts)
         new_end_line = b.new_end_line,
       }
     end
+    -- Built AFTER the hunks table exists (unlike before), so the durable
+    -- log carries the same geometry the in-memory ledger gets below --
+    -- index/old_count/new_count/new_start_line/new_end_line, never line
+    -- contents.
+    require("yana.log").lifecycle_later("review.open", {
+      turn_id = change.turn_id or change.turn_gen,
+      generation = change.turn_gen,
+      path = change.rel or change.path,
+      hunks = hunks,
+    })
     ledger.record_hunks(L, {
       change_id = change.id,
       rel = change.rel or change.path,
@@ -4112,8 +4262,31 @@ function M.open(change, opts)
     -- to if this decision is taken back; the sync after the restoration seals
     -- it so nothing later can be added to the same block.
     local pre_seq = buf_undo_seq(bufnr)
+    -- Was anything ALREADY unaccounted-for dirty before this decision's own
+    -- edit? Captured before the write below so the answer is about the
+    -- buffer this reject inherited, not the one it is about to leave.
+    local pre_dirty = vim.bo[bufnr].modified
     vim.api.nvim_buf_set_lines(bufnr, start_line - 1, end_line, false, restored)
     break_undo_block(bufnr)
+    -- `nvim_buf_set_lines` unconditionally marks the buffer modified, unlike
+    -- accept (CORE: "accept moves no bytes", so it never dirties the buffer
+    -- at all). Nothing downstream of a per-hunk reject ever clears that flag
+    -- -- bulk reject-all and accept-all both compute a truthful one in
+    -- finish_session, but this per-hunk path (`co` on one hunk, leaving
+    -- siblings pending) returns straight to the still-open review. Left
+    -- alone, `modified` stays wrongly true for the rest of the review,
+    -- including any later `]x`/`[x` park+reopen, and open_review_buffer's
+    -- unsaved-edits guard reads that stale bit and refuses the reopen even
+    -- though the buffer holds nothing but this review's own decided and
+    -- still-pending hunks (MEASURED 2026-08-21, FIX-NAV lane: reject one
+    -- hunk, leave a sibling pending, `]x` away, `[x` back misfired
+    -- "buffer has unsaved edits unrelated to this review"). Reset only what
+    -- THIS decision dirtied: if the buffer was already carrying an
+    -- unaccounted-for edit before this reject ran, that edit is still there
+    -- afterward and the flag must keep saying so.
+    if not pre_dirty then
+      vim.bo[bufnr].modified = false
+    end
     local delta = #restored - replaced
     -- The anchor spans what the restoration LEFT in the buffer, so an
     -- un-decide can find the region again after the human has typed above it.
@@ -5506,12 +5679,12 @@ function M.review(change, opts)
   -- entry that had no one-line report of its own. Fail like the queue path
   -- does: stamped (in open_or_abandon), announced, reported in one line, and
   -- falsy to the caller.
-  local ok, res = open_or_abandon(change, opts)
+  local ok, err = open_or_abandon(change, opts)
   if not ok then
-    notify_one_line("yana: inline review failed: " .. notify.error_headline(res), vim.log.levels.ERROR)
+    notify_one_line("yana: inline review failed: " .. notify.error_headline(err), vim.log.levels.ERROR)
     return false
   end
-  return res
+  return true
 end
 
 function M.pending_count(opts)

@@ -182,9 +182,14 @@ local LIFECYCLE_TYPE_KEY = "kind"
 local LIFECYCLE_TYPE_COLLISION_KEY = "row_kind"
 
 local function lifecycle_line(kind, fields)
+  -- Additive millisecond epoch alongside the existing second-resolution
+  -- `at`, which stays byte-identical. vim.uv falls back to vim.loop on
+  -- older builds (module-level `uv` above already resolves this).
+  local s, us = uv.gettimeofday()
   local payload = {
     kind = tostring(kind or "unknown"),
     at = os.date("!%Y-%m-%dT%H:%M:%SZ"),
+    at_ms = s * 1000 + math.floor((us or 0) / 1000),
   }
   for k, v in pairs(fields or {}) do
     if v ~= nil then

@@ -50,6 +50,10 @@ Versioning.
 
 ### Added
 
+- Vendor→model convenience: `pick_vendor_then_model` (nvim `<leader>am`
+  cascades layer 1 then layer 2; `:YanaBackend` / `:YanaModel` stay separate).
+- Per-vendor model-list cache warmed at `setup()` so model picks open from
+  `(cached)` without re-spawning the vendor CLI.
 - `scripts/install-deps.sh`: the one-command dependency installer. Detects
   apt/dnf/pacman and prints a single copy-paste install line with the real
   package names for whatever's missing (e.g. `bubblewrap`, not `bwrap`);

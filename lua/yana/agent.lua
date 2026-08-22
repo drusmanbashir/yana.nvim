@@ -1029,10 +1029,53 @@ local function parse_json_models(out)
   return models
 end
 
--- List available models via the active backend's `list_models_args`.
+-- Per-backend model catalogue cache (session-scoped). Keyed by backend name
+-- so a vendor switch never shows another vendor's list (row 58). Filled at
+-- setup via M.prefetch_model_lists and on first pick; successes stick for
+-- the Neovim process so \am / :YanaModel do not re-spawn the CLI.
+--
+-- Entry shapes:
+--   { status = "ready", models, code, reason }
+--   { status = "pending", waiters = { cb, ... } }
+-- Failed spawns are NOT cached (retry on next pick). Unsupported (-2) and
+-- static `bd.models` catalogues ARE cached.
+local model_list_cache = {}
+
+local function cache_notify_waiters(entry, models, code, reason)
+  local waiters = entry.waiters or {}
+  entry.waiters = nil
+  for _, w in ipairs(waiters) do
+    w(models, code, reason)
+  end
+end
+
+--- Snapshot if this backend's list is already warm. Returns
+--- models, code, reason or nil when missing/pending.
+function M.cached_model_list(backend)
+  local entry = model_list_cache[backend]
+  if entry and entry.status == "ready" then
+    return entry.models, entry.code, entry.reason
+  end
+  return nil
+end
+
+--- Clear one backend (or every backend when nil). Tests / force-refresh.
+function M.clear_model_list_cache(backend)
+  if backend then
+    model_list_cache[backend] = nil
+  else
+    model_list_cache = {}
+  end
+end
+
+-- List available models via a backend's `list_models_args`.
 -- cb(models, code, reason) where models = { { id, label, current, default }, ... }.
 --
--- code -2 means "the active backend's descriptor declares list_models =
+-- opts.backend  — which vendor (default: active). Prefetch and the vendor
+--                 cascade pass the name explicitly.
+-- opts.force    — bypass cache and re-spawn.
+--
+-- code -2 means "this backend's descriptor declares list_models =
 -- false" -- reason names the backend. Requirement 4 (row 58): a backend that
 -- cannot list models must degrade HONESTLY (say so in the picker) rather
 -- than silently showing the PREVIOUS backend's list under the new backend's
@@ -1047,15 +1090,48 @@ end
 -- `subcommand` entirely, so `codex debug models` is correct and
 -- `codex exec debug models` (what prepending subcommand would produce) is
 -- not a command codex understands at all.
-function M.list_models(cb)
-  local backend = config.options.backend
+function M.list_models(cb, opts)
+  opts = opts or {}
+  local backend = opts.backend or config.options.backend
   local bd = config.backend_descriptor(backend) or {}
+
+  if not opts.force then
+    local cached = model_list_cache[backend]
+    if cached and cached.status == "ready" then
+      cb(cached.models, cached.code, cached.reason)
+      return
+    end
+    if cached and cached.status == "pending" then
+      cached.waiters[#cached.waiters + 1] = cb
+      return
+    end
+  end
+
   if not bd.list_models_args then
-    cb({}, -2, backend .. " does not support listing models")
+    -- Static catalogue (e.g. claude): treat as a ready cache entry so the
+    -- picker and prefetch share one path. Empty/absent still degrades -2.
+    if bd.models and #bd.models > 0 then
+      local models = {}
+      for _, m in ipairs(bd.models) do
+        models[#models + 1] = { id = m.id, label = m.label }
+      end
+      model_list_cache[backend] = { status = "ready", models = models, code = 0, reason = nil }
+      cb(models, 0, nil)
+      return
+    end
+    local reason = backend .. " does not support listing models"
+    model_list_cache[backend] = { status = "ready", models = {}, code = -2, reason = reason }
+    cb({}, -2, reason)
     return
   end
+
+  local pending = { status = "pending", waiters = { cb } }
+  model_list_cache[backend] = pending
+
   local out = {}
-  local argv = { config.cmd() }
+  -- MUST resolve THIS backend's binary, not the active dial — prefetch runs
+  -- for every vendor while the operator may still be on another one.
+  local argv = { config.cmd(backend) }
   vim.list_extend(argv, bd.list_models_args)
   local job = vim.fn.jobstart(argv, {
     env = { LC_ALL = "C" },
@@ -1074,14 +1150,34 @@ function M.list_models(cb)
           else
             models = parse_lines_models(out)
           end
-          cb(models, code)
+          local entry = model_list_cache[backend]
+          if code == 0 and #models > 0 then
+            model_list_cache[backend] = { status = "ready", models = models, code = 0, reason = nil }
+          else
+            -- Leave uncached on failure so the next pick retries.
+            if entry and entry.status == "pending" then
+              model_list_cache[backend] = nil
+            end
+          end
+          cache_notify_waiters(entry or pending, models, code, nil)
         end)
       end)
     end,
   })
 
   if job <= 0 then
-    cb({}, -1)
+    model_list_cache[backend] = nil
+    cache_notify_waiters(pending, {}, -1, nil)
+  end
+end
+
+--- Warm every configured backend's model list in the background at setup.
+--- Static catalogues fill synchronously; CLI listings spawn and fill the
+--- cache without blocking setup() return.
+function M.prefetch_model_lists()
+  local backends = config.options.backends or {}
+  for name, _ in pairs(backends) do
+    M.list_models(function() end, { backend = name })
   end
 end
 

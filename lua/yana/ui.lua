@@ -760,7 +760,40 @@ local function mode_chip(p)
   return text
 end
 
-local function model_chip(p)
+-- Row 65 / row 68: a single-character ellipsis, and a UTF8-safe (display-cell,
+-- never byte) way to cut a plain-text field down to a cell budget. Byte
+-- `:sub` truncation on a UTF8 string can land mid-character -- row 68's
+-- lesson -- and this is now shared by every field in the winbar that ever
+-- shortens itself (the model label, the echoed session title, and row 65's
+-- own last-resort core shrink).
+local WINBAR_ELLIPSIS = "…"
+
+local function trunc_display(text, max_cells)
+  if max_cells <= 0 then
+    return ""
+  end
+  if vim.fn.strdisplaywidth(text) <= max_cells then
+    return text
+  end
+  local ell_w = vim.fn.strdisplaywidth(WINBAR_ELLIPSIS)
+  local budget = math.max(0, max_cells - ell_w)
+  local nchars = vim.fn.strchars(text)
+  local lo, hi = 0, nchars
+  while lo < hi do
+    local mid = math.floor((lo + hi + 1) / 2)
+    if vim.fn.strdisplaywidth(vim.fn.strcharpart(text, 0, mid)) <= budget then
+      lo = mid
+    else
+      hi = mid - 1
+    end
+  end
+  return vim.fn.strcharpart(text, 0, lo) .. WINBAR_ELLIPSIS
+end
+
+-- cap: max display cells for the "backend:model" label (default 24, as
+-- before). Row 65's last-resort core shrink calls this with a shrinking cap
+-- when even the untouchable core does not fit a genuinely narrow window.
+local function model_chip(p, cap)
   -- Session-scoped, like mode's own chip reads through config.panel_mode:
   -- the model picked in ANY panel is the whole nvim session's model, so
   -- every panel's chip reads the session value directly rather than a
@@ -774,15 +807,30 @@ local function model_chip(p)
   -- (`cursor:claude-4-sonnet` vs `claude:claude-sonnet-5`).
   local backend = config.options.backend or "cursor"
   local label = config.options.model or "auto"
-  local text = backend .. ":" .. label
-  if #text > 24 then
-    text = text:sub(1, 23) .. "…"
-  end
+  local text = trunc_display(backend .. ":" .. label, cap or 24)
   local hl = config.model_hl_group
   return string.format("model: %%#%s#%s%%*", hl, text:gsub("%%", "%%%%"))
 end
 
-local function winbar_text(p)
+-- no_lock: row 65's last-resort core shrink drops the "(locked)" annotation
+-- before it ever touches the model label -- cheaper information to lose,
+-- and the mode name itself still tells the operator what mode they are in.
+local function mode_chip(p, no_lock)
+  local mode = config.resolve_mode(p.mode)
+  local label = config.panel_mode(p.mode)
+  local locked = (not no_lock and mode_locked(p)) and " (locked)" or ""
+  local text = label .. locked
+  local hl = config.mode_hl_groups[mode]
+  if hl then
+    return string.format("%%#%s#%s%%*", hl, text:gsub("%%", "%%%%"))
+  end
+  return text
+end
+
+-- The spinner/state word. Factored out of winbar_text so row 65's fit
+-- computation (core_text, below) can build the identical untouchable prefix
+-- without a second, drifting copy of the spinner-state branches.
+local function state_word(p)
   local o = config.options
   local left
   if p.applying then
@@ -806,86 +854,119 @@ local function winbar_text(p)
   if #panels > 1 then
     left = left .. " [" .. panel_index(p) .. "]"
   end
-  -- ESCAPE THE PERCENTS. p.title is the raw first line of the user's prompt,
-  -- and 'winbar' is a statusline-syntax option: a bare "%" raises E539 and
-  -- "%{" raises E540. So a first prompt like "cut tokens by 50%" made every
-  -- update_winbar throw -- including the one in on_done, which sits BEFORE
-  -- persist_session and maybe_drain_queue, so queued prompts stopped
-  -- draining and the session stopped persisting for the rest of the
-  -- session. A lifecycle stall reachable by typing an ordinary sentence.
+  return left
+end
+
+-- ESCAPE THE PERCENTS. p.title is the raw first line of the user's prompt,
+-- and 'winbar' is a statusline-syntax option: a bare "%" raises E539 and
+-- "%{" raises E540. So a first prompt like "cut tokens by 50%" made every
+-- update_winbar throw -- including the one in on_done, which sits BEFORE
+-- persist_session and maybe_drain_queue, so queued prompts stopped
+-- draining and the session stopped persisting for the rest of the
+-- session. A lifecycle stall reachable by typing an ordinary sentence.
+local function session_segment(p)
   local sess
   if p.title and p.title ~= "" then
-    sess = p.title
-    if #sess > 24 then
-      sess = sess:sub(1, 23) .. "…"
-    end
+    sess = trunc_display(p.title, 24)
     sess = sess:gsub("%%", "%%%%")
   else
     sess = p.session_id and "session" or "new"
   end
+  return sess
+end
+
+local function pending_segment(p)
   local pending = #diff.pending(p.changes)
   reconcile_pending(p, pending)
-  local pend = pending > 0 and (" · " .. pending .. " pending") or ""
+  return pending > 0 and (" · " .. pending .. " pending") or ""
+end
+
+local function queued_segment(p)
   local qn = #p.queue
-  local queued = qn > 0 and (" · " .. qn .. " queued") or ""
-  local shell_fail = ""
+  return qn > 0 and (" · " .. qn .. " queued") or ""
+end
+
+local function shell_fail_segment(p)
   if not p.busy and not p.awaiting_exit and (p.shell_steps_failed or 0) > 0 then
-    shell_fail = string.format(
+    return string.format(
       " · %d command failed (exit %s)",
       p.shell_steps_failed,
       tostring(p.first_failed_shell_exit or "?")
     )
   end
-  -- Row 64: this used to spell the segment using the removed `shadow` option
-  -- name (as `shadow` + a colon + `apply`, or `shadow` + a colon + `confined`)
-  -- -- `shadow` is one of the ten option names MODE-30 removed (see the modes
-  -- module's migration notes), and the operator saw a dead option name in the
-  -- winbar of every turn. `overlay` is the surviving word for the confinement
-  -- layer itself; `review`/`confined` say what happens inside it.
-  local confinement = ""
+  return ""
+end
+
+-- Row 64: this used to spell the segment using the removed `shadow` option
+-- name (as `shadow` + a colon + `apply`, or `shadow` + a colon + `confined`)
+-- -- `shadow` is one of the ten option names MODE-30 removed (see the modes
+-- module's migration notes), and the operator saw a dead option name in the
+-- winbar of every turn. `overlay` is the surviving word for the confinement
+-- layer itself; `review`/`confined` say what happens inside it.
+local function confinement_segment()
   if not config.overlay_mode() then
     -- `agentic`: no overlay, no review -- the agent writes. Say so. The old
     -- label here named the removed `preview` mode (ruling R-1), advertising a
     -- diagnostic nobody can be in on the one surface every session shows.
-    confinement = " · unconfined"
+    return " · unconfined"
   elseif config.review_mode_active() then
-    confinement = " · overlay:review"
+    return " · overlay:review"
   else
     -- `ask`: confined like `inline`, but nothing is proposed so no review is
     -- owed. Saying so beats saying nothing, which reads as "no overlay".
-    confinement = " · overlay:confined"
+    return " · overlay:confined"
   end
+end
+
+-- The untouchable prefix: state word, liveness, mode chip, model chip.
+-- Row 65's priority order keeps these three always present; nothing else on
+-- the bar may cause them to be dropped. cap/no_lock let the last-resort
+-- shrink in fit_winbar ask for a smaller model label or a de-locked mode
+-- chip -- still never a mid-word cut, and never the field omitted outright.
+local function core_text(p, cap, no_lock)
+  return string.format(
+    "%%#Title#%s%%*%s · %s · %s",
+    state_word(p),
+    liveness_text(p),
+    mode_chip(p, no_lock),
+    model_chip(p, cap)
+  )
+end
+
+local function winbar_text(p)
+  local pend = pending_segment(p)
+  local queued = queued_segment(p)
+  local shell_fail = shell_fail_segment(p)
+  local confinement = confinement_segment()
+  local sess = session_segment(p)
   -- The liveness segment sits immediately after the spinner/state word and
   -- BEFORE the mode and model chips: it is the most volatile thing on the bar
   -- and the only thing that changes while the operator is waiting. Everything
   -- to its right keeps the exact position and text it had before, so an
   -- ordinary turn looks as it always did apart from these few characters.
   --
-  -- Row 65: `winbar` is one Vim statusline-style line -- it can never wrap,
-  -- and Neovim only clips it for DISPLAY at draw time; the STRING returned
-  -- here (and stored in `vim.wo[win].winbar`) always carries every field in
-  -- full -- pending/queued/failed counts included -- because other readers
-  -- (the pending-count witness, the operator's own `:echo &winbar`) depend on
-  -- that being the truth, not a pre-shortened guess. `%<` is Neovim's own
-  -- truncation-point marker: without it, a too-long bar truncates from the
-  -- START (default), which used to eat the state word, the liveness segment
-  -- and -- worst -- the MODE, while keeping the echoed prompt at the far
-  -- right. Observed 2026-08-21 on a narrow panel: the bar read "<del:
-  -- claude-4-sonnet · [the pre-row-64 shadow segment] · can some of those be
-  -- re…", the `<del:` being the tail of `model:` after the left half was cut
-  -- away. Placing
-  -- `%<` right before the echoed session label, UNCONDITIONALLY (previously
-  -- only the titled branch carried one; a fresh/resumed chat with no title
-  -- had none, so IT still truncated from the start) protects everything to
-  -- its left -- state, liveness, mode, model, pending/queued/failed counts,
-  -- and the row-64 confinement segment -- and sacrifices only the one field
-  -- already established as "the right thing to lose": the operator's own
-  -- echoed sentence, which they already know. Neovim marks the cut itself
-  -- (a literal `<`) when it draws a truncated bar, so a shortened line still
-  -- SAYS it was shortened without this file inventing a second, divergent
-  -- truncation mechanism that could disagree with what is actually on screen.
-  return string.format("%%#Title#%s%%*%s · %s · %s%s%s%s%s%%<  · %s",
-    left,
+  -- Row 65, CORRECTED: this function still returns every field in full --
+  -- pending/queued/failed counts included -- because other readers (the
+  -- pending-count counter-truth row, the mode/model highlight smokes, the
+  -- operator's own `:echo &winbar`) depend on that being the whole truth,
+  -- not a pre-shortened guess, and `winbar_text` has no window to measure
+  -- against in every caller (a fake panel table with no `conv_win`, for
+  -- one). What changed is where the SHORTENING happens: `update_winbar`
+  -- now computes the fit itself (see `fit_winbar` below) and installs a
+  -- string that already fits, rather than trusting Neovim's own draw-time
+  -- clip. The trailing `%<` stays as a harmless no-op marker -- it is
+  -- consumed by Neovim's renderer, never shows up in painted text, and
+  -- costs nothing -- but it is no longer this bug's fix; measured
+  -- 2026-08-21 with `nvim_eval_statusline`: once the PROTECTED part before
+  -- `%<` alone exceeds the window (an ordinary narrow panel, not an
+  -- extreme one), Neovim's own clipper does not honour `%<` at all -- it
+  -- falls back to a plain left-anchored clip, word-blind, marked with a
+  -- literal `>` at the end. That `>` is what the operator's 17:18
+  -- recording actually showed as "over>": a real character Neovim itself
+  -- paints for that fallback, not an OCR-misread `<`.
+  return string.format(
+    "%%#Title#%s%%*%s · %s · %s%s%s%s%s%%<  · %s",
+    state_word(p),
     liveness_text(p),
     mode_chip(p),
     model_chip(p),
@@ -893,7 +974,115 @@ local function winbar_text(p)
     queued,
     shell_fail,
     confinement,
-    sess)
+    sess
+  )
+end
+
+-- Returns the DISPLAY-CELL width nvim_eval_statusline would actually paint
+-- for `str` in `winid` -- Neovim's own ruler, multibyte-safe, and immune to
+-- the difference between `%#hl#...%*` highlight bytes and visible columns
+-- (row 68: never count bytes). A huge maxwidth asks for the NATURAL width,
+-- unclipped, so the caller can compare it against the real window width
+-- itself rather than trust Neovim's clipper to have done that already.
+local function natural_width(str, winid)
+  local ok, res = pcall(vim.api.nvim_eval_statusline, str, {
+    winid = winid,
+    use_winbar = true,
+    maxwidth = 100000,
+  })
+  if not ok or type(res) ~= "table" or type(res.width) ~= "number" then
+    return nil
+  end
+  return res.width
+end
+
+-- Row 65: THE FIX. A winbar that does not fit the window must SAY it was
+-- shortened (one trailing "…", never a bare Neovim draw-time clip) and must
+-- drop whole SEGMENTS from the right rather than cut a word. Priority,
+-- named in the row: keep `yana`, the mode chip, and the model chip (row
+-- 58's vendor trap) always; drop `N pending`, `queued`, the confinement
+-- chip, and the echoed session title first -- session first of all, since
+-- it is the one field already established (row 65's own history) as "the
+-- right thing to lose": the operator's own sentence, which they already
+-- know. Confinement is dropped LAST among the droppables because it is the
+-- one safety fact among them -- whether the agent is writing confined or
+-- direct -- so it survives longer than a bare count.
+--
+-- `nvim_eval_statusline` is the fit oracle throughout, exactly as the row
+-- specifies: never a byte count, always Neovim's own display-cell ruler.
+local WINBAR_DROP_ORDER = { "session", "pending", "queued", "shell_fail", "confinement" }
+
+local function fit_winbar(p, winid)
+  local full = winbar_text(p)
+  local width = win_valid(winid) and vim.api.nvim_win_get_width(winid) or nil
+  if width == nil or width <= 0 then
+    return full
+  end
+  local full_w = natural_width(full, winid)
+  if full_w == nil or full_w <= width then
+    -- Fits, or unmeasurable (fail OPEN to the full text rather than guess).
+    return full
+  end
+
+  local pieces = {
+    pending = pending_segment(p),
+    queued = queued_segment(p),
+    shell_fail = shell_fail_segment(p),
+    confinement = confinement_segment(),
+    session = " · " .. session_segment(p),
+  }
+  local core = core_text(p)
+
+  local function assemble(keep, shortened)
+    local buf = { core }
+    for _, name in ipairs({ "pending", "queued", "shell_fail", "confinement", "session" }) do
+      if keep[name] then
+        buf[#buf + 1] = pieces[name]
+      end
+    end
+    local out = table.concat(buf)
+    if shortened then
+      out = out .. " " .. WINBAR_ELLIPSIS
+    end
+    return out
+  end
+
+  local keep = { pending = true, queued = true, shell_fail = true, confinement = true, session = true }
+  for _, name in ipairs(WINBAR_DROP_ORDER) do
+    keep[name] = nil
+    local cand = assemble(keep, true)
+    local cw = natural_width(cand, winid)
+    if cw ~= nil and cw <= width then
+      return cand
+    end
+  end
+
+  -- Every droppable segment is gone and the untouchable core (state,
+  -- liveness, mode, model) still does not fit. Keep shrinking, cheapest
+  -- information first: the "(locked)" annotation (the mode name itself
+  -- still shows), then the model label one character at a time -- always
+  -- keeping its vendor prefix, since that is exactly the fact row 58
+  -- exists to protect -- never dropping the field outright.
+  local core_bare = core_text(p, nil, true) .. " " .. WINBAR_ELLIPSIS
+  local bare_w = natural_width(core_bare, winid)
+  if bare_w ~= nil and bare_w <= width then
+    return core_bare
+  end
+
+  local backend = config.options.backend or "cursor"
+  local label = config.options.model or "auto"
+  local max_chars = vim.fn.strchars(backend .. ":" .. label)
+  for cap = max_chars - 1, 0, -1 do
+    local cand = core_text(p, cap, true) .. " " .. WINBAR_ELLIPSIS
+    local cw = natural_width(cand, winid)
+    if cw ~= nil and cw <= width then
+      return cand
+    end
+  end
+
+  -- A pathologically narrow window: state word and a bare mode name are all
+  -- that is left to show, but they are still never cut mid-word.
+  return core_text(p, 0, true) .. " " .. WINBAR_ELLIPSIS
 end
 
 local function update_winbar(p)
@@ -904,7 +1093,7 @@ local function update_winbar(p)
     -- persistence. Escaping (above) removes the known trigger; this removes
     -- the whole class of consequence.
     pcall(function()
-      vim.wo[p.conv_win].winbar = winbar_text(p)
+      vim.wo[p.conv_win].winbar = fit_winbar(p, p.conv_win)
     end)
   end
 end
@@ -1873,6 +2062,43 @@ end
 -- vendor's own last stderr line, which backend answered, where this turn's
 -- evidence lives -- pass it here so it reaches the one surface the operator
 -- reads instead of staying in a log they were never told to open.
+-- UTF-8-safe prefix of at most max_bytes bytes: never returns a slice that
+-- ends mid multibyte sequence (a lone leading byte with its continuation
+-- bytes cut off), which would leave message an invalid UTF-8 string for the
+-- JSON encoder below.
+local function utf8_safe_truncate(s, max_bytes)
+  if #s <= max_bytes then
+    return s
+  end
+  local i = max_bytes
+  while i > 0 do
+    local b = s:byte(i)
+    if b < 0x80 or b >= 0xC0 then
+      break -- ASCII byte, or the leading byte of a multibyte sequence
+    end
+    i = i - 1 -- continuation byte (0x80-0xBF); keep walking back
+  end
+  local lead = s:byte(i)
+  if lead and lead >= 0xC0 then
+    local seqlen = 2
+    if lead >= 0xF0 then
+      seqlen = 4
+    elseif lead >= 0xE0 then
+      seqlen = 3
+    end
+    if i + seqlen - 1 > max_bytes then
+      i = i - 1 -- the sequence starting at i does not fit; drop it whole
+    else
+      i = i + seqlen - 1 -- it fits exactly: keep the whole sequence, not just its lead byte
+    end
+  end
+  return s:sub(1, i)
+end
+
+-- Pure-function boundary probe for the headless row (no panel needed).
+M._test = M._test or {}
+M._test.utf8_safe_truncate = utf8_safe_truncate
+
 local function render_error(p, msg, extra)
   local lines = { "", "> **error:** " .. (msg or "unknown error") }
   if extra then
@@ -1888,6 +2114,18 @@ local function render_error(p, msg, extra)
   end
   table.insert(lines, "")
   append(p, lines, "error")
+  -- Every render_error call now also leaves a durable turn.error row (gated
+  -- by YANA_LIFECYCLE_LOG, same as every other lifecycle row), so a terminal
+  -- error nobody was watching the panel for still has a trace. pcall'd so a
+  -- logging failure can never take the panel render down with it -- the
+  -- render above already happened.
+  pcall(function()
+    log.lifecycle("turn.error", {
+      panel = p and p.id or nil,
+      message = utf8_safe_truncate(tostring(msg or "unknown error"), 200),
+      exit_code = extra and extra.exit_code or nil,
+    })
+  end)
 end
 
 -- Best-effort pointer to the turn's own evidence directory, for the error
@@ -4095,6 +4333,13 @@ function M.pick_model()
   end
 
   if bd.list_models_args then
+    -- Warm cache (filled at setup prefetch, or a prior pick): open the
+    -- picker immediately — no "loading…" flash and no CLI spawn.
+    local cached, cached_code = agent.cached_model_list(backend)
+    if cached and cached_code == 0 and #cached > 0 then
+      present(cached, "(cached)")
+      return
+    end
     notify_one_line("yana: loading models for backend " .. backend .. "…", vim.log.levels.INFO)
     agent.list_models(function(models, code, reason)
       if code == -2 then
@@ -4113,8 +4358,17 @@ function M.pick_model()
         return
       end
       present(models, "(from " .. backend .. " " .. table.concat(bd.list_models_args, " ") .. ")")
-    end)
+    end, { backend = backend })
     return
+  end
+
+  -- Static catalogue / cache path for vendors with no listing CLI (claude).
+  do
+    local cached, cached_code = agent.cached_model_list(backend)
+    if cached and cached_code == 0 and #cached > 0 then
+      present(cached, "(cached)")
+      return
+    end
   end
 
   if bd.models and #bd.models > 0 then
@@ -4122,6 +4376,8 @@ function M.pick_model()
     for _, m in ipairs(bd.models) do
       table.insert(models, { id = m.id, label = m.label })
     end
+    -- Seed the shared cache so a later pick_vendor_then_model hit is warm.
+    agent.list_models(function() end, { backend = backend })
     present(models, "(declared in config)")
     return
   end
@@ -4134,6 +4390,63 @@ function M.pick_model()
       .. "; set config.options.model directly if you know the id",
     vim.log.levels.WARN
   )
+end
+
+-- LAYER 1 apply: switch backend + reset model + drop vendor session ids.
+-- Shared by M.pick_backend and the operator convenience cascade below so the
+-- two dials stay one source of truth for switch side effects.
+local function apply_backend_switch(choice)
+  local from_backend = config.options.backend or config.defaults.backend
+  if not choice or choice == from_backend then
+    return false
+  end
+  local from_model = config.options.model
+  config.options.backend = choice
+  -- Layer 2 reset (operator requirement, 2026-08-21): a model id is only
+  -- meaningful to the backend it was picked under -- "claude-4-sonnet" is
+  -- a Cursor id, "claude-sonnet-5" is an Anthropic one. Carrying it across
+  -- a backend switch would pass a foreign id as --model to a vendor that
+  -- has never heard of it, and the failure would be a vendor error the
+  -- operator has to decode: exactly the confusion row 58 exists to
+  -- remove. Resets to absence ("auto"/vendor default), never resurrected
+  -- from a per-backend memory -- this build does not keep one (see the
+  -- report: a reasonable nicety, deliberately skipped rather than risking
+  -- resurrecting an id the new backend does not actually offer).
+  config.options.model = nil
+  for _, q in ipairs(panels) do
+    -- Vendor-specific session rule (row 58's sharp edge): a `--resume`
+    -- session id belongs to the backend that issued it. Handing it to a
+    -- different backend is meaningless or actively wrong, so every open
+    -- panel's upstream session is dropped on a backend switch -- the
+    -- CHAT continues (transcript kept, title kept) but as a fresh
+    -- upstream session under the new backend rather than a resumed one.
+    if q.session_id then
+      q.session_id = nil
+    end
+    update_winbar(q)
+  end
+  log.lifecycle("backend.switch", {
+    panel = current_panel() and current_panel().id or nil,
+    from = from_backend,
+    to = choice,
+    model_from = from_model,
+    model_to = nil,
+  })
+  notify_one_line(
+    "yana: backend (layer 1) → " .. choice .. " — model reset to auto; open chats continue as new sessions under " .. choice,
+    vim.log.levels.INFO
+  )
+  return true
+end
+
+local function configured_backend_names()
+  local backends_tbl = config.options.backends or {}
+  local names = {}
+  for name in pairs(backends_tbl) do
+    names[#names + 1] = name
+  end
+  table.sort(names)
+  return names
 end
 
 -- LAYER 1: pick the BACKEND -- which binary, which account, which bill
@@ -4150,12 +4463,7 @@ end
 -- (a new chat or new panel does not reset it) but never touches the
 -- operator's config file and does not survive a restart.
 function M.pick_backend()
-  local backends_tbl = config.options.backends or {}
-  local names = {}
-  for name in pairs(backends_tbl) do
-    names[#names + 1] = name
-  end
-  table.sort(names)
+  local names = configured_backend_names()
   if #names <= 1 then
     notify_one_line(
       "yana: only one backend configured (" .. (names[1] or "none") .. ") — add one to config.backends to switch",
@@ -4170,46 +4478,33 @@ function M.pick_backend()
       return (name == current) and ("● " .. name .. "  (current)") or ("  " .. name)
     end,
   }, function(choice)
-    if not choice or choice == current then
+    apply_backend_switch(choice)
+  end)
+end
+
+-- Operator convenience only (e.g. nvim `<leader>am`): run LAYER 1 then
+-- LAYER 2 as two separate pickers. Does not replace M.pick_backend /
+-- M.pick_model — those stay distinct commands and in-panel keys.
+-- Cancel on the vendor step stops; picking the current vendor still opens
+-- the model picker. One configured backend skips the vendor step.
+function M.pick_vendor_then_model()
+  local names = configured_backend_names()
+  if #names <= 1 then
+    M.pick_model()
+    return
+  end
+  local current = config.options.backend or config.defaults.backend
+  vim.ui.select(names, {
+    prompt = "yana: select vendor, then model (current: " .. current .. ")",
+    format_item = function(name)
+      return (name == current) and ("● " .. name .. "  (current)") or ("  " .. name)
+    end,
+  }, function(choice)
+    if not choice then
       return
     end
-    local from_backend = current
-    local from_model = config.options.model
-    config.options.backend = choice
-    -- Layer 2 reset (operator requirement, 2026-08-21): a model id is only
-    -- meaningful to the backend it was picked under -- "claude-4-sonnet" is
-    -- a Cursor id, "claude-sonnet-5" is an Anthropic one. Carrying it across
-    -- a backend switch would pass a foreign id as --model to a vendor that
-    -- has never heard of it, and the failure would be a vendor error the
-    -- operator has to decode: exactly the confusion row 58 exists to
-    -- remove. Resets to absence ("auto"/vendor default), never resurrected
-    -- from a per-backend memory -- this build does not keep one (see the
-    -- report: a reasonable nicety, deliberately skipped rather than risking
-    -- resurrecting an id the new backend does not actually offer).
-    config.options.model = nil
-    for _, q in ipairs(panels) do
-      -- Vendor-specific session rule (row 58's sharp edge): a `--resume`
-      -- session id belongs to the backend that issued it. Handing it to a
-      -- different backend is meaningless or actively wrong, so every open
-      -- panel's upstream session is dropped on a backend switch -- the
-      -- CHAT continues (transcript kept, title kept) but as a fresh
-      -- upstream session under the new backend rather than a resumed one.
-      if q.session_id then
-        q.session_id = nil
-      end
-      update_winbar(q)
-    end
-    log.lifecycle("backend.switch", {
-      panel = current_panel() and current_panel().id or nil,
-      from = from_backend,
-      to = choice,
-      model_from = from_model,
-      model_to = nil,
-    })
-    notify_one_line(
-      "yana: backend (layer 1) → " .. choice .. " — model reset to auto; open chats continue as new sessions under " .. choice,
-      vim.log.levels.INFO
-    )
+    apply_backend_switch(choice)
+    M.pick_model()
   end)
 end
 
@@ -5325,26 +5620,24 @@ end
 
 -- Pick a session from the registry (+ discovered CLI sessions) and resume it.
 -- opts.new_panel: resume into a new panel (parallel session).
+--
+-- Telescope when available: opens in normal mode (type `i` to filter by name).
+-- Tips: `d` delete selected · `D` delete all for this directory.
 function M.pick_session(opts)
   opts = opts or {}
-  local list = M.session_history(vim.fn.getcwd())
+  local cwd = vim.fn.getcwd()
+  local list = M.session_history(cwd)
   if #list == 0 then
     notify_one_line("yana: no previous sessions for this directory", vim.log.levels.INFO)
     return
   end
-  vim.ui.select(list, {
-    prompt = "yana: sessions (resume)",
-    format_item = function(s)
-      local mark = find_panel_by_session(s.id) and "● " or "  "
-      return mark .. sessions.format(s)
-    end,
-  }, function(choice)
+
+  local function take_choice(choice)
     if not choice then
       return
     end
     local existing = find_panel_by_session(choice.id)
     if existing and not opts.new_panel then
-      -- Already open in a panel: just focus it.
       if not panel_open(existing) then
         open_windows(existing)
       end
@@ -5352,7 +5645,92 @@ function M.pick_session(opts)
       return
     end
     M.resume(choice, opts)
-  end)
+  end
+
+  local ok_tel, pickers = pcall(require, "telescope.pickers")
+  if not ok_tel then
+    vim.ui.select(list, {
+      prompt = "yana: sessions (resume)",
+      format_item = function(s)
+        local mark = find_panel_by_session(s.id) and "● " or "  "
+        return mark .. sessions.format(s)
+      end,
+    }, take_choice)
+    return
+  end
+
+  local finders = require("telescope.finders")
+  local conf = require("telescope.config").values
+  local actions = require("telescope.actions")
+  local action_state = require("telescope.actions.state")
+
+  local tip = "d: delete selected · D: delete all"
+  local function make_finder(rows)
+    return finders.new_table({
+      results = rows,
+      entry_maker = function(s)
+        local mark = find_panel_by_session(s.id) and "● " or "  "
+        local label = mark .. sessions.format(s)
+        return {
+          value = s,
+          display = label,
+          ordinal = label .. " " .. tostring(s.id or ""),
+        }
+      end,
+    })
+  end
+
+  pickers
+    .new({}, {
+      prompt_title = "yana sessions  [" .. tip .. "]",
+      results_title = tip,
+      initial_mode = "normal",
+      finder = make_finder(list),
+      sorter = conf.generic_sorter({}),
+      attach_mappings = function(prompt_bufnr, map)
+        actions.select_default:replace(function()
+          local entry = action_state.get_selected_entry()
+          actions.close(prompt_bufnr)
+          if entry and entry.value then
+            take_choice(entry.value)
+          end
+        end)
+
+        local function refresh_or_close()
+          local rows = M.session_history(cwd)
+          if #rows == 0 then
+            actions.close(prompt_bufnr)
+            notify_one_line("yana: no sessions left for this directory", vim.log.levels.INFO)
+            return
+          end
+          local picker = action_state.get_current_picker(prompt_bufnr)
+          picker:refresh(make_finder(rows), { reset_prompt = false })
+        end
+
+        map("n", "d", function()
+          local entry = action_state.get_selected_entry()
+          if not entry or not entry.value or not entry.value.id then
+            return
+          end
+          local id = entry.value.id
+          sessions.delete(id, cwd)
+          notify_one_line("yana: deleted session " .. tostring(id):sub(1, 8), vim.log.levels.INFO)
+          refresh_or_close()
+        end)
+
+        map("n", "D", function()
+          local n = sessions.delete_all(cwd)
+          actions.close(prompt_bufnr)
+          notify_one_line(
+            string.format("yana: deleted %d session%s for this directory", n, n == 1 and "" or "s"),
+            vim.log.levels.INFO
+          )
+        end)
+
+        return true
+      end,
+    })
+    :find()
 end
 
 -- Resume the most recent session for this cwd, or a specific session id.
@@ -5548,6 +5926,8 @@ M._test.winbar_text = winbar_text
 M._test.update_winbar = update_winbar
 M._test.mode_chip = mode_chip
 M._test.model_chip = model_chip
+M._test.fit_winbar = fit_winbar
+M._test.trunc_display = trunc_display
 M._test.backend_label = backend_label
 M._test.turn_evidence_dir = turn_evidence_dir
 M._test.last_stderr_line = last_stderr_line
