@@ -96,6 +96,26 @@ local function workspace_candidate(opts)
 	return cwd
 end
 
+local function buffer_real_path(opts)
+	opts = opts or {}
+	local selection = opts.selection
+	if selection and selection.buf and vim.api.nvim_buf_is_valid(selection.buf) then
+		local name = vim.api.nvim_buf_get_name(selection.buf)
+		if name ~= "" then
+			return diff.abs_path(name)
+		end
+	end
+	local origin = opts.origin
+	if origin and origin.name and origin.name ~= "" and vim.fn.isdirectory(origin.name) ~= 1 then
+		return origin.name:match("^/") and diff.abs_path(origin.name) or diff.abs_path(origin.name)
+	end
+	local name = vim.api.nvim_buf_get_name(0)
+	if name ~= "" then
+		return diff.abs_path(name)
+	end
+	return nil
+end
+
 --- THE TURN'S WORKSPACE: the repository the candidate directory belongs to.
 ---
 --- WI-3 (PLAN-R1-capture.md §3 and §8 row 3, issue-log row 3). This used to be
@@ -469,6 +489,11 @@ function M.begin_turn(opts)
 		return nil, jail.OVERLAY_UNAVAILABLE_MSG
 	end
 
+	local candidate = workspace_candidate(opts)
+	local flags = opts.single_file_flags or {}
+	if flags.workspace and flags.workspace ~= "" then
+		opts.workspace = flags.workspace
+	end
 	local workspace = diff.abs_path(opts.workspace or M.workspace_for_turn(opts))
 	local stream = opts.stream or "default"
 	local turn_id = tostring(opts.turn_id or opts.turn_gen or "0")
@@ -480,12 +505,47 @@ function M.begin_turn(opts)
 	if declared == nil then
 		declared = config.options.write_roots
 	end
+	local single_file_decision
+	if not (flags.workspace and flags.workspace ~= "") then
+		local single_file = require("yana.single_file")
+		local decision, derr = single_file.decide({
+			real_path = buffer_real_path(opts),
+			candidate_dir = candidate,
+			flags = flags,
+		})
+		if derr then
+			return nil, derr
+		end
+		if decision then
+			if type(declared) == "table" and #declared > 0 then
+				return nil, "single-file mode: declared write roots are not available"
+			end
+			local materialised, merr = single_file.materialise(decision, M.state_root())
+			if not materialised then
+				return nil, merr
+			end
+			single_file_decision = decision
+			workspace = materialised.workspace
+			opts._single_file_materialised = materialised
+			require("yana.log").lifecycle("single_file_mode", {
+				trigger = decision.trigger,
+				real_path = decision.real_path,
+				scratch_ws = materialised.workspace,
+				flag_lifetime = "next turn only",
+			})
+		end
+	end
 
 	-- THE BROAD ROOT IS CHOSEN BEFORE ANY PER-TURN STATE EXISTS, for the same
 	-- reason the declared set is: a turn that cannot have the scope it was
 	-- configured for must not leave a layer, a claim or a turn directory behind
 	-- for the next one to trip over.
-	local broad_root, broad_why = M.broad_root_for(workspace, declared)
+	local broad_root, broad_why
+	if opts._single_file_materialised then
+		broad_root = workspace
+	else
+		broad_root, broad_why = M.broad_root_for(workspace, declared)
+	end
 	if not broad_root then
 		return nil, broad_why
 	end
@@ -595,6 +655,18 @@ function M.begin_turn(opts)
 		refused_bytes = 0,
 		refused_retained = {},
 	}
+	if opts._single_file_materialised then
+		session.single_file = {
+			trigger = single_file_decision.trigger,
+			real_path = single_file_decision.real_path,
+			candidate_dir = single_file_decision.candidate_dir,
+			workspace = workspace,
+			copy_path = opts._single_file_materialised.copy_path,
+			records = opts._single_file_materialised.records,
+			map = opts._single_file_materialised.map,
+			base = opts._single_file_materialised.base,
+		}
+	end
 	local lifecycle = require("yana.turn_lifecycle")
 	session.turn_pass = lifecycle.begin_turn({
 		panel_id = opts.panel_id or 0,
@@ -1183,6 +1255,16 @@ function M.discard(session)
 	if session.turn_dir and not keep_private and not keep_refused then
 		pcall(vim.fn.delete, session.turn_dir, "rf")
 	end
+	-- SFM scratch-ws cleanup is deliberately NOT wired to this generic
+	-- discard(): discard() also runs at ordinary review-settle (a successful
+	-- ct/cA accept-transfer closes the review and reaches here), and the SFM
+	-- gate's own sfm_accept_then_save row asserts the scratch copy is still
+	-- present right after that accept (it is the pre-:w evidence that the
+	-- real folder was never written directly). Cleanup instead happens at the
+	-- one call site where a turn ends with NO review ever possible (the
+	-- launcher never started -- ui.lua's release-before-spawn path) and at
+	-- the next materialise() for the same real file, which wipes and
+	-- recreates its one stable dir (REV2 item 3).
 	return true
 end
 

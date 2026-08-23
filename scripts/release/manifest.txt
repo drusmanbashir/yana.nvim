@@ -11,6 +11,7 @@ bin/yana-apply
 bin/yana-changeset
 bin/yana-jail
 bin/yana-ledger
+bin/yana-ollama-agent
 bin/yana-overlay
 bin/yana-overlay-inner
 bin/yana-sandbox
@@ -91,4 +92,6 @@ tests/release/helper_gate.sh
 tests/release/optional_dependencies_smoke.lua
 tests/release/policy_mutation_gate.sh
 tests/release/smoke.lua
+tests/release/turn_smoke.lua
+tests/release/turn_smoke_agent
 tests/release/workflow_policy.py

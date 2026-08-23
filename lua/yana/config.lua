@@ -217,15 +217,27 @@ M.defaults = {
                        -- give, so ask mode is not requested at all rather
                        -- than mistranslated into a hang.
       list_models_args = false, -- claude has no --list-models; the picker
-                                 -- says so rather than showing cursor's
-                                 -- stale list.
+                                 -- uses the static `models` catalogue below.
       -- No listing surface exists to probe (`claude --help` gives only
       -- illustrative alias examples -- "fable", "opus", "sonnet" -- in its
       -- --model flag text, never an accepted-ids catalogue; there is no
-      -- `claude models` or equivalent command). Work order VENDORS ruling:
-      -- ship the single honest fallback rather than invent a catalogue from
-      -- example text.
-      models = { { id = "auto", label = "let claude choose" } },
+      -- `claude models` or equivalent command). Operator ruling 2026-08-23:
+      -- ship a static declared catalogue with auto first; the picker
+      -- prompt notes the list is declared and may go stale.
+      models = {
+        { id = "auto", label = "let claude choose" },
+        { id = "fable", label = "fable (alias)" },
+        { id = "opus", label = "opus (alias)" },
+        { id = "sonnet", label = "sonnet (alias)" },
+        { id = "haiku", label = "haiku (alias)" },
+        { id = "claude-fable-5", label = "claude-fable-5" },
+        { id = "claude-opus-5", label = "claude-opus-5" },
+        { id = "claude-sonnet-5", label = "claude-sonnet-5" },
+        {
+          id = "claude-haiku-4-5-20251001",
+          label = "claude-haiku-4-5-20251001",
+        },
+      },
       close_stdin = true, -- row 66: a claude turn pays a fixed 3s wait for
                           -- stdin data Yana never sends ("Warning: no stdin
                           -- data received in 3s, proceeding without it");
@@ -263,6 +275,25 @@ M.defaults = {
       close_stdin = true, -- piped stdin makes codex wait to read a
                            -- `<stdin>` block; a codex turn must be spawned
                            -- with stdin closed/empty.
+    },
+    -- Local Ollama (server-mode). The shim `yana-ollama-agent` (plugin
+    -- `bin/`) speaks cursor stream-json so no new stream_protocol is
+    -- needed. Bare `cmd` resolves to plugin `bin/` via M.resolve_cmd
+    -- (bundled), so `\am` / :YanaBackend list_models work without PATH.
+    -- Override with an absolute path if desired. Confinement: Yana's jail
+    -- wraps the shim; the Ollama daemon is a separate localhost service
+    -- outside that wrap (modes.md server-mode note). Default model when
+    -- dial is "auto": shim env YANA_OLLAMA_MODEL or qwen2.5-coder:7b.
+    ollama = {
+      cmd = "yana-ollama-agent",
+      noninteractive_flag = "-p",
+      stream_json_args = { "--output-format", "stream-json" },
+      allow_edits_args = { "--force" },
+      select_model_flag = "--model",
+      resume_flag = nil, -- shim has no session resume yet
+      ask_args = { "--mode", "ask" },
+      list_models_args = { "--list-models" },
+      close_stdin = true,
     },
   },
 
@@ -326,6 +357,11 @@ M.defaults = {
   -- costs one more overlay mount and one more claim per turn (measured ~181 ms
   -- per root on the reference box).
   write_roots = {},
+
+  single_file = {
+    enabled = true,
+    max_entries = 2000,
+  },
 
   -- THE BROAD ROOT: the ONE directory the turn's single overlay is mounted at
   -- (PLAN-R1-capture.md §1). Everything beneath it is writable inside the jail
@@ -606,6 +642,21 @@ Agent mode: when the user asks to populate, add, change, or give an example in a
 	-- with this on the log stays untouched — the flag only decides whether the
 	-- recording files exist at all. See lua/yana/record.lua.
 	debug_record = false,
+}
+
+-- Grouped-by-surface view of the three keymap tables above (avante.nvim's
+-- `mappings = { diff=, suggestion=, ... }` shape, applied to yana's own
+-- surfaces: hunk review, panel, global). Each group is the SAME table object
+-- as its legacy flat counterpart at this point, so M.defaults cannot itself
+-- disagree about a default key -- there is exactly one literal per key,
+-- referenced twice. `diff_keymaps` / `keymaps` / `global_keymaps` remain
+-- valid spellings; M.setup (see M.normalize_mappings) is the one authority
+-- that reconciles the two names once a `setup()` opts table can set either
+-- (or both) to something other than these defaults.
+M.defaults.mappings = {
+  diff = M.defaults.diff_keymaps,
+  panel = M.defaults.keymaps,
+  global = M.defaults.global_keymaps,
 }
 
 M.options = vim.deepcopy(M.defaults)
@@ -1242,6 +1293,25 @@ end
 ---               `tried = true` means this step produced a candidate (raw is
 ---               the pre-expansion string); `tried = false` means it was
 ---               skipped or empty, and `note` says why.
+--- Plugin root (…/yana), derived from this module's path — same shape as
+--- shadow/jail.lua's repo_dir. Used so a shipped bare cmd like
+--- `yana-ollama-agent` resolves to `bin/` without the operator putting the
+--- plugin on PATH (required for `\am` list_models on a fresh install).
+local function plugin_root()
+  return debug.getinfo(1, "S").source:sub(2):gsub("/lua/yana/config%.lua$", "")
+end
+
+local function bundled_bin(bare_name)
+  if type(bare_name) ~= "string" or bare_name == "" or bare_name:find("/", 1, true) then
+    return nil
+  end
+  local candidate = plugin_root() .. "/bin/" .. bare_name
+  if vim.fn.executable(candidate) == 1 then
+    return candidate
+  end
+  return nil
+end
+
 --- Resolve the spawn binary for `backend_name` (default: the active backend).
 --- Prefetch / list_models for a non-active vendor MUST pass that vendor's
 --- name — otherwise argv would mix one binary with another's list flags.
@@ -1259,6 +1329,21 @@ function M.resolve_cmd(backend_name)
   -- byte-identical to pre-backends Yana.
   if type(entry.cmd) == "string" and entry.cmd ~= "" then
     local expanded = vim.fn.expand(entry.cmd)
+    -- Bare shipped shim: prefer plugin bin/ over a PATH miss so `:YanaBackend`
+    -- / `\am` can list models without a manual install step.
+    if not expanded:find("/", 1, true) then
+      local bundled = bundled_bin(expanded)
+      if bundled then
+        candidates[#candidates + 1] = {
+          step = "backend_bundled",
+          backend = active,
+          tried = true,
+          raw = entry.cmd,
+          expanded = bundled,
+        }
+        return { step = "backend_bundled", value = bundled, backend = active, candidates = candidates }
+      end
+    end
     candidates[#candidates + 1] =
       { step = "backend", backend = active, tried = true, raw = entry.cmd, expanded = expanded }
     return { step = "backend", value = expanded, backend = active, candidates = candidates }
@@ -1358,6 +1443,23 @@ function M.normalize_write_roots(roots)
     end
   end
   table.sort(out)
+  return out
+end
+
+function M.normalize_single_file(value)
+  local base = vim.deepcopy(M.defaults.single_file)
+  if value == nil then
+    return base
+  end
+  if type(value) ~= "table" then
+    error("single_file must be a table")
+  end
+  local out = vim.tbl_deep_extend("force", base, value)
+  out.enabled = out.enabled ~= false
+  if type(out.max_entries) ~= "number" or out.max_entries < 0 then
+    error("single_file.max_entries must be a non-negative number")
+  end
+  out.max_entries = math.floor(out.max_entries)
   return out
 end
 
@@ -1489,6 +1591,84 @@ function M.normalize_inline_exec_allowlist(list)
   return out
 end
 
+-- The three keymap groups, and the legacy flat name each one mirrors.
+-- Order is not meaningful; declared once so M.normalize_mappings and any
+-- future reader of "which groups exist" share one list.
+M.MAPPING_GROUPS = {
+  { group = "diff", legacy_key = "diff_keymaps" },
+  { group = "panel", legacy_key = "keymaps" },
+  { group = "global", legacy_key = "global_keymaps" },
+}
+
+--- Reconcile the new grouped `mappings = { diff=, panel=, global= }` shape
+--- (avante.nvim's mappings shape, applied to yana's surfaces) against the
+--- three legacy flat tables (`diff_keymaps`, `keymaps`, `global_keymaps`),
+--- so `config.options.mappings.<group>` becomes the ONE internal authority
+--- every consumer can read, while a consumer that still reads a legacy flat
+--- name never disagrees with it.
+---
+--- `next_options` is the candidate table already produced by
+--- `vim.tbl_deep_extend("force", vim.deepcopy(M.defaults), opts)` in
+--- M.setup -- i.e. `next_options.mappings.<group>` and
+--- `next_options.<legacy_key>` are each ALREADY the defaults deep-merged
+--- against whichever of the two spellings the RAW `opts` set (independently
+--- of each other, since they are different top-level keys). `opts` is the
+--- raw, pre-merge table the caller passed to M.setup, needed here only to
+--- tell "the user set this spelling" apart from "this equals the default
+--- because nothing touched it".
+---
+--- Precedence per group, independently:
+---   * neither spelling set by the user  -> the shared default (the two
+---     already agree, since M.defaults.mappings.<group> and
+---     M.defaults.<legacy_key> are the same object at declaration time).
+---   * exactly one spelling set          -> that spelling's merged value;
+---     the alias resolves into it with no warning (a plain legacy setting
+---     behaves exactly as it always has).
+---   * BOTH set, to equal values         -> that value; no warning (the two
+---     spellings agree, so there is nothing to name).
+---   * BOTH set, to DIFFERENT values     -> `mappings.<group>` wins, and one
+---     `vim.notify` WARN line names the group and both source spellings --
+---     conflicting operator intent is never silently resolved.
+--- Either way, BOTH `next_options.mappings.<group>` and
+--- `next_options.<legacy_key>` are overwritten with the SAME resolved table
+--- before returning, so no consumer -- new name or old -- can ever observe
+--- the two disagreeing.
+function M.normalize_mappings(next_options, opts)
+  opts = opts or {}
+  next_options.mappings = next_options.mappings or {}
+  local user_mappings = type(opts.mappings) == "table" and opts.mappings or nil
+  for _, g in ipairs(M.MAPPING_GROUPS) do
+    local legacy_set = opts[g.legacy_key] ~= nil
+    local new_set = user_mappings ~= nil and user_mappings[g.group] ~= nil
+    local legacy_resolved = next_options[g.legacy_key]
+    local new_resolved = next_options.mappings[g.group]
+    local resolved
+    if new_set and legacy_set then
+      if not vim.deep_equal(new_resolved, legacy_resolved) then
+        vim.notify(
+          string.format(
+            "yana: config.mappings.%s and config.%s were both set to different values -- config.mappings.%s wins",
+            g.group,
+            g.legacy_key,
+            g.group
+          ),
+          vim.log.levels.WARN
+        )
+      end
+      resolved = new_resolved
+    elseif new_set then
+      resolved = new_resolved
+    elseif legacy_set then
+      resolved = legacy_resolved
+    else
+      resolved = new_resolved -- neither set: defaults already agree
+    end
+    next_options.mappings[g.group] = resolved
+    next_options[g.legacy_key] = resolved
+  end
+  return next_options.mappings
+end
+
 --- Install configuration ATOMICALLY: nothing becomes effective until every
 --- validator has accepted.
 ---
@@ -1530,6 +1710,12 @@ function M.setup(opts)
   if opts.model_highlight then
     next_options.model_highlight = vim.deepcopy(opts.model_highlight)
   end
+  -- Reconcile mappings.{diff,panel,global} against the three legacy flat
+  -- keymap tables BEFORE the raising validators below, so a conflict warning
+  -- (if any) is seen even when a later validator goes on to reject the
+  -- config outright. Mutates next_options.mappings.* and next_options.{
+  -- diff_keymaps,keymaps,global_keymaps} in place; never raises.
+  M.normalize_mappings(next_options, opts)
   -- Every validator runs against the candidate. Any of them may raise; none of
   -- them can leave a half-installed configuration behind.
   next_options.selection_scope = M.normalize_selection_scope(next_options.selection_scope)
@@ -1539,6 +1725,7 @@ function M.setup(opts)
   next_options.skill_dirs = M.normalize_skill_dirs(next_options.skill_dirs)
   next_options.artifact_dir_prefixes = M.normalize_artifact_dir_prefixes(next_options.artifact_dir_prefixes)
   next_options.write_roots = M.normalize_write_roots(next_options.write_roots)
+  next_options.single_file = M.normalize_single_file(next_options.single_file)
   next_options.workspace_roots = M.normalize_workspace_roots(next_options.workspace_roots)
   next_options.capture_root = M.normalize_capture_root(next_options.capture_root)
   next_options.inline_exec_allowlist = M.normalize_inline_exec_allowlist(next_options.inline_exec_allowlist)
@@ -1574,6 +1761,7 @@ function M.apply_mode_highlights()
     hl.link = nil
     vim.api.nvim_set_hl(0, M.model_hl_group, hl)
   end
+  vim.api.nvim_set_hl(0, "YanaSingleFileBanner", { link = "WarningMsg", bold = true, default = true, force = true })
 end
 
 -- The cursor-agent permission mode for this turn. The panel argument is kept so

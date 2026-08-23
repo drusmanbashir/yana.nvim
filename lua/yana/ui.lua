@@ -79,6 +79,11 @@ local function new_panel_state()
     prompt_buf = nil,
     prompt_win = nil,
     session_id = nil,
+    session_slots = { ask = nil, inline = nil, agentic = nil },
+    model_actual = nil,    -- the model the VENDOR said it ran, set only by
+                           -- set_model_actual from a system event; nil reads
+                           -- as "unknown" in the winbar, never the operator's
+                           -- pick (operator ruling, 2026-08-22)
     title = nil,           -- short session title (from the first prompt)
     mode = nil,
     job = nil,
@@ -128,6 +133,9 @@ local function new_panel_state()
     scope_rejections = {}, -- per-turn out-of-zone rejections by path
     review_rejections = {}, -- per-turn inline-review rejections by path
     turn_modes = {},       -- turn_gen -> resolved mode used for that submit
+    turn_backends = {},    -- turn_gen -> backend resolved at submit
+    turn_end_outcome = {}, -- turn_gen -> close_turn outcome for turn.end
+    turn_end_emitted = {}, -- turn_gen -> true once turn.end written
     turn_questions = {},   -- turn_gen -> composed prompt sent for that submit
     turn_answers = {},     -- turn_gen -> final assistant answer text (result payload)
     last_answer_text = nil, -- most recent final assistant answer text
@@ -395,6 +403,24 @@ local function mode_change_blocked(p)
   return false, nil
 end
 
+local function remember_mode_session(p)
+  if not p then
+    return
+  end
+  local mode = config.panel_mode(p.mode)
+  p.session_slots = p.session_slots or { ask = nil, inline = nil, agentic = nil }
+  p.session_slots[mode] = p.session_id
+end
+
+local function restore_mode_session(p, mode)
+  if not p then
+    return
+  end
+  p.session_slots = p.session_slots or { ask = nil, inline = nil, agentic = nil }
+  p.session_id = p.session_slots[config.panel_mode(mode)]
+  p.model_actual = nil
+end
+
 ----------------------------------------------------------------------
 -- STAGE 0 MID-CHAT SWITCH: quiescent renewal (the mode contract §3)
 --
@@ -458,9 +484,28 @@ local function renewal_brief(p, from_mode, to_mode)
   return renewal.display_text(renewal.build(p, from_mode, to_mode))
 end
 
+local function pack_shared_context(p)
+  if not p or p.session_id ~= nil then
+    return nil
+  end
+  if not ((p.last_question and p.last_question ~= "") or (p.last_answer_text and p.last_answer_text ~= "")) then
+    return nil
+  end
+  local lines = { "[Context shared from this session pack]" }
+  if p.last_question and p.last_question ~= "" then
+    lines[#lines + 1] = "Previous request:"
+    lines[#lines + 1] = p.last_question
+  end
+  if p.last_answer_text and p.last_answer_text ~= "" then
+    lines[#lines + 1] = "Previous answer:"
+    lines[#lines + 1] = p.last_answer_text
+  end
+  return table.concat(lines, "\n")
+end
+
 
 local function mode_change_refused_notify(p, reason)
-  local nk = (config.options.keymaps or {}).new_chat
+  local nk = (config.options.mappings.panel or {}).new_chat
   local new_hint = (nk and nk ~= "") and (" with " .. nk) or " (:YanaNew)"
   if reason == "in_flight" then
     notify_one_line(
@@ -794,10 +839,16 @@ end
 -- before). Row 65's last-resort core shrink calls this with a shrinking cap
 -- when even the untouchable core does not fit a genuinely narrow window.
 local function model_chip(p, cap)
-  -- Session-scoped, like mode's own chip reads through config.panel_mode:
-  -- the model picked in ANY panel is the whole nvim session's model, so
-  -- every panel's chip reads the session value directly rather than a
-  -- per-panel copy that could go stale the moment another panel picks.
+  -- CONFIRMED, not requested (operator ruling, 2026-08-22, issue-log row
+  -- 91). `config.options.model` is what the operator PICKED --
+  -- a request the vendor may ignore, refuse, or silently substitute -- and is
+  -- no longer read here. `p.model_actual` is set only from the vendor's own
+  -- system event (`set_model_actual`, fed by `agent.lua`'s `emit()`), so this
+  -- chip shows a name Yana actually observed running, or `unknown` when it
+  -- has observed none. Panel-scoped: cleared at every point the panel's
+  -- upstream session ends or changes (new_chat, mode-switch renewal, backend
+  -- switch, resume), so a resumed session that never re-announces cannot
+  -- inherit a confirmation that belonged to a different session.
   --
   -- Row 58: `model: claude-4-sonnet` alone
   -- is ambiguous by construction -- it is what let the operator believe
@@ -806,7 +857,7 @@ local function model_chip(p, cap)
   -- two different meters are never displayed identically
   -- (`cursor:claude-4-sonnet` vs `claude:claude-sonnet-5`).
   local backend = config.options.backend or "cursor"
-  local label = config.options.model or "auto"
+  local label = p.model_actual or "unknown"
   local text = trunc_display(backend .. ":" .. label, cap or 24)
   local hl = config.model_hl_group
   return string.format("model: %%#%s#%s%%*", hl, text:gsub("%%", "%%%%"))
@@ -1069,8 +1120,11 @@ local function fit_winbar(p, winid)
     return core_bare
   end
 
+  -- Same source as model_chip itself (the CONFIRMED model, not the request)
+  -- -- this is only a loop bound, but a mismatched source could size the
+  -- shrink search for the wrong label.
   local backend = config.options.backend or "cursor"
-  local label = config.options.model or "auto"
+  local label = p.model_actual or "unknown"
   local max_chars = vim.fn.strchars(backend .. ":" .. label)
   for cap = max_chars - 1, 0, -1 do
     local cand = core_text(p, cap, true) .. " " .. WINBAR_ELLIPSIS
@@ -1085,6 +1139,8 @@ local function fit_winbar(p, winid)
   return core_text(p, 0, true) .. " " .. WINBAR_ELLIPSIS
 end
 
+local single_file_banner
+
 local function update_winbar(p)
   if win_valid(p.conv_win) then
     -- Cosmetic chrome must never be able to abort its caller. update_winbar
@@ -1094,6 +1150,11 @@ local function update_winbar(p)
     -- the whole class of consequence.
     pcall(function()
       vim.wo[p.conv_win].winbar = fit_winbar(p, p.conv_win)
+    end)
+  end
+  if win_valid(p.prompt_win) then
+    pcall(function()
+      vim.wo[p.prompt_win].winbar = single_file_banner(p) or "%#Comment#  prompt — type your question %*"
     end)
   end
 end
@@ -1295,7 +1356,7 @@ end
 
 local function change_footer_text(change, _k)
   if change.status == "pending" then
-    local maps = config.options.diff_keymaps or {}
+    local maps = config.options.mappings.diff or {}
     return string.format(
       "_Review in **file buffer**: `%s` reject hunk · `%s` accept hunk · `%s` accept all · `%s` accept all changes · `%s` reject file_",
       maps.ours or "co",
@@ -1366,7 +1427,7 @@ local function refresh_change_block(p, change)
   if change.conv_header_line < 1 or change.conv_header_line > total then
     return
   end
-  local k = config.options.keymaps
+  local k = config.options.mappings.panel
   local counts = string.format("(+%s −%s)", change.added or "?", change.removed or "?")
   local header = change_header_text(change, counts)
   vim.bo[p.conv_buf].modifiable = true
@@ -1570,6 +1631,17 @@ local function panel_claimed_workspace(p)
   })
 end
 
+single_file_banner = function(p)
+  local sfm = p and p.shadow_turn and p.shadow_turn.single_file
+  if not sfm then
+    return nil
+  end
+  local name = vim.fn.fnamemodify(sfm.real_path or sfm.copy_path or "file", ":t")
+  return "%#YanaSingleFileBanner# SINGLE-FILE MODE · agent EDITS only "
+    .. name
+    .. " · multi-file/create/delete refused · :Yana --workspace DIR to widen %*"
+end
+
 -- Shared on_accept/on_reject pair for an inline review of `change`. Used by
 -- render_tool_change's first-time inline.enqueue AND by the accept_change/
 -- reject_change retry path below, so a retried review behaves identically to
@@ -1637,6 +1709,54 @@ local function preview_module()
   return require("yana.shadow.preview")
 end
 
+-- Row 85: one helper for both turn.end emission sites so the payload cannot
+-- fork. Serialises ledger.close_turn's outcome onto the lifecycle line — not a
+-- second schema. Vendor claim counts are deliberately absent (raw stream is
+-- already teed; they fail the retention tests).
+local function emit_turn_end(p, pass, reason, outcome)
+  -- Release may run from on_exit_confirmed before on_done stashes the
+  -- close_turn outcome. Skip then; on_done emits with the full payload.
+  if type(outcome) ~= "table" then
+    return
+  end
+  outcome = outcome or {}
+  local gen = (pass and pass.generation) or outcome.generation or (p and p.turn_gen)
+  if p then
+    p.turn_end_emitted = p.turn_end_emitted or {}
+    if gen and p.turn_end_emitted[gen] then
+      return
+    end
+    if gen then
+      p.turn_end_emitted[gen] = true
+    end
+  end
+  local mode = nil
+  local backend = nil
+  if p and gen and p.turn_modes then
+    mode = p.turn_modes[gen]
+  end
+  if p and gen and p.turn_backends then
+    backend = p.turn_backends[gen]
+  end
+  mode = mode or (p and config.panel_mode(p.mode)) or nil
+  backend = backend or (config.options.backend or "cursor")
+  log.lifecycle("turn.end", {
+    turn_id = pass and pass.turn_id or outcome.turn_id,
+    panel = pass and pass.panel or (p and p.id) or outcome.panel,
+    generation = gen,
+    reason = reason,
+    mode = mode,
+    backend = backend,
+    changes = outcome.changes,
+    changes_pending = outcome.changes_pending,
+    exit_code = outcome.exit_code,
+    got_result = outcome.got_result,
+    cancelled = outcome.cancelled,
+    turn_errored = outcome.turn_errored,
+    session_id = outcome.session_id,
+  })
+end
+
 -- Close the workspace claim this turn holds, then drop the turn's private
 -- state. Every path that finishes or abandons a review funnels through here.
 --
@@ -1648,15 +1768,18 @@ local function release_shadow_turn(p, reason)
   local pass = p.turn_pass
   p.shadow_turn = nil
   p.shadow_pass = nil
+  -- Stash the caller reason per generation so on_done's later turn.end emit
+  -- (when this call skips because turn_end_outcome is not yet set — the
+  -- on_exit_confirmed → finalize path) carries THIS reason, never a
+  -- hard-coded "process exited". Refusal / empty / ask reasons must win.
+  if p and pass and pass.generation ~= nil then
+    p.turn_end_reasons = p.turn_end_reasons or {}
+    p.turn_end_reasons[tostring(pass.generation)] = reason
+  end
   if not turn then
     if pass then
       require("yana.turn_lifecycle").close_turn(pass, reason)
-      log.lifecycle("turn.end", {
-        turn_id = pass.turn_id,
-        panel = pass.panel,
-        generation = pass.generation,
-        reason = reason,
-      })
+      emit_turn_end(p, pass, reason, p.turn_end_outcome and p.turn_end_outcome[pass.generation])
       p.turn_pass = nil
     end
     return
@@ -1690,12 +1813,7 @@ local function release_shadow_turn(p, reason)
   end
   if pass then
     require("yana.turn_lifecycle").close_turn(pass, reason)
-    log.lifecycle("turn.end", {
-      turn_id = pass.turn_id,
-      panel = pass.panel,
-      generation = pass.generation,
-      reason = reason,
-    })
+    emit_turn_end(p, pass, reason, p.turn_end_outcome and p.turn_end_outcome[pass.generation])
     p.turn_pass = nil
   end
   preview.discard(turn)
@@ -1772,7 +1890,7 @@ local function inline_review_opts(p, change)
     on_shadow_accept = journaled and (function()
       local lifecycle = require("yana.turn_lifecycle")
       local owner = p.turn_pass
-      local accept = function(c, composed)
+      local accept = function(c, composed, opts)
         local panel = current_panel()
         if not panel then
           return false, "no panel"
@@ -1797,9 +1915,9 @@ local function inline_review_opts(p, change)
           )
         end
         if panel.shadow_pass then
-          return shadow_apply.accept_composed(panel.shadow_pass, c, composed)
+          return shadow_apply.accept_composed(panel.shadow_pass, c, composed, opts)
         end
-        return shadow_apply.accept_standalone(panel, c, composed)
+        return shadow_apply.accept_standalone(panel, c, composed, opts)
       end
       return owner and lifecycle.bind_callback(owner, "shadow accept", accept) or accept
     end)() or nil,
@@ -1969,7 +2087,7 @@ end
 local function render_tool_change(p, change)
   commit_stream(p)
   p.rendered_any = true
-  local k = config.options.keymaps
+  local k = config.options.mappings.panel
   stamp_undeclared_badge(p, change)
   if (not change.diff or change.diff == "") and change.before and change.after then
     change.diff = diff.synthesize_diff(change.before, change.after, change.path)
@@ -2308,6 +2426,7 @@ local function on_event_body(p, gen, obj)
   if obj.type == "system" and obj.subtype == "init" then
     ledger.mark(L, "session_init")
     p.session_id = obj.session_id or p.session_id
+    remember_mode_session(p)
   elseif obj.type == "assistant" then
     local content = obj.message and obj.message.content or {}
     for _, item in ipairs(content) do
@@ -2388,6 +2507,7 @@ local function on_event_body(p, gen, obj)
       p.last_answer_text = obj.result
     end
     p.session_id = obj.session_id or p.session_id
+    remember_mode_session(p)
     finish_assistant_block(p, obj)
     if obj.is_error then
       render_error(p, type(obj.result) == "string" and obj.result ~= "" and obj.result or "agent reported an error", {
@@ -2434,7 +2554,7 @@ function maybe_drain_queue(p)
       string.format(
         "yana: turn errored — %d queued prompt(s) held; send with %s",
         #p.queue,
-        config.options.keymaps.queue or "the queue picker"
+        config.options.mappings.panel.queue or "the queue picker"
       ),
       vim.log.levels.WARN
     )
@@ -2559,6 +2679,102 @@ local function record_artifact_refusals(p, turn, classification)
     ))
   end
   return true
+end
+
+local function apply_single_file_filter(turn, changes, classification)
+  local sfm = turn and turn.single_file
+  if not sfm then
+    return changes, classification
+  end
+  classification = classification or { groups = {}, individual = {}, unsafe = {} }
+  classification.groups = classification.groups or {}
+  classification.unsafe = classification.unsafe or {}
+  classification.individual = classification.individual or {}
+  local allowed_copy = sfm.copy_path and diff.abs_path(sfm.copy_path)
+  local allowed_name = vim.fn.fnamemodify(sfm.real_path or allowed_copy or "file", ":t")
+  local records = sfm.records
+  local kept = {}
+  local refused = {}
+
+  local function typed_op_path(op)
+    if op.path and op.path ~= "" then
+      return diff.abs_path(op.path)
+    end
+    if op.root and op.rel and op.rel ~= "" then
+      return diff.abs_path(op.root .. "/" .. op.rel)
+    end
+    return nil
+  end
+
+  -- A bare delete (or any other destructive op the generic classifier
+  -- already routed away from `changes` entirely, ruling 81's own
+  -- "unsafe destructive artifact operation" logic in ops.classify_artifacts)
+  -- never reaches the `changes` loop below AT ALL -- it is excluded from
+  -- `changes` before this filter ever runs. In an SFM turn it is STILL an
+  -- SFM refusal (only the tracked file may change, and only by modify), so
+  -- it is reclassified here into the SAME named single-file-mode group,
+  -- instead of surfacing as the undifferentiated `unsafe_operation_refused`
+  -- ledger decision (no kind_counts/sample shape a caller can name the file
+  -- from -- gate row sfm_refuses_nonbuffer_kinds[delete]).
+  for _, bucket_name in ipairs({ "unsafe", "individual" }) do
+    local kept_ops = {}
+    for _, op in ipairs(classification[bucket_name]) do
+      local opath = typed_op_path(op)
+      if allowed_copy and opath == allowed_copy then
+        local rel = op.rel or vim.fn.fnamemodify(opath, ":t")
+        refused[#refused + 1] = {
+          kind = op.kind,
+          rel = rel,
+          path = opath,
+          detail = "single-file mode",
+          refusal_reason = "single-file mode: only " .. allowed_name .. " may change (refused " .. rel .. ")",
+          status = "system_refused",
+        }
+      else
+        kept_ops[#kept_ops + 1] = op
+      end
+    end
+    classification[bucket_name] = kept_ops
+  end
+
+  for _, change in ipairs(changes or {}) do
+    local cpath = require("yana.diff").abs_path(change.path)
+    local ok_path = allowed_copy and cpath == allowed_copy
+    local ok_kind = change.kind ~= "delete" and change.before ~= nil and change.after ~= nil
+    if ok_path and ok_kind then
+      change.path = sfm.real_path
+      change.review_workspace = records
+      change.single_file = sfm
+      kept[#kept + 1] = change
+    else
+      local rel = change.rel or vim.fn.fnamemodify(cpath, ":t")
+      refused[#refused + 1] = {
+        kind = change.kind or (change.before == nil and "create" or "modify"),
+        rel = rel,
+        path = cpath,
+        detail = "single-file mode",
+        refusal_reason = "single-file mode: only " .. allowed_name .. " may change (refused " .. rel .. ")",
+        status = "system_refused",
+      }
+    end
+  end
+  if #refused > 0 then
+    local counts = {}
+    for _, op in ipairs(refused) do
+      counts[op.kind] = (counts[op.kind] or 0) + 1
+    end
+    table.insert(classification.groups, {
+      root = "single-file mode",
+      root_kind = "single_file",
+      count = #refused,
+      kind_counts = counts,
+      members = refused,
+      root_workspace = records,
+      upper_dir = turn.upper_dir,
+      upper_prefix = "",
+    })
+  end
+  return kept, classification
 end
 
 -- A write the confinement refused becomes an operator-visible refusal.
@@ -2695,6 +2911,14 @@ local function finalize_shadow_turn_body(p, turn)
   end
   turn._review_finalized = true
   p.shadow_turn = turn
+  -- ROW 86 WITNESS: `p.system_refusals` is a bounded, NEVER-cleared history
+  -- (":YanaRefusals" reads all of it back across every turn a panel has ever
+  -- run), so its total count cannot say whether THIS turn refused anything.
+  -- Snapshotting the count here, before either confinement or artifact
+  -- refusals for this turn are recorded below, is what lets the empty-turn
+  -- branch further down tell "this turn refused N things" from "a PRIOR turn
+  -- once did" -- see the read site at the bottom of this function.
+  local system_refusals_before_turn = #(p.system_refusals or {})
   -- Writes the confinement itself refused during the turn (EROFS outside the
   -- claimed workspace) become operator-visible refusals here, before any
   -- branch decides what the turn produced: a turn with none carries no rows
@@ -2731,6 +2955,7 @@ local function finalize_shadow_turn_body(p, turn)
     local changes, cerr, typed, classification = ops.changes_from_session(turn, {
       tracked_evidence = p.turn_pass and p.turn_pass.tracked_evidence or nil,
     })
+    changes, classification = apply_single_file_filter(turn, changes, classification)
     ledger.mark(turn_ledger(p, shadow_turn_gen(turn, p)), "change_set_read")
     -- HOW MANY REPOSITORIES THIS TURN TOUCHED, from the walk and nothing else
     -- (PLAN-R1-capture.md §1: grouping is computed from the walk, not declared
@@ -2861,7 +3086,24 @@ local function finalize_shadow_turn_body(p, turn)
         end
         end
       else
-        release_shadow_turn(p, "all artifact operations system-refused")
+        -- ROW 86 FIX. `changes` empty is reached by TWO different turns: one
+        -- where every artifact operation was genuinely system-refused
+        -- (`record_artifact_refusals` just above grew `p.system_refusals`),
+        -- and one where the agent simply produced nothing at all -- no
+        -- edits, no artifact writes, no confinement refusals either. The old
+        -- unconditional reason named the first case even for the second,
+        -- reporting a refusal that never happened. The turn-scoped delta
+        -- against `system_refusals_before_turn` (captured before ANY
+        -- refusal for this turn could be recorded, confinement included) is
+        -- the one witness that actually distinguishes them -- unlike
+        -- `#p.system_refusals` on its own, which never resets and would
+        -- stay "true" forever after the first refusal any panel ever saw.
+        local turn_had_refusals = #(p.system_refusals or {}) > system_refusals_before_turn
+        if turn_had_refusals then
+          release_shadow_turn(p, "all artifact operations system-refused")
+        else
+          release_shadow_turn(p, "no_changes")
+        end
         maybe_drain_queue(p)
       end
     end
@@ -2943,14 +3185,6 @@ local function on_done(p, gen, code, stderr)
   local L = ledger.ensure(p.id, gen)
   ledger.set_current_event(L, nil)
   p.busy = false
-  local turn = p.job_shadow_turn or p.shadow_turn
-  if turn and tostring(shadow_turn_gen(turn, p)) == tostring(gen) then
-    finalize_shadow_turn(p, turn)
-  end
-  -- Idempotent; normally a no-op because on_exit_confirmed already flushed
-  -- (agent.lua fires it first). This call exists for the spawn-failure path,
-  -- which calls on_done(-1) synchronously and never produces an exit at all.
-  flush_review_batch(p)
   local cancelled = p.cancelled
   p.cancelled = false
   -- jobstop() → exit 143 (SIGTERM). Intentional cancel already noted in the panel.
@@ -2964,6 +3198,59 @@ local function on_done(p, gen, code, stderr)
     })
     p.turn_errored = true
   end
+
+  -- Close-turn outcome FIRST so release's turn.end (and the agentic no-claim
+  -- path below) can serialise it. Row 85: plumbing, not a second schema.
+  local turn_changes, turn_pending = 0, 0
+  for _, c in ipairs(p.changes or {}) do
+    if c.turn_gen == gen then
+      turn_changes = turn_changes + 1
+      if c.status == "pending" then
+        turn_pending = turn_pending + 1
+      end
+    end
+  end
+  local outcome = {
+    exit_code = code,
+    stderr_len = stderr and #stderr or 0,
+    got_result = p.got_result and true or false,
+    turn_errored = p.turn_errored and true or false,
+    cancelled = cancelled and true or false,
+    changes = turn_changes,
+    changes_pending = turn_pending,
+    queued = #p.queue,
+    session_id = p.session_id,
+    shell_steps_total = p.shell_steps_total or 0,
+    shell_steps_failed = p.shell_steps_failed or 0,
+    generation = gen,
+    panel = p.id,
+    turn_id = p.turn_pass and p.turn_pass.turn_id or nil,
+  }
+  p.turn_end_outcome = p.turn_end_outcome or {}
+  p.turn_end_outcome[gen] = outcome
+  ledger.close_turn(L, outcome)
+  if (p.shell_steps_failed or 0) > 0 then
+    require("yana.log").write(
+      require("yana.log").levels.WARN,
+      string.format(
+        "yana: turn finished with %d failed shell command(s) (first exit %s: %s)",
+        p.shell_steps_failed,
+        tostring(p.first_failed_shell_exit),
+        tostring(p.first_failed_shell_command or "?")
+      )
+    )
+    update_winbar(p)
+  end
+
+  local turn = p.job_shadow_turn or p.shadow_turn
+  if turn and tostring(shadow_turn_gen(turn, p)) == tostring(gen) then
+    finalize_shadow_turn(p, turn)
+  end
+  -- Idempotent; normally a no-op because on_exit_confirmed already flushed
+  -- (agent.lua fires it first). This call exists for the spawn-failure path,
+  -- which calls on_done(-1) synchronously and never produces an exit at all.
+  flush_review_batch(p)
+
   -- p.job / awaiting_exit / job_spawn_gen: owned by on_exit_confirmed only
   -- (agent.lua fires that first). Never clear them here — a live turn's
   -- drain/redirect may already own a newer job by the time a stale on_done
@@ -2973,65 +3260,72 @@ local function on_done(p, gen, code, stderr)
   update_winbar(p)
   persist_session(p)
 
-  -- Terminal state of the turn. Written here rather than at exit because this
-  -- is the callback that knows the exit code and the stderr; the ledger merges
-  -- rather than replaces, so the spawn-failure path (which reaches on_done
-  -- without any exit at all) records the same shape.
-  do
-    local turn_changes, turn_pending = 0, 0
-    for _, c in ipairs(p.changes or {}) do
-      if c.turn_gen == gen then
-        turn_changes = turn_changes + 1
-        if c.status == "pending" then
-          turn_pending = turn_pending + 1
-        end
+  -- Recalc witness AFTER finalize: overlay walk may have just appended changes.
+  turn_changes, turn_pending = 0, 0
+  for _, c in ipairs(p.changes or {}) do
+    if c.turn_gen == gen then
+      turn_changes = turn_changes + 1
+      if c.status == "pending" then
+        turn_pending = turn_pending + 1
       end
     end
-    ledger.close_turn(L, {
-      exit_code = code,
-      stderr_len = stderr and #stderr or 0,
-      got_result = p.got_result and true or false,
-      turn_errored = p.turn_errored and true or false,
-      cancelled = cancelled and true or false,
-      changes = turn_changes,
-      changes_pending = turn_pending,
-      queued = #p.queue,
-      session_id = p.session_id,
-      shell_steps_total = p.shell_steps_total or 0,
-      shell_steps_failed = p.shell_steps_failed or 0,
-    })
-    if (p.shell_steps_failed or 0) > 0 then
-      require("yana.log").write(
-        require("yana.log").levels.WARN,
-        string.format(
-          "yana: turn finished with %d failed shell command(s) (first exit %s: %s)",
-          p.shell_steps_failed,
-          tostring(p.first_failed_shell_exit),
-          tostring(p.first_failed_shell_command or "?")
-        )
-      )
-      update_winbar(p)
+  end
+  outcome.changes = turn_changes
+  outcome.changes_pending = turn_pending
+  p.turn_end_outcome[gen] = outcome
+  ledger.close_turn(L, outcome)
+
+  -- Emit turn.end once process outcome is known.
+  -- * Zero-edit inline: finalize already released and emitted (may have lacked
+  --   the post-finalize change counts — re-emit is suppressed by turn_end_emitted).
+  -- * Review still open: pass stays; emit turn.end WITHOUT closing the pass.
+  -- * Agentic (no shadow turn): pass never released via release_shadow_turn.
+  -- Reason comes from the caller that already released (stashed on the panel),
+  -- never a literal chosen here: "process exited" only when nothing more
+  -- specific was recorded (row 89).
+  if not (p.turn_end_emitted and p.turn_end_emitted[gen]) then
+    local end_reason = p.turn_end_reasons and p.turn_end_reasons[tostring(gen)] or nil
+    if not end_reason and not cancelled and not p.turn_errored and turn_changes == 0 and turn_pending == 0 and #p.queue == 0 then
+      end_reason = "no_changes"
+    end
+    end_reason = end_reason or "process exited"
+    if p.turn_end_reasons then
+      p.turn_end_reasons[tostring(gen)] = nil
+    end
+    if p.turn_pass and tostring(p.turn_pass.generation) == tostring(gen) and p.shadow_turn == nil then
+      local pass = p.turn_pass
+      require("yana.turn_lifecycle").close_turn(pass, end_reason)
+      emit_turn_end(p, pass, end_reason, outcome)
+      p.turn_pass = nil
+    else
+      emit_turn_end(p, p.turn_pass, end_reason, outcome)
+    end
+  elseif p.turn_end_emitted and p.turn_end_emitted[gen] then
+    -- Released during finalize before post-finalize recalc: the first emit may
+    -- have carried changes=0 correctly for the empty walk. Nothing more to do.
+    if p.turn_end_reasons then
+      p.turn_end_reasons[tostring(gen)] = nil
     end
   end
 
   -- Drain one queued follow-up (queued via submit_panel while p.busy was
-  -- true). Advice for a completed ask-no-edit turn must be decided BEFORE
-  -- draining — drain submits the next prompt and overwrites p.last_question.
+  -- true). Zero-edit advice must be decided BEFORE draining. Row 85: the
+  -- turn_edits loop already existed for ask; extend it for edit-capable modes.
+  -- Witness is p.changes for this generation (and optional force_turn_edits
+  -- mutation hook) — NEVER a vendor subtype / tool_calls field.
   local resolved_mode = p.turn_modes and p.turn_modes[gen]
-  if resolved_mode == "ask" and not cancelled and not p.turn_errored then
-    local turn_edits = 0
-    for _, c in ipairs(p.changes or {}) do
-      if c.turn_gen == gen then
-        turn_edits = turn_edits + 1
-      end
-    end
-    if turn_edits == 0 and #p.queue == 0 then
+  local turn_edits = turn_changes
+  if type(M._test.force_turn_edits) == "number" then
+    turn_edits = M._test.force_turn_edits
+  end
+  if not cancelled and not p.turn_errored and turn_edits == 0 and #p.queue == 0 then
+    if resolved_mode == "ask" then
       local completed_question = p.turn_questions and p.turn_questions[gen]
       local completed_answer = p.turn_answers and p.turn_answers[gen]
       if completed_question and completed_question ~= "" then
         p.ask_advice_resend = build_apply_resend(completed_question, completed_answer)
       end
-      local k = config.options.keymaps
+      local k = config.options.mappings.panel
       local resend_hint
       if k.resend and k.resend ~= "" then
         resend_hint = k.resend .. "a"
@@ -3045,6 +3339,16 @@ local function on_done(p, gen, code, stderr)
           .. " to resend this prompt in a new agent chat._",
         "",
       })
+    end
+    if resolved_mode ~= "ask" then
+      append(p, {
+        "",
+        "_This turn produced no reviewable changes._",
+        "",
+      })
+      if p.turn_end_reasons then
+        p.turn_end_reasons[tostring(gen)] = "no_changes"
+      end
     end
   end
 
@@ -3113,6 +3417,22 @@ local function on_exit_confirmed(p, gen, _code)
     -- Prompts submitted while the exit was pending queued up; fire them now.
     maybe_drain_queue(p)
   end
+end
+
+-- The winbar's CONFIRMED-model source (operator ruling, 2026-08-22,
+-- issue-log row 91). `agent.lua`'s `emit()` calls this the
+-- moment a system event names a model the vendor actually used — never from
+-- the operator's pick, which lands on `config.options.model` (the REQUEST)
+-- and reaches the screen only once this fires. gen-gated the same way
+-- on_event/on_done are (`gen ~= p.turn_gen` = a stale callback from a job
+-- this panel has already moved past), so a late echo from a cancelled or
+-- superseded turn can never overwrite what a newer turn has confirmed.
+local function set_model_actual(p, gen, model)
+  if gen ~= p.turn_gen then
+    return
+  end
+  p.model_actual = model
+  update_winbar(p)
 end
 
 ----------------------------------------------------------------------
@@ -3361,6 +3681,11 @@ submit_panel = function(p, opts)
         .. tostring(carried_brief and carried_brief.panel_id)
         .. ")"
     )
+  else
+    local shared = pack_shared_context(p)
+    if shared then
+      built.prompt = shared .. "\n\n" .. built.prompt
+    end
   end
 
   p.last_question = question
@@ -3405,8 +3730,11 @@ submit_panel = function(p, opts)
   })
   p.turn_scopes[gen] = (selection and selection.scope) or false
   p.turn_modes[gen] = config.panel_mode(p.mode)
+  p.turn_backends[gen] = config.options.backend or "cursor"
   p.turn_questions[gen] = question
   p.turn_answers[gen] = nil
+  p.turn_end_outcome[gen] = nil
+  p.turn_end_emitted[gen] = nil
   start_spinner(p)
   update_winbar(p)
 
@@ -3418,14 +3746,14 @@ submit_panel = function(p, opts)
   if config.overlay_mode() then
     local preview = require("yana.shadow.preview")
     local turn, perr = preview.begin_turn({
-      workspace = preview.workspace_for_turn({
-        cwd = p.cwd,
-        selection = selection,
-        origin = origin,
-      }),
+      cwd = p.cwd,
+      selection = selection,
+      origin = origin,
+      single_file_flags = require("yana.single_file").consume_next_flags(),
       stream = p.session_id or ("panel-" .. tostring(p.conv_buf)),
       turn_id = turn_id,
       turn_gen = gen,
+      panel_id = p.id,
     })
     if not turn then
       p.busy = false
@@ -3440,6 +3768,7 @@ submit_panel = function(p, opts)
     L.turn.turn_dir = turn.turn_dir
     p.shadow_turn = turn
     p.job_shadow_turn = turn
+    update_winbar(p)
   end
   -- Open the turn's lifecycle pass. From here the turn has a DURABLE id and an
   -- owning tuple, and it is explicitly NOT actionable: nothing has been walked
@@ -3451,6 +3780,7 @@ submit_panel = function(p, opts)
     stream = p.session_id or ("panel-" .. tostring(p.conv_buf)),
     workspace = p.shadow_turn and p.shadow_turn.workspace or p.cwd,
     claim_dir = p.shadow_turn and p.shadow_turn.claim_dir or nil,
+    state_dir = p.shadow_turn and p.shadow_turn.turn_dir or lifecycle.state_dir(),
     tracked_evidence = lifecycle.capture_tracked_evidence(
       p.shadow_turn and p.shadow_turn.workspace or p.cwd
     ),
@@ -3470,6 +3800,9 @@ submit_panel = function(p, opts)
     on_event = function(obj)
       on_event(p, gen, obj)
     end,
+    on_model_actual = function(model)
+      set_model_actual(p, gen, model)
+    end,
     on_done = function(code, stderr)
       on_done(p, gen, code, stderr)
     end,
@@ -3481,6 +3814,13 @@ submit_panel = function(p, opts)
     p.job_spawn_gen = nil
     -- The overlay never ran, so it never took a claim; nothing to release.
     if p.shadow_turn then
+      -- This IS "the turn ends without a review" (REV2 item 3): the launcher
+      -- never spawned, so no review will ever exist to consume the scratch
+      -- copy. discard() itself no longer cleans this up (see its own note),
+      -- so an SFM turn's scratch ws is reclaimed explicitly, here.
+      pcall(function()
+        require("yana.single_file").cleanup(p.shadow_turn)
+      end)
       preview_module().discard(p.shadow_turn)
       p.shadow_turn = nil
     end
@@ -4078,7 +4418,7 @@ local function install_stop_on_key()
   if stop_on_key_installed then
     return
   end
-  local stop = config.options.keymaps.stop
+  local stop = config.options.mappings.panel.stop
   if not stop or stop == "" or (stop ~= "<C-c>" and stop ~= "<C-C>") then
     return
   end
@@ -4145,50 +4485,19 @@ function M.toggle_mode()
     return
   end
   local from_mode = config.options.mode
-  -- FAIL CLOSED (MODE-23). The brief is composed BEFORE anything moves, and a
-  -- throw while composing it refuses the switch outright: the alternative is a
-  -- half-renewed chat whose upstream session has been retired and whose next
-  -- prompt carries nothing, which is the orphaned-review shape the contract
-  -- forbids. Either the old session survives intact, or the switch refuses.
-  local brief = nil
-  if renewing then
-    local okb, built = pcall(renewal.build, p, from_mode, nextmode)
-    if not okb then
-      log.write("ERROR", "yana: renewal brief could not be composed: " .. tostring(built))
-      notify_one_line(
-        "yana: cannot switch mode — the handoff brief could not be composed, so nothing changed"
-          .. " — retry, or start a new chat (:YanaNew) to change mode",
-        vim.log.levels.ERROR
-      )
-      return
-    end
-    brief = built
-  end
+  local from_session = p.session_id
+  remember_mode_session(p)
   config.options.mode = nextmode
   p.mode = nextmode
+  restore_mode_session(p, nextmode)
   log.lifecycle("mode.switch", {
     panel = p.id,
     from = from_mode,
     to = nextmode,
-    session = p.session_id,
+    session = from_session,
+    from_session = from_session,
+    to_session = p.session_id,
   })
-  if renewing then
-    -- END the upstream session. The next submit starts a fresh one in the new
-    -- mode and carries the brief as its opening context; nothing tries to
-    -- mutate the old session, because that is the thing cursor does not allow.
-    p.session_id = nil
-    renewal.stage(p, brief)
-    -- Shown to the operator at the moment of switching, not buried in a log:
-    -- they are the one who can tell that a handoff dropped something. The
-    -- DISPLAY rendering, not the carry rendering: the operator's copy names a
-    -- long artifact and shows its head, while the next turn receives it whole.
-    render_note(
-      p,
-      "**Mode → " .. nextmode .. "**. This chat renewed its session. The next message carries:\n\n```\n"
-        .. renewal.display_text(brief)
-        .. "\n```"
-    )
-  end
   update_winbar(p)
   -- Exactly one notification per successful switch. Two lanes each added one
   -- ("mode = X" and "mode → X"); the merge kept both and every toggle spoke
@@ -4210,6 +4519,7 @@ function M.set_mode(p, mode)
   if config.resolve_mode(p.mode) == want then
     p.mode = want
     config.options.mode = want
+    restore_mode_session(p, want)
     update_winbar(p)
     return true
   end
@@ -4226,8 +4536,10 @@ function M.set_mode(p, mode)
     update_winbar(p)
     return false
   end
+  remember_mode_session(p)
   p.mode = want
   config.options.mode = want
+  restore_mode_session(p, want)
   update_winbar(p)
   return true
 end
@@ -4378,7 +4690,7 @@ function M.pick_model()
     end
     -- Seed the shared cache so a later pick_vendor_then_model hit is warm.
     agent.list_models(function() end, { backend = backend })
-    present(models, "(declared in config)")
+    present(models, "(declared list; " .. backend .. " has no model listing — may be stale)")
     return
   end
 
@@ -4423,6 +4735,9 @@ local function apply_backend_switch(choice)
     if q.session_id then
       q.session_id = nil
     end
+    -- Same reasoning as the session drop above: a model id, and a
+    -- confirmation of one, both belong to the vendor that issued them.
+    q.model_actual = nil
     update_winbar(q)
   end
   log.lifecycle("backend.switch", {
@@ -4764,6 +5079,8 @@ function M.new_chat()
   release_shadow_turn(p, "conversation discarded")
   persist_session(p)
   p.session_id = nil
+  -- New conversation, no vendor confirmation for it yet.
+  p.model_actual = nil
   p.title = nil
   p.turns = 0
   p.got_result = false
@@ -4914,7 +5231,7 @@ local function set_panel_buf_opts(buf, ft, is_prompt)
 end
 
 local function apply_panel_keymaps(p)
-  local k = config.options.keymaps
+  local k = config.options.mappings.panel
   local function map(buf, modes, lhs, rhs, desc)
     if not lhs or lhs == "" then
       return
@@ -5219,7 +5536,7 @@ end
 
 local function create_panel()
   -- Deferred to first panel creation rather than module load: at load time
-  -- config.setup() may not have run yet, so config.options.keymaps.stop
+  -- config.setup() may not have run yet, so config.options.mappings.panel.stop
   -- would still read the default instead of the user's configured value.
   -- install_stop_on_key() is idempotent (stop_on_key_installed guard), so
   -- this is safe to call on every panel creation.
@@ -5534,10 +5851,16 @@ function M.resume(sess, opts)
   end
 
   p.session_id = sess.id
+  -- Resuming a session is not the vendor confirming anything: a reused panel
+  -- (the `p = current_panel()` branch above) may carry a confirmation from a
+  -- PRIOR, unrelated conversation, and this resume's backend may never
+  -- re-announce a model at all -- the chip must read `unknown` until it does,
+  -- never inherit the earlier session's answer (T5, row 91).
+  p.model_actual = nil
   p.title = sess.title
   local restored = config.panel_mode(sess.mode or p.mode)
   if config.options.mode == "agentic" and (restored == "ask" or restored == "plan") then
-    local nk = (config.options.keymaps or {}).new_chat
+    local nk = (config.options.mappings.panel or {}).new_chat
     notify_one_line(
       "yana: cannot resume a "
         .. restored
@@ -5546,9 +5869,10 @@ function M.resume(sess, opts)
       vim.log.levels.WARN
     )
     return nil
-  end
-  p.mode = restored
-  -- sess.model is what THIS chat used when it was saved -- historical
+	  end
+	  p.mode = restored
+	  remember_mode_session(p)
+	  -- sess.model is what THIS chat used when it was saved -- historical
   -- metadata, not a live setting. Resuming does not change the session's
   -- current model (model is session-scoped per the 2026-08-21 ruling); the
   -- resumed chat continues under whatever the session is set to now.
@@ -5904,7 +6228,9 @@ function M.show_refusals()
 end
 
 M._test = M._test or {}
+M._test.force_turn_edits = nil -- row85 mutation: number overrides turn_edits witness
 M._test.on_done = on_done
+M._test.emit_turn_end = emit_turn_end
 M._test.on_event = on_event
 M._test.on_exit_confirmed = on_exit_confirmed
 M._test.finalize_shadow_turn = finalize_shadow_turn
@@ -5926,6 +6252,7 @@ M._test.winbar_text = winbar_text
 M._test.update_winbar = update_winbar
 M._test.mode_chip = mode_chip
 M._test.model_chip = model_chip
+M._test.set_model_actual = set_model_actual
 M._test.fit_winbar = fit_winbar
 M._test.trunc_display = trunc_display
 M._test.backend_label = backend_label

@@ -689,6 +689,17 @@ function M.run(req)
         if rec then
           rec:note_model_actual(obj.model)
         end
+        -- The winbar's CONFIRMED-model source (operator ruling, 2026-08-22):
+        -- the operator's pick is a request, never a display value
+        -- on its own -- this is the one place that request turns into a fact,
+        -- because it is the one place the vendor has actually spoken. Fired on
+        -- every system event that names a model (not gated by
+        -- model_mismatch_checked below, which only dedupes the mismatch
+        -- notification), so a later system event's model — a fact, same as the
+        -- first — still reaches the panel.
+        if req.on_model_actual then
+          req.on_model_actual(obj.model)
+        end
         if not model_mismatch_checked then
           model_mismatch_checked = true
           -- "auto"/nil is NO PREFERENCE, never a mismatch (row 76): the

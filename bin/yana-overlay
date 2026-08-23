@@ -154,6 +154,7 @@ Usage:
                      [--extra-claim DIR]]... -- CMD [ARGS...]
   yana-overlay release --claim DIR [--nonce TOKEN]
   yana-overlay force-release --claim DIR --reason TEXT
+  yana-overlay --print-secret-roots
 
 Establish a kernel overlay at the workspace's real absolute path inside bwrap,
 run CMD confined with an empty capability set, and tear down. Fail closed: if
@@ -227,6 +228,18 @@ Exit codes:
 EOF
 }
 
+print_secret_roots() {
+	local home
+	home=$(operator_home)
+	local entry
+	for entry in "${SECRET_MASK_DIRS[@]}"; do
+		printf '%s/%s\n' "$home" "$entry"
+	done
+	for entry in "${SECRET_MASK_FILES[@]}"; do
+		printf '%s/%s\n' "$home" "$entry"
+	done
+}
+
 die_usage() {
 	echo "yana-overlay: $*" >&2
 	echo "yana-overlay: run with --help for usage" >&2
@@ -269,6 +282,25 @@ realpath_safe() {
 path_is_prefix() {
 	local parent=$1 child=$2
 	[[ "$child" == "$parent" || "$child" == "$parent"/* ]]
+}
+
+# Ported from bin/yana-sandbox's components_below_root: counts path segments
+# below /, so / itself is 0 and /home/user is 2. validate_workspace_sanity
+# uses it to refuse a workspace too shallow to be a real project directory.
+components_below_root() {
+	local p="${1%/}"
+	if [[ -z "$p" || "$p" == "/" ]]; then
+		echo 0
+		return
+	fi
+	local rest="${p#/}"
+	local count=1
+	local tail="$rest"
+	while [[ "$tail" == */* ]]; do
+		count=$((count + 1))
+		tail="${tail#*/}"
+	done
+	echo "$count"
 }
 
 # Filesystem identity, not spelling. The launch table is populated once after
@@ -733,6 +765,49 @@ ensure_bwrap() {
 	fi
 }
 
+# Ported from bin/yana-sandbox's validate_workspace (bin/yana-sandbox:127-152):
+# the four refusals that keep an operator from launching a turn whose
+# workspace IS the operator's home, the passwd-recorded home, the filesystem
+# root, or a directory too shallow to be a real project. Applied only to the
+# primary workspace root (root_noun == "workspace") -- an --extra-root or
+# --broad-root is additional write surface inside an already-accepted
+# workspace, not a new place the operator could mistake for a project
+# directory, so this check does not run for those.
+#
+# It runs before resolve_cursor_dir, which is where the writable-host
+# exception (~/.cursor) collides with workspace == $HOME and produces the
+# "must be disjoint from the workspace" refusal -- a true but misleading
+# symptom of the real problem this function names directly. That
+# disjointness check stays in place as defence in depth; this function just
+# makes sure the operator sees the right refusal first.
+validate_workspace_sanity() {
+	local ws_real=$1
+	local passwd_home env_home depth
+
+	passwd_home=$(getent passwd "${USER:-$(id -un)}" 2>/dev/null | cut -d: -f6 || true)
+	if [[ -n "$passwd_home" ]]; then
+		passwd_home=$(realpath_safe "$passwd_home")
+	fi
+	env_home=""
+	if [[ -n "${HOME:-}" ]]; then
+		env_home=$(realpath_safe "$HOME")
+	fi
+
+	if [[ "$ws_real" == "/" ]]; then
+		refuse "workspace resolves to / — refusing to sandbox the filesystem root"
+	fi
+	if [[ -n "$passwd_home" && "$ws_real" == "$passwd_home" ]]; then
+		refuse "workspace resolves to the user home directory ($passwd_home, passwd lookup) — pick a project subdirectory"
+	fi
+	if [[ -n "$env_home" && "$ws_real" == "$env_home" ]]; then
+		refuse "workspace resolves to the user home directory ($env_home, \$HOME) — pick a project subdirectory"
+	fi
+	depth=$(components_below_root "$ws_real")
+	if (( depth < 2 )); then
+		refuse "workspace '$ws_real' has fewer than 2 path components below root — pick a deeper directory (e.g. /home/user/project)"
+	fi
+}
+
 # validate_root_triple — one root's (root, upper, work) triple, validated
 # exactly as the single-root launcher always validated the workspace's. The
 # message nouns are parameters so the primary root's refusals stay word for
@@ -757,6 +832,12 @@ validate_root_triple() {
 
 	if [[ ! -d "$ws" ]]; then
 		refuse "$root_noun '$root_in' does not exist or is not a directory"
+	fi
+	# Sanity refusal fires only for the primary workspace root, before
+	# resolve_cursor_dir gets a chance to raise the misleading writable-host
+	# disjointness refusal for the same underlying mistake (workspace == $HOME).
+	if [[ "$root_noun" == "workspace" ]]; then
+		validate_workspace_sanity "$ws"
 	fi
 	if [[ -e "$upper" && ! -d "$upper" ]]; then
 		refuse "$upper_noun '$upper_in' exists and is not a directory"
@@ -2283,6 +2364,10 @@ main() {
 			shift
 			parse_claim_only_args "$@"
 			force_release_claim
+			exit 0
+			;;
+		--print-secret-roots)
+			print_secret_roots
 			exit 0
 			;;
 		""|-h|--help|help)

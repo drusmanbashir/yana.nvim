@@ -11,8 +11,9 @@
 --   1. a hunk decision moves no buffer bytes, so there is no undo state to
 --      attach a boundary to;
 --   2. `u`/`U`/`<C-r>` are released when the review closes;
---   3. an ACCEPTED review writes the real file BEFORE it closes; a REJECTED one
---      closes and writes nothing. `review_closed` NEVER implies `durable`.
+--   3. an ACCEPTED review writes the real file BEFORE it closes ONLY for files
+--      no buffer holds (#87/#96); a REJECTED one closes and writes nothing.
+--      `review_closed` NEVER implies `durable`.
 --
 -- THE CONSTRAINT THAT SHAPES THE SURFACE. `diary.revert_operation` verifies the
 -- path still equals that operation's accepted result, so durable revert is
@@ -84,9 +85,20 @@ end
 --- a file's own review has closed) retrace against; see
 --- `lua/yana/timeline/record.lua`'s `M.next_undo` for the full account. It
 --- does not change the shape of anything already pinned above.
+--- `gate` (optional) names the turn whose rows may be returned -- operator
+--- ruling #99, `u` never crosses into an older turn. See `record.next_undo`.
 --- @return table|nil {rel, id, kind, global_seq}, string|nil err
-function M.next_undo(workspace, exclude)
-	return require("yana.timeline.record").next_undo(workspace, exclude)
+function M.next_undo(workspace, exclude, gate)
+	return require("yana.timeline.record").next_undo(workspace, exclude, gate)
+end
+
+--- ADDITIVE (turn-gate lane, 2026-08-23, operator ruling #99): the turn the
+--- newest register row of this workspace belongs to, as {session_id, turn_id,
+--- id, ts, seq}, or nil when the workspace has no rows. The cross-root `u`
+--- dispatcher decides ONE current turn from these before asking any root for
+--- a row -- see `record.current_turn`.
+function M.current_turn(workspace)
+	return require("yana.timeline.record").current_turn(workspace)
 end
 
 --- ADDITIVE (FIX-UNDO lane, 2026-08-21): read-only head position -- see

@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# turn_smoke_agent — fixture agent for tests/release/turn_smoke.lua ONLY.
+#
+# tests/release/fake-cursor-agent (used by every other release smoke) never
+# edits a file: its stream is three fixed narration lines and nothing else,
+# which is exactly why the release smoke that used it never drove a real
+# turn (fresh install ran `yana.setup()` and opened the panel, never
+# submitted a prompt). This script is deliberately different: it makes ONE
+# real file edit as a side effect of its own execution -- the same technique
+# tests/release/confined_turn_smoke.lua's raw `sh -c` command already uses
+# and proves works under the real bwrap-confined overlay -- and THEN emits a
+# narration stream, so a turn driven through the ordinary product path
+# (yana.agent.run -> yana.vendor_stream -> overlay walk -> yana.inline_diff
+# review) produces a real, reviewable hunk instead of a no-op turn.
+#
+# The edit must happen for real, inside whatever confinement wraps this
+# process (bin/yana-overlay-inner via bwrap for mode=inline/ask): the whole
+# point of turn_smoke.lua is that the review it asserts on is derived from
+# the overlay's own upper-layer diff at turn end, never from parsing this
+# stream's JSON content.
+set -euo pipefail
+for arg in "$@"; do
+	if [[ "$arg" == "--list-models" ]]; then
+		printf 'Available models\n\nauto - Auto (current)\n'
+		exit 0
+	fi
+done
+target="${YANA_TURN_SMOKE_TARGET:-notes.txt}"
+printf 'turn smoke edit\n' >>"$target"
+printf '%s\n' \
+	'{"type":"system","subtype":"init","session_id":"yana-turn-smoke","model":"Auto"}' \
+	'{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"turn smoke edit"}]},"session_id":"yana-turn-smoke"}' \
+	'{"type":"result","subtype":"success","is_error":false,"result":"turn smoke edit","session_id":"yana-turn-smoke","usage":{"inputTokens":1,"outputTokens":1}}'

@@ -63,6 +63,7 @@ local KINDS = {
 	hunk_accepted = true,
 	hunk_rejected = true,
 	human_edit = true,
+	save_marker = true,
 	review_closed = true,
 	applied = true,
 }
@@ -428,12 +429,67 @@ end
 -- Correlation ids and buffer observation helpers.
 -- ---------------------------------------------------------------------------
 
+--- THIS NVIM PROCESS, as an explicit field (operator ruling, 2026-08-23).
+--- It is not a new identity: it is the SAME hex pid that has always been the
+--- first component of a minted row id (`tl-<session>-<hrtime>-<n>`) and of a
+--- buffer epoch (`ep-<session>-<hrtime>`) -- the `243b57` and `2706a` the
+--- operator's own log lines compare. Both formats below now derive from this
+--- one constant so the field and the ids can never disagree.
+---
+--- WHAT IT IS FOR. The journal outlives the editor, so a row minted by a DEAD
+--- nvim is still on disk and still looks walkable ("buffer epoch mismatch for
+--- row tl-...: ... buffer now has nil", yana.log:10813-10825). Comparing this
+--- field is how `next_undo` refuses a previous session's rows without having
+--- to reverse-engineer the id format at every reader.
+---
+--- KNOWN AND ACCEPTED: a pid can be reused by a LATER nvim. That was already
+--- true of every id and epoch this module has ever minted; the turn gate does
+--- not rest on the session field alone -- a reused pid still has to match a
+--- `turn_id` no other process ever minted (`turn_lifecycle.new_turn_id`
+--- carries the pid AND `hrtime` AND a counter).
+local SESSION_ID = string.format("%x", uv.os_getpid())
+
+--- Read-only view, for readers that must ask "is this row from the live
+--- editor" without parsing an id.
+function M.session_id()
+	return SESSION_ID
+end
+
+--- The TURN a row belongs to (operator ruling #99 + the stamp ruling on top of
+--- it, 2026-08-23). NEVER MINTED HERE: the agent turn already has a durable id
+--- (`turn_lifecycle.new_turn_id`, carried onto every change as
+--- `change.turn_id` by `shadow/ops.changes_from_session`), and a second id
+--- minted here would name a turn nothing else in the product could recognise.
+---
+--- THE FALLBACK, and why it is not a hole. Two writers append rows:
+--- `inline_diff.tl_record`, which HAS the change and passes its turn id, and
+--- `timeline/edit_capture.lua`, whose `human_edit` rows are the operator
+--- typing OUTSIDE any review and so have no change to read one from. Those
+--- rows belong to whatever turn is in flight in this editor, which is exactly
+--- the last turn id a row was stamped with -- so that is what they get. Before
+--- any turn has stamped a row at all (a bare engine caller, e.g. P113's direct
+--- `timeline.intent`), the rows share one process-scoped id: one editor with
+--- no turns is one turn's worth of history, which is the behaviour every such
+--- caller had before this stamp existed.
+local last_turn_id = nil
+local function turn_id_for(entry)
+	local given = entry and entry.turn_id
+	if given ~= nil and tostring(given) ~= "" then
+		last_turn_id = tostring(given)
+		return last_turn_id
+	end
+	if last_turn_id == nil then
+		last_turn_id = SESSION_ID .. "-unbound"
+	end
+	return last_turn_id
+end
+
 local mint_seq = 0
 local function mint_id()
 	mint_seq = mint_seq + 1
-	-- pid + hrtime + counter: unique across restarts of the editor, which the
-	-- per-file journal outlives.
-	return string.format("tl-%x-%x-%d", uv.os_getpid(), uv.hrtime(), mint_seq)
+	-- session + hrtime + counter: unique across restarts of the editor, which
+	-- the per-file journal outlives.
+	return string.format("tl-%s-%x-%d", SESSION_ID, uv.hrtime(), mint_seq)
 end
 
 --- The epoch of a buffer's undo tree: minted once per buffer LIFETIME and kept
@@ -446,7 +502,7 @@ function M.buffer_epoch(bufnr)
 	if ok and type(v) == "string" and v ~= "" then
 		return v
 	end
-	local epoch = string.format("ep-%x-%x", uv.os_getpid(), uv.hrtime())
+	local epoch = string.format("ep-%s-%x", SESSION_ID, uv.hrtime())
 	vim.api.nvim_buf_set_var(bufnr, EPOCH_VAR, epoch)
 	return epoch
 end
@@ -550,6 +606,48 @@ end
 --- seq and a hash, precisely what `M.sync_buffer_head` already writes.
 function M.buffer_head(bufnr)
 	return buffer_head(bufnr)
+end
+
+--- A history move YANA ITSELF made: the plain `:undo`/`:redo` the product's
+--- own `u`/`<C-r>` handlers fall through to once their register has nothing
+--- left, and the repaint an open review does after one. Re-anchors the head on
+--- where that move actually left the buffer, and tells the edit watch the same
+--- so the movement is never mistaken for the human's own typing.
+---
+--- WHY THIS IS NOT SPARE BOOKKEEPING. The head is the ONLY thing
+--- `retrace.on_u_key` compares against to decide whether a press belongs to
+--- the register or to Neovim (see that module's seam comment: the head names
+--- "where YANA's own bookkeeping last put this buffer's undo tree"). A
+--- fallthrough `:undo` moved the buffer and left the head where it was, so
+--- from the very next press the head sat one seq AHEAD -- which reads as "the
+--- operator moved this tree out of band" and refuses with "undo sequence
+--- drift: buffer is at seq N, but Yana's register head is seq N+1", undoing
+--- nothing. Nothing ever moved the head back, so it refused FOREVER.
+--- MEASURED on three operator screencasts, 2026-08-23, each at the moment the
+--- register's last row had just been walked: det3d
+--- ~/.local/state/nvim/yana.log:10663-10673, nnDetection :10697-10699 and
+--- :10719-10724, localiser :10728-10737.
+---
+--- SCOPE, stated so this cannot creep: it is called only where YANA issued
+--- the move. An OPERATOR's out-of-band `:undo`/`g-` still drifts and is still
+--- named, exactly as before -- that refusal is the reason the head exists.
+---
+--- The pair written here is the one `walk_impl.step_buffer` already writes
+--- after its own step; this is that pair, for the moves that are not walks.
+function M.absorb_own_history_move(bufnr)
+	if not (bufnr and vim.api.nvim_buf_is_valid(bufnr) and vim.api.nvim_buf_is_loaded(bufnr)) then
+		return false
+	end
+	local obs = M.observe_buffer(bufnr)
+	if not obs then
+		return false
+	end
+	M.sync_buffer_head(bufnr, obs)
+	local ok, capture = pcall(require, "yana.timeline.edit_capture")
+	if ok and type(capture) == "table" and type(capture.sync) == "function" then
+		pcall(capture.sync, bufnr)
+	end
+	return true
 end
 
 local function find_buffer(abs)
@@ -687,6 +785,15 @@ local function prepare_row(entry)
 		-- WHETHER a row is reachable -- `reachable()`'s per-path LIFO rule is
 		-- untouched and still the one authority for that.
 		global_seq = next_global_seq(ws),
+		-- THE TURN GATE'S DURABLE HALF (operator ruling #99 + the stamp
+		-- ruling, 2026-08-23), stamped at the SAME single choke point
+		-- `global_seq` is, so `M.intent` and `M.intent_async` cannot drift and
+		-- no row can ever be written without it. Unlike `global_seq` these two
+		-- DO decide reachability: `next_undo` walks only rows carrying the
+		-- current turn's pair, and `reachable()`'s per-path LIFO rule is
+		-- untouched underneath it.
+		session_id = SESSION_ID,
+		turn_id = turn_id_for(entry),
 	}
 	if regime == "durable" then
 		if entry.buffer_epoch ~= nil or entry.undo_seq ~= nil or entry.expected_hash ~= nil then
@@ -737,7 +844,15 @@ function M.intent(entry)
 	-- itself -- halting the caller here would turn a secondary index's fsync
 	-- failure into a refused accept/reject, which is a worse outcome than a
 	-- stale pointer.
-	local pok, perr = append_order_row(ws, { seq = row.global_seq, rel = rel, id = row.id, kind = row.kind })
+	local pok, perr = append_order_row(
+		ws,
+		-- The stamp goes on the POINTER too, not only the per-file journal:
+		-- `next_undo` decides the current turn from this file alone (it is the
+		-- one file that knows what happened LAST anywhere in the workspace),
+		-- and a pointer line without the pair would make that decision from
+		-- rows it cannot place.
+		{ seq = row.global_seq, rel = rel, id = row.id, kind = row.kind, session_id = row.session_id, turn_id = row.turn_id }
+	)
 	if not pok then
 		log_warn("timeline order pointer not durable for " .. tostring(rel) .. ": " .. tostring(perr))
 	end
@@ -776,7 +891,15 @@ function M.intent_async(entry, callback)
 	-- JSON line) and this keeps the ordering guarantee simple -- the order
 	-- pointer for THIS row is on disk before the caller's `intent_async`
 	-- returns, never racing a later row's pointer append.
-	local pok, perr = append_order_row(ws, { seq = row.global_seq, rel = rel, id = row.id, kind = row.kind })
+	local pok, perr = append_order_row(
+		ws,
+		-- The stamp goes on the POINTER too, not only the per-file journal:
+		-- `next_undo` decides the current turn from this file alone (it is the
+		-- one file that knows what happened LAST anywhere in the workspace),
+		-- and a pointer line without the pair would make that decision from
+		-- rows it cannot place.
+		{ seq = row.global_seq, rel = rel, id = row.id, kind = row.kind, session_id = row.session_id, turn_id = row.turn_id }
+	)
 	if not pok then
 		log_warn("timeline order pointer not durable for " .. tostring(rel) .. ": " .. tostring(perr))
 	end
@@ -798,6 +921,17 @@ end
 --- was damaged mid-file (the rows before the damage are still returned).
 function M.entries(workspace, rel)
 	local ws = diff.abs_path(workspace or vim.fn.getcwd())
+	-- The REAL directory (never the SFM records root below), for every buffer
+	-- lookup in this function: an SFM turn's journal lives under
+	-- state_root/single-file/<slug>/records/, but the buffer this file's rows
+	-- describe is still opened at its real path, and a buffer search rooted
+	-- at the records dir never finds it (measured: "no loaded buffer for
+	-- x.md" from a rebind that reused `ws` for both purposes).
+	local real_ws = ws
+	local sfm_records = require("yana.single_file").records_for_real(ws, rel)
+	if sfm_records then
+		ws = sfm_records
+	end
 	local rows, err = read_rows(journal_file(ws, rel))
 	local out = {}
 	if not rows then
@@ -818,16 +952,21 @@ function M.entries(workspace, rel)
 				expected_hash = row.expected_hash,
 				diary_dir = row.diary_dir,
 				op_id = row.op_id,
+				-- Carried, never interpreted here: `entries()` describes what a
+				-- file's history HOLDS; whether a row is inside the current
+				-- turn is `next_undo`'s question, asked of the order pointer.
+				session_id = row.session_id,
+				turn_id = row.turn_id,
 			}
 			if row.regime == "durable" then
 				e.state, e.state_detail = durable_state(row, summaries)
 			else
-				e.state, e.state_detail = buffer_state(ws, row)
+				e.state, e.state_detail = buffer_state(real_ws, row)
 			end
 			out[#out + 1] = e
 		end
 	end
-	local bufnr = find_buffer(diff.abs_path(ws .. "/" .. rel))
+	local bufnr = find_buffer(require("yana.single_file").buffer_abs_path(real_ws, rel))
 	if bufnr then
 		local head = buffer_head(bufnr)
 		local head_i
@@ -864,6 +1003,42 @@ end
 -- `review_opened`/`review_closed` are markers -- they carry a real undo_seq
 -- (so `walk`'s own machinery can target them as a LANDING state) but
 -- reverting "review opened" is not a thing the operator did.
+--- THE CURRENT TURN, read off the order pointer: the stamp on its NEWEST
+--- line. Ruling #99 defines it exactly that way -- "the newest turn whose rows
+--- exist" -- so it is a read of one file, not a question for the panel, and it
+--- keeps working after the panel that ran the turn is gone.
+--- Returns nil when this workspace has no pointer rows at all; the returned
+--- table carries `id` and `ts` so a cross-root caller can order two roots'
+--- answers by MINT time (`retrace.mint_order_key`).
+local function turn_of_newest(order_rows)
+	local best
+	for _, r in ipairs(order_rows) do
+		if best == nil or (r.seq or 0) > (best.seq or 0) then
+			best = r
+		end
+	end
+	if best == nil then
+		return nil
+	end
+	return { session_id = best.session_id, turn_id = best.turn_id, id = best.id, ts = best.ts, seq = best.seq }
+end
+
+--- Public twin of `turn_of_newest`, for the cross-root dispatcher: it must
+--- decide ONE current turn across every root before asking any root for a row.
+--- @return table|nil {session_id, turn_id, id, ts, seq}, string|nil err
+function M.current_turn(workspace)
+	local ws = diff.abs_path(workspace or vim.fn.getcwd())
+	local sfm_records = require("yana.single_file").records_for_real(ws, nil)
+	if sfm_records then
+		ws = sfm_records
+	end
+	local order_rows, oerr = read_rows(order_file(ws))
+	if order_rows == nil then
+		return nil, oerr
+	end
+	return turn_of_newest(order_rows)
+end
+
 local UNDOABLE_KIND = {
 	hunk_accepted = true,
 	hunk_rejected = true,
@@ -892,9 +1067,23 @@ local UNDOABLE_KIND = {
 --- UNTOUCHED here: excluding it from this scan does not revert it, mark it,
 --- or remove it from its own file's ordinary review -- it stays exactly
 --- pending, reachable the normal way.
+--- `gate` (optional, {session_id, turn_id}) NAMES THE TURN whose rows this
+--- scan may return -- operator ruling #99: `u` never crosses into an older
+--- turn's rows. Omitted, this derives it from THIS workspace's own newest
+--- pointer line (`M.current_turn`), which is right for a single-root caller.
+--- A cross-root caller MUST pass one: each root's pointer file has its own
+--- newest line, and a turn that touched only root A would otherwise let root
+--- B offer its previous turn's rows as if they were current
+--- (`retrace.next_undo_across` computes the newest turn ACROSS roots and
+--- passes it to every root).
 --- @return table|nil {rel, id, kind, global_seq, walk_target}, string|nil err
-function M.next_undo(workspace, exclude)
+function M.next_undo(workspace, exclude, gate)
 	local ws = diff.abs_path(workspace or vim.fn.getcwd())
+	local real_ws = ws
+	local sfm_records = require("yana.single_file").records_for_real(ws, nil)
+	if sfm_records then
+		ws = sfm_records
+	end
 	local order_rows, oerr = read_rows(order_file(ws))
 	if order_rows == nil then
 		return nil, oerr
@@ -902,6 +1091,25 @@ function M.next_undo(workspace, exclude)
 	table.sort(order_rows, function(a, b)
 		return (a.seq or 0) > (b.seq or 0)
 	end)
+	-- OPERATOR RULING #99 (2026-08-23): `u` NEVER crosses into an older turn's
+	-- rows. The journal is append-only and outlives both the buffer and the
+	-- editor, so without this the walk runs from the newest row straight into
+	-- a previous turn ("undid reject hunk 2 in .../eval.py" with no decision
+	-- taken in the live turn, yana.log:10593-10620) and even into a previous
+	-- NVIM (`ep-72738-...` rows reached from an `ep-84c9a-...` buffer,
+	-- :10813-10825). Older rows STAY on disk -- ruling 76's durability is
+	-- untouched -- they are simply never candidates for this scan.
+	local turn = gate or turn_of_newest(order_rows)
+	if turn == nil or turn.turn_id == nil or turn.turn_id == "" then
+		-- Pre-stamp journals: a row that cannot say which turn wrote it is
+		-- ALWAYS older, so there is nothing here for `u`.
+		return nil
+	end
+	if turn.session_id ~= SESSION_ID then
+		-- The newest turn anywhere belongs to a DEAD nvim. Ruling #99: "if no
+		-- turn of this nvim session has rows, yana has nothing."
+		return nil
+	end
 	local entries_cache = {}
 	for _, prow in ipairs(order_rows) do
 		local rel = prow.rel
@@ -910,13 +1118,21 @@ function M.next_undo(workspace, exclude)
 			and type(prow.id) == "string"
 			and UNDOABLE_KIND[prow.kind]
 			and not (exclude and exclude[prow.id])
+			-- The gate itself. A pointer line from another turn (or from
+			-- before the stamp existed, which is the same thing) is skipped
+			-- outright -- never opened, never epoch-checked, never named.
+			and prow.turn_id == turn.turn_id
+			and prow.session_id == turn.session_id
 		then
 			if M.review_open_for(ws, rel) then
 				goto continue_next_undo
 			end
 			local list = entries_cache[rel]
 			if list == nil then
-				list = M.entries(ws, rel)
+				-- real_ws, not ws: entries() does its OWN SFM records rebind, and
+				-- feeding it an already-rebound records dir here would make its
+				-- buffer lookups look in the wrong place a second time over.
+				list = M.entries(real_ws, rel)
 				entries_cache[rel] = list
 			end
 			for i, e in ipairs(list) do
@@ -928,6 +1144,10 @@ function M.next_undo(workspace, exclude)
 							id = e.id,
 							kind = e.kind,
 							global_seq = prow.seq,
+							buffer_epoch = e.buffer_epoch,
+							undo_seq = e.undo_seq,
+							expected_hash = e.expected_hash,
+							prior_buffer_undo_seq = prev and prev.undo_seq or nil,
 							walk_target = prev and prev.id or nil,
 							-- Carried for the ONE case `walk_target == nil` cannot
 							-- express: a durable row with no buffer-recorded
@@ -958,10 +1178,17 @@ end
 --- false. This function only OBSERVES — it never moves buffer, tree or disk.
 function M.reachable(workspace, rel, id)
 	local ws = diff.abs_path(workspace or vim.fn.getcwd())
+	local real_ws = ws
+	local sfm_records = require("yana.single_file").records_for_real(ws, rel)
+	if sfm_records then
+		ws = sfm_records
+	end
 	if M.review_open_for(ws, rel) then
 		return false, nil, "a review is open for " .. rel .. ": the timeline surface is disabled; use u/U/<C-r> or :YanaAbortReview"
 	end
-	local list, lerr = M.entries(ws, rel)
+	-- real_ws, not ws: see the same note in next_undo -- entries() does its
+	-- own SFM records rebind from the real path.
+	local list, lerr = M.entries(real_ws, rel)
 	if lerr then
 		return false, nil, "timeline journal damaged — refusing to judge reachability: " .. lerr
 	end
@@ -1003,7 +1230,9 @@ function M.reachable(workspace, rel, id)
 
 	-- Buffer row: the undo tree is the authority, and the row's epoch + hash
 	-- decide whether the live tree is the one the row was recorded against.
-	local abs = diff.abs_path(ws .. "/" .. rel)
+	-- real_ws: the buffer lives at the real path, never at the SFM records
+	-- root ws may have been rebound to above.
+	local abs = require("yana.single_file").buffer_abs_path(real_ws, rel)
 	local buf = find_buffer(abs)
 	if not buf then
 		return false, nil, "no loaded buffer for " .. rel .. ": undo_seq is buffer-local and cannot be resolved without its buffer"

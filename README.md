@@ -33,7 +33,8 @@ way the editor's own undo should. Nothing reaches disk until you say so.
 ## Installation
 
 Requirements: Linux, Neovim 0.10.4+, and one agent CLI signed in — `cursor-agent`,
-`claude`, or `codex`.
+`claude`, `codex`, or local [Ollama](https://ollama.com) via the shipped
+`bin/yana-ollama-agent` (resolved from the plugin tree; PATH optional).
 
 Install the system packages:
 
@@ -130,7 +131,7 @@ require("yana").setup({})
 
 ```lua
 require("yana").setup({
-  backend = "cursor",         -- "cursor" | "claude" | "codex" | your own entry in `backends`
+  backend = "cursor",         -- "cursor" | "claude" | "codex" | "ollama" | your own entry in `backends`
   cmd = nil,                  -- explicit path/name; see "Environment variables" above
   cmd_env = "YANA_AGENT_BIN",
   model = nil,
@@ -379,7 +380,7 @@ opt-in with `enable_agentic`). Switching mid-chat hands the next session a
 short brief of what you asked, what landed, and what was refused, once.
 
 **Backends — two layers of "which model".** Layer 1 is the backend: which
-binary, which account, which bill (`cursor`, `claude`, `codex`, or a vendor
+binary, which account, which bill (`cursor`, `claude`, `codex`, `ollama`, or a vendor
 you add yourself). Layer 2 is the model within that backend. Conflating them
 is a real trap: picking `claude-4-sonnet` *inside* `cursor-agent` is Cursor's
 own resale of Claude, billed on Cursor's meter — a different product from
@@ -394,11 +395,13 @@ vendor are prefetched into a session cache at setup so that cascade (and
 `:YanaModel`) open from memory instead of re-spawning each vendor CLI. A
 `--resume`
 session id is vendor-specific too: resuming a session recorded under a
-different backend is refused by name, naming both backends.
+different backend is refused by name, naming both backends. Local unpaid
+path: install Ollama, set `backend = "ollama"` (or pick it in `<leader>am`);
+the plugin resolves `bin/yana-ollama-agent` itself.
 
 Backends are declared in `config.backends` — a named table of vendor entries
 (avante.nvim's `providers` shape, applied to a CLI agent instead of an HTTP
-provider). Three ship today; `codex`'s entry shows the fields a vendor whose
+provider). Four ship today (`cursor`, `claude`, `codex`, `ollama`); `codex`'s entry shows the fields a vendor whose
 CLI shape genuinely differs needs (non-interactive mode as a subcommand
 rather than a flag, a positional resume id, its own JSON stream token):
 
@@ -439,6 +442,13 @@ forensics bundle and `bin/yana-stall-report` classifies every stalled turn by
 cause. Every turn can record its raw agent stream and a per-event history
 (`YANA_DEBUG_EVENTS`, `YANA_LIFECYCLE_LOG`, both off by default) under the
 state root.
+
+**Where a turn may run.** The workspace is any folder, not only a git
+project, but never your whole home, `/`, or a top-level folder such as
+`/home` or `/tmp` (fewer than two path components below `/`). Those are
+refused by name with the remedy "pick a project subdirectory" — start Yana
+inside `~/code/myproject`, `~/notes`, and so on. For a file in `$HOME`, a loose
+folder, or a huge directory, see `:help yana-single-file` (ruling 94).
 
 **Recovery.** One claim per workspace keeps two editors from clobbering each
 other; a second turn on a busy repo is refused by name. If Neovim dies with a

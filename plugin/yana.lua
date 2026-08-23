@@ -43,11 +43,34 @@ vim.api.nvim_create_autocmd("BufReadPost", {
 -- re-raises, so :messages/E5108 behaviour on error is unchanged.
 local cmd = vim.api.nvim_create_user_command
 
-cmd("Yana", function()
+local function parse_yana_args(raw)
+  local flags = {}
+  local args = raw and vim.split(raw, "%s+", { trimempty = true }) or {}
+  local i = 1
+  while i <= #args do
+    local a = args[i]
+    if a == "--file" then
+      flags.file = true
+    elseif a == "--workspace" then
+      i = i + 1
+      if not args[i] or args[i] == "" then
+        error("Yana --workspace requires a directory", 0)
+      end
+      flags.workspace = vim.fn.fnamemodify(vim.fn.expand(args[i]), ":p"):gsub("/+$", "")
+    else
+      error("unknown Yana argument: " .. tostring(a), 0)
+    end
+    i = i + 1
+  end
+  return flags
+end
+
+cmd("Yana", function(opts)
   log.guard("Yana", function()
+    require("yana.single_file").set_next_flags(parse_yana_args(opts.args))
     yana().toggle()
   end)
-end, { desc = "Toggle the yana agent panel" })
+end, { nargs = "*", desc = "Toggle the yana agent panel" })
 
 cmd("YanaOpen", function()
   log.guard("YanaOpen", function()

@@ -19,6 +19,7 @@ Runtime provenance inventory:
 - post-fork original: `bin/yana-changeset`
 - post-fork original: `bin/yana-jail`
 - post-fork original: `bin/yana-ledger`
+- post-fork original: `bin/yana-ollama-agent`
 - post-fork original: `bin/yana-overlay`
 - post-fork original: `bin/yana-overlay-inner`
 - post-fork original: `bin/yana-sandbox`

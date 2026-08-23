@@ -55,6 +55,25 @@
 --   subprocess and not a wait on external process output.
 -- - Unknown event types return `{}` and bump `state.unknown_count`; they
 --   never throw and never produce a change row.
+--
+-- BINDING CONTRACT: `file_change_count`. Every `result` event this module
+-- emits carries `file_change_count`, the turn's total of file-affecting
+-- tool calls (Edit/Write/NotebookEdit/MultiEdit for claude, `file_change`
+-- items for codex, and the five cursor envelopes named in
+-- `CURSOR_FILE_TOOL_CALLS` below) THIS MODULE ITSELF observed from the
+-- stream -- never a vendor-supplied count, so a backend that says nothing
+-- about its own tool calls (or lies in its own count field) still gets an
+-- honest number, and zero is stamped, not omitted, when nothing
+-- file-affecting fired.
+--
+-- For cursor the count is of recognised file-affecting tool-call ENVELOPE
+-- NAMES on `tool_call`/`completed` events (the same ToolCall$ member
+-- `agent.lua`'s `tool_member()` already pulls). That is deliberate and
+-- separate from `diff.change_from_payload()`: ATTEMPTED vs SHOWN must not
+-- share an origin, or "agent wrote N times but review shows zero" becomes
+-- comparing a number with itself. Non-result cursor events stay
+-- byte-identical; only the `result` event gains the stamped field (the
+-- same deliberate cost claude and codex already pay on their result lines).
 
 local M = {}
 
@@ -341,15 +360,33 @@ local function claude_note_payload(state, name, inp, tur, is_error)
   return cursor_name, args, result
 end
 
+-- BINDING CONTRACT: `state.file_change_count` counts the file-affecting
+-- tool calls THIS module actually translated this turn -- never a
+-- vendor-claimed number, and derived solely from the stream normalize()
+-- itself parsed (a backend that says nothing about its tool calls, or
+-- lies about a count in its own payload, still gets a correct number).
+-- Only a synthetic that actually carries the Edit/Write/NotebookEdit/
+-- MultiEdit family's real success payload counts -- an is_error tool_use,
+-- or one `claude_file_payload` refused for missing before/after evidence
+-- (cursor_name comes back nil, the early return below fires first), was
+-- never translated into a change-bearing event and does not count.
+-- Bash-driven delete narration (claude_emit_deletes) is a SEPARATE
+-- mechanism from this map and is deliberately NOT counted here -- this
+-- pass scopes the count to the Edit/Write/NotebookEdit/MultiEdit family
+-- the task named; widening it to deletes is a follow-up, not this change.
 local function claude_emit_synthetic(state, obj, tid, name, inp, tur, is_error, out)
   local cursor_name, args, result
-  if FILE_TOOL_MAP[name] and not is_error then
+  local is_file_tool = FILE_TOOL_MAP[name] and not is_error
+  if is_file_tool then
     cursor_name, args, result = claude_file_payload(state, name, inp, tur)
   else
     cursor_name, args, result = claude_note_payload(state, name, inp, tur, is_error)
   end
   if not cursor_name then
     return
+  end
+  if is_file_tool then
+    state.file_change_count = state.file_change_count + 1
   end
   out[#out + 1] = {
     type = "tool_call",
@@ -521,7 +558,11 @@ end
 -- tool_call/completed per matched tool_use_id.
 -- `system/init` -> forwarded (ui.lua reads session_id from it); also tracked
 -- locally for Bash delete-candidate path resolution.
--- `result` -> forwarded unchanged (already cursor-shaped enough).
+-- `result` -> forwarded, STAMPED in place with `file_change_count` (the
+-- turn's running total of translated file-affecting tool calls -- see the
+-- BINDING CONTRACT comment above `claude_emit_synthetic`). This is the one
+-- additive change to an otherwise-unchanged forward: every other field on
+-- the vendor's own `result` line is untouched.
 -- Anything else (rate_limit_event, hook_started/hook_response, ...) ->
 -- forwarded unchanged, same as cursor's own unrecognised-but-harmless lines.
 local function normalize_claude(state, obj)
@@ -534,6 +575,8 @@ local function normalize_claude(state, obj)
     claude_note_tool_uses(state, obj)
   elseif t == "user" then
     claude_handle_user(state, obj, out)
+  elseif t == "result" then
+    obj.file_change_count = state.file_change_count
   end
   out[#out + 1] = obj
   return out
@@ -593,6 +636,13 @@ local function codex_item_completed(state, obj)
     -- row -- the review list comes only from the overlay walk
     -- (finalize_shadow_turn_body -> bin/yana-changeset), the cardinal
     -- ruling in the core spec, never from this stream.
+    --
+    -- It IS codex's spelling of the Edit/Write/MultiEdit family for
+    -- `file_change_count` (BINDING CONTRACT, see the comment above
+    -- `claude_emit_synthetic`): every `file_change` item this turn is a
+    -- file-affecting tool call this module translated, counted here
+    -- regardless of the note-only payload shape above.
+    state.file_change_count = state.file_change_count + 1
     local paths = {}
     local changes = nilify(item.changes)
     if type(changes) == "table" then
@@ -649,7 +699,13 @@ local function normalize_codex(state, obj)
   if t == "turn.completed" then
     -- UNVERIFIED (no live codex turn available 2026-08-21).
     local usage = nilify(obj.usage)
-    local result = { type = "result", subtype = "success", is_error = false, timestamp_ms = obj.timestamp_ms }
+    local result = {
+      type = "result",
+      subtype = "success",
+      is_error = false,
+      timestamp_ms = obj.timestamp_ms,
+      file_change_count = state.file_change_count,
+    }
     if usage ~= nil then
       result.usage = usage
     end
@@ -659,7 +715,14 @@ local function normalize_codex(state, obj)
     local err = nilify(obj.error)
     local message = (type(err) == "table") and err.message or nil
     return {
-      { type = "result", subtype = "error", is_error = true, result = message, timestamp_ms = obj.timestamp_ms },
+      {
+        type = "result",
+        subtype = "error",
+        is_error = true,
+        result = message,
+        timestamp_ms = obj.timestamp_ms,
+        file_change_count = state.file_change_count,
+      },
     }
   end
   if t == "error" then
@@ -690,7 +753,63 @@ function M.new_state(opts)
     -- unrecognised event/item shapes this turn has seen; reachable for the
     -- flow report (V2-1: "bump a counter reachable for the flow report").
     unknown_count = 0,
+    -- BINDING CONTRACT: running count of file-affecting tool calls THIS
+    -- module has observed so far this turn (Edit/Write/NotebookEdit/
+    -- MultiEdit for claude, `file_change` items for codex, the five cursor
+    -- envelopes in `CURSOR_FILE_TOOL_CALLS` -- see the module-level
+    -- BINDING CONTRACT comment). Initialised to 0 for every protocol;
+    -- each protocol's `result`-emitting site stamps it onto the outgoing
+    -- event. Cursor non-result events stay byte-identical; only `result`
+    -- gains the field.
+    file_change_count = 0,
   }
+end
+
+-- Cursor file-affecting envelope names. Counted by NAME on completed
+-- tool_call events, not by whether `diff.change_from_payload` later builds
+-- a reviewable change -- attempted vs shown stay separate (see BINDING
+-- CONTRACT above). `started` is ignored so a started+completed pair for
+-- one call_id counts once.
+local CURSOR_FILE_TOOL_CALLS = {
+  editToolCall = true,
+  writeToolCall = true,
+  deleteToolCall = true,
+  multiEditToolCall = true,
+  notebookEditToolCall = true,
+}
+
+local function cursor_tool_member_name(obj)
+  local tc = obj.tool_call
+  if type(tc) ~= "table" then
+    return nil
+  end
+  for k, v in pairs(tc) do
+    if type(k) == "string" and type(v) == "table" and k:match("ToolCall$") then
+      return k
+    end
+  end
+  return nil
+end
+
+-- Cursor path: count recognised file-affecting envelopes; stamp
+-- file_change_count onto result; every other event stays the same table.
+local function normalize_cursor(state, obj)
+  if obj.type == "tool_call" and obj.subtype == "completed" then
+    local name = cursor_tool_member_name(obj)
+    if name and CURSOR_FILE_TOOL_CALLS[name] then
+      -- Deliberate: count the envelope by name, never via
+      -- diff.change_from_payload -- ATTEMPTED vs SHOWN must diverge.
+      state.file_change_count = state.file_change_count + 1
+    end
+    return { obj }
+  end
+  if obj.type == "result" then
+    -- Ours wins over any vendor-supplied / pre-set value (same rule as
+    -- claude's lying-num_edits path).
+    obj.file_change_count = state.file_change_count
+    return { obj }
+  end
+  return { obj }
 end
 
 function M.normalize(state, obj)
@@ -705,8 +824,9 @@ function M.normalize(state, obj)
     return normalize_codex(state, obj)
   end
   -- "cursor", and any other/unset protocol (config validates the closed set
-  -- before a turn ever reaches here) -- byte-identical passthrough.
-  return { obj }
+  -- before a turn ever reaches here). Non-result events stay byte-identical;
+  -- result gains file_change_count.
+  return normalize_cursor(state, obj)
 end
 
 return M

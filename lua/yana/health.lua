@@ -156,7 +156,7 @@ end
 -- user/plugin mapping on the same lhs is a real, visible behavior change
 -- the moment the user is inside yana's buffer, so that stays WARN.
 local function keymap_collision_row()
-  local km = config.options.keymaps or {}
+  local km = config.options.mappings.panel or {}
   local names = {}
   for name in pairs(km) do
     names[#names + 1] = name
@@ -211,7 +211,7 @@ end
 -- so this is docs + an INFO row naming exactly what degrades without that
 -- private setup, never a shipped default.
 local function completion_menu_row()
-  local lhs = config.options.keymaps and config.options.keymaps.completion_menu
+  local lhs = config.options.mappings.panel and config.options.mappings.panel.completion_menu
   if not lhs or lhs == false then
     return
   end
@@ -269,7 +269,7 @@ end
 -- default is still in place — a user who already rebound steer has already
 -- solved this themselves.
 local function steer_key_row()
-  local lhs = config.options.keymaps and config.options.keymaps.steer
+  local lhs = config.options.mappings.panel and config.options.mappings.panel.steer
   if type(lhs) ~= "string" or lhs:lower() ~= "<c-cr>" then
     return
   end

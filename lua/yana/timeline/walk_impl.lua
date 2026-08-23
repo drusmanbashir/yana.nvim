@@ -106,7 +106,17 @@ function M.plan(workspace, rel, target_id)
 	for _, e in ipairs(entries) do
 		if e.regime == "buffer" then
 			e._undo_to = previous_buffer
-			previous_buffer = e
+			-- ONLY A LIVE ROW IS A LANDING STATE (issue-log row 112). A row the
+			-- index already reads as `reverted` describes bytes that are no
+			-- longer in this buffer, so landing "on" it would drag the buffer
+			-- FORWARD into a state the operator has already walked out of --
+			-- measured on the base tree (row112-evidence/debug-base.log,
+			-- press 7): undoing an accept whose immediate predecessor was an
+			-- already-reverted reject re-applied that reject, so the next press
+			-- had to spend itself undoing the same row a second time.
+			if e.state == "done" then
+				previous_buffer = e
+			end
 		end
 	end
 	local ti
@@ -199,6 +209,45 @@ local function step_buffer(entry, bufnr, rel)
 				.. " was recorded against "
 				.. tostring(destination.buffer_epoch)
 				.. " — refusing; a recreated buffer's sequence numbers are not evidence"
+	end
+
+	-- A YANA-ONLY ENTRY (issue-log row 112, rulings 75/87): the recorded action
+	-- MOVED NO BYTES, so this row and the state it lands on carry the SAME
+	-- content hash and Neovim's tree holds no step between them. Accepting a
+	-- hunk in an open review is the case that matters -- the agent's text has
+	-- sat in the buffer since the review opened (`inline_diff.lua`'s
+	-- `accept_block_at`: "accept moves NO bytes"), so `pre_seq == post_seq` --
+	-- and walking such a row back is a REGISTER move only. Issuing
+	-- `:undo destination.undo_seq` for it instead drags the buffer to a
+	-- NEIGHBOURING row's sequence and re-applies (or re-reverts) whatever OTHER
+	-- decision shares that position: measured on the base tree
+	-- (row112-evidence/debug-base.log, press 7) as an undone accept putting a
+	-- reject back. The buffer's own hash is the evidence that nothing is owed;
+	-- any other position falls through to the ordinary walk below, which
+	-- hash-checks and refuses on its own terms rather than guessing.
+	if
+		entry.expected_hash ~= nil
+		and entry.expected_hash == destination.expected_hash
+		and M.buffer_hash(bufnr) == destination.expected_hash
+	then
+		local ok_rec, rec = pcall(require, "yana.timeline.record")
+		if ok_rec and type(rec.sync_buffer_head) == "function" and type(rec.observe_buffer) == "function" then
+			-- The head names the ROW the register now rests on; the POSITION
+			-- stays the live one, because nothing moved. Writing the
+			-- destination's own seq here would tell `retrace.on_u_key` that the
+			-- operator had moved this tree out of band and hand the next press
+			-- to plain Neovim undo.
+			local obs = rec.observe_buffer(bufnr)
+			if obs then
+				obs.id = destination.id
+				rec.sync_buffer_head(bufnr, obs)
+			end
+		end
+		local ok_capture, capture = pcall(require, "yana.timeline.edit_capture")
+		if ok_capture and type(capture.sync) == "function" then
+			capture.sync(bufnr)
+		end
+		return true
 	end
 
 	local err

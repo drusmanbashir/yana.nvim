@@ -39,6 +39,12 @@
 -- in every way that matters to the operator watching the messages go by).
 local M = {}
 
+-- FAULT INJECTION, default OFF, the same `_test.fault` shape
+-- lua/yana/shadow/apply.lua uses. Armed only by the recorder's synthetic-bug
+-- menu (oracle/adapters/yana-v2/rec/plant) so the "undo moved the bytes but
+-- the hunk never came back" defect can be put on camera deliberately.
+M._test = { fault = {} }
+
 local timeline = require("yana.timeline")
 local walk = require("yana.timeline.walk")
 local diff = require("yana.diff")
@@ -72,7 +78,7 @@ end
 local skip_set = {}
 
 local function abs_path(ws, rel)
-	return (diff.abs_path(ws):gsub("/$", "")) .. "/" .. rel
+	return require("yana.single_file").buffer_abs_path(ws, rel)
 end
 
 --- `workspace` is one root or a list of roots (a panel/turn can have more
@@ -130,10 +136,38 @@ end
 --- scan); across roots their counters are independent, so this compares by
 --- MINT ORDER instead (see `mint_order_key`) -- never `global_seq` against
 --- `global_seq` from a different root.
+--- THE TURN BOUNDARY, decided ONCE across every root (operator ruling #99,
+--- 2026-08-23). Asking each root to derive its own current turn would leak: a
+--- turn that touched only root A leaves root B's newest row belonging to the
+--- PREVIOUS turn, and root B would then offer that row as if it were current
+--- -- the cross-root shape of exactly the bug this gate closes.
+--- `mint_order_key` is the same cross-root ordering `next_undo_across` already
+--- uses for the rows themselves.
+--- Returns nil when no root has a single register row.
+local function current_turn_across(roots)
+	local gate, gate_key
+	for _, ws in ipairs(roots) do
+		local t = timeline.current_turn(ws)
+		if t then
+			local key = mint_order_key(t)
+			if gate == nil or key > gate_key then
+				gate, gate_key = t, key
+			end
+		end
+	end
+	return gate
+end
+
 local function next_undo_across(roots)
+	local gate = current_turn_across(roots)
+	if gate == nil then
+		-- No root has a single register row: the same "history is empty"
+		-- answer this function has always given for that.
+		return nil
+	end
 	local best, best_ws, best_key
 	for _, ws in ipairs(roots) do
-		local row, err = timeline.next_undo(ws, skip_set)
+		local row, err = timeline.next_undo(ws, skip_set, gate)
 		if row == nil and err then
 			return nil, ws .. ": " .. tostring(err)
 		end
@@ -177,6 +211,42 @@ local function lifecycle(kind, fields)
 	if not ok then
 		pcall(log.write, "WARN", kind .. ": " .. vim.inspect(fields))
 	end
+end
+
+local function buffer_range(bufnr)
+	if not (bufnr and vim.api.nvim_buf_is_valid(bufnr) and vim.api.nvim_buf_is_loaded(bufnr)) then
+		return nil
+	end
+	local n = vim.api.nvim_buf_line_count(bufnr)
+	return { start_line = 1, end_line = n, source = "buffer_after_undo" }
+end
+
+--- Yana just moved this buffer's history itself (the plain `:undo`/`:redo`
+--- below, reached when this dispatcher's own register has nothing left). Put
+--- the head on the position that move produced, or the next press compares
+--- against the position BEFORE it and refuses as drift -- forever. See
+--- `record.absorb_own_history_move` for the operator measurements.
+local function absorb_own_move(bufnr)
+	local ok, rec = pcall(require, "yana.timeline.record")
+	if ok and type(rec) == "table" and type(rec.absorb_own_history_move) == "function" then
+		pcall(rec.absorb_own_history_move, bufnr)
+	end
+end
+
+local function notify_drift(bufnr, head, cur, action)
+	local rel = vim.api.nvim_buf_get_name(bufnr)
+	local reason = "undo sequence drift: buffer is at seq "
+		.. tostring(cur and cur.undo_seq)
+		.. ", but Yana's register head is seq "
+		.. tostring(head and head.undo_seq)
+	notify.one_line("yana: " .. reason, vim.log.levels.WARN)
+	lifecycle("undo.retrace_refused", {
+		rel = rel,
+		reason = reason,
+		action = action,
+		head_seq = head and head.undo_seq,
+		current_seq = cur and cur.undo_seq,
+	})
 end
 
 --- OPERATOR RULING ROW 72(b), 2026-08-21: revert a durable row DIRECTLY
@@ -311,6 +381,109 @@ local function reintegration_panel(ws)
 	return p
 end
 
+--- THE BASE A REINTEGRATED REVIEW MUST DIFF AGAINST (issue-log row 112).
+--- Disk alone is not it. Ruling 87: accepting a hunk in an OPEN buffer writes
+--- NOTHING, so a file whose review closed with one hunk accepted and one
+--- rejected still holds its PRE-TURN bytes on disk -- and disk-vs-buffer then
+--- paints the ACCEPTED hunk as pending again alongside the one this press
+--- actually reversed. One `u` press hands back two decisions (row 112's
+--- measured pending counts 4,3,2,**4** where 3 was owed).
+--- Every decision this file's own timeline still reads as `done` is a decision
+--- the operator has NOT walked back, so its hunk is composed back into the
+--- base here and only the reverted hunk returns as pending.
+--- NO SECOND BYTE AUTHORITY: nothing is stored. The hunk boundaries come from
+--- `inline.build_diff_blocks` over the change's OWN turn-start pair, disk and
+--- the buffer are read fresh by the caller, and the composition is refused
+--- outright (returning disk unchanged, the old behaviour) whenever the pair no
+--- longer describes the bytes on disk.
+--- NAMED LIMIT: a decision recorded FROM a reintegrated review labels its hunk
+--- by that mini-review's own ordinal, not the turn model's, so a still-standing
+--- accept taken inside one is mapped by that ordinal. Every walk this lane
+--- measures reverts such a row before it is read back; a later lane that wants
+--- the mapping exact should carry `model_index` on the timeline row itself
+--- (`inline_diff.lua` already has it at both record sites) instead of parsing
+--- the operator-facing label.
+local function settled_base(ws, rel, change, before, after, inline)
+	if type(inline.build_diff_blocks) ~= "function" or type(change) ~= "table" then
+		return before
+	end
+	-- The turn-start pair, captured ONCE -- this function's own overwrite of
+	-- `change.before`/`change.after` below is what would otherwise make the
+	-- model drift after the first reintegration.
+	local model = change._retrace_model
+	if model == nil then
+		model = { before = change.before, after = change.after }
+		change._retrace_model = model
+	end
+	if type(model.before) ~= "string" or model.before ~= before then
+		-- Disk is not at the turn-start bytes (a save, a durable write, an
+		-- outside edit): the model's hunk boundaries do not describe this text,
+		-- so nothing is composed and the caller gets plain disk-vs-buffer.
+		return before
+	end
+	local ok, entries = pcall(timeline.entries, ws, rel)
+	if not ok or type(entries) ~= "table" then
+		return before
+	end
+	-- LAST DECISION PER HUNK WINS. The journal is append-only and the head is a
+	-- single pointer, so a hunk decided, walked back, and decided AGAIN carries
+	-- two rows -- and once the newer one is itself walked back, the older one
+	-- reads `done` again simply by sitting at the head. Reading every `done` row
+	-- would then call that hunk settled and the press would reopen nothing at
+	-- all (measured: r74_reviews_opened_does_not_grow, cycle 2's `u`). Only the
+	-- NEWEST row for a hunk describes its current state; an older row for the
+	-- same hunk was superseded when the operator decided it again.
+	local last, any = {}, false
+	for _, e in ipairs(entries) do
+		if e.regime == "buffer" and (e.kind == "hunk_accepted" or e.kind == "hunk_rejected") then
+			local n = tonumber(tostring(e.label or ""):match("hunk (%d+)"))
+			if n then
+				last[n] = e
+			end
+		end
+	end
+	local settled = {}
+	for n, e in pairs(last) do
+		if e.state == "done" and e.kind == "hunk_accepted" then
+			settled[n] = true
+			any = true
+		end
+	end
+	if not any then
+		return before
+	end
+	local blocks = inline.build_diff_blocks(model.before, model.after or after)
+	if type(blocks) ~= "table" or #blocks == 0 then
+		return before
+	end
+	local lines = vim.split(before, "\n", { plain = true })
+	local out, cursor = {}, 1
+	for i, b in ipairs(blocks) do
+		local first = b.start_line
+		local last = b.end_line
+		if type(first) ~= "number" or type(last) ~= "number" or first < cursor then
+			return before
+		end
+		for k = cursor, first - 1 do
+			out[#out + 1] = lines[k]
+		end
+		if settled[i] then
+			for _, l in ipairs(b.new_lines or {}) do
+				out[#out + 1] = l
+			end
+		else
+			for k = first, last do
+				out[#out + 1] = lines[k]
+			end
+		end
+		cursor = last + 1
+	end
+	for k = cursor, #lines do
+		out[#out + 1] = lines[k]
+	end
+	return table.concat(out, "\n")
+end
+
 --- THE SEAM: `inline_diff.review(change, opts)` -- the SAME public
 --- open-or-enqueue entry every other caller (the panel picker, the queue
 --- drain) already uses to hand a change to the review machinery. Feeding it
@@ -353,44 +526,132 @@ end
 --- would close this, not attempted here. Neither limit loses bytes or data:
 --- every row this lane touches still reverts correctly regardless of
 --- whether its paint stays fresh.
-local function reintegrate(ws, rel, before, after)
-	if before == after then
+local function reintegrate(ws, rel, before, after, reverted_ids)
+	-- REC-PLANT seam (`skip_reintegrate`, default off, see M._test.fault at the
+	-- top): the caller's byte and timeline revert has already happened; only the
+	-- reopening of the review is skipped, which is exactly the reported shape.
+	if M._test.fault.skip_reintegrate then
 		return
 	end
 	if after == nil then
 		return
 	end
+	-- NO `before == after` EARLY RETURN. It used to sit here, and it is the
+	-- upstream half of issue-log row 113: `before` is DISK and `after` is the
+	-- BUFFER, an accept in an open review moves no bytes (ruling 87), so the
+	-- moment anything writes the accepted bytes -- a `:w`, ruling 76's
+	-- register entry, a turn-end write -- disk EQUALS the buffer and this
+	-- returned silently. The register said "undid accept hunk 2 in a.py", the
+	-- change stayed accepted with zero painted bands, and the active review
+	-- never left the other file (measured by lane row113-s3,
+	-- /s/agent_rw/tmp/lpd-20260823/row113-s3/SUMMARY.md section 1).
+	-- Whether a hunk is pending is a REGISTER question, and
+	-- `inline.reopen_from_register` below is what asks it. Disk-vs-buffer is
+	-- kept only as the fallback for a file the register knows nothing about.
 	local inline_ok, inline = pcall(require, "yana.inline_diff")
 	if not inline_ok or type(inline.review) ~= "function" then
 		return
 	end
 	local abs = abs_path(ws, rel)
 	local uv = vim.uv or vim.loop
-	local stat = uv.fs_stat(abs)
-	local change = {
-		id = "retrace-reintegrate-" .. tostring(uv.hrtime()),
-		path = abs,
-		rel = rel,
-		kind = "modify",
-		before = before,
-		after = after,
-		-- The empty hash for an absent path (shadow/ops.lua's own
-		-- convention) -- `before == nil` here means retrace's revert left
-		-- nothing on disk (a never-opened create, reversed), so the
-		-- reintegrated mini-review is itself a create.
-		base_hash = hash.hash_bytes(before or ""),
-		base_state = stat and "file" or "absent",
-		base_mode = stat and stat.mode or nil,
-		status = "pending",
-		_retrace_reintegration = true,
-	}
 	local opts = {
 		workspace = ws,
 		shadow_apply = true,
-		on_shadow_accept = function(c, composed)
-			return shadow_apply.accept_standalone(reintegration_panel(ws), c, composed)
+		on_shadow_accept = function(c, composed, ...)
+			return shadow_apply.accept_standalone(reintegration_panel(ws), c, composed, ...)
 		end,
 	}
+	-- RULING 74 (AD:895): `u` after a review closes REOPENS THE ORIGINAL
+	-- review, same identity -- it does not manufacture a new one. LOOK UP the
+	-- change this workspace's pool already recorded for `rel` (the same set
+	-- `undo_rest_of_turn`'s `turn_changes` draws from, `inline_diff.lua`)
+	-- BEFORE minting anything. Found: reuse THAT table -- every decision
+	-- record, ledger row and log line already names it by `change.id`, and
+	-- `M.enqueue`/`park_and_open_state` never rebuild a change table either,
+	-- so this is the same kind of identity-preserving reuse the rest of the
+	-- tree already relies on. Not found (a genuinely cross-turn `u`: nothing
+	-- has ever been recorded for this rel in this workspace's pool): mint a
+	-- fresh one exactly as before, and say so -- there is no original
+	-- identity to reopen.
+	local change = type(inline._find_change_for_rel) == "function" and inline._find_change_for_rel(rel, opts) or nil
+	if change then
+		-- ROW 113: ONE reopen path. `inline.reopen_from_register` builds the
+		-- pending set from this file's REGISTER and anchors it in the BUFFER --
+		-- it needs no disk read, so it is correct whether or not the accepted
+		-- bytes have already been written, and it sets the change's pair,
+		-- status and markers itself. It also refuses by name (returning nil)
+		-- rather than guessing when the buffer no longer matches what the
+		-- register says was decided.
+		local reopened = nil
+		if type(inline.reopen_from_register) == "function" then
+			local bufnr = vim.fn.bufnr(abs, false)
+			if bufnr > 0 and vim.api.nvim_buf_is_loaded(bufnr) then
+				reopened = inline.reopen_from_register(ws, rel, bufnr, nil, reverted_ids)
+			end
+		end
+		if reopened then
+			before, after = reopened.before, reopened.after
+		else
+			-- FALLBACK, unchanged: a file the register holds no hunk decisions
+			-- for (ruling 72(b)'s never-opened accept, a cross-turn mint) is
+			-- still reintegrated from disk-vs-buffer, with row 112's
+			-- still-standing accepts composed back into the base.
+			-- ROW 112: only the decision this press reversed comes back as
+			-- pending (see `settled_base`).
+			before = settled_base(ws, rel, change, before, after, inline)
+			if before == after then
+				return
+			end
+		end
+		-- Only the two sides of THIS hunk decision, and the pending state,
+		-- move. `base_hash`/`base_state`/`base_mode` describe the file at
+		-- TURN START, not at this reintegration, and stay whatever they were;
+		-- `id` is the whole point of reusing the table. The navigation order
+		-- is refreshed below so the reused object occupies the same "just
+		-- reopened" position the old fresh-object path occupied.
+		change.before = before
+		change.after = after
+		change.status = "pending"
+		change._retrace_reintegration = true
+		-- ROW 112: this pair is NEWER than any parked snapshot the change is
+		-- still carrying (`inline_diff.lua`'s `M.open` reads the flag once and
+		-- clears it), so the reopened review shows what the walk just left,
+		-- not what the file looked like before this press.
+		change._retrace_fresh = true
+		if type(inline._reopen_review_order) == "function" then
+			inline._reopen_review_order(change, opts)
+		end
+	elseif before == after then
+		-- Nothing recorded for this rel and disk already equals the buffer:
+		-- there is no pair to mint a review from. (This is the ONLY case the
+		-- deleted top-of-function early return still covers.)
+		return
+	else
+		log.write(
+			"INFO",
+			"yana.timeline.retrace reintegrate: no prior change recorded for "
+				.. rel
+				.. " in this workspace's pool -- minting a fresh review (cross-turn undo)"
+		)
+		local stat = uv.fs_stat(abs)
+		change = {
+			id = "retrace-reintegrate-" .. tostring(uv.hrtime()),
+			path = abs,
+			rel = rel,
+			kind = "modify",
+			before = before,
+			after = after,
+			-- The empty hash for an absent path (shadow/ops.lua's own
+			-- convention) -- `before == nil` here means retrace's revert left
+			-- nothing on disk (a never-opened create, reversed), so the
+			-- reintegrated mini-review is itself a create.
+			base_hash = hash.hash_bytes(before or ""),
+			base_state = stat and "file" or "absent",
+			base_mode = stat and stat.mode or nil,
+			status = "pending",
+			_retrace_reintegration = true,
+		}
+	end
 	-- ROW 80: `change` above is never `inline.M.enqueue`d -- the takeover
 	-- below hands it straight to `_park_and_open_state` (or, when nothing is
 	-- active, to `inline.review`, which itself skips enqueue when the pool is
@@ -449,7 +710,16 @@ local function reintegrate(ws, rel, before, after)
 		local active = inline.active_state and inline.active_state(opts)
 		local ok, result
 		if active and inline._park_and_open_state then
-			ok, result = pcall(inline._park_and_open_state, active, "next", { change = change, opts = opts, owner = nil })
+			ok, result = pcall(inline._park_and_open_state, active, "next", {
+				change = change,
+				opts = opts,
+				owner = nil,
+				-- Rulings 74/77: the file being parked here is being stepped
+				-- away from by an UNDO, not by navigation -- it keeps its
+				-- pending hunks painted so the operator can see both sides of
+				-- the walk (row 112).
+				retrace_repaint = true,
+			})
 			if not (ok and result == true) then
 				-- Either the pcall threw, or `park_and_open_state` returned
 				-- false (not an exception -- the takeover itself failed to
@@ -526,7 +796,21 @@ function M.undo(workspace, opts)
 			lifecycle("undo.retrace_error", { workspace = roots[1], reason = rerr })
 			return true
 		end
-		notify.one_line("yana: nothing left to undo — the cross-file history is empty", vim.log.levels.INFO)
+		-- RULING #100 (operator, 2026-08-23). `u` is a key SHARED with Neovim.
+		-- An empty cross-file register means yana has NOTHING LEFT TO DO for this
+		-- press -- and a press yana does nothing for must look, to the operator,
+		-- exactly as it would if yana's keymap were not installed: the buffer
+		-- moves under plain Neovim undo and no line is printed. This used to
+		-- notify at INFO ("yana: nothing left to undo -- the cross-file history is
+		-- empty") on EVERY press from there on, which is once per keystroke for
+		-- the rest of the session on a key the operator holds down. The fact is
+		-- still recorded, in the one place a fact of this kind belongs.
+		--
+		-- `false` is unchanged and is what carries the meaning: every dispatcher
+		-- below (`on_u_key`, and `inline_diff.lua`'s floor via `try_from_floor`)
+		-- reads it as "fall through to plain undo".
+		log.write("INFO", "yana.timeline.retrace undo: cross-file register empty for "
+			.. tostring(roots[1]) .. " -- press handed to plain Neovim undo")
 		return false
 	end
 	row.workspace = ws
@@ -591,6 +875,17 @@ function M.undo(workspace, opts)
 		refuse(row, berr)
 		return true
 	end
+	if row.kind == "human_edit" and type(row.undo_seq) == "number" then
+		local cur = timeline.observe_buffer(bufnr)
+		if cur and cur.buffer_epoch == row.buffer_epoch and type(cur.undo_seq) == "number" and cur.undo_seq < row.undo_seq then
+			notify_drift(bufnr, { undo_seq = row.undo_seq }, cur, "resync")
+			return true
+		end
+		if type(row.prior_buffer_undo_seq) == "number" and row.undo_seq < row.prior_buffer_undo_seq then
+			notify_drift(bufnr, { undo_seq = row.prior_buffer_undo_seq }, { undo_seq = row.undo_seq }, "resync")
+			return true
+		end
+	end
 
 	local result = walk.execute(ws, row.rel, row.walk_target, { bufnr = bufnr })
 	local committed = result.committed or {}
@@ -631,6 +926,7 @@ function M.undo(workspace, opts)
 		global_seq = row.global_seq,
 		regime = last.regime,
 		steps = #committed,
+		range = buffer_range(bufnr),
 	})
 	-- REINTEGRATION. Gated on the LAST committed entry's kind: a plain
 	-- `human_edit` reversal is the operator's own typing coming back, not a
@@ -643,8 +939,21 @@ function M.undo(workspace, opts)
 	if opts.reintegrate and last.kind ~= "human_edit" then
 		local disk = diff.read_file_bytes(abs_path(ws, row.rel))
 		local buf_now = diff.buffer_bytes_snapshot(bufnr)
+		-- WHAT THIS PRESS JUST UNDID, by row id, per hunk. The reopen needs it
+		-- because a byte-neutral row (an accept -- ruling 87) leaves the
+		-- buffer's undo position unchanged, so `timeline.entries`' head-derived
+		-- state still reads that row as `done` for the rest of this press and
+		-- the reopen would compose a review with nothing pending in it.
+		local reverted_ids = nil
+		for _, entry in ipairs(committed) do
+			local n = tonumber(tostring(entry.label or ""):match("hunk (%d+)"))
+			if n and (entry.kind == "hunk_accepted" or entry.kind == "hunk_rejected") then
+				reverted_ids = reverted_ids or {}
+				reverted_ids[n] = entry.id
+			end
+		end
 		if buf_now ~= nil then
-			reintegrate(ws, row.rel, disk, buf_now)
+			reintegrate(ws, row.rel, disk, buf_now, reverted_ids)
 		end
 	end
 	return true
@@ -667,12 +976,53 @@ end
 --- ruling under repair is "undo -- the hunk comes back", not redo); a later
 --- lane can teach this call to discard or refresh that review the way
 --- `reintegrate`'s own NAMED LIMITS comment already anticipates.
+--- The turn a redo-memory entry's row belongs to, read from the row's own
+--- durable stamp rather than from the in-memory entry: the memory predates
+--- the stamp and carrying a copy on it would be a second, drift-prone
+--- authority for the same fact.
+local function entry_turn_id(entry)
+	if entry == nil or entry.workspace == nil or entry.rel == nil or entry.id == nil then
+		return nil
+	end
+	local ok, rows = pcall(timeline.entries, entry.workspace, entry.rel)
+	if not ok or type(rows) ~= "table" then
+		return nil
+	end
+	for _, e in ipairs(rows) do
+		if e.id == entry.id then
+			return e.turn_id
+		end
+	end
+	return nil
+end
+
 function M.redo(workspace)
 	local roots = resolve_roots(workspace)
 	local stack = redo_stack(roots_key(roots))
+	-- OPERATOR RULING #99, the `<C-r>` half: "`<C-r>` likewise never redoes
+	-- into an older turn". The redo memory is per root-SET and is never
+	-- cleared between turns, so a `u` taken in turn 1 leaves an entry that a
+	-- `<C-r>` pressed in turn 2 would otherwise replay. The stack is LIFO and
+	-- the turn boundary is monotonic, so an older-turn entry on top means
+	-- every entry under it is older too: there is nothing for this press.
+	-- The entries STAY on the stack (nothing is destroyed here, the same
+	-- posture as the journal rows the undo gate refuses to walk).
+	local top = stack[#stack]
+	if top ~= nil then
+		local gate = current_turn_across(roots)
+		local top_turn = entry_turn_id(top)
+		if gate == nil or gate.turn_id == nil or top_turn == nil or top_turn ~= gate.turn_id then
+			notify.one_line("yana: nothing left to redo in the cross-file history", vim.log.levels.INFO)
+			return false
+		end
+	end
 	local entry = table.remove(stack)
 	if entry == nil then
-		notify.one_line("yana: nothing left to redo in the cross-file history", vim.log.levels.INFO)
+		-- RULING #100, the redo mirror of `M.undo`'s empty register above:
+		-- `<C-r>` is Neovim's key too, and a press this module does nothing
+		-- for must be indistinguishable from one it never saw. `false` still
+		-- tells `on_redo_key` to fall through to plain `:redo`.
+		log.write("INFO", "yana.timeline.retrace redo: cross-file redo stack empty -- press handed to plain Neovim redo")
 		return false
 	end
 	if entry.regime == "durable" then
@@ -816,12 +1166,23 @@ function M.on_u_key(bufnr)
 		and head.buffer_epoch == cur.buffer_epoch
 		and head.undo_seq == cur.undo_seq
 	if not eligible then
+		if head ~= nil
+			and cur ~= nil
+			and type(head.undo_seq) == "number"
+			and type(cur.undo_seq) == "number"
+			and head.buffer_epoch == cur.buffer_epoch
+			and cur.undo_seq < head.undo_seq
+		then
+			notify_drift(bufnr, head, cur, "undo")
+			return
+		end
 		local ok, err = pcall(vim.api.nvim_buf_call, bufnr, function()
 			vim.cmd("silent undo")
 		end)
 		if not ok then
 			log.write("WARN", "yana.timeline.retrace native undo: " .. tostring(err))
 		end
+		absorb_own_move(bufnr)
 		return
 	end
 	local roots = timeline.known_workspaces()
@@ -844,6 +1205,7 @@ function M.on_u_key(bufnr)
 		if not ok then
 			log.write("WARN", "yana.timeline.retrace native undo (fallthrough): " .. tostring(err))
 		end
+		absorb_own_move(bufnr)
 	end
 end
 
@@ -864,6 +1226,7 @@ function M.on_redo_key(bufnr)
 		if not ok then
 			log.write("WARN", "yana.timeline.retrace native redo: " .. tostring(err))
 		end
+		absorb_own_move(bufnr)
 		return
 	end
 	local roots = timeline.known_workspaces()
@@ -878,6 +1241,7 @@ function M.on_redo_key(bufnr)
 		if not ok then
 			log.write("WARN", "yana.timeline.retrace native redo (fallthrough): " .. tostring(err))
 		end
+		absorb_own_move(bufnr)
 	end
 end
 
@@ -903,6 +1267,25 @@ function M.try_from_floor()
 		roots = { vim.fn.getcwd() }
 	end
 	return M.undo(roots, { reintegrate = true })
+end
+
+--- RULING #100's other half, asked for by `inline_diff.lua`'s floor when a
+--- retrace-reopened review is closed by a press walking below it. Everything
+--- on this module's redo stack for these roots names a decision INSIDE
+--- reviews the walk itself reopened; the operator has just walked out below
+--- the last of them, so there is nothing left for `<C-r>` to re-take and the
+--- key goes back to meaning what it means everywhere else. Without this the
+--- next `<C-r>` would replay a decision into a review that no longer exists,
+--- which is the mirror of the defect the floor press itself was.
+---
+--- Roots-scoped, not global: another root's walk is a different history and
+--- is untouched.
+function M.forget_walk_redo()
+	local roots = timeline.known_workspaces()
+	if #roots == 0 then
+		roots = { vim.fn.getcwd() }
+	end
+	redo_stacks[roots_key(roots)] = nil
 end
 
 --- Install `on_u_key`/`on_redo_key` as buffer-local `u`/`<C-r>` on `bufnr`.

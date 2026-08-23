@@ -55,6 +55,8 @@ M.LIMITS = {
 -- the post-render `vim.schedule` stamp that is the closest in-process proxy
 -- for "the user can see it" (limitations register L6; true paint time is only
 -- observable from the oracle capture tier).
+-- `accept_applied` means a journaled write completed. `accept_transferred`
+-- means accepted lines crossed to a loaded buffer and nothing was written.
 M.PHASES = {
   "turn_submitted",
   "confinement_established",
@@ -72,6 +74,7 @@ M.PHASES = {
   "review_redraw",
   "review_resolved",
   "accept_applied",
+  "accept_transferred",
 }
 
 local PHASE_ORDER = {}
@@ -813,6 +816,30 @@ function M.close_turn(L, outcome)
   o.closed_at_ms = since(L)
   L.outcome = o
   L.closed = true
+  -- Row 85: one desync WARN when a normaliser tool-call count (sibling lane may
+  -- add it on the ledger / outcome) disagrees with Yana's own changes witness.
+  -- Both are fed by the same stream, so agreement is near-tautological — what
+  -- this really catches is a Yana pipeline bug or a lying shim Yana itself
+  -- ships. Absent normaliser count => no-op (sibling may land after this).
+  do
+    local claimed = o.normaliser_tool_calls
+    if claimed == nil and type(L.normaliser_tool_calls) == "number" then
+      claimed = L.normaliser_tool_calls
+    end
+    if type(claimed) == "number" and type(o.changes) == "number" and claimed ~= o.changes then
+      local log = require("yana.log")
+      log.write(
+        log.levels.WARN,
+        string.format(
+          "yana: TURN_END_DESYNC panel=%s gen=%s normaliser_tool_calls=%s changes=%s",
+          tostring(L.panel_id or (L.turn and L.turn.panel_id)),
+          tostring(L.gen or (L.turn and L.turn.generation)),
+          tostring(claimed),
+          tostring(o.changes)
+        )
+      )
+    end
+  end
   return o
 end
 

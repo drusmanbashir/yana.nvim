@@ -228,6 +228,7 @@ local function derive_target(opts)
     local ok, ci = pcall(require, "yana.claim_identity")
     workspace = (ok and ci.canonical_workspace(vim.fn.getcwd())) or vim.fn.getcwd()
   end
+  workspace = require("yana.single_file").real_workspace_for(workspace)
   local rel = opts.rel
   if not rel then
     local name = vim.api.nvim_buf_get_name(0)

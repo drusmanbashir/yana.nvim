@@ -798,8 +798,42 @@ function M.reconcile_applied_buffer(applied)
 	return true
 end
 
---- Accept composed file content (post-hunk review) through the diary.
-function M.accept_composed(pass, change, composed)
+local function mode_perm(mode)
+	return mode and (mode % 4096) or nil
+end
+
+local function valid_loaded_buffer(bufnr)
+	return type(bufnr) == "number" and vim.api.nvim_buf_is_valid(bufnr) and vim.api.nvim_buf_is_loaded(bufnr)
+end
+
+local function mode_delta(change)
+	if not change or not change.base_mode or not change.after_mode then
+		return false
+	end
+	return mode_perm(change.base_mode) ~= mode_perm(change.after_mode)
+end
+
+function M.single_file_accept_refusal(change, staged_bufnr)
+	if not (change and change.single_file) then
+		return nil
+	end
+	local name = vim.fn.fnamemodify(change.single_file.real_path or change.path or "file", ":t")
+	if not valid_loaded_buffer(staged_bufnr) then
+		return "single-file mode: the buffer is closed — reopen " .. name .. " and decide again"
+	end
+	-- Compared against change.after (the AGENT'S proposed full file), not the
+	-- caller's just-taken snapshot of this same buffer.
+	local live = diff.buffer_bytes_snapshot(staged_bufnr)
+	if live ~= change.after then
+		return "single-file mode: buffer differs from the composed review — decide again"
+	end
+	if change.kind == "delete" or change.before == nil or mode_delta(change) then
+		return "single-file mode: only " .. name .. " may change (refused " .. tostring(change.rel or name) .. ")"
+	end
+	return nil
+end
+
+local function transfer_preflight(pass, change)
 	-- Any structured refusal detail is from a PREVIOUS attempt on this change;
 	-- clearing it here means a refusal is only ever labelled by evidence this
 	-- attempt actually gathered.
@@ -837,7 +871,28 @@ function M.accept_composed(pass, change, composed)
 	if claim_refusal then
 		return false, claim_refusal
 	end
+	return true
+end
 
+function M.accept_transfer(pass, change, composed, bufnr)
+	local ok, err = transfer_preflight(pass, change)
+	if not ok then
+		return false, err
+	end
+	return true, nil, {
+		kind = "transfer",
+		path = change.path,
+		bufnr = bufnr,
+		composed_hash = hash.hash_bytes(composed or ""),
+	}
+end
+
+--- Accept composed file content (post-hunk review) through the diary.
+function M.accept_apply(pass, change, composed)
+	local ok, err = transfer_preflight(pass, change)
+	if not ok then
+		return false, err
+	end
 	-- THE ACTION WAITING FOR ITS DURABLE STATE. The journal is opened here, on
 	-- the accept, rather than when the review opened. It is opened BEFORE the
 	-- checkpoint, because the checkpoint writes inside the diary directory the
@@ -938,6 +993,33 @@ function M.accept_composed(pass, change, composed)
 	return true, nil, applied
 end
 
+function M.accept_composed(pass, change, composed, opts)
+	opts = opts or {}
+	local staged_bufnr = opts.staged_bufnr
+	if change and change.single_file then
+		local refusal = M.single_file_accept_refusal(change, staged_bufnr)
+		if refusal then
+			return false, refusal
+		end
+		return M.accept_transfer(pass, change, composed, staged_bufnr)
+	end
+	if valid_loaded_buffer(staged_bufnr) then
+		local live = diff.buffer_bytes_snapshot(staged_bufnr)
+		if live == composed and change and change.kind ~= "delete" and change.before ~= nil and not mode_delta(change) then
+			return M.accept_transfer(pass, change, composed, staged_bufnr)
+		end
+		if live ~= composed then
+			log.write(
+				log.levels.WARN,
+				"yana: staged buffer mismatch for " .. tostring(change and change.path or "?") .. " -- written at accept"
+			)
+		elseif mode_delta(change) then
+			log.write(log.levels.WARN, "yana: mode change — written at accept (ruling 81 gate pending)")
+		end
+	end
+	return M.accept_apply(pass, change, composed)
+end
+
 --- The panel-local journal a standalone accept or scope revert writes through.
 ---
 --- Primary-root changes keep `panel._standalone_diary`, opened at the review
@@ -980,9 +1062,32 @@ end
 --- Journaled accept when no apply-mode shadow_pass exists (preview-mode inline
 --- review). Checkpoint is omitted: preview turns discard the overlay without a
 --- pass, but a real-tree accept during review still routes through the diary.
-function M.accept_standalone(panel, change, composed)
+function M.accept_standalone(panel, change, composed, opts)
 	if not panel then
 		return false, "no panel"
+	end
+	opts = opts or {}
+	local staged_bufnr = opts.staged_bufnr
+	if change and change.single_file then
+		local refusal = M.single_file_accept_refusal(change, staged_bufnr)
+		if refusal then
+			return false, refusal
+		end
+		return M.accept_transfer(nil, change, composed, staged_bufnr)
+	end
+	if valid_loaded_buffer(staged_bufnr) then
+		local live = diff.buffer_bytes_snapshot(staged_bufnr)
+		if live == composed and change and change.kind ~= "delete" and change.before ~= nil and not mode_delta(change) then
+			return M.accept_transfer(nil, change, composed, staged_bufnr)
+		end
+		if live ~= composed then
+			log.write(
+				log.levels.WARN,
+				"yana: staged buffer mismatch for " .. tostring(change and change.path or "?") .. " -- written at accept"
+			)
+		elseif mode_delta(change) then
+			log.write(log.levels.WARN, "yana: mode change — written at accept (ruling 81 gate pending)")
+		end
 	end
 	if change.base_hash == nil then
 		return false,

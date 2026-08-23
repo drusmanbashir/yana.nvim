@@ -3,10 +3,48 @@
 All notable changes to Yana are documented here. Versions follow Semantic
 Versioning.
 
+## Unreleased
+
+### Added
+- Single-file mode (ruling 94): a turn on a file in `$HOME`, a folder with no
+  `.git`, or a folder over `single_file.max_entries` entries runs against a
+  scratch copy under the state root; the agent may edit only that file,
+  multi-file/create/delete are refused by name, and a `SINGLE-FILE MODE` banner
+  sits under the prompt. `:Yana --file` forces it, `:Yana --workspace DIR`
+  widens it. Review and `:w` stay in the real buffer (ruling 87). User guide:
+  `:help yana-single-file`.
+
+### Changed
+
+- Accepting a hunk in an open buffer no longer writes the file: the accepted
+  lines become yours, the buffer turns `modified`, and your own `:w` writes
+  them. Yana writes a file directly only when no buffer holds it (a queued
+  file you never opened, or a create/delete/chmod). Undo after accept is a
+  buffer edit again; drift on disk is Neovim's `W12` at `:w`.
+- Rejecting a hunk takes your in-hunk typing with it: text you typed inside a
+  pending hunk belongs to that hunk (accept keeps it, reject removes it). The
+  old "ambiguous hunk, refused by name" path is gone.
+
+### Fixed
+
+- Starting a turn with your home directory (or `/`, or a top-level folder such
+  as `/home`) as the workspace is refused by name with the remedy "pick a
+  project subdirectory", instead of the misleading `writable-host exception
+  (~/.cursor) must be disjoint from the workspace` message.
+
+### Docs
+
+- `:help yana-workspace` explains where a turn may run and how depth is
+  counted.
+
 ## 0.1.0-alpha.2 - 2026-08-21
 
 ### Added
 
+- Local Ollama backend in the model zoo (`backends.ollama` +
+  `bin/yana-ollama-agent`): `<leader>am` / `:YanaBackend` list `ollama` and
+  resolve the shim from the plugin `bin/` (no PATH install). Models come from
+  the local Ollama daemon (`/api/tags`).
 - Capture root: the sandbox now mounts ONE overlay at the nearest `.git` root
   (or a configured root, or the opened folder), so an agent that edits a
   sibling repository or creates a directory that does not exist yet has its

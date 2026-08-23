@@ -175,16 +175,22 @@ function M.snapshot(opts)
   vim.fn.mkdir(dir, "p")
   local pids = proc_tree(opts.pid)
   write_file(dir .. "/ps-tree.txt", shell_capture({ "ps", "-o", "pid,ppid,stat,pcpu,comm,args", "-p", table.concat(pids, ",") }))
-  local statuses, wchans, fds = {}, {}, {}
+  local stats, statuses, wchans, stacks, fds = {}, {}, {}, {}, {}
   for _, pid in ipairs(pids) do
+    append(stats, "### pid " .. pid)
+    append(stats, read_file("/proc/" .. pid .. "/stat") or "missing")
     append(statuses, "### pid " .. pid)
     append(statuses, read_file("/proc/" .. pid .. "/status") or "missing")
     append(wchans, tostring(pid) .. "\t" .. tostring(read_file("/proc/" .. pid .. "/wchan") or "missing"))
+    append(stacks, "### pid " .. pid)
+    append(stacks, read_file("/proc/" .. pid .. "/stack") or "missing")
     append(fds, "### pid " .. pid)
     append(fds, shell_capture({ "sh", "-c", "ls -l /proc/" .. tostring(pid) .. "/fd 2>/dev/null || true" }))
   end
+  write_file(dir .. "/proc-stat.txt", table.concat(stats, "\n"))
   write_file(dir .. "/proc-status.txt", table.concat(statuses, "\n"))
   write_file(dir .. "/proc-wchan.txt", table.concat(wchans, "\n"))
+  write_file(dir .. "/proc-stack.txt", table.concat(stacks, "\n"))
   write_file(dir .. "/fds.txt", table.concat(fds, "\n"))
   write_file(dir .. "/sockets.txt", shell_capture({ "ss", "-tanp" }))
   local vendor_dir = dir .. "/vendor-store"

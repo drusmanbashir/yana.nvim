@@ -10,6 +10,8 @@ CONTENTS                                                        *yana-contents*
 5. Configuration ...................................... |yana-configuration|
 6. Machine-specific configuration ................ |yana-machine-config|
 7. Security ................................................ |yana-security|
+   Where a turn may run ................................. |yana-workspace|
+   Single-file mode ..................................... |yana-single-file|
 8. Health .................................................... |yana-health|
 
 ==============================================================================
@@ -266,6 +268,109 @@ their complete per-operation metadata survives for the newest five turns and
 at most seven days. |:YanaRefusals| expands that metadata. Unsafe destructive
 operations apply nothing, release the workspace claim, and name a preserved
 recovery directory.
+
+                                                          *yana-workspace*
+WHERE A TURN MAY RUN. The workspace is the nearest `.git` root above the file
+you are editing, else a configured `workspace_roots` entry, else the folder
+itself. It may be any folder, not only a git project — but never your whole
+home directory, `/`, or a top-level folder such as `/home` or `/tmp`. Those
+are refused by name before the agent starts, with the remedy "pick a project
+subdirectory". Depth is counted in path components below `/` after resolving
+symlinks: `/` is 0, `/home` is 1 (refused), `/home/you` is your home (refused
+by the home rule, via `$HOME` and via your passwd entry), `/home/you/notes` is
+3 (allowed). The rule exists because a top-level folder is never a project:
+accepting it would put every sibling under the agent's write scope. Start
+Yana inside the project or folder you mean to change. When the file you mean
+to edit would otherwise be refused or is loose, huge, or explicitly pinned,
+Yana may run in |yana-single-file| instead (ruling 94).
+
+                                                        *yana-single-file*
+SINGLE-FILE MODE (ruling 94). When a turn would otherwise use a refused or
+oversized workspace, Yana runs the agent against a scratch copy of exactly ONE
+file. The review paints in your real buffer; the agent's confined writes land
+only in the scratch workspace; your `:w` writes the real file (ruling 87).
+Reads stay the jail's read-only view of the host (decision 94a). A file inside
+a git project below `$HOME` is never single-file, whatever its folder size.
+
+WHEN IT TRIGGERS. Checks run in this order; the first match wins:
+
+1. `single_file.enabled = false` — single-file mode is off; ordinary workspace
+   rules apply.
+2. `:Yana --workspace DIR` on this turn — widens the workspace; single-file
+   mode is not entered.
+3. The file is behind the secrets wall — turn refused (see REFUSALS below).
+4. The file is not saved to disk yet — turn refused.
+5. `:Yana --file` — forced for this turn only.
+6. The file's folder would be refused as a workspace (`/`, `$HOME`, passwd
+   home, or depth < 2 below `/` after resolving symlinks) — trigger `home`.
+7. The file has no `.git` ancestor below `$HOME` — trigger `loose`.
+8. The file's folder has more than `single_file.max_entries` entries (default
+   2000; non-recursive `readdir`) — trigger `huge`.
+9. Otherwise — ordinary folder mode (not single-file).
+
+WHAT THE AGENT MAY TOUCH. Exactly one file: a byte-equal copy in the scratch
+workspace. Multi-file edits, create, delete, and chmod are refused by name.
+Declared `write_roots` are unavailable in single-file mode.
+
+SCRATCH COPY. Yana creates under the state root (`$XDG_STATE_HOME/nvim` by
+default, overridable with `YANA_STATE_ROOT`):
+
+    <state_root>/single-file/<sha16>/ws/<basename>
+    <state_root>/single-file/<sha16>/records/     " timeline journal
+    <state_root>/single-file/<sha16>/meta.json    " real_path, real_workspace
+
+`<sha16>` is the first 16 hex digits of a hash of the file's real path. The
+`ws/` tree is wiped and recopied at each single-file turn; it is removed when
+the turn ends or the review closes. Yana never writes a `.yana` directory
+under `$HOME` for these turns.
+
+BANNER. While a single-file turn is open, the prompt winbar shows:
+
+    SINGLE-FILE MODE · agent EDITS only <basename> · multi-file/create/delete refused · :Yana --workspace DIR to widen
+
+REFUSALS (verbatim; `<basename>` and `<rel>` are filled in by Yana):
+
+                                                              *yana-sfm-refusals*
+`single-file mode: <basename> is behind the secrets wall`
+    Open a file outside the masked secrets paths.
+
+`single-file mode: save <basename> first`
+    `:write` the file to disk, then start the turn.
+
+`single-file mode: could not read <basename>`
+    Fix permissions or disk errors and retry.
+
+`single-file mode: declared write roots are not available`
+    Remove `write_roots` or use `:Yana --workspace DIR` to widen.
+
+`single-file mode: only <basename> may change (refused <rel>)`
+    The agent proposed another file or a non-modify change; the allowed file's
+    hunk may still be offered.
+
+`single-file mode: the buffer is closed — reopen <basename> and decide again`
+    `:edit` the file, then accept or reject again.
+
+`single-file mode: buffer differs from the composed review — decide again`
+    Reconcile the real buffer with what you want, then decide again.
+
+ACCEPT, REJECT, UNDO. Accept (`ct`) lands the hunk in the real buffer and
+marks it `modified`; the real disk file is unchanged until your `:w`. Reject
+(`co`) restores the pre-turn lines in the real buffer. After accept closes the
+review, `u` in the real buffer may reopen the hunk for another decision
+(ruling 74); the review stays in the real buffer, not the scratch copy.
+
+DISABLE OR FORCE. >lua
+
+    require("yana").setup({
+      single_file = {
+        enabled = false,
+        max_entries = 2000,
+      },
+    })
+<
+`:Yana --file` forces single-file mode on the next panel turn only.
+`:Yana --workspace DIR` widens the workspace for one turn and skips
+single-file mode.
 
                                                         *yana-write-roots*
 `write_roots` declares directories OUTSIDE the opened workspace that a turn may

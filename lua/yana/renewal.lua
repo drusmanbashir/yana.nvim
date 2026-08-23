@@ -293,6 +293,12 @@ local function decision_sets(p)
 		local name = c.rel or c.path
 		local hash = c.base_hash
 		if c.status == "accepted" then
+			if c._accept_regime == "transfer" then
+				local b = vim.fn.bufnr(c.path, false)
+				if b > 0 and vim.api.nvim_buf_is_loaded(b) and vim.bo[b].modified then
+					name = tostring(name) .. " (accepted, unsaved — not yet on disk)"
+				end
+			end
 			push_unique(accepted, seen_a, name, { rel = name, hash = hash })
 		elseif c.status == "rejected" then
 			push_unique(rejected, seen_r, name, { rel = name })
@@ -658,15 +664,17 @@ end
 
 --- What this chat can offer such a prompt as a referent.
 ---
---- Two honest sources, either of which is enough, and BOTH are things the NEXT
+--- Three honest sources, any of which is enough, and ALL are things the NEXT
 --- AGENT will actually receive:
 ---   * a LIVE upstream session (`--resume`): the agent has the history itself;
 ---   * a STAGED BRIEF carrying the previous instruction or artifact.
+---   * a PACK SHARED CONTEXT block assembled from the panel's conversation
+---     memory when entering an empty slot.
 ---
---- `p.last_question` is deliberately NOT a source. After a renewal the panel
---- still remembers the previous instruction, but the renewed session does not
---- and never will unless the brief carries it — counting the panel's memory as
---- a link is exactly the silent amnesia this refusal exists to prevent.
+--- Under the retired renewal model `p.last_question` alone was not a source:
+--- the renewed session did not receive it. Under session packs, an empty slot's
+--- first submit receives a pack-shared context block from the panel's
+--- conversation memory, so that same memory is now a real link.
 local function has_linked_intent(p)
 	if not p then
 		return false, "no panel"
@@ -679,6 +687,9 @@ local function has_linked_intent(p)
 		if (brief.instruction and brief.instruction ~= "") or (brief.artifact and brief.artifact ~= "") then
 			return true, "staged renewal brief"
 		end
+	end
+	if (p.last_question and p.last_question ~= "") or (p.last_answer_text and p.last_answer_text ~= "") then
+		return true, "pack shared context"
 	end
 	return false, nil
 end
