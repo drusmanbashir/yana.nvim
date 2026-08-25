@@ -43,15 +43,28 @@ local function probe_birth_time_support(dir)
   -- such `.yana-birthcheck-*` files were found stray in this repo).
   -- Wrapping the stat call itself in a pcall means the removal below always
   -- runs immediately after, regardless of whether the stat succeeded.
-  local stat_ok, out = pcall(vim.fn.system, { "stat", "-c", "%w", path })
+  -- GNU `stat -c %w` is Linux/coreutils; Darwin stat uses `-f %B` (birth
+  -- epoch). Using the GNU form on macOS made this row a tool-mismatch, not
+  -- a filesystem signal.
+  local uname = (vim.uv or vim.loop).os_uname()
+  local stat_argv
+  local stat_label
+  if uname.sysname == "Darwin" then
+    stat_argv = { "stat", "-f", "%B", path }
+    stat_label = "`stat -f %B`"
+  else
+    stat_argv = { "stat", "-c", "%w", path }
+    stat_label = "`stat -c %w`"
+  end
+  local stat_ok, out = pcall(vim.fn.system, stat_argv)
   local shell_err = vim.v.shell_error
   pcall(os.remove, path)
 
   if not stat_ok then
-    return nil, "`stat -c %w` failed on " .. dir .. ": " .. tostring(out)
+    return nil, stat_label .. " failed on " .. dir .. ": " .. tostring(out)
   end
   if shell_err ~= 0 or type(out) ~= "string" then
-    return nil, "`stat -c %w` failed on " .. dir
+    return nil, stat_label .. " failed on " .. dir
   end
 
   local birth = vim.trim(out)
@@ -286,6 +299,155 @@ local function steer_key_row()
   )
 end
 
+-- Row 117 (release-audit first-run-experience gap): dependencies.lua's
+-- exec:<name> rows and configured_agent_row() only prove a CLI BINARY
+-- resolves; they prove nothing about whether the operator is actually
+-- SIGNED IN to it. The commonest first-run failure -- binary installed,
+-- never authenticated -- produced no :checkhealth row at all and degraded
+-- into whatever the vendor CLI happened to print mid-turn.
+--
+-- Generic over config.options.backends (config.lua's descriptor table) by
+-- construction: this function is called once per configured backend name
+-- and reads that entry's OPTIONAL `whoami_args`/`auth_login_hint` fields --
+-- there is no per-vendor if-chain here, and none is needed for a future
+-- vendor to get a row: it declares its probe in data.
+--
+-- Cheap and non-interactive by construction: `whoami_args` is validated at
+-- setup (config.lua's normalize_backends) to be a plain arglist, so the
+-- probe below is always exactly `{resolved binary} ++ whoami_args`, run
+-- once through dependencies.probe()'s fixed 2s timeout -- never a network
+-- turn, never a prompt, never something that can hang :checkhealth.
+--
+-- Two ways to JUDGE a completed probe, chosen per backend by its
+-- (optional) `auth_output_patterns` descriptor -- config.lua's
+-- `optional_output_patterns`, generic here too: no per-vendor branch.
+--
+--   * no auth_output_patterns declared (default, unchanged since row 117):
+--       exit 0                        -> "signed in"                  (ok)
+--       exit != 0                     -> "NOT signed in", names the
+--                                          exact fix command           (warn)
+--   * auth_output_patterns declared (a vendor whose exit code cannot be
+--     trusted at all -- cursor-agent's `status` exits 0 either way, see
+--     VENDOR-AUTH-PROBES.md): the exit code is IGNORED entirely and the
+--     probe's captured stdout+stderr is matched against each declared
+--     pattern instead --
+--       signed_in matches, signed_out does not -> "signed in"          (ok)
+--       signed_out matches, signed_in does not -> "NOT signed in",
+--                                                  names the fix command(warn)
+--       BOTH match, NEITHER matches, or the
+--       relevant key was not declared          -> "unknown", names WHY (info)
+--
+-- Independent of which judge ran, plus:
+--   * binary missing, no whoami_args
+--     declared, or the probe itself
+--     could not complete (spawn/wait
+--     error, or timeout)            -> "unknown", names WHY         (info)
+-- Never claims "signed in" without a positively-matching, completed probe
+-- -- every case neither judge can positively confirm renders as unknown,
+-- not as a guess in either direction.
+local function backend_auth_row(name, entry)
+  local resolution = config.resolve_cmd(name)
+  local resolved = vim.fn.exepath(resolution.value)
+  if resolved == "" then
+    info("auth (" .. name .. "): unknown — " .. tostring(resolution.value) .. " not found on PATH")
+    return
+  end
+  if not entry.whoami_args then
+    info(
+      "auth ("
+        .. name
+        .. "): unknown — this backend declares no auth check (whoami_args), so there is no cheap way to "
+        .. "tell whether "
+        .. resolved
+        .. " is signed in without a real turn"
+    )
+    return
+  end
+
+  local cmd = { resolved }
+  vim.list_extend(cmd, entry.whoami_args)
+  local args_str = table.concat(entry.whoami_args, " ")
+  local ok_probe, result, probe_err = dependencies.probe(cmd, 2000)
+  if not ok_probe then
+    info("auth (" .. name .. "): unknown — auth probe " .. tostring(probe_err))
+    return
+  end
+
+  local hint = entry.auth_login_hint
+  if type(hint) ~= "string" or hint == "" then
+    hint = "run " .. resolved .. "'s own login/auth command (see its --help or docs)"
+  end
+
+  local patterns = entry.auth_output_patterns
+  if patterns then
+    -- Exit code is not trusted at all for this backend (that is exactly
+    -- why it declared this field -- e.g. cursor-agent's `status` exits 0
+    -- regardless of auth state): judge captured output only.
+    local output = (result.stdout or "") .. "\n" .. (result.stderr or "")
+    local matched_in = patterns.signed_in ~= nil and output:find(patterns.signed_in) ~= nil
+    local matched_out = patterns.signed_out ~= nil and output:find(patterns.signed_out) ~= nil
+    if matched_in and not matched_out then
+      ok("auth (" .. name .. "): signed in (" .. resolved .. " " .. args_str .. ", output matched signed-in pattern)")
+      return
+    elseif matched_out and not matched_in then
+      warn(
+        "auth ("
+          .. name
+          .. "): NOT signed in ("
+          .. resolved
+          .. " "
+          .. args_str
+          .. ", output matched signed-out pattern)",
+        { hint }
+      )
+      return
+    end
+    local reason = (matched_in and matched_out) and "matched BOTH declared patterns" or "matched NEITHER declared pattern"
+    info(
+      "auth ("
+        .. name
+        .. "): unknown — "
+        .. resolved
+        .. " "
+        .. args_str
+        .. " output "
+        .. reason
+        .. " (declared auth_output_patterns); ambiguous output is never guessed"
+    )
+    return
+  end
+
+  if result.code == 0 then
+    ok("auth (" .. name .. "): signed in (" .. resolved .. " " .. args_str .. ")")
+    return
+  end
+  warn(
+    "auth ("
+      .. name
+      .. "): NOT signed in ("
+      .. resolved
+      .. " "
+      .. args_str
+      .. " exited "
+      .. tostring(result.code)
+      .. ")",
+    { hint }
+  )
+end
+
+-- One row per configured backend name, sorted so the output order is
+-- deterministic across runs regardless of Lua table iteration order.
+local function backend_auth_rows()
+  local names = {}
+  for backend_name in pairs(config.options.backends or {}) do
+    names[#names + 1] = backend_name
+  end
+  table.sort(names)
+  for _, backend_name in ipairs(names) do
+    backend_auth_row(backend_name, config.options.backends[backend_name])
+  end
+end
+
 function M.check()
   start("yana")
 
@@ -306,6 +468,7 @@ function M.check()
     end
   end
 
+  backend_auth_rows()
   birth_time_row()
   keymap_collision_row()
   completion_menu_row()

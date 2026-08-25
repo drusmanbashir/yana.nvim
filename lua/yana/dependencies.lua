@@ -2,7 +2,7 @@ local config = require("yana.config")
 
 local M = {}
 
-M.minimum_neovim = "0.10.4"
+M.minimum_neovim = "0.11.2"
 
 local confined_executables = {
   "bash",
@@ -131,6 +131,12 @@ local function probe(cmd, timeout_ms)
   end
   return true, result
 end
+
+-- Exposed for health.lua's generic per-backend auth probe (whoami_args):
+-- the same fail-closed spawn-with-timeout helper every probe in this file
+-- already uses, so the auth row gets the same "a probe that could not run
+-- proves nothing" guarantee rather than a second ad hoc vim.system call.
+M.probe = probe
 
 -- bwrap on PATH proves nothing about whether THIS kernel will let it create
 -- an unprivileged user namespace: kernel.apparmor_restrict_unprivileged_userns=1
@@ -432,6 +438,10 @@ end
 
 local function kernel_rows(rows)
   local uname = (vim.uv or vim.loop).os_uname()
+  local darwin = uname.sysname == "Darwin"
+  -- Confined modes stay Linux-only (S-24). On Darwin, name the operator
+  -- choice — explicit agentic, or Linux — never "mount procfs".
+  local mac_confined_remedy = "ask/inline need Linux overlayfs+bwrap; on macOS set enable_agentic=true and mode='agentic' (no overlay, no review), or run Yana on Linux. Yana never falls back to agentic by itself"
   if uname.sysname == "Linux" then
     rows[#rows + 1] = row("kernel:linux", "ok", "Linux kernel: " .. tostring(uname.release))
   else
@@ -439,14 +449,19 @@ local function kernel_rows(rows)
       "kernel:linux",
       "error",
       "confined modes require Linux (found " .. tostring(uname.sysname) .. ")",
-      "run Yana on Linux; it never falls back to direct writes"
+      darwin and mac_confined_remedy or "run Yana on Linux; it never falls back to direct writes"
     )
   end
 
   if vim.fn.filereadable("/proc/self/status") == 1 then
     rows[#rows + 1] = row("kernel:proc", "ok", "/proc is available")
   else
-    rows[#rows + 1] = row("kernel:proc", "error", "/proc is unavailable", "mount procfs before starting Neovim")
+    rows[#rows + 1] = row(
+      "kernel:proc",
+      "error",
+      "/proc is unavailable",
+      darwin and mac_confined_remedy or "mount procfs before starting Neovim"
+    )
   end
 
   local filesystems = ""
@@ -460,7 +475,7 @@ local function kernel_rows(rows)
       "kernel:overlayfs",
       "error",
       "overlayfs is not listed by /proc/filesystems",
-      "load or enable the Linux overlay filesystem"
+      darwin and mac_confined_remedy or "load or enable the Linux overlay filesystem"
     )
   end
 
@@ -471,7 +486,8 @@ local function kernel_rows(rows)
       "kernel:cgroup2",
       "warn",
       "cgroup v2 controllers are unavailable; automatic dead-turn reclaim may refuse",
-      "enable a delegated cgroup v2 hierarchy for the user session"
+      darwin and mac_confined_remedy
+        or "enable a delegated cgroup v2 hierarchy for the user session"
     )
   end
 end

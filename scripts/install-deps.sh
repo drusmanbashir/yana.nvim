@@ -24,6 +24,11 @@
 # without --run, and never without printing the exact command and getting a
 # literal "y" first.
 #
+# macOS (Darwin): confined executables (bwrap, capsh, overlayfs, /proc) do
+# not exist and Homebrew cannot provide them. This script prints that split
+# and only checks cursor-agent. It MUST NOT use bash-4 features (`declare
+# -A`) on the Darwin path — stock macOS /bin/bash is 3.2.
+#
 # Usage:
 #   scripts/install-deps.sh          Check only. Touches nothing.
 #   scripts/install-deps.sh --run    Check, then offer to install what's
@@ -172,6 +177,56 @@ confirm() {
 
 missing=()
 cursor_agent_missing=0
+
+# Darwin has no confined-mode packages. Handle it before check_missing()
+# lists bwrap/capsh and before `declare -A` (bash 4) on the Linux path.
+if [[ "$(uname -s)" == Darwin ]]; then
+	echo "yana: macOS — confined modes (ask, inline) are Linux-only."
+	echo
+	echo "Bubblewrap, overlayfs, /proc, and capsh are not available here."
+	echo "Homebrew cannot provide them. Preflight refuses confined turns;"
+	echo "Yana never falls back to agentic by itself."
+	echo
+	echo "To run WITHOUT confinement (agent writes the real tree, no hunk review):"
+	echo
+	echo '  require("yana").setup({ enable_agentic = true, mode = "agentic" })'
+	echo
+	if command -v cursor-agent >/dev/null 2>&1; then
+		echo "cursor-agent is on PATH. Agentic mode can run."
+		exit 0
+	fi
+	echo "cursor-agent is not on PATH. Install it with:"
+	echo
+	echo "  curl https://cursor.com/install -fsS | zsh"
+	echo "  xattr -cr ~/.local/share/cursor-agent/"
+	echo
+	if ((!run)); then
+		echo "Re-run with --run to install cursor-agent (asks first), or run" \
+			"':checkhealth yana' inside Neovim."
+		exit 1
+	fi
+	if command -v curl >/dev/null 2>&1; then
+		echo "About to run:"
+		echo "  curl https://cursor.com/install -fsS | zsh"
+		if confirm "Proceed? [y/N]"; then
+			curl https://cursor.com/install -fsS | zsh
+			if [[ -d "$HOME/.local/share/cursor-agent" ]]; then
+				xattr -cr "$HOME/.local/share/cursor-agent/" 2>/dev/null || true
+			fi
+		else
+			echo "Skipped."
+		fi
+	else
+		echo "curl not found -- install cursor-agent manually: https://cursor.com/install"
+	fi
+	if command -v cursor-agent >/dev/null 2>&1; then
+		echo "install-deps: cursor-agent is present. Agentic mode can run."
+		exit 0
+	fi
+	echo "install-deps: still missing: cursor-agent"
+	exit 1
+fi
+
 check_missing
 
 if ((${#missing[@]} == 0)) && ((!cursor_agent_missing)); then

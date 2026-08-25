@@ -17,7 +17,7 @@ way the editor's own undo should. Nothing reaches disk until you say so.
 - Reset the whole turn with one key
 - Switch which agent answers — Cursor, Claude, or Codex — and which model, mid-chat
 - Keep your unsaved typing: an accept never overwrites it
-- Recover automatically if Neovim crashes mid-review
+- After a crash, the dead turn's lock on the project is released so the next editor is not blocked (pending hunks are NOT restored)
 - Resume a past chat, with its open review intact
 - Stop a stuck turn with one command
 - See which model actually answered, and be told if it wasn't the one you asked for
@@ -32,9 +32,7 @@ way the editor's own undo should. Nothing reaches disk until you say so.
 
 ## Installation
 
-Requirements: Linux, Neovim 0.10.4+, and one agent CLI signed in — `cursor-agent`,
-`claude`, `codex`, or local [Ollama](https://ollama.com) via the shipped
-`bin/yana-ollama-agent` (resolved from the plugin tree; PATH optional).
+**Required:** Linux for confined `ask` / `inline` (glibc — musl/Alpine does not work, see Known issues). macOS can run **agentic** only (see below). Neovim 0.11.2+; one agent CLI signed in: `cursor-agent`, `claude`, or `codex`.
 
 Install the system packages:
 
@@ -53,7 +51,34 @@ sudo dnf install -y bubblewrap libcap python3 util-linux findutils gawk glibc-co
 sudo pacman -S --needed bubblewrap libcap python3 util-linux findutils gawk glibc inetutils
 ```
 
-Everything else Yana needs — `bash`, `sed`, `grep`, and standard coreutils — ships
+**macOS**
+
+Confined `ask` / `inline` (overlay + hunk review) need Linux kernel facilities
+Homebrew cannot provide: bubblewrap, overlayfs, `/proc`, capsh. On Darwin,
+Yana **refuses those modes before the agent starts**. It does not silently
+switch to `agentic`.
+
+To chat and edit on a Mac without confinement (the agent writes your real
+tree; there is no overlay and no hunk review):
+
+```lua
+require("yana").setup({
+  enable_agentic = true,
+  mode = "agentic",
+})
+```
+
+Then install an agent CLI. `cursor-agent` on macOS:
+
+```sh
+curl https://cursor.com/install -fsS | zsh
+xattr -cr ~/.local/share/cursor-agent/
+```
+
+`scripts/install-deps.sh` on Darwin prints this same split and only checks
+`cursor-agent`. For hunk review, run Yana on Linux.
+
+Everything else Yana needs on Linux — `bash`, `sed`, `grep`, and standard coreutils — ships
 with any mainstream distro already. `scripts/install-deps.sh` (still in the repo)
 checks the complete list against your actual machine and prints only what's
 really missing; `:checkhealth yana` does the same check after `setup()` has run.
@@ -72,6 +97,9 @@ All optional. Yana reads these directly:
 ```sh
 # Only needed if cursor-agent isn't already on $PATH:
 export YANA_AGENT_BIN=~/.local/bin/cursor-agent
+
+# Optional machine profile file (Lua table), loaded from this variable:
+export YANA_VENDOR_PROFILE=~/.config/nvim/yana-vendors.lua
 
 # Opt-in diagnostics, both off by default:
 export YANA_DEBUG_EVENTS=1     # record every turn's raw agent stream
@@ -98,14 +126,41 @@ opts = function()
 end
 ```
 
+`vendor_profile` is the same pattern, but for vendor entries and model defaults:
+
+```lua
+-- ~/.config/nvim/yana-vendors.lua (must return a table)
+return {
+  backend = "claude", -- default layer-1 backend for this machine
+  model = "claude-sonnet-5", -- default layer-2 model for this machine
+  backends = {
+    claude = {
+      cmd = "/home/me/.local/bin/claude",
+    },
+    codex = {
+      cmd = "codex",
+    },
+  },
+}
+```
+
+```lua
+-- Lazy spec
+require("yana").setup({
+  vendor_profile = false, -- never load YANA_VENDOR_PROFILE for this one machine
+})
+```
+
 ### With lazy.nvim
 
 ```lua
+-- Install your agent CLI first (see above); the plugin cannot download it.
 {
   "drusmanbashir/yana.nvim",
   cmd = { "Yana", "YanaAsk", "YanaEdit", "YanaOpen" },
-  build = "scripts/install-deps.sh", -- re-checks and prints what's missing, on install/update
+  build = "scripts/install-deps.sh", -- checks system packages on install and update; prints only what is missing
   opts = {
+    backend = "cursor", -- or "claude", "codex" — whichever CLI you installed
     global_keymaps = {
       toggle = "<leader>cc",
       ask = "<leader>ca", -- normal mode opens the panel; visual mode asks about the selection
@@ -127,15 +182,31 @@ vim.opt.runtimepath:prepend("~/.local/share/nvim/yana.nvim")
 require("yana").setup({})
 ```
 
+### Verify installation
+
+Run `:Yana` to open the panel; if it fails, `:checkhealth yana` names the missing package, the agent binary it tried, and the fix.
+
 ## Default setup configuration
+
+Most people need only this:
 
 ```lua
 require("yana").setup({
-  backend = "cursor",         -- "cursor" | "claude" | "codex" | "ollama" | your own entry in `backends`
+  backend = "cursor",
+  global_keymaps = { toggle = "<leader>cc", ask = "<leader>ca", inline_edit = "<C-k>" },
+})
+```
+
+<details><summary><strong>Default setup configuration — every option</strong> (override only what you need; defaults are safe)</summary>
+
+```lua
+require("yana").setup({
+  backend = "cursor",         -- "cursor" | "claude" | "codex" | your own entry in `backends`
   cmd = nil,                  -- explicit path/name; see "Environment variables" above
   cmd_env = "YANA_AGENT_BIN",
+  vendor_profile = nil,       -- path/table/profile env var; load before opts
   model = nil,
-  mode = "inline",             -- "ask" | "inline" | "agentic"
+  mode = "inline",             -- "ask" (reads and answers, edits nothing) | "inline" (edits arrive as hunks you review) | "agentic" (writes files directly, no review; needs enable_agentic)
   enable_agentic = false,
   approve_mcps = false,
 
@@ -174,6 +245,10 @@ require("yana").setup({
     next = "]x",
     prev = "[x",
   },
+
+  review = {
+    tabs = true, -- multi-file turns open one tab per file; false keeps single-tab review navigation
+  },
   -- The chat panel:
   keymaps = {
     submit = "<C-s>",
@@ -205,6 +280,8 @@ require("yana").setup({
 })
 ```
 
+</details>
+
 See `:help yana-configuration`
 for the complete option reference, and "How it works" below for `backends`,
 multi-repository turns, and machine-specific resolution of `cmd`.
@@ -230,7 +307,7 @@ multi-repository turns, and machine-specific resolution of `cmd`.
 | `]x` / `[x` | Next / previous hunk |
 | `u` | Undo your last decision (retraces across files once this file's own history is empty) |
 | `U` | Undo the whole turn — every file, back to where you started |
-| `<C-r>` | Redo |
+| `<C-r>` | Redo your last undone decision or edit (same cross-file order `u` walked, reverse) |
 
 ### Panel — the chat pane
 
@@ -293,6 +370,53 @@ multi-repository turns, and machine-specific resolution of `cmd`.
 | `:YanaRenderCheck` | Reconcile every open review's display against its actual state |
 | `:YanaDiffThemes` | Live-preview Yana's inline diff color themes |
 
+## REPL and context integration (optional)
+
+If you drive a REPL alongside Neovim (iron.nvim, vim-slime, or neopyter — whichever is bound for the current filetype), you can wire a few extra maps that pull REPL output into a Yana turn instead of typing it in by hand. None of this ships as built-in Yana behaviour today: it is a pattern from one operator's own config, kept here as a documented, opt-in recipe. It needs a REPL-scrollback reader (something that can capture the bound REPL's pane/window text — the example config does this over kitty or tmux) and works with whatever backend that reader is pointed at.
+
+| Action | What it sends to Yana | Example map |
+|---|---|---|
+| Ask about the current line/selection, with the last N lines of REPL output appended (the "REPL tail") | The line or visual block, plus the REPL's last N lines, prefilled into the prompt | `<leader>ak` (bare = ask only; `N<leader>ak` or typing `N<CR>` in the prompt = attach last N lines) |
+| Ask about the current line/selection, with the REPL's last Python traceback extracted and prefilled | The line or visual block, plus the sliced `Traceback...Error` block from the REPL, prompt set to agent mode | `<leader>ap` |
+| Ask without any file/selection context | Just the prompt — no line, selection, or REPL text | `<leader>aK` |
+| Copy the cursor location or selection, optionally with the linked REPL traceback appended, to the system clipboard for pasting into Yana (or anywhere) by hand | Nothing automatically — the clipboard, for a manual paste into the prompt | `<C-y>` / `<C-S-y>` (visual: `x` mode) |
+| Jump from a REPL traceback/output line straight to the matching source line and column | Nothing — pure editor navigation, no Yana call; useful right before one of the "ask" actions above | `\j` (from bottom) / `\J` (from top) |
+| Open/focus the Yana panel already in the right capability mode (`ask` vs `agent`) as part of the actions above | N/A — routing, not content | automatic, inside `<leader>ak` / `<leader>ap` / `<leader>aK` |
+
+There is no `integrations.repl` key in `require("yana").setup()` yet — configure this yourself by mapping the helpers, in the same shape as the operator's own config:
+
+```lua
+-- Sketch, not a Yana API: your own REPL-scrollback reader in place of
+-- `myrepl.last_tail_text(n)` / `myrepl.last_traceback_text()`.
+vim.keymap.set({ "n", "x" }, "<leader>ak", function()
+  -- 1. ask about the current line/visual selection as usual
+  local yana = require("yana")
+  if vim.fn.mode():find("[vV\22]") then
+    local l1, l2 = vim.fn.line("v"), vim.fn.line(".")
+    if l1 > l2 then l1, l2 = l2, l1 end
+    vim.cmd("normal! \27")
+    yana.ask_range(0, l1, l2, nil)
+  else
+    local l = vim.fn.line(".")
+    yana.ask_range(0, l, l, nil)
+  end
+  -- 2. optionally prefill the prompt with the REPL's last N lines
+  local n = vim.v.count
+  if n > 0 then
+    local tail = require("myrepl").last_tail_text(n)
+    if tail then
+      local p = require("yana.ui").open()
+      vim.bo[p.prompt_buf].modifiable = true
+      vim.api.nvim_buf_set_lines(p.prompt_buf, 0, -1, false, vim.split(tail, "\n"))
+      require("yana.ui").focus_prompt(p)
+    end
+  end
+end, { desc = "Yana: ask + optional REPL tail" })
+```
+
+A built-in `integrations.repl` option that wraps this (and the traceback/no-context variants) is planned but not yet implemented.
+
+
 ## Highlight Groups
 
 | Group | Paints | Configured via |
@@ -320,10 +444,75 @@ docs, and open an issue or PR here if a cell is wrong.
 | Can the agent wreck my repo? | Not in the default modes — a turn can't reach `.git`, credentials, or anything outside the project I opened until I accept a change; the opt-in `agentic` mode removes this protection entirely | not documented | not documented | not documented | not documented | not documented | Partially — a `--sandbox <mode>` / `/sandbox` setting toggles command-execution sandboxing; file-write restrictions aren't documented |
 | Can the agent read my SSH keys, cloud credentials, or other secrets? | No — `~/.ssh`, `~/.gnupg`, `~/.aws`, and other credential files are kept out of its reach | not documented (scoped `AVANTE_`-prefixed keys concern the plugin's own API keys, not files hidden from the agent) | not documented | not documented | not documented | not documented | Only the `sudo` password is documented: it "flows directly to `sudo` via a secure IPC channel; the AI model never sees it" |
 | What happens if I open two editors on the same project? | Refused by name — only one editor's turn can work on a project at a time, so two editors never overwrite each other's changes | not documented | not documented | not documented | not documented | not documented | not documented |
-| What happens if Neovim crashes mid-review? | Recovered on my next turn — pending edits are kept, and Yana says why | not documented | not documented | not documented | not documented | not documented | not documented |
+| What happens if Neovim crashes mid-review? | Pending hunks are lost — nothing is applied, the file on disk is untouched, and the dead turn's lock is released so the next editor is not blocked | not documented | not documented | not documented | not documented | not documented | not documented |
 | Can I see exactly what the agent did? | Yes — every turn's actions are recorded, and a stalled turn is diagnosed by cause instead of a bare spinner | Yes — `prompt_logger` "logs prompts to disk (timestamped, for replay/debugging)" | Yes — `log_level = "DEBUG"` or `"TRACE"`, path shown via `:checkhealth codecompanion` | Yes — `:ClaudeCodeVerbose` gives "full turn-by-turn output" | Yes — a `debug` config option; see `:messages` | not documented | not documented |
 | Which accounts can I run this on — do I pay Cursor's markup, or my own provider? | Three, switchable mid-chat: my own Cursor, Anthropic (Claude), or OpenAI (Codex) account — I choose whose bill it is, not just which model answers | Many — Claude, OpenAI, Azure OpenAI, Gemini, Cohere, Copilot, Bedrock, Moonshot, Ollama, plus Morph (Fast Apply) and ACP agents; scoped API keys "recommended for isolation" let me bring my own per provider | Many — Anthropic, DeepSeek, Google Gemini, GitHub Copilot, GitHub Models, Kimi, Mistral, Novita, Ollama, OpenAI, Azure OpenAI, OpenRouter, HuggingFace, xAI "out of the box (or bring your own)", plus ACP/MCP agent CLIs: Claude Code, Codex, Copilot CLI, Gemini CLI, Goose, Cursor CLI, Kimi CLI, Kiro, Mistral Vibe, OpenCode | One — the Claude Code CLI only | Many CLIs listed — Aider, Amazon Q, Claude, Codex, Copilot, Crush, Cursor, Gemini, Grok, OpenCode, Pi, Qwen — each on its own account; not brokered by the plugin | One — locked to the OpenCode server | n/a — it is the account being billed |
-| What Neovim version do I need? | 0.10.4+ (tested on 0.10.4, 0.11.2, 0.12.4) | 0.11.0+ | not documented | 0.7.0+ | 0.11.2+ | not documented | n/a |
+| What Neovim version do I need? | 0.11.2+ (tested on 0.11.2, 0.12.4) | 0.11.0+ | not documented | 0.7.0+ | 0.11.2+ | not documented | n/a |
+
+## Known issues
+
+Open as of 2026-08-23 (each has a ledger row or a never-green test; none loses
+data on disk — `:w` always withholds pending agent lines):
+
+- **`:earlier` / `:later` / `g-` / `g+` rewind the WHOLE review, not one hunk**
+  (ruling 98, built 2026-08-24). Crossing the point where Yana inserted the
+  proposal takes the whole review back — every decision in it, together — and
+  crossing it forward again restores the exact proposal and reopens the same
+  review with every hunk pending. Decisions are not stepped one at a time by
+  time travel; use `u` / `<C-r>` for that. If the undo history itself is gone
+  (`:bwipeout`, cleared undo), Yana says so rather than guessing.
+- **Whole-file `ca` / `cb` inside a 4-file undo/redo walk** is being rebuilt as one
+  register step (ruling 2026-08-23); until it lands, `u` after `ca` may fragment
+  across presses. Branch `ap/filelevel-2`.
+- **`o` / `O` on the edge of a one-line hunk** can grow the green band over your
+  new line until the next repaint (branch `ap/paint-leak-o`).
+- **Crash + reopen** (SIGKILL) shows Neovim's own swap-file prompt (E325) before
+  Yana restores the session; answer it as usual, the review state survives.
+- **Undo-seq drift after `:bwipeout` / recreated undo tree** is named, not
+  resynced: the proposal insertion is gone from the undo tree, so there is
+  nothing left to rewind to or restore from (row
+  `r75_undo_seq_drift_is_named`).
+- **Confined modes are Linux-only.** Overlay + hunk review (`ask`, `inline`)
+  need bubblewrap, overlayfs, `/proc`, and capsh. macOS cannot provide those;
+  Homebrew cannot either. On Darwin, preflight refuses confined turns (no
+  silent fallback). **Agentic** works if you set `enable_agentic = true` and
+  `mode = "agentic"` — the agent writes the real tree, with no overlay and no
+  review. Windows is still unsupported. The compatibility matrix remains
+  Linux containers.
+- **Redo of a write that already reached disk does nothing.** Once a decision
+  has been written out, `<C-r>` past that boundary silently leaves the file at
+  its turn-start bytes rather than redoing (`lua/yana/timeline/retrace.lua`,
+  "durable redo not implemented"). Undo still works; only redo across a
+  completed write is unbuilt, and it fails quietly rather than saying so.
+- **musl-based Linux (Alpine) does not work** with the official Neovim tarball:
+  it is built against glibc and fails to load with `fcntl64: symbol not found`.
+  This is Neovim's packaging, not Yana — but until a musl build is used, Alpine
+  is out. Verified in the compatibility matrix (cell `alpine320`).
+- **REPL / SLIME integration is known to work only under the kitty terminal.**
+  The whole suite (vim-slime / iron.nvim / neopyter routing, cells, traceback
+  jump, REPL tail into the prompt) is being integrated as a `yana.repl` module
+  under an internal design plan; it has been exercised only in kitty, which
+  it uses for pane targeting. Other terminals are untested.
+
+## Missing features
+
+Deliberately not built. Each entry says what does not exist and why, so the
+absence is a decision on record rather than a gap you discover mid-review.
+
+- **Crash / session recovery.** If Neovim dies mid-review, the pending hunks
+  are gone. Nothing was applied and the file on disk is untouched, so no work
+  is lost from the file's point of view — but the review itself does not come
+  back, and no prompt offers to restore it. What runs at the next start only
+  releases the dead turn's lock on the project so the next editor is not
+  refused. Restoring the review instead would mean bringing an older turn's
+  decisions into a new editing session, and that reaches into every boundary
+  the plugin is careful about at once: which project a dead session belongs to
+  when repositories nest or share files, a lock still held by a process that no
+  longer exists, an undo register that deliberately refuses to walk into an
+  older turn, and a prompt that would have to fire before you have typed
+  anything — including in scripted and headless starts where nobody is there to
+  answer. The blast radius is not acceptable for the safety this would buy,
+  so it is not planned. Save before you walk away; that is the whole remedy.
 
 ## Roadmap
 
@@ -334,8 +523,36 @@ Recorded in the private design notes; nothing here ships until it has tests.
 - File-keyed resume: opening a file offers the sessions that touched it.
 - Chat picker: see and switch between ongoing chats from the keyboard.
 - Install automation: `:YanaInstallDeps` fetches user-space dependencies.
-- Agent profile file (JSON): a declarative alternative to configuring
+- Agent profile file (Lua): a declarative alternative to configuring
   backends only in Lua.
+- macOS confined (`ask`/`inline`) support: still unsupported (see Known
+  issues). Agentic on macOS is documented. Closing the overlay hole means a
+  Darwin confinement backend that still satisfies the real-path + separable-
+  writes rules, then a matrix cell — not a brew package list.
+- Windows support: unsupported. Same audit as the macOS overlay hole, plus
+  process spawn and crash/restart paths, then a matrix cell.
+- Per-decision time travel: `:earlier`/`:later`/`g-`/`g+` stepping Yana's
+  accept/reject decisions back and forth one at a time, in lockstep with
+  Neovim's own undo history. Not planned. Accepting or rejecting a hunk in an
+  open buffer changes no text, and Neovim's undo tree only records text
+  changes, so four accepts share one undo sequence and there is no state for
+  `:earlier` to step through per decision; building it means manufacturing a
+  synthetic undo boundary for every decision, which puts Yana's bookkeeping
+  inside Neovim's undo tree. What IS built instead, since 2026-08-24, is the
+  whole-review rewind: crossing the proposal insertion backward withdraws the
+  whole review and every decision in it together, and crossing it forward
+  restores the exact proposal and reopens the same review with all hunks
+  pending.
+- Undocked panel: run the Yana panel in its own kitty window (or cockpit pane)
+  instead of a split, so the editor keeps the full width. Neovim's UI protocol
+  draws one screen per instance, so this is a second Neovim talking to the
+  editing one over its RPC socket, not a detached window. Window placement and
+  socket discovery reuse the pattern the REPL integration already uses for
+  kitty; the transport is Neovim RPC rather than `kitty @ send-text`, because
+  the panel must paint hunks back into the editing instance, not only push text
+  out. Measured locally: 0.016 ms per synchronous round trip, 0.21 ms to place
+  100 extmarks batched in one `nvim_exec_lua` (1.66 ms unbatched), so repaint
+  cost is transport-free — provided pushes batch and use `rpcnotify`.
 
 <details>
 <summary><strong>How it works, security, data, and release policy</strong></summary>
@@ -380,7 +597,7 @@ opt-in with `enable_agentic`). Switching mid-chat hands the next session a
 short brief of what you asked, what landed, and what was refused, once.
 
 **Backends — two layers of "which model".** Layer 1 is the backend: which
-binary, which account, which bill (`cursor`, `claude`, `codex`, `ollama`, or a vendor
+binary, which account, which bill (`cursor`, `claude`, `codex`, or a vendor
 you add yourself). Layer 2 is the model within that backend. Conflating them
 is a real trap: picking `claude-4-sonnet` *inside* `cursor-agent` is Cursor's
 own resale of Claude, billed on Cursor's meter — a different product from
@@ -395,13 +612,11 @@ vendor are prefetched into a session cache at setup so that cascade (and
 `:YanaModel`) open from memory instead of re-spawning each vendor CLI. A
 `--resume`
 session id is vendor-specific too: resuming a session recorded under a
-different backend is refused by name, naming both backends. Local unpaid
-path: install Ollama, set `backend = "ollama"` (or pick it in `<leader>am`);
-the plugin resolves `bin/yana-ollama-agent` itself.
+different backend is refused by name, naming both backends.
 
 Backends are declared in `config.backends` — a named table of vendor entries
 (avante.nvim's `providers` shape, applied to a CLI agent instead of an HTTP
-provider). Four ship today (`cursor`, `claude`, `codex`, `ollama`); `codex`'s entry shows the fields a vendor whose
+provider). Three ship today (`cursor`, `claude`, `codex`); `codex`'s entry shows the fields a vendor whose
 CLI shape genuinely differs needs (non-interactive mode as a subcommand
 rather than a flag, a positional resume id, its own JSON stream token):
 
@@ -457,7 +672,7 @@ pending edits for recovery, and logs why. Sessions persist and resume
 (`:YanaSessions`, `:YanaResume`), naming a still-open review's files instead
 of discarding them.
 
-**Portability.** Tested on Neovim 0.10.4, 0.11.2 and 0.12.4 on every change;
+**Portability.** Tested on Neovim 0.11.2 and 0.12.4 on every change;
 dependencies probed for real capability (user namespaces, GNU tools) not just
 presence, with the exact `apt`/`dnf`/`pacman` line for anything missing.
 
@@ -544,4 +759,4 @@ Prereleases use tags such as `v0.1.0-alpha.1`, `v0.1.0-beta.1`, or
 
 ## Licence
 
-MIT. See [LICENSE](LICENSE) and [NOTICE](NOTICE) for provenance.
+Apache 2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE) for provenance.
