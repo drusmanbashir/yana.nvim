@@ -37,6 +37,127 @@ local function clean_error(msg)
 end
 
 -- Optional. Plugin works with defaults without calling setup().
+-- Global hunk navigation (`]x` / `[x`) is opt-in, and opting in must not COST
+-- the user the key. Yana owns it only for as long as it has a review to
+-- navigate; the rest of the time the press has to land wherever it would have
+-- landed if Yana had never mapped anything.
+--
+-- Neovim has one global mapping slot per lhs, so Yana's `vim.keymap.set`
+-- necessarily evicts whatever was there. The fallthrough is therefore two
+-- halves, and it needs both:
+--
+--   1. `install_nav_map` snapshots (maparg dict form) the mapping it is about
+--      to evict, so the mapping that existed when Yana took the key can be put
+--      back. It re-snapshots on EVERY setup, and never records one of Yana's
+--      own mappings as the fallback, so a mapping installed after the first
+--      setup -- lazy.nvim orders plugins, not us -- is picked up the next time
+--      Yana takes the key rather than being lost to a capture-once.
+--   2. `stand_aside` resolves the press through the real mapping stack instead
+--      of replaying a remembered rhs: Yana's own mapping is deleted, the
+--      snapshot (if any) is mapset back, and the key is fed with `feedkeys`
+--      in remap mode. Buffer-local mappings, <buffer> ftplugin maps and
+--      anything installed after Yana all get their ordinary precedence, and
+--      with nothing mapped at all the key does its plain Neovim thing.
+--
+-- Recursion is not possible during the replay because Yana's mapping is not
+-- installed while the fed key is resolved; the `aside` flag covers the
+-- pathological case of a fallback that feeds the same key back at us, by
+-- replaying that one without remapping.
+--
+-- IDENTITY: "is the mapping I'm about to evict one of MINE?" is answered by
+-- object identity of the installed Lua function, never by reading `desc`.
+-- Two things break a description guess and neither is exotic: (a) `maparg()`
+-- resolves the CURRENT BUFFER's mapping first when one exists, so calling
+-- setup() while focused on a review buffer -- which owns a BUFFER-LOCAL
+-- `]x`/`[x` of its own, desc "yana: next hunk" -- silently substitutes that
+-- buffer-local mapping for the actual global one; and (b) nothing stops a
+-- user's own mapping from having a `desc` that happens to start with
+-- "yana:". `get_global_map` below reads only the global mapping table
+-- (`nvim_get_keymap`, which -- unlike `maparg()` -- never merges in a
+-- buffer-local shadow), and `entry.owned` is a set of the actual handler
+-- function objects Yana itself has ever installed for that lhs, so "is this
+-- mine" is answered by "did I put this exact function there", which is true
+-- for exactly the mappings Yana installed and nothing else, regardless of
+-- what any mapping's desc says.
+local nav_maps = {}
+
+local function nav_map_key(lhs)
+  return "n\0" .. lhs
+end
+
+--- The GLOBAL mapping for `lhs`, or nil. Deliberately not `maparg()`: maparg
+--- resolves the current buffer's mapping first when the buffer has one, so
+--- reading it while focused on a review buffer (which owns a buffer-local
+--- ]x/[x) returns the review's mapping instead of the real global one.
+--- `nvim_get_keymap` only ever lists global mappings, so it can't be fooled
+--- by whatever buffer happens to be current.
+local function get_global_map(lhs)
+  local want = vim.api.nvim_replace_termcodes(lhs, true, false, true)
+  for _, m in ipairs(vim.api.nvim_get_keymap("n")) do
+    if vim.api.nvim_replace_termcodes(m.lhs, true, false, true) == want then
+      return m
+    end
+  end
+  return nil
+end
+
+local function install_nav_map(lhs, desc, handler)
+  local key = nav_map_key(lhs)
+  local entry = nav_maps[key] or {}
+  entry.owned = entry.owned or {}
+  local prev = get_global_map(lhs)
+  if prev and entry.owned[prev.callback] then
+    -- Re-taking a key one of Yana's OWN previously-installed global
+    -- handlers still holds (a second setup() call, or Yana retaking the
+    -- key after standing aside): keep the fallback recorded the first
+    -- time rather than overwriting it with ourselves.
+    prev = entry.saved
+  else
+    entry.saved = prev
+  end
+  entry.owned[handler] = true
+  entry.aside = entry.aside or false
+  nav_maps[key] = entry
+  vim.keymap.set("n", lhs, handler, { silent = true, desc = desc })
+end
+
+local function stand_aside(lhs, desc, handler)
+  local entry = nav_maps[nav_map_key(lhs)] or {}
+  local keys = vim.api.nvim_replace_termcodes(lhs, true, false, true)
+  if entry.aside then
+    pcall(vim.api.nvim_feedkeys, keys, "nx", false)
+    return
+  end
+  entry.aside = true
+  pcall(vim.keymap.del, "n", lhs)
+  if entry.saved then
+    pcall(vim.fn.mapset, entry.saved)
+  end
+  local ok, err = pcall(vim.api.nvim_feedkeys, keys, "mtx", false)
+  entry.aside = false
+  -- Take the key back whatever happened, and re-snapshot while doing it: if
+  -- the fallback that just ran installed a new mapping, that is the one Yana
+  -- must stand aside to next time.
+  install_nav_map(lhs, desc, handler)
+  if not ok then
+    error(err, 0)
+  end
+end
+
+--- One opted-in global nav key. `direction` is "next" or "prev".
+local function set_nav_keymap(lhs, direction, desc)
+  local handler
+  handler = function()
+    log.guard("yana global keymap " .. direction .. "_hunk", function()
+      local ok, reason = require("yana.inline_diff").navigate_active_review(direction)
+      if not ok and reason == "no-review" then
+        stand_aside(lhs, desc, handler)
+      end
+    end)
+  end
+  install_nav_map(lhs, desc, handler)
+end
+
 function M.setup(opts)
   local deps = require("yana.dependencies")
   if vim.fn.has("nvim-" .. deps.minimum_neovim) == 0 then
@@ -165,6 +286,12 @@ function M.setup(opts)
         require("yana.inline_edit").open_line()
       end)
     end, { silent = true, desc = "yana: inline edit current line" })
+  end
+  if gk.next_hunk and gk.next_hunk ~= "" then
+    set_nav_keymap(gk.next_hunk, "next", "yana: next review hunk")
+  end
+  if gk.prev_hunk and gk.prev_hunk ~= "" then
+    set_nav_keymap(gk.prev_hunk, "prev", "yana: previous review hunk")
   end
 
   -- Crash recovery runs on startup, deferred so it never delays `setup`, and

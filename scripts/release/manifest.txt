@@ -7,6 +7,8 @@ LICENSE
 NOTICE
 README.md
 VERSION
+assets/yana-review-still.png
+assets/yana-review.gif
 bin/yana-apply
 bin/yana-changeset
 bin/yana-jail
@@ -57,6 +59,7 @@ lua/yana/shadow/apply.lua
 lua/yana/shadow/jail.lua
 lua/yana/shadow/ops.lua
 lua/yana/shadow/preview.lua
+lua/yana/single_file.lua
 lua/yana/timeline/edit_capture.lua
 lua/yana/timeline/init.lua
 lua/yana/timeline/record.lua

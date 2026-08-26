@@ -207,6 +207,12 @@ local function tl_record(state, kind, label, extra, async)
     -- (see `same_turn`), so the stamp names a turn by exactly the identity the
     -- product already agrees on.
     turn_id = change.turn_id or change.turn_gen,
+    -- ONE FILE-LEVEL DECISION, ONE REGISTER ROW (ruling 75): `accept_all`/
+    -- `reject_all` record a SINGLE `file_accepted`/`file_rejected` row
+    -- (never one row per hunk) and carry the hunks it covers here, for the
+    -- reopen path (`M._register_decisions`) to paint them all pending
+    -- again. Every other caller omits it.
+    members = extra and extra.members,
   }
   if entry.regime == "buffer" then
     entry.buffer_epoch = extra and extra.buffer_epoch
@@ -305,6 +311,12 @@ function M._tl_head_row(state, id, land_before)
   end
   obs.id = target.id
   rec.sync_buffer_head(bufnr, obs)
+  -- The explicit mark (see `record.mark_reverted`): a pop reverts `id`, a
+  -- redo puts it back. Head position alone cannot say this for a byte-less
+  -- row.
+  if type(rec.mark_reverted) == "function" then
+    rec.mark_reverted(id, land_before and true or false)
+  end
 end
 
 local function tl_same_observation(a, b)
@@ -365,6 +377,17 @@ local function tl_capture_human_edit(state)
   if not (state and state.bufnr and vim.api.nvim_buf_is_valid(state.bufnr)) then
     return
   end
+  -- Force any classification `attach_buffer_watch`'s on_lines watcher left
+  -- queued (`state.watch_pending`) to run NOW, before `state.free_standing_edit`
+  -- is read below. Without this, a decision key pressed before the watcher's
+  -- deferred `vim.schedule` callback had run read a STALE flag left over from
+  -- the previous decision boundary and silently downgraded a genuine
+  -- free-standing edit to an `absorbed_edit` marker (issue 15).
+  -- Idempotent: `process_pending_watch` no-ops if there is nothing queued,
+  -- including when the scheduler already ran it first.
+  if type(state.flush_pending_watch) == "function" then
+    state.flush_pending_watch()
+  end
   local obs = tl_observe(state.bufnr)
   if
     state.timeline_obs
@@ -372,9 +395,34 @@ local function tl_capture_human_edit(state)
     and not tl_buffer_at_register_head(state.bufnr)
   then
     obs.regime = "buffer"
-    tl_record(state, "human_edit", "edit " .. (state.change.rel or state.change.path or "?"), obs)
+    local rel = state.change.rel or state.change.path or "?"
+    -- RULING 75/73/57: typing absorbed into a still-pending hunk (decision
+    -- 57's `absorb_human_edits`, ruling 73's hunk-edge rule) is NOT a
+    -- register STEP of its own -- it becomes part of that hunk's own bytes
+    -- and is undone/redone with whichever decision the hunk gets. But its
+    -- position in the buffer's own undo tree is still real, and the
+    -- decision that follows it must land back exactly there rather than
+    -- skipping past it into the file's older history -- so it is recorded
+    -- as a MARKER (`absorbed_edit`, `record.UNDOABLE_KIND` excludes it),
+    -- never as an actionable `human_edit`. Without this distinction a walk
+    -- edge that typed at a hunk boundary and then decided it (`o<Esc>`,
+    -- `dd`, `ct`) either minted an extra press-consuming step between the
+    -- two, or (recording nothing at all) let the decision's own undo skip
+    -- straight past the typing to the file's turn-start bytes, losing it --
+    -- both measured on the four-file mirror walk
+    -- (`r75_four_file_walk_mirror`).
+    -- `state.free_standing_edit` is set true only when some part of the
+    -- drift since the last observation landed OUTSIDE every pending hunk
+    -- (the buffer watcher below); reset here regardless of which way this
+    -- goes, so the next round of edits starts fresh.
+    if state.free_standing_edit then
+      tl_record(state, "human_edit", "edit " .. rel, obs)
+    else
+      tl_record(state, "absorbed_edit", "absorbed edit " .. rel, obs)
+    end
   end
   state.timeline_obs = obs
+  state.free_standing_edit = false
 end
 
 local function tl_sync_observation(state)
@@ -650,17 +698,38 @@ function M.build_diff_blocks(before, after)
 end
 
 local function win_for_buf(bufnr)
-  for _, w in ipairs(vim.api.nvim_list_wins()) do
-    if vim.api.nvim_win_get_buf(w) == bufnr then
-      return w
+  for _, tab in ipairs(vim.api.nvim_list_tabpages()) do
+    for _, w in ipairs(vim.api.nvim_tabpage_list_wins(tab)) do
+      if vim.api.nvim_win_get_buf(w) == bufnr then
+        return w, tab
+      end
     end
   end
-  return nil
+  return nil, nil
+end
+
+local function tab_for_path(path)
+  local abs = diff.abs_path(path)
+  for _, tab in ipairs(vim.api.nvim_list_tabpages()) do
+    for _, w in ipairs(vim.api.nvim_tabpage_list_wins(tab)) do
+      local b = vim.api.nvim_win_get_buf(w)
+      if vim.api.nvim_buf_is_valid(b) then
+        local name = vim.api.nvim_buf_get_name(b)
+        if name ~= "" and diff.abs_path(name) == abs then
+          return tab, w, b
+        end
+      end
+    end
+  end
+  return nil, nil, nil
 end
 
 local function focus_buf(path, bufnr)
-  local win = win_for_buf(bufnr)
+  local win, tab = win_for_buf(bufnr)
   if win and vim.api.nvim_win_is_valid(win) then
+    if tab and vim.api.nvim_tabpage_is_valid(tab) then
+      pcall(vim.api.nvim_set_current_tabpage, tab)
+    end
     vim.api.nvim_set_current_win(win)
   else
     -- vim.cmd("edit ...") can throw E37 asynchronously (inside vim.schedule)
@@ -690,6 +759,215 @@ local function focus_buf(path, bufnr)
     end
   end
   return bufnr, win_for_buf(bufnr)
+end
+
+local function review_tabs_state_path(opts)
+  if opts and type(opts.review_tabs_state_path) == "string" and opts.review_tabs_state_path ~= "" then
+    return opts.review_tabs_state_path
+  end
+  return nil
+end
+
+local function review_tabs_enabled(opts)
+  if opts and opts.review_tabs == false then
+    return false
+  end
+  return true
+end
+
+local function review_turn_key(change)
+  if not change then
+    return nil
+  end
+  return tostring(change.turn_id or change.turn_gen or "")
+end
+
+local function read_json_file(path)
+  local fh = io.open(path, "rb")
+  if not fh then
+    return nil
+  end
+  local raw = fh:read("*a")
+  fh:close()
+  if type(raw) ~= "string" or raw == "" then
+    return nil
+  end
+  local ok, decoded = pcall(vim.json.decode, raw)
+  if not ok or type(decoded) ~= "table" then
+    return nil
+  end
+  return decoded
+end
+
+local function write_json_file(path, value)
+  local dir = vim.fn.fnamemodify(path, ":h")
+  if dir and dir ~= "" then
+    pcall(vim.fn.mkdir, dir, "p")
+  end
+  local ok, payload = pcall(vim.json.encode, value)
+  if not ok or type(payload) ~= "string" then
+    return false
+  end
+  local fh = io.open(path, "wb")
+  if not fh then
+    return false
+  end
+  fh:write(payload)
+  fh:close()
+  return true
+end
+
+local function review_tabs_save_state(st, opts)
+  local path = review_tabs_state_path(opts)
+  local rt = st and st.review_tabs
+  if not path or not rt or not rt.turn_key then
+    return
+  end
+  local owned = {}
+  for abs, entry in pairs(rt.owned or {}) do
+    owned[abs] = {
+      tab_id = entry.tab_id,
+      rel = entry.rel,
+    }
+  end
+  write_json_file(path, {
+    version = 1,
+    turn_key = rt.turn_key,
+    owned = owned,
+  })
+end
+
+local function review_tabs_collect_turn_changes(st, change)
+  local out = {}
+  local seen = {}
+  local function same_turn_local(a, b)
+    if a == b then
+      return true
+    end
+    if not a or not b then
+      return false
+    end
+    if a.turn_id ~= nil or b.turn_id ~= nil then
+      return a.turn_id == b.turn_id
+    end
+    return a.turn_gen == b.turn_gen
+  end
+  for _, entry in ipairs(st.order or {}) do
+    local c = (entry and entry.change) or entry
+    if c and c.path and (change == nil or same_turn_local(c, change)) and not seen[c.path] then
+      seen[c.path] = true
+      out[#out + 1] = c
+    end
+  end
+  for _, item in ipairs(st.queue or {}) do
+    local c = item and item.change
+    if c and c.path and (change == nil or same_turn_local(c, change)) and not seen[c.path] then
+      seen[c.path] = true
+      out[#out + 1] = c
+    end
+  end
+  if change and change.path and not seen[change.path] then
+    out[#out + 1] = change
+  end
+  table.sort(out, function(a, b)
+    return tostring(a.rel or a.path) < tostring(b.rel or b.path)
+  end)
+  return out
+end
+
+function M._review_tabs_init_for_turn(st, change, opts)
+  if not review_tabs_enabled(opts) then
+    st.review_tabs = nil
+    return nil
+  end
+  local turn_key = review_turn_key(change)
+  if (turn_key == nil or turn_key == "") and opts and opts.review_owner then
+    turn_key = tostring(opts.review_owner.panel_id or "?") .. ":" .. tostring(opts.review_owner.epoch or "?")
+  end
+  if turn_key == nil or turn_key == "" then
+    turn_key = "unknown"
+  end
+  local turn_changes = review_tabs_collect_turn_changes(st, change)
+  if opts and type(opts.review_paths) == "table" then
+    local seen = {}
+    for _, c in ipairs(turn_changes) do
+      seen[diff.abs_path(c.path)] = true
+    end
+    for _, path in ipairs(opts.review_paths) do
+      local abs = diff.abs_path(path)
+      if not seen[abs] then
+        turn_changes[#turn_changes + 1] = {
+          path = abs,
+          rel = opts.workspace and abs:sub(#diff.abs_path(opts.workspace) + 2) or abs,
+          turn_id = change and change.turn_id or nil,
+          turn_gen = change and change.turn_gen or nil,
+        }
+        seen[abs] = true
+      end
+    end
+    table.sort(turn_changes, function(a, b)
+      return tostring(a.rel or a.path) < tostring(b.rel or b.path)
+    end)
+  end
+  if st.review_tabs and st.review_tabs.turn_key ~= turn_key then
+    st.review_tabs = nil
+  end
+  local rt = st.review_tabs or {
+    turn_key = turn_key,
+    owned = {},
+    enabled = false,
+    all_paths = {},
+  }
+  rt.turn_key = turn_key
+  if #turn_changes < 2 then
+    rt.enabled = false
+    st.review_tabs = rt
+    return rt
+  end
+  rt.enabled = true
+  local cur_tab = vim.api.nvim_get_current_tabpage()
+  local cur_win = vim.api.nvim_get_current_win()
+  local existed = {}
+  for _, c in ipairs(turn_changes) do
+    local abs = diff.abs_path(c.path)
+    local rel = c.rel or c.path
+    rt.all_paths[abs] = rel
+    existed[abs] = select(1, tab_for_path(abs))
+  end
+
+  -- ownership is decided at open time: tabs pre-existing for a file are reused
+  -- and never owned; tabs this turn creates are owned.
+  for _, c in ipairs(turn_changes) do
+    local abs = diff.abs_path(c.path)
+    local rel = c.rel or c.path
+    local tab = existed[abs]
+    if not tab then
+      if change and abs == diff.abs_path(change.path) then
+        tab = cur_tab
+      else
+        local ok = pcall(vim.cmd, "tabnew " .. vim.fn.fnameescape(abs))
+        if ok then
+          tab = vim.api.nvim_get_current_tabpage()
+        end
+      end
+    end
+    if tab and not existed[abs] and rt.owned[abs] == nil then
+      rt.owned[abs] = { tab_id = tab, rel = rel }
+    elseif tab and rt.owned[abs] ~= nil then
+      rt.owned[abs].tab_id = tab
+      rt.owned[abs].rel = rel
+    end
+  end
+
+  st.review_tabs = rt
+  if cur_tab and vim.api.nvim_tabpage_is_valid(cur_tab) then
+    pcall(vim.api.nvim_set_current_tabpage, cur_tab)
+  end
+  if cur_win and vim.api.nvim_win_is_valid(cur_win) then
+    pcall(vim.api.nvim_set_current_win, cur_win)
+  end
+  review_tabs_save_state(st, opts)
+  return rt
 end
 
 -- 16 hex chars of the content hash, for refusal records only. Never the
@@ -1001,10 +1279,87 @@ local function open_review_buffer(change, preview)
   -- `target` (below) never diverges from what is already on screen.
   if change._retrace_reintegration and existing > 0 and vim.api.nvim_buf_is_loaded(existing) then
     local cur = diff.buffer_text_normalized(existing)
-    if diff.text_equal_snapshot(cur, change.after or "") then
+    local target = change.after or ""
+    -- `rewind_restore` parks `rec.open_text` (the watched proposal snapshot,
+    -- which may include absorbed human edits) while `change.after` stays the
+    -- raw agent turn. Native `<C-r>` after a floor `u` lands on the watched
+    -- bytes, not necessarily on `change.after` (property seed 87008 step 35).
+    if change._rewind_restored and type(change._parked_review) == "table" and type(change._parked_review.staged_text) == "string" then
+      target = change._parked_review.staged_text
+    end
+    if diff.text_equal_snapshot(cur, target) then
       change.disk_at_open = diff.read_file_bytes(path)
       change.undo_pre_stage_seq = buf_undo_seq(existing)
       return existing, nil
+    end
+  end
+
+  -- PARKED-ALREADY-STAGED FAST PATH (class fix, issue 7 / ruling 75's redo
+  -- corruption row, r75_redo_paint_matches_proposal's `redo3-extra`).
+  --
+  -- The retrace fast path above only fires when THIS press's own mechanism
+  -- (a cross-file undo reintegration) stamped `_retrace_reintegration`. An
+  -- ORDINARY parked review -- the queue simply handing the file back after
+  -- some OTHER file's decision closed it, never touched by any undo/redo --
+  -- has the exact same property that fast path exists to protect: its
+  -- buffer was never edited while parked, so it already holds precisely
+  -- `change._parked_review.staged_text`. Falling through to the ordinary
+  -- path below (`diff.reload_file` + `stage()`, then `M.open`'s own
+  -- `insert_new_lines` + `set_lines(parked.staged_text)`) writes that SAME
+  -- content back, sealing real, undo-tree-visible entries that are
+  -- byte-identical to what was already there -- invisible to Yana's own
+  -- decision/redo bookkeeping (they name no hunk, no register row), but
+  -- REAL forward branches a later cross-file `u` can walk BEHIND (via its
+  -- own `:undo <pre_seq>`, landing at an earlier, real decision boundary)
+  -- and a subsequent native `:redo` fallback -- nothing left in Yana's own
+  -- cross-file redo register, ruling #100's "a press Yana does nothing for
+  -- must look exactly as if Yana were not installed" -- can then walk BACK
+  -- INTO, landing on a stale intermediate state instead of reporting
+  -- nothing to redo.
+  --
+  -- MEASURED: `r75_redo_paint_matches_proposal`'s `redo3-extra`.
+  -- `diff.reload_file`'s own disk-reload state (raw pre-agent bytes, every
+  -- hunk's proposal stripped -- disk never carries the agent's proposal at
+  -- all, E7) sat as an orphaned child one step ahead of where the cross-file
+  -- walk's own `:undo` had left the buffer, and a plain `<C-r>` landed on
+  -- it, corrupting the paint to 0 painted rows against 1 pending line
+  -- ("hunk 3 no longer matches the buffer -- its highlight is withdrawn").
+  --
+  -- `_parked_already_staged` is named SEPARATELY from `_retrace_reintegration`
+  -- on purpose: it must skip only the restage writes (here, and mirrored in
+  -- `M.open`'s own `insert_new_lines`/`set_lines(parked.staged_text)`), not
+  -- the other retrace-specific behaviour that flag also gates (reviews_opened
+  -- counting, `M._announce_open_failure`'s suppressed notice) -- this reopen
+  -- is an ordinary queue advance, not a retrace event, and must keep looking
+  -- like one everywhere except the phantom-write it shares the same fix with.
+  if
+    not change._retrace_reintegration
+    and existing > 0
+    and vim.api.nvim_buf_is_loaded(existing)
+    and type(change._parked_review) == "table"
+    and type(change._parked_review.staged_text) == "string"
+  then
+    local cur = diff.buffer_text_normalized(existing)
+    if diff.text_equal_snapshot(cur, change._parked_review.staged_text) then
+      -- Snapshot equality alone cannot separate Yana-owned park state from an
+      -- outside-hunk human edit captured into the same park snapshot (P118).
+      -- Discriminator is the buffer's modified bit after reject_block_at's
+      -- truthful recompute (ruling 79): review-owned park leaves modified
+      -- false (or dirty explained by sealed accepts); unrelated dirtiness
+      -- keeps modified true and must fall through to the refusal below.
+      -- Do NOT require cur == before — that breaks parked reopen with
+      -- still-pending green hunks (r75 redo paint).
+      local dirty = vim.bo[existing].modified
+      if dirty
+        and not M._parked_dirty_explained_by_decisions(change, change._parked_review)
+      then
+        -- fall through
+      else
+        change._parked_already_staged = true
+        change.disk_at_open = diff.read_file_bytes(path)
+        change.undo_pre_stage_seq = buf_undo_seq(existing)
+        return existing, nil
+      end
     end
   end
 
@@ -1305,13 +1660,16 @@ local function nearest_block(blocks, bufnr, direction)
   return direction == "next" and blocks[1] or blocks[#blocks]
 end
 
-local function jump_to_block(bufnr, block)
+local function land_on(path, bufnr, block)
+  if path and not focus_buf(path, bufnr) then
+    return false
+  end
   if not block then
-    return
+    return true
   end
   local win = win_for_buf(bufnr)
   if not win then
-    return
+    return false
   end
   -- Clamp, and never throw. A pure-deletion hunk at the end of the file
   -- shrinks the buffer below new_start_line, and an unprotected set_cursor
@@ -1325,6 +1683,7 @@ local function jump_to_block(bufnr, block)
   pcall(vim.api.nvim_win_call, win, function()
     vim.cmd("normal! zz")
   end)
+  return true
 end
 
 local function insert_new_lines(bufnr, blocks)
@@ -1475,13 +1834,32 @@ end
 --- taken, are LEFT AS BUFFER TEXT and counted for the caller's WARN. Neither
 --- is a refused save: CORE requires that a human save is never blocked.
 ---
+--- `range`, when given, is `{q1, q2}` -- an inclusive LIVE-buffer line range
+--- (1-indexed) -- and restricts the OUTPUT to whatever falls in that slice,
+--- the same way ruling 72 restricts `:w` to buffer-owned text. This is what
+--- lets `:{range}w file` / `:{range}w >>file` (Vim's FileWriteCmd /
+--- FileAppendCmd -- ruling 72/87, "saving a copy to another path" keeps
+--- hunk ownership scoped to the requested range) compose only the slice
+--- the human asked for, through
+--- this SAME function, rather than a second one. A verbatim buffer line is
+--- kept iff its own line number falls in the range. A pending hunk's
+--- withheld replacement is indivisible -- there is no such thing as half a
+--- withheld hunk -- so it is kept whenever the range touches ANY of the
+--- hunk's live span (a pure-deletion hunk's empty span collapses to its
+--- insertion point for this test). `range == nil` means "the whole buffer",
+--- byte-identical to this function's pre-ranged behaviour.
+---
 --- Returns: composed lines, hunks actually withheld, first skip reason or nil,
 --- number skipped.
-function M._compose_buffer_owned_lines(bufnr, blocks)
+function M._compose_buffer_owned_lines(bufnr, blocks, range)
   local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
   if #lines == 1 and lines[1] == "" then
     -- Vim's forced blank line is not a line of the file.
     lines = {}
+  end
+  local q1, q2
+  if range then
+    q1, q2 = range[1], range[2]
   end
   local ranges, skipped, first_reason = {}, 0, nil
   for _, block in ipairs(blocks or {}) do
@@ -1513,18 +1891,34 @@ function M._compose_buffer_owned_lines(bufnr, blocks)
       reach = math.max(reach, r.e)
     end
   end
+  local function want_line(i)
+    return not q1 or (i >= q1 and i <= q2)
+  end
+  local function want_hunk(r)
+    if not q1 then
+      return true
+    end
+    local eff_e = math.max(r.s, r.e)
+    return r.s <= q2 and eff_e >= q1
+  end
   local out, cursor = {}, 1
   for _, r in ipairs(kept) do
     for i = cursor, r.s - 1 do
-      out[#out + 1] = lines[i]
+      if want_line(i) then
+        out[#out + 1] = lines[i]
+      end
     end
-    for _, line in ipairs(r.old) do
-      out[#out + 1] = line
+    if want_hunk(r) then
+      for _, line in ipairs(r.old) do
+        out[#out + 1] = line
+      end
     end
     cursor = math.max(cursor, r.e + 1)
   end
   for i = cursor, #lines do
-    out[#out + 1] = lines[i]
+    if want_line(i) then
+      out[#out + 1] = lines[i]
+    end
   end
   return out, #kept, first_reason, skipped
 end
@@ -1589,7 +1983,51 @@ end
 -- hunk, `end_line < start_line`) is untouched by this function no longer
 -- reading them.
 local function reject_restoration(bufnr, block, start_line, end_line)
-  return block.old_lines or {}, nil
+  local old_lines = block.old_lines or {}
+  if end_line < start_line then
+    return old_lines, nil
+  end
+  local live = vim.api.nvim_buf_get_lines(bufnr, start_line - 1, end_line, false)
+  local new_lines = block.new_lines or {}
+  if #live <= #new_lines then
+    return old_lines, nil
+  end
+  local remaining = {}
+  for _, line in ipairs(new_lines) do
+    remaining[line] = (remaining[line] or 0) + 1
+  end
+  local function standalone_human_line(line)
+    if vim.tbl_contains(new_lines, line) then
+      return false
+    end
+    for _, nl in ipairs(new_lines) do
+      if #nl > 0 and line:sub(1, #nl) == nl and #line > #nl then
+        return false
+      end
+    end
+    return true
+  end
+  local human_inserts = {}
+  local agent_seen = 0
+  for _, line in ipairs(live) do
+    if remaining[line] and remaining[line] > 0 then
+      remaining[line] = remaining[line] - 1
+      agent_seen = agent_seen + 1
+    elseif standalone_human_line(line) then
+      human_inserts[#human_inserts + 1] = { after = agent_seen, text = line }
+    else
+      agent_seen = agent_seen + 1
+    end
+  end
+  if #human_inserts == 0 then
+    return old_lines, nil
+  end
+  local out = vim.deepcopy(old_lines)
+  for _, h in ipairs(human_inserts) do
+    local pos = math.min(h.after + 1, #out + 1)
+    table.insert(out, pos, h.text)
+  end
+  return out, nil
 end
 
 local function resolve_disk_unchanged(change)
@@ -1700,9 +2138,6 @@ local function apply_review_blocks_to_reloaded_disk(base, disk_now, blocks)
     relocated = math.max(1, relocated)
     local old_count = #block.old_lines
     local replacement = vim.deepcopy(block.new_lines)
-    if #replacement > 0 and replacement[#replacement] == "" then
-      table.remove(replacement)
-    end
     if old_count > 0 and relocated + old_count - 1 > #lines then
       return nil, "conflict: reviewed hunk could not be relocated after reload"
     end
@@ -1736,9 +2171,9 @@ local function capture_live_authority_ranges(bufnr, blocks)
   return out
 end
 
---- Within the live authority range, paint only rows whose text matches the
---- hunk's own new_lines (earliest unclaimed row per line). Interior human
---- inserts become gaps between spans.
+--- Within the live authority range, paint only rows whose text is still one of
+--- the hunk's own `new_lines` (mark-derived position, multiset match — no
+--- forward text search). Interior human inserts are gaps between spans.
 local function paint_spans_for_block(bufnr, block, start_line, end_line)
   if #block.new_lines == 0 then
     return {}
@@ -1746,37 +2181,22 @@ local function paint_spans_for_block(bufnr, block, start_line, end_line)
   if end_line < start_line then
     return {}
   end
-  local spans = {}
-  local search_from = start_line
+  local remaining = {}
   for _, want in ipairs(block.new_lines) do
-    local found = nil
-    for r = search_from, end_line do
-      local line = (vim.api.nvim_buf_get_lines(bufnr, r - 1, r, false) or {})[1]
-      if line == want then
-        found = r
-        break
+    remaining[want] = (remaining[want] or 0) + 1
+  end
+  local spans = {}
+  for r = start_line, end_line do
+    local line = (vim.api.nvim_buf_get_lines(bufnr, r - 1, r, false) or {})[1]
+    if remaining[line] and remaining[line] > 0 then
+      remaining[line] = remaining[line] - 1
+      local last = spans[#spans]
+      if last and last.last + 1 == r then
+        last.last = r
+      else
+        spans[#spans + 1] = { first = r, last = r }
       end
     end
-    if not found then
-      -- SKIP, do not abort. A line the human has replaced is one line the
-      -- product cannot claim; it is not a reason to stop claiming the rest of
-      -- the hunk. Aborting here painted nothing for a hunk whose FIRST line had
-      -- been edited even though its remaining lines were still the agent's,
-      -- word for word — found by the property runner, which asked for
-      -- [3,5,7,8] and got [5,7,8] after one `replace_inside`.
-      --
-      -- `search_from` is deliberately not advanced: nothing was consumed, so
-      -- the next line of the hunk may legitimately match at the same row.
-      goto continue
-    end
-    local last = spans[#spans]
-    if last and last.last + 1 == found then
-      last.last = found
-    else
-      spans[#spans + 1] = { first = found, last = found }
-    end
-    search_from = found + 1
-    ::continue::
   end
   return spans
 end
@@ -1943,17 +2363,36 @@ local function highlight_blocks(bufnr, blocks)
       :totable()
     local deleted_above = #block.new_lines > 0 or start_line == 1
     local deleted_row = deleted_above and (start_line - 1) or (end_line_1 - 1)
+    -- INVARIANT: every row this function hands to nvim_buf_set_extmark is
+    -- clamped to the CURRENT buffer's bounds -- `start_line`/`end_line_1`
+    -- come from `live[block]`, which falls back to `block.new_start_line`/
+    -- `new_end_line` whenever a block has no authority_extmark_id (see
+    -- capture_live_authority_ranges above). Those fallback fields are only
+    -- ever advanced by absorb_human_edits' own bookkeeping and can go stale
+    -- the instant the buffer is replaced wholesale out from under them (an
+    -- external rewrite reloaded via `:checktime`/autoread fires this
+    -- function's caller, `render_blocks`, from the buffer-watch's on_lines
+    -- callback BEFORE the reload's own conflict handler has had a chance to
+    -- tear the stale review down -- a scheduling race, not a positional
+    -- one). The position argument below was already clamped; `end_row` was
+    -- not, so a stale deleted_row past the new, smaller buffer threw
+    -- "Invalid 'end_row': out of range" and the traceback aborted the
+    -- repaint mid-block. Clamping both ends of the same call the same way
+    -- makes the extmark call itself total over any row math this module can
+    -- produce, however stale -- no code path needs to reason about the
+    -- staleness case separately.
+    local deleted_row_clamped = math.min(math.max(deleted_row, 0), line_count - 1)
     block.delete_extmark_id = vim.api.nvim_buf_set_extmark(
       bufnr,
       NS,
-      math.min(math.max(deleted_row, 0), line_count - 1),
+      deleted_row_clamped,
       0,
       {
         virt_lines = deleted_virt,
         virt_lines_above = deleted_above,
         hl_eol = true,
         hl_mode = "combine",
-        end_row = deleted_row,
+        end_row = deleted_row_clamped,
         right_gravity = false,
         end_right_gravity = true,
       }
@@ -2354,6 +2793,48 @@ local function announce_state()
   end
 end
 
+-- R8: `YanaReviewSettled`, a `User` autocmd fired exactly when a
+-- review-state transition has FULLY applied -- paint, extmarks and the
+-- decision register all consistent for the buffer named in `data.buf`.
+-- Replaces 13 rows' fixed-delay "nothing happened" waits (issue 54 bucket
+-- (b)) with a positive signal a test (or a real integration) can
+-- `autocmd User YanaReviewSettled` on instead of guessing a timeout.
+--
+-- NOT a single pre-existing funnel: `announce_state()` above looks like the
+-- one function every transition passes through, but it is not -- a per-hunk
+-- accept/reject that leaves the review open (`accept_block_at`/
+-- `reject_block_at`) never calls it; only a FULL close does (`finish_session`
+-- and its three tails). Verified by reading every call site (2026-08-26).
+-- So this is the documented fallback: one shared helper, called at each
+-- transition's own tail, always strictly after that transition's own
+-- `render_blocks`/`render_invariant` call -- never before.
+--
+-- `bufnr`/`turn` are read back off `data` by `wait_settled`
+-- (tests/headless/lib/settled.lua) so a caller can filter to the exact
+-- buffer/turn it just drove, and `reason` names WHICH transition settled
+-- (`"open"`, `"accept_hunk"`, `"reject_hunk"`, `"accept_file"`,
+-- `"reject_file"`, `"abort"`, `"undo_decision"`, `"native_undo"`,
+-- `"redo_decision"`, `"native_redo"`, `"reload"`; that is the full list,
+-- mirrored in `:help yana-events`). `pcall`-guarded like `announce_state`:
+-- a throwing `autocmd User`
+-- handler is the LISTENER's bug, and must not break the engine emitting it.
+--
+-- Defined as `M._emit_review_settled`, not a bare local: `M.open` (the
+-- function every hunk/undo/redo/reload closure below is nested inside) is
+-- already at Lua's 60-upvalue ceiling -- `M` itself is already one of its
+-- upvalues (`M._test`, `M.cleanup`, `M.build_diff_blocks`, ... are called
+-- from inside it throughout), so reaching this function as an `M` FIELD
+-- adds zero new upvalues to every nested closure that calls it. A bare
+-- local here reds `M.open` at load time: measured directly (the first
+-- version of this change did exactly that --
+-- "function at line 6339 has more than 60 upvalues").
+function M._emit_review_settled(bufnr, turn, reason)
+  pcall(vim.api.nvim_exec_autocmds, "User", {
+    pattern = "YanaReviewSettled",
+    data = { buf = bufnr, turn = turn, reason = reason },
+  })
+end
+
 -- M.open installs real, buffer-visible side effects -- an augroup, the
 -- BufWriteCmd write guard, buffer-local review keymaps, extmarks, winhl --
 -- and then keeps going. A throw anywhere after `active = state` used to leave
@@ -2472,6 +2953,13 @@ end
 
 local process_next_for
 
+--- Forward declaration. Defined with the rest of the rewind machinery in
+--- "WHOLE-REVIEW REWIND AT THE SINGLE INSERT BOUNDARY" far below, and used
+--- up here by `schedule_queue_advance`: deferred work started while Yana
+--- owns a transaction is still Yana's own transaction, and must run under
+--- the same guard rather than after it.
+local rewind_schedule
+
 local function process_next_impl(st)
   if st.active or #st.queue == 0 then
     return nil
@@ -2508,7 +2996,13 @@ local function schedule_queue_advance(state)
   if state._skip_queue_advance then
     return
   end
-  vim.schedule(function()
+  -- `rewind_schedule`, not `vim.schedule`. A queue advance is almost always
+  -- queued by a close, and a close inside the cross-file retrace walk (a redo
+  -- putting the last decision back, say) belongs to that walk: the advance
+  -- opens the NEXT file's review and stages its proposal bytes, and those
+  -- bytes are Yana's, not the operator time travelling. Outside a hold this
+  -- is exactly `vim.schedule`.
+  rewind_schedule(function()
     process_next_for(state.opts)
   end)
 end
@@ -2702,7 +3196,17 @@ local function park_and_open_state(state, direction, target_item, landing)
   -- (row 112's measured "b.py has 0 painted bands after the undo chain").
   -- Only the retrace asks for this: ordinary `]x`/`[x` parking is navigation
   -- and still leaves the file it steps away from clean.
-  if target_item and target_item.retrace_repaint and bufnr and vim.api.nvim_buf_is_valid(bufnr) then
+  --
+  -- Not when the file being opened IS this file: a reintegration that
+  -- reopens the same buffer (a second `u` into a file the first `u` already
+  -- reopened) rebuilds every hunk from the turn-start model and paints them
+  -- itself. Painting the parked blocks here first describes lines the walk
+  -- has just moved and withdraws a hunk that is not stale ("hunk ? no
+  -- longer matches the buffer"; r75_redo_replays_mixed_decisions_in_order).
+  local same_file = target_item
+    and type(target_item.change) == "table"
+    and (target_item.change.rel or target_item.change.path) == (change.rel or change.path)
+  if target_item and target_item.retrace_repaint and not same_file and bufnr and vim.api.nvim_buf_is_valid(bufnr) then
     render_blocks(bufnr, pending_blocks, {
       site = "review_parked_retrace",
       model = state.model_hunks,
@@ -2719,6 +3223,28 @@ local function park_and_open_state(state, direction, target_item, landing)
   if not target_change then
     return false
   end
+  -- NEVER OPEN DIRECTLY OVER A STALE QUEUE DUPLICATE. `ordered_target_for_state`
+  -- (ordinary `]x`/`[x` navigation) already dequeues its target with
+  -- `queue_remove_change` before building `target_item` -- but retrace's own
+  -- takeover (`bring_review_forward`/`reintegrate` in
+  -- `lua/yana/timeline/retrace.lua`) hands this a bare `{change=...}` table
+  -- without doing so, because that file's own `change` may still be sitting
+  -- in `st.queue` from an earlier park. Opening it here (below) sets
+  -- `st.active` directly, bypassing `process_next_impl`'s own queue pop, so
+  -- the old queue entry survives pointing at the SAME change. When this
+  -- review later closes, `finish_session`'s `schedule_queue_advance` runs
+  -- `process_next_impl`, which pops that stale entry and reopens the
+  -- already-resolved change from scratch -- resurrecting a cleanly closed
+  -- review as `active_state()` again with a freshly rebuilt (non-empty)
+  -- `diff_blocks`, even though `change.status` is no longer "pending".
+  -- Measured: charlie's closed review reappearing during redo4 of a 4-file
+  -- walk (`r75_four_file_walk_mirror`'s `[mirror]`/`[cA]` rows) -- charlie's
+  -- own review had been directly opened this way at redo3, three presses
+  -- after its queue entry was parked at u3, and never dequeued in between.
+  -- Removing any stale entry HERE, once, covers every caller that reaches
+  -- this primitive (idempotent when the caller already dequeued) rather than
+  -- requiring each direct-open call site to remember to do it itself.
+  queue_remove_change(st, target_change)
   local ok, err = open_or_abandon(target_change, target_item.opts)
   if ok and st.active and st.active.change == target_change then
     target_change._nav_refusal_announced = nil
@@ -2732,7 +3258,7 @@ local function park_and_open_state(state, direction, target_item, landing)
         local block = want_first
             and active_state.diff_blocks[1]
           or active_state.diff_blocks[#active_state.diff_blocks]
-        jump_to_block(active_state.bufnr, block)
+        land_on(target_change.path, active_state.bufnr, block)
       end
     end)
     return true
@@ -2772,13 +3298,13 @@ local function navigate_or_park_state(state, direction)
   local blocks = state and state.diff_blocks or {}
   local block, idx = current_block(blocks, bufnr)
   if not block then
-    jump_to_block(bufnr, nearest_block(blocks, bufnr, direction))
+    land_on(state.change and state.change.path, bufnr, nearest_block(blocks, bufnr, direction))
     return
   end
   local at_edge = (direction == "next" and idx == #blocks)
     or (direction == "prev" and idx == 1)
   if not at_edge then
-    jump_to_block(bufnr, nearest_block(blocks, bufnr, direction))
+    land_on(state.change and state.change.path, bufnr, nearest_block(blocks, bufnr, direction))
     return
   end
   local item, end_msg = ordered_target_for_state(state, direction)
@@ -2789,6 +3315,47 @@ local function navigate_or_park_state(state, direction)
   park_and_open_state(state, direction, item)
 end
 M._navigate_or_park_state = navigate_or_park_state
+
+local function active_state_for_global_navigation()
+  local current = pool_for({}).active
+  if current then
+    return current
+  end
+  for _, st in pairs(pools) do
+    if st.active then
+      return st.active
+    end
+  end
+  return nil
+end
+
+--- Global `]x`/`[x`. Returns `true` when Yana navigated, and otherwise
+--- `false` plus a REASON the caller can act on:
+---
+---   "no-review"   Yana has nothing to navigate. Not a failure and not worth
+---                 a message: the caller (init.lua) stands aside and lets
+---                 whatever else owns the key run, and a notification on
+---                 every press of the user's own key is pure noise.
+---   "bad-direction" / "focus-failed"
+---                 real navigation failures. `focus-failed` means a review IS
+---                 open and Yana could not get to its buffer, which the user
+---                 has to be told about -- it is not fallthrough.
+function M.navigate_active_review(direction)
+  if direction ~= "next" and direction ~= "prev" then
+    return false, "bad-direction"
+  end
+  local state = active_state_for_global_navigation()
+  if not state then
+    return false, "no-review"
+  end
+  if not focus_buf(state.change.path, state.bufnr) then
+    notify_one_line("yana: cannot open the reviewed file " .. tostring(state.change.path), vim.log.levels.WARN)
+    return false, "focus-failed"
+  end
+  navigate_or_park_state(state, direction)
+  return true
+end
+
 -- Exposed for `lua/yana/timeline/retrace.lua`'s reintegration seam (FIX-UNDO
 -- lane, this session), same pattern as `M._navigate_or_park_state` above: a
 -- reversed hunk must come back where the operator can decide it RIGHT NOW,
@@ -2925,6 +3492,20 @@ function M._register_decisions(ws, rel, reverted_ids)
         newest[n] = e
         any = true
       end
+    elseif e.regime == "buffer" and (e.kind == "file_accepted" or e.kind == "file_rejected") and type(e.members) == "table" then
+      -- RULING 75: a file-level `ca`/`cb` is ONE row covering N hunks
+      -- (`members`), never one `hunk_accepted`/`hunk_rejected` row per hunk.
+      -- Append order still decides "last decision per hunk wins": a later
+      -- row (of either shape) for the same hunk number simply overwrites
+      -- this one, exactly as two `hunk_accepted` rows for the same hunk
+      -- already do above.
+      for _, m in ipairs(e.members) do
+        local n = tonumber(m.hunk)
+        if n then
+          newest[n] = e
+          any = true
+        end
+      end
     end
   end
   if not any then
@@ -2933,7 +3514,7 @@ function M._register_decisions(ws, rel, reverted_ids)
   local out = {}
   for n, e in pairs(newest) do
     if e.state == "done" and not (reverted_ids and reverted_ids[n] == e.id) then
-      out[n] = (e.kind == "hunk_accepted") and "accepted" or "rejected"
+      out[n] = (e.kind == "hunk_accepted" or e.kind == "file_accepted") and "accepted" or "rejected"
     end
   end
   return out
@@ -3073,6 +3654,47 @@ end
 --- @return table|nil pair {before=..., after=...}
 --- @return table|nil withdrawn list of hunk names withdrawn from the reopen
 --- @return string|nil reason why no pair could be built
+--- The walk's per-hunk "reverted" memory (`change._retrace_reverted`, keyed
+--- by hunk number -> row id) forgets one hunk when a redo puts that exact row
+--- back; a later reopen then reads the row as the decision it is again.
+function M._retrace_forget_reverted(change, hunk, id)
+  local acc = type(change) == "table" and change._retrace_reverted
+  if type(acc) ~= "table" or hunk == nil then
+    return
+  end
+  if acc[hunk] == id then
+    acc[hunk] = nil
+  end
+end
+
+--- The turn-start hunk number of a live block (the number the register's
+--- "accept hunk N" labels use). `model_index` when stamped; otherwise found by
+--- content in the turn-start pair (`change._retrace_model`, else
+--- before/after) -- a reintegrated review opened through `M.open` carries no
+--- stamp (measured: redo refused "hunk 2 is not pending", calib/clip3.sim).
+function M._hunk_number_for_block(change, block)
+  if type(block) ~= "table" then
+    return nil
+  end
+  if block.model_index ~= nil then
+    return block.model_index
+  end
+  local model = type(change) == "table" and (change._retrace_model or { before = change.before, after = change.after }) or nil
+  if not (model and type(model.before) == "string" and type(model.after) == "string") then
+    return nil
+  end
+  local ok, blocks = pcall(M.build_diff_blocks, model.before, model.after)
+  if not ok or type(blocks) ~= "table" then
+    return nil
+  end
+  for n, b in ipairs(blocks) do
+    if vim.deep_equal(b.new_lines or {}, block.new_lines or {}) and vim.deep_equal(b.old_lines or {}, block.old_lines or {}) then
+      return n
+    end
+  end
+  return nil
+end
+
 function M.reopen_from_register(ws, rel, bufnr, decisions, reverted_ids)
   if type(rel) ~= "string" or rel == "" then
     return nil, nil, "no rel"
@@ -3100,6 +3722,16 @@ function M.reopen_from_register(ws, rel, bufnr, decisions, reverted_ids)
   if type(blocks) ~= "table" or #blocks == 0 then
     return nil, nil, "no hunks in the turn-start pair for " .. rel
   end
+  -- The turn-start hunk number IS the register's hunk number ("accept hunk
+  -- N" labels, `_register_decisions`, redo by hunk): stamp it so a reopened
+  -- block can be found by it. Unstamped, a redo of a walk-reverted decision
+  -- refused "hunk N is not pending" and the withdraw message said "hunk ?"
+  -- (measured, calib/clip3.sim replay 2026-08-23).
+  for n, b in ipairs(blocks) do
+    if b.model_index == nil then
+      b.model_index = n
+    end
+  end
   -- Decision 57: a hunk the human typed INTO carries THEIR lines as its
   -- proposal from that moment on (`absorb_human_edits`). The turn-start text
   -- is what the model pins, so the absorbed proposal is overlaid here, per
@@ -3125,6 +3757,15 @@ function M.reopen_from_register(ws, rel, bufnr, decisions, reverted_ids)
     end
     for n, id in pairs(reverted_ids) do
       acc[n] = id
+    end
+    local land_model = nil
+    for n, _ in pairs(reverted_ids) do
+      if type(n) == "number" and (land_model == nil or n < land_model) then
+        land_model = n
+      end
+    end
+    if land_model ~= nil then
+      change._retrace_land_model_index = land_model
     end
   end
   decisions = decisions or M._register_decisions(ws, rel, change._retrace_reverted)
@@ -3507,7 +4148,7 @@ local function focus_turn_first_hunk(state)
     return false
   end
   if first == state.change then
-    jump_to_block(state.bufnr, state.diff_blocks and state.diff_blocks[1])
+    land_on(state.change and state.change.path, state.bufnr, state.diff_blocks and state.diff_blocks[1])
     return true
   end
   local item = queue_remove_change(st, first)
@@ -3589,10 +4230,15 @@ function M._record_shadow_accept_refusal(state, err)
   local change = state.change
   local turn_log = change_ledger(change, state.opts)
   change.review_error = tostring(err or "accept failed")
+  local raw_detail = change.shadow_refusal
   ledger.record_decision(turn_log, {
     action = "review_refused",
     actor = "system",
-    reason = "shadow_accept_failed",
+    -- The diary's own machine-readable slug when it produced one -- every one
+    -- of its five refusal categories does, as of the refusal-evidence delta --
+    -- falling back to the legacy bare label only for a refusal that never
+    -- reached the diary at all (e.g. a claim conflict raised in this engine).
+    reason = (type(raw_detail) == "table" and raw_detail.reason_code) or "shadow_accept_failed",
     detail = tostring(err),
     change_id = change.id,
     rel = change.rel or change.path,
@@ -3609,6 +4255,34 @@ function M._record_shadow_accept_refusal(state, err)
     end
   end
   ledger.attach_refusal(turn_log, detail)
+  -- DURABLY, not only in the in-memory ledger (issue: a refusal's evidence
+  -- lived only in the turn journal and the in-memory ledger; the operator
+  -- reads the session log (yana.log), and evidence that never reaches it does
+  -- not exist in practice). Gated by YANA_LIFECYCLE_LOG exactly like every
+  -- other `review.decision` row, so a clean/quiet turn still writes nothing.
+  -- Hashes only cross this boundary, already truncated to 16 hex characters
+  -- by the diary (`diary.lua`'s stale-file record): no content, ever.
+  log.lifecycle_later("review.decision", {
+    turn_id = change and (change.turn_id or change.turn_gen),
+    generation = change and change.turn_gen,
+    action = "review_refused",
+    actor = "system",
+    path = change.rel or change.path,
+    change_id = change.id,
+    -- Mutation seam (gate): `omit_session_log_reason_code` reproduces the
+    -- pre-this-delta session log line, which never carried the diary's
+    -- machine-readable slug at all (issue: "the session log line showed none
+    -- of them").
+    reason_code = (not M._test.fault.omit_session_log_reason_code)
+      and (type(detail) == "table" and detail.reason_code or nil)
+      or nil,
+    reason = (type(detail) == "table" and detail.reason) or "shadow_accept_failed",
+    expected_fp = type(detail) == "table" and detail.expected_fp or nil,
+    actual_fp = type(detail) == "table" and detail.actual_fp or nil,
+    expected_state = type(detail) == "table" and detail.expected_state or nil,
+    found_state = type(detail) == "table" and detail.found_state or nil,
+    base_hash_captured_ts = type(detail) == "table" and detail.base_hash_captured_ts or nil,
+  })
   change.status = "pending"
   notify_one_line(
     "yana: shadow accept failed for " .. (change.rel or change.path) .. ": " .. tostring(err),
@@ -3747,83 +4421,140 @@ local function finish_session(state, accepted)
       -- the same function reject_block_at calls, so the two paths cannot
       -- disagree about the same keystroke.
       --
-      -- Last hunk first: each range is resolved immediately before its own
-      -- replacement, so a line-count change in one hunk cannot shift a range
-      -- already read for another.
+      -- ONE FILE-LEVEL DECISION, ONE REGISTER ROW / ONE UNDO ENTRY (ruling
+      -- 75). `state.timeline_bulk_reject` (set only by `reject_all`'s fresh
+      -- whole-file branch) turns off the PER-HUNK `break_undo_block` calls
+      -- below, so Neovim's own tree collapses every hunk's restoration into
+      -- ONE step -- exactly the "before this, the whole file collapsed into
+      -- one undo state" shape `break_undo_block`'s own comment describes,
+      -- deliberately restored here because ruling 75 amends `u` to be per
+      -- FILE-LEVEL-DECISION, not per hunk, for `ca`/`cb`. Every other caller
+      -- of this reject path (`close_active`, panel-level reject, `U`'s
+      -- abort) leaves the flag unset and keeps the old per-hunk-undo-block,
+      -- no-timeline-row behaviour unchanged.
+      local bulk = state.timeline_bulk_reject
+      local bulk_redo_of = state.timeline_bulk_redo_of
       local blocks = state.diff_blocks or {}
-      for i = #blocks, 1, -1 do
-        local block = blocks[i]
-        local start_line, end_line, range_err = live_block_range(bufnr, block)
-        if start_line then
-          local restored = reject_restoration(bufnr, block, start_line, end_line)
-          -- The ruling's `u` is per HUNK, and this loop is the one place the
-          -- engine rewrites several hunks without the operator touching the
-          -- keyboard between them -- so it is the one place a boundary has to
-          -- be asked for rather than inherited from the main loop's idle.
-          -- The loop runs last hunk first (see above: ranges must be read
-          -- immediately before their own replacement), so `u` walks the
-          -- restorations back FIRST hunk first. There is no operator ordering
-          -- to preserve here: reject-file is a single decision, and what the
-          -- ruling asks for is that one press gives back one hunk.
+      if bulk and bulk_redo_of then
+        -- REDO OF A BULK FILE-LEVEL REJECT (ruling 75, one register). The
+        -- cross-file `u` restored these bytes with Neovim's own `:undo`
+        -- (walk_impl.lua's generic buffer step -- this row is ordinary in
+        -- every way except that it covers several hunks), so the tree's
+        -- next state forward IS this rejection's bytes, all in ONE seq.
+        -- Take it back with a single `:redo` -- the same trust
+        -- `reject_block_at`'s own `redo_of` branch places in the tree,
+        -- generalised to the whole file rather than one hunk.
+        local pre_seq = buf_undo_seq(bufnr)
+        local ok_redo = pcall(vim.api.nvim_buf_call, bufnr, function()
+          vim.cmd("silent redo")
+        end)
+        if not ok_redo then
+          pcall(vim.api.nvim_buf_call, bufnr, function()
+            vim.cmd("silent undo " .. tonumber(pre_seq))
+          end)
+          ok, err = false, "redo could not restore the rejected file"
+        else
           break_undo_block(bufnr)
-          local pre_seq = buf_undo_seq(bufnr)
-          local replaced = (end_line >= start_line) and (end_line - start_line + 1) or 0
-          local restore_ok, restore_err = pcall(
-            vim.api.nvim_buf_set_lines,
-            bufnr,
-            start_line - 1,
-            end_line,
-            false,
-            restored
-          )
-          break_undo_block(bufnr)
-          if not restore_ok then
-            ok = false
-            err = tostring(restore_err)
-          else
-            local delta = #restored - replaced
-            local anchor = park_decision_anchor(
-              bufnr,
-              start_line,
-              start_line + math.max(#restored, 1) - 1
-            )
-            state.decisions[#state.decisions + 1] = {
-              action = "reject",
-              idx = i,
-              block = block,
-              delta = delta,
-              pre_seq = pre_seq,
-              post_seq = buf_undo_seq(bufnr),
-              anchor = anchor,
-            }
+          M._tl_head_row(state, bulk_redo_of, false)
+          state.timeline_obs = tl_observe(bufnr)
+          for _, block in ipairs(blocks) do
             block.authority_extmark_id = nil
             block.incoming_extmark_id = nil
             block.incoming_extmark_ids = nil
             block.delete_extmark_id = nil
-            record_decision(state, "reject_hunk", {
-              hunk = i,
-              model_index = block.model_index,
-              row = start_line,
-              old_count = #(block.old_lines or {}),
-              new_count = #(block.new_lines or {}),
-              source = "bulk_reject",
-            })
-            if state.timeline_bulk_reject then
-              local obs = tl_observe(bufnr)
-              obs.regime = "buffer"
-              tl_record(state, "hunk_rejected",
-                "reject hunk " .. tostring(block.model_index or i), obs)
-              state.timeline_obs = obs
-            end
           end
-        else
-          -- The hunk's position is no longer knowable, so there is nothing to
-          -- restore it over. Say so rather than falling back to the whole-buffer
-          -- snapshot: that fallback is the defect above.
-          notify_one_line(
-            "yana: reject left one hunk in place -- " .. tostring(range_err or "hunk invalidated"),
-            vim.log.levels.WARN
-          )
+        end
+      else
+        if bulk then
+          break_undo_block(bufnr)
+        end
+        local bulk_pre_seq = bulk and buf_undo_seq(bufnr) or nil
+        local bulk_members = bulk and {} or nil
+        -- Last hunk first: each range is resolved immediately before its own
+        -- replacement, so a line-count change in one hunk cannot shift a
+        -- range already read for another. When NOT bulk, `u` is still per
+        -- HUNK here (the shared callers above), so a boundary is asked for
+        -- around each one; when bulk, no boundary is asked for until the
+        -- whole loop is done, so every hunk lands in the SAME undo entry.
+        for i = #blocks, 1, -1 do
+          local block = blocks[i]
+          local start_line, end_line, range_err = live_block_range(bufnr, block)
+          if start_line then
+            local restored = reject_restoration(bufnr, block, start_line, end_line)
+            local pre_seq
+            if not bulk then
+              break_undo_block(bufnr)
+              pre_seq = buf_undo_seq(bufnr)
+            end
+            local replaced = (end_line >= start_line) and (end_line - start_line + 1) or 0
+            local restore_ok, restore_err = pcall(
+              vim.api.nvim_buf_set_lines,
+              bufnr,
+              start_line - 1,
+              end_line,
+              false,
+              restored
+            )
+            if not bulk then
+              break_undo_block(bufnr)
+            end
+            if not restore_ok then
+              ok = false
+              err = tostring(restore_err)
+            else
+              local delta = #restored - replaced
+              local anchor = park_decision_anchor(
+                bufnr,
+                start_line,
+                start_line + math.max(#restored, 1) - 1
+              )
+              state.decisions[#state.decisions + 1] = {
+                action = "reject",
+                idx = i,
+                block = block,
+                delta = delta,
+                pre_seq = bulk and bulk_pre_seq or pre_seq,
+                post_seq = bulk and nil or buf_undo_seq(bufnr),
+                anchor = anchor,
+              }
+              block.authority_extmark_id = nil
+              block.incoming_extmark_id = nil
+              block.incoming_extmark_ids = nil
+              block.delete_extmark_id = nil
+              record_decision(state, "reject_hunk", {
+                hunk = i,
+                model_index = block.model_index,
+                row = start_line,
+                old_count = #(block.old_lines or {}),
+                new_count = #(block.new_lines or {}),
+                source = "bulk_reject",
+              })
+              if bulk then
+                bulk_members[#bulk_members + 1] = {
+                  hunk = block.model_index or i,
+                  old_count = #(block.old_lines or {}),
+                  new_count = #(block.new_lines or {}),
+                }
+              end
+            end
+          else
+            -- The hunk's position is no longer knowable, so there is nothing to
+            -- restore it over. Say so rather than falling back to the whole-buffer
+            -- snapshot: that fallback is the defect above.
+            notify_one_line(
+              "yana: reject left one hunk in place -- " .. tostring(range_err or "hunk invalidated"),
+              vim.log.levels.WARN
+            )
+          end
+        end
+        if bulk and ok then
+          break_undo_block(bufnr)
+          local obs = tl_observe(bufnr)
+          obs.regime = "buffer"
+          obs.members = bulk_members
+          tl_record(state, "file_rejected",
+            "reject all " .. #bulk_members .. " hunk(s)", obs)
+          state.timeline_obs = obs
         end
       end
       if ok then
@@ -3906,6 +4637,20 @@ local function finish_session(state, accepted)
       )
     end
     announce_state()
+    if ok then
+      -- R8: the file-level close settled -- accept or reject, decided by
+      -- `change.status` (accept can still fail post-hoc reconcile above and
+      -- still be an applied settle; reject's `ok` is unconditional true in
+      -- this branch). `perform_whole_review_abort` sets `_abort_no_retrace`
+      -- just before its own `finish_session(state, false)` call -- the ONLY
+      -- caller that does -- so an abort is named `"abort"`, not
+      -- `"reject_file"`, even though it reaches this exact same tail.
+      M._emit_review_settled(
+        bufnr,
+        change.turn_id or change.turn_gen,
+        state._abort_no_retrace and "abort" or (change.status == "accepted" and "accept_file" or "reject_file")
+      )
+    end
     schedule_queue_advance(state)
     return ok == true
   end
@@ -3928,6 +4673,10 @@ local function finish_session(state, accepted)
     local st = pool_for_state(state)
     st.active = nil
     announce_state()
+    -- R8: preview always closes as a reject (see `change.status` just above
+    -- this branch) -- named `"reject_file"`, same as the ordinary case, so a
+    -- waiter does not need to know preview is a distinct mode.
+    M._emit_review_settled(bufnr, change.turn_id or change.turn_gen, "reject_file")
     schedule_queue_advance(state)
     -- Return contract: true only when the requested action completed. Preview
     -- never applies bytes, so an accept request closes without applying.
@@ -4039,28 +4788,51 @@ local function attach_buffer_watch(state)
     return node:parent()
   end
 
-  local function edge_line_is_yana_owned(edge_line, adjacent_hunk_line)
+  -- Ruling 73/89, generalised (paint-leak-o round 3): ownership-by-parent-
+  -- identity answers "is this text part of the hunk's own scope", which is
+  -- only a question TEXT can answer. A blank line (o/O immediately <Esc>'d,
+  -- no matter which edge) has no node of its own -- tree-sitter resolves an
+  -- empty row to whichever enclosing node's byte range happens to swallow
+  -- it, which coincides with the hunk's own parent whenever the hunk sits
+  -- at its block's own first/last statement. That coincidence is a parser
+  -- artifact, not a sibling relationship, so a blank edge line is refused
+  -- (never a CHILD) before parent identity is even consulted -- uniformly,
+  -- for both the trailing edge (below a hunk's last row) and the leading
+  -- edge (above a hunk's first row).
+  local function edge_line_is_yana_owned(bufnr, edge_line, adjacent_hunk_line)
+    local edge_text = (vim.api.nvim_buf_get_lines(bufnr, edge_line - 1, edge_line, false) or {})[1] or ""
+    if edge_text:match("^%s*$") then
+      return false
+    end
     local root = live_tree_root()
     if not root then
       return false
     end
     local edge_parent = direct_parent_for_line(root, edge_line)
     local adjacent_parent = direct_parent_for_line(root, adjacent_hunk_line)
-    if
-      edge_parent
-      and adjacent_parent
-      and edge_line == adjacent_hunk_line + 1
-      and (
-        (edge_parent:type() == "module" and adjacent_parent:type() == "block")
-        or (edge_parent:type() == "block" and adjacent_parent:type() == "module")
-      )
-    then
-      return true
-    end
+    -- REMOVED 2026-08-24: an override that called a module-level line owned by a
+    -- block-level hunk (or the reverse) whenever the two rows were ADJACENT.
+    -- The hunk-ownership rules already say the opposite -- a
+    -- human's `def review(abc):` beside a `load()` body hunk is `[no band]
+    -- buffer`, written to disk -- and the spec's own example draws it with a
+    -- BLANK LINE between the two rows, which is the one spelling this override
+    -- did not fire on. So the shipped behaviour matched the spec in the case the
+    -- spec wrote down and inverted it in the adjacent case nobody wrote down:
+    -- the human's `def` was withheld while the `pass` under it was written, and
+    -- their two-line function landed on disk cut in half.
+    -- Parent identity alone decides, as ruling 73/89 says. Rows:
+    -- `r128_adjacent_module_sibling_is_buffer` (adjacent / blank_line / child).
     return edge_parent ~= nil and adjacent_parent ~= nil and edge_parent == adjacent_parent
   end
 
+  --- Returns `all_absorbed`: true when every change in this batch landed
+  --- inside (or trailing) some pending hunk, per the loop below -- i.e.
+  --- nothing here is a FREE-STANDING edit. `tl_capture_human_edit` reads this
+  --- (via `state.free_standing_edit`) to decide whether the drift since its
+  --- last observation is a register step of its own or purely a hunk's own
+  --- bytes (ruling 75/73/57 -- see that function's comment).
   local function absorb_human_edits(changes)
+    local claimed = {}
     for i, block in ipairs(state.diff_blocks or {}) do
       -- Whether `end_line` below already reflects this edit's growth. The
       -- authority extmark auto-adjusts as edits land INSIDE it -- that is
@@ -4078,11 +4850,84 @@ local function attach_buffer_watch(state)
       local start_line, end_line = live_block_range(bufnr, block)
       local extends_block = false
       local extra_lines = 0
-      for _, change in ipairs(changes) do
+      -- paint-leak-o round 3: rows the CHILD/SIBLING test below refuses at
+      -- either edge, in this batch, that leave the raw authority mark
+      -- (read above, already gravity-grown over them -- MEASURED) tainted.
+      -- `refused_edge` drives the unconditional correction after the loop:
+      -- by construction, the band may only ever be rebuilt from rows this
+      -- function actually decided it owns.
+      local refused_edge = false
+      -- Rows absorbed at the LEADING edge (owned) or excluded there
+      -- (refused) both raise the window's own floor for the REST of this
+      -- batch -- see the MEASURED note below `leading_pure_insert`.
+      local leading_shift = 0
+      -- `ci` indexes `claimed` (ap/filelevel-2): a change absorbed by one
+      -- block must not be re-absorbed by the next.
+      for ci, change in ipairs(changes) do
         if start_line then
+          local effective_start_line = start_line + leading_shift
           local effective_end_line = end_line + extra_lines
+          local pure_insert = change.last_orig == change.first
+          -- paint-leak-o / R1+R2: a pure insertion positioned exactly at
+          -- the hunk's OUTER LEADING edge (`O` on the hunk's own first
+          -- row, or immediately above it -- both land here because the
+          -- authority mark's own gravity already pulled the new row
+          -- inside its live range by the time this runs). Ruling 73/89
+          -- decides ownership here exactly as it already does for the
+          -- trailing edge below -- a CHILD (same scope as the hunk's own
+          -- first row) is absorbed; a SIBLING (or blank, or unparsable)
+          -- is refused. This is NOT a positional replacement of the
+          -- ownership rule -- it is the same rule, applied symmetrically.
+          local leading_pure_insert = pure_insert and change.first == effective_start_line - 1
+          -- A pure insert whose live text is already byte-identical to the
+          -- hunk's OWN known first row can never be a foreign sibling: the
+          -- hunk has already claimed exactly that text as its proposal
+          -- (decision 57's converse -- content beats position). This is
+          -- what keeps the product's OWN re-adoption of a decision it just
+          -- undid or redone (`pop_decision`/`redo_local`, both of which
+          -- issue a native `:undo`/`:redo` and THEN synchronously fix up
+          -- `block.new_start_line`/`new_end_line` and the authority mark
+          -- themselves, before this deferred `on_lines` batch ever runs)
+          -- from being relitigated here as if it were an unexplained human
+          -- edit. Position alone cannot tell "the hunk's own first row,
+          -- restored" from "a human O opened right there" -- both land at
+          -- the identical `effective_start_line - 1` -- but content can:
+          -- only a row the hunk has never claimed needs the treesitter
+          -- CHILD/SIBLING call at all.
+          local leading_row_now = (vim.api.nvim_buf_get_lines(bufnr, effective_start_line - 1, effective_start_line, false) or {})[1]
+          local leading_matches_known = leading_pure_insert
+            and leading_row_now ~= nil
+            and leading_row_now == (block.new_lines or {})[1]
+          local leading_owned = leading_pure_insert
+            and (leading_matches_known or edge_line_is_yana_owned(bufnr, effective_start_line, effective_start_line + 1))
+          -- MEASURED: typing real text into a refused leading row replays,
+          -- keystroke by keystroke, as SAME-ROW edits (`last_orig ==
+          -- first + 1`, not a pure insert) at the SAME `first`. That
+          -- position sits exactly AT `interior`'s lower bound, not past
+          -- it -- unlike a refused TRAILING row, which sits one past its
+          -- own bound and is excluded by the plain numeric checks below
+          -- for the rest of the batch with no help needed. Only the
+          -- leading side needs its floor raised so those replays fail
+          -- `interior` too, not just the row-opening event itself.
+          if leading_pure_insert then
+            refused_edge = refused_edge or not leading_owned
+            -- The floor must rise by however many rows this insert actually
+            -- added (`last_new - first`, since a pure insert's old side is
+            -- empty by definition), not a flat one row. A single `O<Esc>`
+            -- and a multi-line restore (e.g. undoing a reject that puts an
+            -- N-line hunk back -- `pop_decision`'s own native `:undo`, which
+            -- this batch sees exactly like any other buffer edit) both reach
+            -- this branch; a flat `+1` left every LATER block's floor N-1
+            -- rows short of where its content actually moved to, the same
+            -- class of drift the `new_start_line`/`new_end_line` correction
+            -- below exists to prevent.
+            leading_shift = leading_shift + math.max(0, change.last_new - change.first)
+            effective_start_line = start_line + leading_shift
+          end
           -- `first` names the first old buffer row that changed.
-          local interior = change.first >= start_line - 1 and change.first <= effective_end_line - 1
+          local interior = change.first >= effective_start_line - 1
+            and change.first <= effective_end_line - 1
+            and not leading_pure_insert
           -- A newline entered exactly on the hunk's LAST row (`o`, or
           -- `<CR>` at end of line) creates a brand-new row ONE PAST the
           -- hunk's own last row -- `first == end_line` in these units --
@@ -4100,18 +4945,20 @@ local function attach_buffer_watch(state)
           -- which also has `first == end_line` but consumes that row --
           -- is correctly excluded ("typing on the following row does
           -- not [belong to the hunk]").
-          local edge_text = (vim.api.nvim_buf_get_lines(bufnr, effective_end_line, effective_end_line + 1, false) or {})[1] or ""
-          local adjacent_text = (vim.api.nvim_buf_get_lines(bufnr, effective_end_line - 1, effective_end_line, false) or {})[1] or ""
-          local indented_continuation = edge_text:find("^%s+%S") ~= nil and adjacent_text:find("^%S") ~= nil
-          local trailing_insert = change.first == effective_end_line
-            and change.last_orig == change.first
-            and (
-              indented_continuation
-              or edge_line_is_yana_owned(effective_end_line + 1, effective_end_line)
-              or #(block.old_lines or {}) > 0
-            )
-          if interior or trailing_insert then
+          local trailing_pure_insert = change.first == effective_end_line and pure_insert
+          local trailing_owned = trailing_pure_insert
+            and edge_line_is_yana_owned(bufnr, effective_end_line + 1, effective_end_line)
+          if trailing_pure_insert then
+            refused_edge = refused_edge or not trailing_owned
+          end
+          local leading_insert = leading_pure_insert and leading_owned
+          local trailing_insert = trailing_pure_insert and trailing_owned
+          -- Ruling 2026-08-25: interior typing is NOT absorbed into
+          -- `block.new_lines`; the authority mark grows and the paint shows a
+          -- gap. Only the treesitter-gated edges may extend the proposal.
+          if trailing_insert or leading_insert then
             extends_block = true
+            claimed[ci] = true
             -- Interior growth is already reflected in `end_line` above
             -- (the extmark auto-adjusted for us); adding it again here
             -- double-counts (MEASURED: absorbed the fixture's next
@@ -4120,6 +4967,10 @@ local function attach_buffer_watch(state)
             -- paragraph), so it is always added, authority-tracked or
             -- not; the fallback path (no authority mark) tracks nothing
             -- automatically either way and needs both added, as before.
+            -- A leading CHILD's growth, like interior's, IS auto-reflected
+            -- when tracked live (the mark's own gravity already counted
+            -- it in `start_line`/`end_line` above), so it follows
+            -- interior's rule, not trailing's.
             if trailing_insert or not tracked_live then
               extra_lines = extra_lines + math.max(0, change.last_new - change.last_orig)
             end
@@ -4127,6 +4978,28 @@ local function attach_buffer_watch(state)
         end
       end
       if start_line and extends_block then
+        -- Mirrors the `extra_lines` guard just above: when this block is
+        -- LIVE-TRACKED, its authority mark was placed fresh (or its own
+        -- gravity already pulled a newly-OWNED leading row inside the live
+        -- range this function just read as `start_line`) -- either way,
+        -- `start_line` already names the hunk's true current position with
+        -- no help from this function. Adding `leading_shift` here too
+        -- double-counts it: for a leading insert this block DECIDED it
+        -- owns (`leading_insert=true`, this branch's only way in besides
+        -- `interior`), the row `leading_shift` counts is the very row
+        -- `start_line` already points at, so shifting PAST it walks the
+        -- window off the front of the hunk's own now-legitimate first row
+        -- -- MEASURED: undoing a rejected pure-insertion hunk (the
+        -- product's own `pop_decision`, not a human edit) reconstructed the
+        -- mark at the correct position, then this double-shift walked
+        -- `start_line` past it, computed an inverted (empty) window, and
+        -- `block.new_lines` got overwritten with {} -- the hunk vanished
+        -- from its own review. The fallback path (no authority mark) still
+        -- needs the shift: nothing else ever tracks that hunk's position
+        -- for it.
+        if not tracked_live then
+          start_line = start_line + leading_shift
+        end
         end_line = end_line + extra_lines
         local live = {}
         if end_line >= start_line then
@@ -4171,12 +5044,134 @@ local function attach_buffer_watch(state)
           end
         end
       end
+      if not extends_block and leading_shift > 0 then
+        -- A REFUSED leading insertion still physically displaces the
+        -- hunk's own content by `leading_shift` rows, even though none of
+        -- it was absorbed (nothing was added to `block.new_lines`).
+        -- `block.new_start_line`/`new_end_line` must track that
+        -- displacement, or the fallback triggered below (dropping the
+        -- tainted mark) would have `capture_live_authority_ranges` search
+        -- for the hunk's content at its OLD, pre-insertion position and
+        -- find the human's refused row sitting there instead (MEASURED:
+        -- painted only the hunk's first line, dropping the rest -- the
+        -- fallback window was one row short of where the content actually
+        -- moved to).
+        block.new_start_line = (block.new_start_line or start_line) + leading_shift
+        block.new_end_line = (block.new_end_line or end_line) + leading_shift
+        if state.model_hunks and block.model_index and state.model_hunks[block.model_index] then
+          state.model_hunks[block.model_index].new_end_line = block.new_end_line
+        end
+      end
+      -- paint-leak-o / R2: whether or not anything was legitimately
+      -- absorbed above, a refused edge this batch may still have left the
+      -- RAW authority mark's gravity-grown span uncorrected (the branch
+      -- above only drops the mark when a genuine absorb changed
+      -- `block.new_lines`). Drop it here too so the next `highlight_blocks`
+      -- pass (`capture_live_authority_ranges`) falls back to
+      -- `block.new_start_line`/`block.new_end_line` -- which this function
+      -- only ever advances past rows it actually decided to own -- and
+      -- rebuilds the band anchored there instead of on the tainted span.
+      -- By construction, the band can never cover a row absorb refused.
+      if refused_edge and block.authority_extmark_id then
+        pcall(vim.api.nvim_buf_del_extmark, bufnr, AUTH_NS, block.authority_extmark_id)
+        block.authority_extmark_id = nil
+      end
     end
+    local all_absorbed = true
+    for ci = 1, #changes do
+      if not claimed[ci] then
+        all_absorbed = false
+        break
+      end
+    end
+    return all_absorbed
   end
   state.watch_pending = false
   state.watch_detached = false
+  -- RACE (issue 15): the classification below runs deferred
+  -- (`vim.schedule`, see the DEFERRED comment further down for why it must
+  -- stay deferred) so it lands strictly after the edit that triggered it.
+  -- But a decision key (`ct`/`co`/`cA`/etc.) reads `state.free_standing_edit`
+  -- through `tl_capture_human_edit` SYNCHRONOUSLY, and nothing previously
+  -- forced this callback to run first -- a human who types then immediately
+  -- decides (exactly what a real operator does, and exactly what
+  -- `nvim_feedkeys(..., "x", ...)` does back-to-back in this suite) could
+  -- have the decision fire while `state.watch_pending` was still true and
+  -- `state.watch_changes` still unprocessed. `tl_capture_human_edit` then
+  -- read the STALE `free_standing_edit` left over from the PREVIOUS
+  -- decision boundary (false, since it resets it every time) and silently
+  -- downgraded a genuine free-standing edit to an `absorbed_edit` marker --
+  -- MEASURED in the issue-15 suite: `watch_pending=true watch_changes_n=2` at
+  -- the second
+  -- `tl_capture_human_edit` call, with a free-standing edit (line 6, nowhere
+  -- near any of the three hunks) sitting unclassified in `watch_changes`.
+  -- `process_pending_watch` is now a named, idempotent step (guarded by
+  -- `state.watch_pending` itself, so calling it twice is a no-op the second
+  -- time) reachable two ways: the scheduled path below, unchanged, for the
+  -- ordinary case where nothing else needs the answer before the next
+  -- event-loop tick; and `state.flush_pending_watch`, called from
+  -- `tl_capture_human_edit` (the single reader of `free_standing_edit`)
+  -- before it reads the flag, forcing this same classification to run NOW
+  -- when a decision cannot wait for the scheduler. Same code, same result,
+  -- either way -- only the race is removed.
+  local function process_pending_watch()
+    if not state.watch_pending then
+      return
+    end
+    state.watch_pending = false
+    local changes = state.watch_changes or {}
+    state.watch_changes = {}
+    if state.watch_detached or state.closed then
+      return
+    end
+    if state.reload_restaging then
+      return
+    end
+    if not state.bufnr or not vim.api.nvim_buf_is_valid(state.bufnr) then
+      return
+    end
+    if not state.diff_blocks or #state.diff_blocks == 0 then
+      -- Nothing pending to absorb into: this edit is free-standing by
+      -- construction.
+      state.free_standing_edit = true
+      return
+    end
+    if not absorb_human_edits(changes) then
+      state.free_standing_edit = true
+    end
+    -- Ruling 79: every keystroke reaches here via `on_lines`, including
+    -- one Neovim's own machinery just marked the buffer modified for
+    -- (that is real-edit behaviour Yana does not own or suppress). A
+    -- keystroke absorbed into a pending hunk above never crossed into
+    -- the buffer's own half, so that default has to be corrected back;
+    -- one outside every hunk is genuinely buffer-owned and this leaves
+    -- it true. Single choke point for both, decided fresh each time
+    -- (ruling 80), never cached across edits.
+    M._recompute_modified(state.bufnr, state.diff_blocks, state.change and state.change.path)
+    -- Do NOT timeline-capture here. In-hunk typing is absorbed into
+    -- block.new_lines (decision 57); the human_edit row is sealed at the
+    -- next decision boundary (accept/reject) as before. Emitting a row
+    -- per absorb would leave an orphan after reject ("word goes with it")
+    -- whose undo_seq hash no longer matches the buffer.
+    render_blocks(state.bufnr, state.diff_blocks, {
+      site = "buffer_watch",
+      model = state.model_hunks,
+      model_source = state.model_source,
+      change = state.change,
+      opts = state.opts,
+    })
+    local snap = diff.buffer_bytes_snapshot(state.bufnr)
+    if snap then
+      state.staged_text = snap
+      state.latest_undo_seq = buf_undo_seq(state.bufnr)
+    end
+  end
+  state.flush_pending_watch = process_pending_watch
   vim.api.nvim_buf_attach(bufnr, false, {
     on_lines = function(_, _, _, first, last_orig, last_new)
+      if state.watch_suspended then
+        return
+      end
       state.watch_changes = state.watch_changes or {}
       state.watch_changes[#state.watch_changes + 1] = {
         first = first,
@@ -4189,7 +5184,22 @@ local function attach_buffer_watch(state)
       end
       -- Returning true detaches. Do it once the review is gone so a closed
       -- review cannot keep repainting a buffer it no longer owns.
-      if state.watch_detached or state.closed or not state.diff_blocks or #state.diff_blocks == 0 then
+      if state.watch_detached or state.closed then
+        return true
+      end
+      -- No pending hunk anywhere in this file (issue 15 class):
+      -- there is nothing left to absorb into, so this edit is free-standing
+      -- BY CONSTRUCTION -- the same fact `process_pending_watch` records for
+      -- the identical condition when it gets to run deferred. This early
+      -- exit used to detach WITHOUT ever setting `state.free_standing_edit`,
+      -- leaving whatever stale value the last decision boundary reset it to
+      -- (always false) -- so an edit typed after a file's last hunk was
+      -- decided, but before the review finished closing, silently read as
+      -- `absorbed_edit` even though there was no hunk left for it to be
+      -- absorbed into. Set the flag inline here, since there is no batch to
+      -- defer for this case -- the detach still happens on the same return.
+      if not state.diff_blocks or #state.diff_blocks == 0 then
+        state.free_standing_edit = true
         return true
       end
       -- CORRECTED 2026-08-19, after an adversary review found the comment here
@@ -4216,52 +5226,14 @@ local function attach_buffer_watch(state)
       -- it is mid-decision on. The ordinary-undo regression case started
       -- hitting the review's floor refusal. Scheduling puts the repaint after
       -- the product's edit has finished, which costs one loop turn and removes
-      -- the reentrancy entirely.
+      -- the reentrancy entirely. (The `flush_pending_watch` synchronous path
+      -- added for the race above reuses the same idempotent function rather
+      -- than adding a second, non-deferred writer of this state.)
       if state.watch_pending then
         return
       end
       state.watch_pending = true
-      vim.schedule(function()
-        state.watch_pending = false
-        local changes = state.watch_changes or {}
-        state.watch_changes = {}
-        if state.watch_detached or state.closed then
-          return
-        end
-        if not state.bufnr or not vim.api.nvim_buf_is_valid(state.bufnr) then
-          return
-        end
-        if not state.diff_blocks or #state.diff_blocks == 0 then
-          return
-        end
-        absorb_human_edits(changes)
-        -- Ruling 79: every keystroke reaches here via `on_lines`, including
-        -- one Neovim's own machinery just marked the buffer modified for
-        -- (that is real-edit behaviour Yana does not own or suppress). A
-        -- keystroke absorbed into a pending hunk above never crossed into
-        -- the buffer's own half, so that default has to be corrected back;
-        -- one outside every hunk is genuinely buffer-owned and this leaves
-        -- it true. Single choke point for both, decided fresh each time
-        -- (ruling 80), never cached across edits.
-        M._recompute_modified(state.bufnr, state.diff_blocks, state.change and state.change.path)
-        -- Do NOT timeline-capture here. In-hunk typing is absorbed into
-        -- block.new_lines (decision 57); the human_edit row is sealed at the
-        -- next decision boundary (accept/reject) as before. Emitting a row
-        -- per absorb would leave an orphan after reject ("word goes with it")
-        -- whose undo_seq hash no longer matches the buffer.
-        render_blocks(state.bufnr, state.diff_blocks, {
-          site = "buffer_watch",
-          model = state.model_hunks,
-          model_source = state.model_source,
-          change = state.change,
-          opts = state.opts,
-        })
-        local snap = diff.buffer_bytes_snapshot(state.bufnr)
-        if snap then
-          state.staged_text = snap
-          state.latest_undo_seq = buf_undo_seq(state.bufnr)
-        end
-      end)
+      vim.schedule(process_pending_watch)
     end,
   })
 end
@@ -4315,9 +5287,37 @@ function M.cleanup(state)
     -- undo/redo, unchanged. Never `U`: ruling 48's turn-wide reset has no
     -- cross-review meaning once a review has closed, and reusing the
     -- letter for something else here would be its own defect.
-    local retrace_ok, retrace = pcall(require, "yana.timeline.retrace")
-    if retrace_ok and retrace.install_post_review_keys then
-      retrace.install_post_review_keys(bufnr)
+    --
+    -- WHY `u` AND `<C-r>` ARE NOT SYMMETRIC IN WHAT THEY GO ON TO DO, though
+    -- they are reinstalled together here and this will look like a bug if you
+    -- read only this function. Both are reinstalled as the cross-file retrace
+    -- keys. `u` goes on retracing decisions across files, which is all it ever
+    -- does. `<C-r>` has a SECOND job that nothing in this function performs and
+    -- that is easy to miss: when the buffer it moves forward lands exactly on a
+    -- withdrawn review's own proposal, the per-buffer rewind reconciler reopens
+    -- that review (operator ruling 2026-08-25; see the whole-review rewind's
+    -- forward clause). That does NOT happen here and is NOT a property of this
+    -- keymap -- the retrace handler just runs Neovim's own redo, and the reopen
+    -- is driven entirely by the surviving rewind record plus a content-hash
+    -- match. So this reinstall is symmetric on purpose: the asymmetry lives in
+    -- whether a withdrawn record exists for the path, not in the key.
+    -- ABORT IS THE ONE EXCEPTION -- the class of close that undoes every
+    -- decision it made, and so must release these maps with them (operator
+    -- ruling 2026-08-25; see `M.abort_active`). Every other close leaves a
+    -- real decision behind
+    -- (something accepted, something rejected, something the human typed)
+    -- for `u`/`<C-r>` to retrace across files. An abort undoes ALL of that
+    -- first -- there is nothing left anywhere for a retrace to walk back
+    -- into -- so reinstalling these maps would hand the operator a `u` that
+    -- LOOKS like Neovim's own key but silently dispatches to a cross-file
+    -- walk with nothing on it. `M.abort_active` sets this flag on every
+    -- state (the active review and each rewound sibling) it tears down
+    -- through this function, exactly once, for exactly that reason.
+    if not state._abort_no_retrace then
+      local retrace_ok, retrace = pcall(require, "yana.timeline.retrace")
+      if retrace_ok and retrace.install_post_review_keys then
+        retrace.install_post_review_keys(bufnr)
+      end
     end
   end
   if state.augroup then
@@ -4369,6 +5369,7 @@ end
 function M._withdraw_for_plain_undo(state, retrace)
   local change = state.change
   local bufnr = state.bufnr
+  state.diff_blocks = {}
   state.watch_detached = true
   change.status = "rejected"
   change.review_error = nil
@@ -4397,10 +5398,85 @@ function M._withdraw_for_plain_undo(state, retrace)
   -- about. Nothing is stranded: the parked/queued reviews stay in the pool and
   -- in the panel, and the next deliberate gesture opens them.
   announce_state()
-  -- The press itself. `silent` for the same reason `native_undo` is silent:
-  -- "Already at oldest change" is Neovim's own line about its own history.
-  local ok, err = pcall(vim.api.nvim_buf_call, bufnr, function()
-    vim.cmd("silent undo")
+  -- R8: ruling #100 says this press is SILENT (no `vim.notify` line) --
+  -- exactly the "asserts absence" shape issue 54 bucket (b) named
+  -- (`r113_r100_register_exhausted_is_silent`, `r113_undo_past_register_floor`).
+  -- Silent to the OPERATOR does not mean unobservable to a test: this is
+  -- still a review-state transition that fully applied (the review closed,
+  -- `M.cleanup` released its keymaps/marks), so it gets the same positive
+  -- signal every other transition does -- a row can wait_settled() for this
+  -- instead of asserting silence after a fixed delay.
+  M._emit_review_settled(bufnr, change.turn_id or change.turn_gen, "undo_withdraw")
+  -- YANA'S OWN TRANSACTION (KI-1 ruling 2026-08-24 meeting ruling #100). This
+  -- function has ALREADY withdrawn the review, by hand, for this very press --
+  -- and the undo below is Yana issuing the operator's press on its behalf,
+  -- which crosses the proposal insertion. Left observable, the rewind
+  -- reconciler sees that crossing, withdraws a review that is already gone and
+  -- SAYS SO: "yana: undo crossed the proposal insertion in a.py -- the whole
+  -- review was withdrawn". #100 requires this press to be silent, so the guard
+  -- belongs here exactly as it does around `U` and abort.
+  --
+  -- THE WATCH SURVIVES THIS WITHDRAWAL, MARKED (operator ruling 2026-08-25:
+  -- "yes redo should reopen the hunk -- make it be yana owned at that
+  -- boundary"). It used to be DROPPED here, on the reasoning that this review
+  -- was over and travelling forward must not resurrect it. That reasoning is
+  -- overruled for `u` and only for `u`: the rewind ruling's forward clause
+  -- promises that crossing the insertion forward "restores the exact proposal
+  -- bytes and reopens the SAME review identity with every hunk pending again",
+  -- and dropping the record made that promise unkeepable through this door
+  -- while it was kept through `:earlier`/`:later` -- which withdraw via
+  -- `rewind_withdraw`, keep the record, and restore correctly. The same review
+  -- therefore came back or did not purely by which key withdrew it. Found by
+  -- the review-state property fuzzer at seed 87007 (`u, redo`); pinned by
+  -- `r129_rewind_redo_key_reopens_at_boundary`.
+  --
+  -- AN ABORT IS STILL DIFFERENT and still drops the record outright: see
+  -- `M.abort_active`, which calls `M._rewind_forget_path` for exactly the
+  -- reason this call site no longer does. An abort is the operator discarding
+  -- the review deliberately; this is the operator stepping backward through
+  -- history with a key that is Neovim's too, and the ruling says that step is
+  -- reversible.
+  --
+  -- THE CARVE-OUT IS NOT "`<C-r>` IS NOW YANA'S". Nothing about the keymap
+  -- changes here. What comes back is gated in `rewind_reconcile` on the
+  -- CONTENT HASH (`at_proposal` against `rec.open_hash`), so a forward move
+  -- that lands anywhere other than exactly the proposal reopens nothing and
+  -- stays an ordinary editor redo, which is what keeps ruling #100's silence
+  -- rows true. `r129`'s `control` phase measures precisely that edge.
+  --
+  -- THE RECORD IS KEPT FOR EVERY REVIEW, INCLUDING A REINTEGRATED ONE.
+  -- Ownership at this boundary is ASYMMETRIC (operator ruling 2026-08-25, as
+  -- adjudicated by the cursor pane; see the whole-review rewind ruling), and
+  -- the asymmetry is the whole of it:
+  --
+  --   BACKWARD, Yana DECLINES. A reintegration writes no bytes and so mints no
+  --   insertion at its own sequence; ordinary operator history below it must
+  --   never be treated as crossing a proposal insertion, and no new floor is
+  --   invented. This function is that decline: it closes the review under
+  --   ruling #100, silently, and hands the press to plain undo.
+  --
+  --   FORWARD, Yana CLAIMS. The review still INHERITS the original insertion
+  --   for restorability, so a forward move landing on exactly the proposal
+  --   CONTENT reopens the same review identity with every hunk pending --
+  --   the operator's words, "just as if it was being done for the first
+  --   time". Landing anywhere else reopens nothing.
+  --
+  -- An earlier revision of this lane forgot the record whenever
+  -- `undo_pre_stage_seq == undo_open_seq`, reading the spec's backward
+  -- justification as settling forward too. It does not -- the spec was SILENT
+  -- there. Forgetting protected the backward case by destroying the forward
+  -- one, and `r113_undo_past_register_floor`'s retargeted redo half is what
+  -- now holds this honest: with the record forgotten it reds with "the buffer
+  -- is byte-identical to the proposal but no review reopened".
+  --
+  -- Ruling #100 is not in tension with this. Its silence governs a press Yana
+  -- has nothing to restore FOR; it does not forbid a reopen when a withdrawn
+  -- proposal is under the cursor again by content.
+  M._rewind_mark_withdrawn(change and change.path)
+  local ok, err = pcall(M._rewind_suppress, function()
+    vim.api.nvim_buf_call(bufnr, function()
+      vim.cmd("silent undo")
+    end)
   end)
   if not ok then
     log.write("WARN", "yana.inline_diff floor undo: " .. tostring(err))
@@ -4484,6 +5560,801 @@ local function binary_reason(change)
   return nil
 end
 
+-- ===========================================================================
+-- WHOLE-REVIEW REWIND AT THE SINGLE INSERT BOUNDARY
+-- KI-1, operator ruling 2026-08-24.
+--
+-- THE CONTRACT, and it is deliberately not per-hunk. Accepting a hunk in an
+-- open buffer moves no bytes, so four accepts share ONE undo sequence and
+-- there is no crossed range that can tell one accept from four. The only
+-- state Neovim can represent honestly is the atomic proposal insertion, so
+-- that single boundary is the whole of it:
+--
+--   * crossing it BACKWARD (`u` past it, `:earlier`, `:later` onto another
+--     branch, `g-`, `:undo {seq}` -- any Neovim time travel) withdraws the
+--     WHOLE review and every Yana decision in it, together;
+--   * crossing it FORWARD restores the exact proposal bytes (Neovim's own
+--     time travel does that part) and reopens the SAME review identity with
+--     every hunk pending again.
+--
+-- Per-hunk time travel is NOT built. It would need a real undo boundary for
+-- every accept, which is the larger alternative the ruling explicitly did not
+-- adopt.
+--
+-- HOW IT OBSERVES, and why not `TextChanged`. `TextChanged` is checked only
+-- for `curbuf` from the Normal-mode main loop, so `nvim_buf_call` or `:bufdo`
+-- on another buffer bypasses it entirely (NV-6). This uses a per-buffer
+-- `nvim_buf_attach(..., {on_lines=...})`, which fires for a buffer that is
+-- not current. Many crossed states collapse into one callback and the
+-- callback cannot count the steps it crossed (NV-7), so nothing here tries
+-- to: the work is deferred with `vim.schedule`, coalesced by `rec.pending`,
+-- and reconciles the FINAL `undotree()` branch plus a content hash exactly
+-- once.
+--
+-- WHY A BRANCH WALK AND NOT "IS THE SEQ STILL THERE". `undotree()` exposes
+-- alternate branches, and the existence of a sequence is not evidence that
+-- it is on the path the buffer is currently on (NV-2); `undo_time()` rotates
+-- branches so path membership changes during the command itself (NV-3). So
+-- membership is an explicit ancestor walk over `entries` AND every `alt`
+-- branch hanging off them, and it is confirmed by a content hash before
+-- anything is restored -- never by the sequence number alone.
+--
+-- WHY "GONE" IS ITS OWN ANSWER. A sequence can be absent from the tree
+-- altogether after undo history is cleared or the buffer is wiped and
+-- re-read: neither current nor abandoned (NV-8). Treating that silently as
+-- a rewind would throw away a review the operator never withdrew, so it is
+-- classified GONE and NAMED as drift instead -- the fallback the ruling
+-- keeps for exactly the case where resync is impossible.
+--
+-- WHAT IT DOES NOT DO: it never writes the real tree. Reverting a file on
+-- disk from inside a buffer-change callback is the silent out-of-tree write
+-- KI-1 itself documents as corrupting, and ruling 87 forbids disk IO on an
+-- undo after an accept. An accept moves no bytes and reaches no disk until
+-- the turn applies, so a buffer-local withdrawal is the whole of it here.
+-- ===========================================================================
+
+--- The register kind a decision withdrawn by a rewind is recorded under. Not
+--- `hunk_rejected`: the operator did not reject anything, Neovim's time
+--- travel took the bytes the decision described, and a reader that cannot
+--- tell those apart would replay a rejection the operator never made.
+M.REWIND_KIND = "rejected-by-rewind"
+
+local rewind_watch = {}
+local rewind_suppress = 0
+-- Outstanding HOLDS (see below): suppression that outlives one frame.
+local rewind_held = 0
+
+--- Run `fn` with reconciliation suppressed. Yana drives Neovim's own
+--- `:undo {seq}` for its `U` (`undo_turn`) and its abort (`M.abort_active`),
+--- and an abort lands BELOW the insert boundary on purpose. Without this the
+--- reconciler would see Yana's own transaction as the operator time
+--- travelling and withdraw a review that is already being torn down by hand.
+--- The release is itself scheduled, so a callback queued by the suppressed
+--- edit is drained while the guard is still up.
+function M._rewind_suppress(fn)
+  rewind_suppress = rewind_suppress + 1
+  local ok, err = pcall(fn)
+  vim.schedule(function()
+    rewind_suppress = math.max(0, rewind_suppress - 1)
+  end)
+  if not ok then
+    error(err, 0)
+  end
+  return true
+end
+
+-- ---------------------------------------------------------------------------
+-- HOLDS: Yana's own transaction when it is not synchronous.
+--
+-- `_rewind_suppress` covers a transaction that begins AND ends inside one
+-- frame, and releases on the next scheduler tick. The cross-file retrace walk
+-- is not that shape: `retrace.M.undo`/`M.redo` move the buffer synchronously
+-- and then do their reintegration and review reopen from `vim.schedule`
+-- callbacks, and a close inside the walk queues a queue advance that opens
+-- and STAGES the next file a tick later again. Every one of those edits is
+-- Yana's, and every one of them used to land after the guard was already
+-- down, so the reconciler read the walk's own bytes as the operator time
+-- travelling and withdrew a review the walk still owned, mid-step. (Measured
+-- under the parallel gate as the r75 redo-paint and r113 reopen families:
+-- "[redo3-extra] alpha.py: painted rows (0) == proposal lines (1)".)
+--
+-- A HOLD IS A TOKEN, NOT A DURATION. Nothing here waits for a length of time;
+-- the guard comes down when the walk's own work is finished and not before.
+-- The walk opens a hold, and:
+--   * `hold.schedule(fn)` queues one piece of the walk's deferred work and
+--     COUNTS it, so the hold cannot settle while that piece is outstanding;
+--   * the hold is the CURRENT hold while that piece runs, so anything the
+--     piece schedules in turn (a queue advance, a further reintegration)
+--     joins the same hold before its parent is discounted -- the chain is
+--     covered by construction, however deep it goes, and the count cannot
+--     bottom out in the middle of it;
+--   * `hold.release()` drops the walk's own reference when its synchronous
+--     part returns.
+-- Only when both are gone does the guard drop, and that drop is itself
+-- scheduled, so a callback queued by the very last piece drains while the
+-- guard is still up -- the same rule `_rewind_suppress` already follows.
+--
+-- The suppression a hold provides is ABSOLUTE, exactly like `_rewind_suppress`
+-- (see `rewind_reconcile`): a reconcile that lands inside one is dropped, not
+-- re-armed onto the next tick. That was tried and reverted (4d18790).
+local rewind_hold_current = nil
+
+--- Open a hold. The caller MUST call `hold.release()` on the way out of its
+--- synchronous part, on every path including an error one.
+function M._rewind_hold()
+  local hold = { refs = 1, released = false, settled = false }
+  rewind_held = rewind_held + 1
+  local function settle()
+    if hold.settled or hold.refs > 0 then
+      return
+    end
+    hold.settled = true
+    vim.schedule(function()
+      rewind_held = math.max(0, rewind_held - 1)
+    end)
+  end
+  function hold.schedule(fn)
+    if hold.settled then
+      -- The walk already finished and let go; this is no longer its work.
+      vim.schedule(fn)
+      return
+    end
+    hold.refs = hold.refs + 1
+    vim.schedule(function()
+      local prev = rewind_hold_current
+      rewind_hold_current = hold
+      local ok, err = pcall(fn)
+      rewind_hold_current = prev
+      hold.refs = hold.refs - 1
+      settle()
+      if not ok then
+        pcall(function()
+          log.write("WARN", "yana.inline_diff rewind hold: " .. tostring(err))
+        end)
+      end
+    end)
+  end
+  function hold.release()
+    if hold.released then
+      return
+    end
+    hold.released = true
+    hold.refs = hold.refs - 1
+    settle()
+  end
+  return hold
+end
+
+--- The current hold, or nil. Callers that need to know whether the work they
+--- are about to defer belongs to a walk.
+function M._rewind_hold_current()
+  return rewind_hold_current
+end
+
+--- `vim.schedule`, except that inside a hold the deferred work joins the
+--- hold instead of escaping it. Outside a hold this IS `vim.schedule`.
+rewind_schedule = function(fn)
+  local hold = rewind_hold_current
+  if hold then
+    hold.schedule(fn)
+  else
+    vim.schedule(fn)
+  end
+end
+
+--- The public face of `rewind_schedule`, for the walk's own deferred work in
+--- other modules (`timeline/retrace.lua`'s reintegration reopen).
+function M._rewind_schedule(fn)
+  rewind_schedule(fn)
+end
+
+--- The seam a walk uses: run `fn` as Yana's own transaction, holding the
+--- guard until the walk's scheduled work has actually finished rather than
+--- until the next tick. Re-raises whatever `fn` raised, after releasing.
+function M._rewind_own_transaction(fn)
+  local hold = M._rewind_hold()
+  local prev = rewind_hold_current
+  rewind_hold_current = hold
+  local ok, res = pcall(fn)
+  rewind_hold_current = prev
+  hold.release()
+  if not ok then
+    error(res, 0)
+  end
+  return res
+end
+
+local function rewind_hash(text)
+  if type(text) ~= "string" then
+    return nil
+  end
+  local ok, h = pcall(function()
+    return require("yana.safety.hash").hash_bytes(text)
+  end)
+  if ok and type(h) == "string" then
+    return h
+  end
+  return nil
+end
+
+--- Every sequence on the path from the undo tree's ROOT to `target`, or nil
+--- when `target` names no reachable state at all. An `alt` list hangs off the
+--- entry it diverges from, so the entries BEFORE that entry are the prefix of
+--- any path found inside it -- which is why `acc` is rolled back to the mark
+--- when an alternate branch does not contain the target.
+local function undo_path_to(entries, target)
+  local acc = {}
+  if target == nil then
+    return nil
+  end
+  if target == 0 then
+    return acc
+  end
+  local function rec(list)
+    for _, e in ipairs(list or {}) do
+      if type(e.alt) == "table" and #e.alt > 0 then
+        local mark = #acc
+        if rec(e.alt) then
+          return true
+        end
+        for i = #acc, mark + 1, -1 do
+          acc[i] = nil
+        end
+      end
+      acc[#acc + 1] = e.seq
+      if e.seq == target then
+        return true
+      end
+    end
+    return false
+  end
+  if rec(entries) then
+    return acc
+  end
+  return nil
+end
+
+--- Is `target` anywhere in this tree at all -- current branch or abandoned
+--- one? A `false` here is the GONE case (NV-8), and it is the ONLY thing
+--- that may be called drift.
+local function undo_seq_present(entries, target)
+  if target == nil then
+    return false
+  end
+  if target == 0 then
+    return true
+  end
+  for _, e in ipairs(entries or {}) do
+    if e.seq == target then
+      return true
+    end
+    if type(e.alt) == "table" and undo_seq_present(e.alt, target) then
+      return true
+    end
+  end
+  return false
+end
+
+local function rewind_forget(path)
+  local rec = rewind_watch[path]
+  if rec then
+    rec.detached = true
+    rewind_watch[path] = nil
+  end
+end
+
+--- Exposed so `M.abort_active` can drop the watch: an abort is the operator
+--- withdrawing the review by hand, and a later `:later` must not resurrect it.
+function M._rewind_forget_path(path)
+  if type(path) == "string" then
+    rewind_forget(path)
+  end
+end
+
+--- Mark a watched path's review as withdrawn WITHOUT dropping the record, so
+--- crossing the insertion forward can still restore it (operator ruling
+--- 2026-08-25). Used by `M._withdraw_for_plain_undo`, which withdraws by hand
+--- rather than through `rewind_withdraw` and so has to set the same flag that
+--- function sets. Distinct from `M._rewind_forget_path` on purpose: forgetting
+--- is for an ABORT, where the operator has discarded the review and no forward
+--- move may bring it back; marking is for a `u` across the boundary, which the
+--- ruling makes reversible. A path with no watch is a no-op -- there is no
+--- proposal insertion to be on the far side of.
+function M._rewind_mark_withdrawn(path)
+  if type(path) ~= "string" then
+    return
+  end
+  local rec = rewind_watch[path]
+  if rec and not rec.detached then
+    rec.withdrawn = true
+  end
+end
+
+--- Drop every watch belonging to a discarded owner (or all of them). A review
+--- the operator has DISCARDED must not come back: without this, a rewind watch
+--- outlives `discard_pool`/`discard_for_owner` and a later `:later` re-queues
+--- a change whose conversation is gone and whose claim has been released.
+function M._rewind_forget_owner(owner)
+  for path, rec in pairs(rewind_watch) do
+    if owner == nil or owners_match(rec.owner, owner) then
+      rec.detached = true
+      rewind_watch[path] = nil
+    end
+  end
+end
+
+function M._rewind_reset()
+  rewind_watch = {}
+  rewind_suppress = 0
+  rewind_held = 0
+  rewind_hold_current = nil
+end
+
+--- Test/diagnostic: snapshot one watched path's rewind record (or nil).
+function M._rewind_peek(path)
+  if type(path) ~= "string" then
+    return nil
+  end
+  local rec = rewind_watch[path]
+  if not rec or rec.detached then
+    return nil
+  end
+  return {
+    boundary_seq = rec.boundary_seq,
+    withdrawn = rec.withdrawn,
+    drift_named = rec.drift_named,
+    open_hash = rec.open_hash,
+  }
+end
+
+local rewind_reconcile
+
+local function rewind_attach(rec, bufnr)
+  if not (bufnr and bufnr > 0 and vim.api.nvim_buf_is_valid(bufnr)) then
+    return
+  end
+  if rec.attached_to == bufnr then
+    return
+  end
+  rec.attached_to = bufnr
+  vim.api.nvim_buf_attach(bufnr, false, {
+    on_lines = function()
+      if rewind_watch[rec.path] ~= rec or rec.detached then
+        return true
+      end
+      if rec.attached_to ~= bufnr then
+        return true
+      end
+      -- NV-7: one callback may cover many crossed states and cannot count
+      -- them. Coalesce and reconcile the FINAL state, once.
+      if rec.pending then
+        return
+      end
+      rec.pending = true
+      vim.schedule(function()
+        rec.pending = false
+        rewind_reconcile(rec.path, true)
+      end)
+    end,
+    on_detach = function()
+      if rec.attached_to == bufnr then
+        rec.attached_to = nil
+      end
+    end,
+  })
+end
+
+local function rewind_lifecycle(kind, rec, extra)
+  local fields = {
+    path = rec.rel,
+    boundary_seq = rec.boundary_seq,
+    change_id = rec.change and rec.change.id,
+  }
+  for k, v in pairs(extra or {}) do
+    fields[k] = v
+  end
+  pcall(function()
+    require("yana.log").lifecycle_later(kind, fields)
+  end)
+end
+
+--- The undo tree no longer holds the proposal insertion at all. Nothing can
+--- be rewound to and nothing can be restored, so the fact is NAMED rather
+--- than swallowed, and the watch retires.
+local function rewind_drift(rec)
+  if rec.drift_named then
+    return
+  end
+  rec.drift_named = true
+  local said = "yana: undo drift in "
+    .. tostring(rec.rel)
+    .. " -- this review's proposal insertion (undo_seq "
+    .. tostring(rec.boundary_seq)
+    .. ") is no longer in the buffer's undo history, so it cannot be rewound or restored"
+  rewind_lifecycle("undo.rewind_drift", rec, { reason = "undo_tree_destroyed", detail = said })
+  pcall(function()
+    require("yana.log").write("WARN", said)
+  end)
+  notify_one_line(said, vim.log.levels.WARN)
+  rewind_forget(rec.path)
+end
+
+--- Mark this review's decision rows reverted in the journal. Every row at or
+--- above the insert boundary described bytes that the rewind has just taken,
+--- so a later cross-file `u` must not spend a press on one.
+local function rewind_mark_rows(rec, reverted)
+  pcall(function()
+    local tl = require("yana.timeline")
+    local record = require("yana.timeline.record")
+    if type(tl.entries) ~= "function" or type(record.mark_reverted) ~= "function" then
+      return
+    end
+    local ok, entries = pcall(tl.entries, rec.workspace, rec.rel)
+    if not ok or type(entries) ~= "table" then
+      return
+    end
+    for _, e in ipairs(entries) do
+      if e.regime == "buffer"
+        and record.UNDOABLE_KIND[e.kind]
+        and type(e.undo_seq) == "number"
+        and e.undo_seq >= (rec.boundary_seq or 0)
+      then
+        record.mark_reverted(e.id, reverted and true or false)
+      end
+    end
+  end)
+end
+
+--- Crossing the insertion BACKWARD. The whole review goes, and every decision
+--- in it goes with it, together.
+local function rewind_withdraw(rec)
+  rec.withdrawn = true
+  local st = pool_for(rec.opts or {})
+  local state = st.active
+  local dropped = 0
+  if state and state.change == rec.change then
+    dropped = #(state.decisions or {})
+    record_decision(state, "review_rejected_by_rewind", {
+      kind = M.REWIND_KIND,
+      boundary_seq = rec.boundary_seq,
+      decisions_withdrawn = dropped,
+      hunks = #(state.diff_blocks or {}),
+    })
+    -- The blocks and decisions are dropped BEFORE the session is finished,
+    -- and that ordering is the whole of it -- the same ordering
+    -- `M.abort_active` needs and for the same measured reason. The buffer is
+    -- ALREADY at a state that predates the proposal: Neovim's own time travel
+    -- put it there. `finish_session`'s reject path would otherwise walk hunks
+    -- that no longer exist and restore pre-turn content over live rows.
+    state.diff_blocks = {}
+    state.decisions = {}
+    finish_session(state, false)
+  end
+  rewind_mark_rows(rec, true)
+  rewind_lifecycle("undo.rewind_withdrawn", rec, {
+    decisions_withdrawn = dropped,
+    hunks = #(rec.blocks or {}),
+    kind = M.REWIND_KIND,
+  })
+  notify_one_line(
+    "yana: undo crossed the proposal insertion in "
+      .. tostring(rec.rel)
+      .. " -- the whole review was withdrawn; redo brings it back",
+    vim.log.levels.INFO
+  )
+  announce_state()
+end
+
+--- Crossing the insertion FORWARD. Neovim has already put the exact proposal
+--- bytes back -- confirmed by content hash above, never by the sequence
+--- number alone -- so this reopens the SAME review over them.
+local function rewind_restore(rec)
+  local change = rec.change
+  if not change then
+    rewind_forget(rec.path)
+    return
+  end
+  local st = pool_for(rec.opts or {})
+  if st.active and st.active.change == change then
+    rec.withdrawn = false
+    return
+  end
+  -- `M._withdraw_for_plain_undo` deliberately does NOT call
+  -- `schedule_queue_advance`, so the change can still sit in `st.queue`
+  -- with `st.active == nil` after a floor `u`. An earlier guard returned
+  -- whenever the change was merely queued, which blocked `rewind_restore`
+  -- after post-close `<C-r>` even when the buffer had already landed on the
+  -- proposal (content hash matched, boundary seq present). property seed 87008
+  -- step 35; pinned by `r130_rewind_redo_after_reload_withdraw`.
+  for i, item in ipairs(st.queue) do
+    if item.change == change then
+      table.remove(st.queue, i)
+      break
+    end
+  end
+  rec.withdrawn = false
+  -- SAME REVIEW IDENTITY. The `change` table itself is reused, so `change.id`,
+  -- its turn and its ledger are the ones the operator was already shown: this
+  -- is the review coming back, not a new one opened over the same file.
+  -- `_retrace_reintegration` is the existing marker for precisely that, and it
+  -- carries the second thing this needs -- `open_review_buffer` returns the
+  -- buffer AS-IS instead of re-staging bytes Neovim has already put back,
+  -- which would otherwise insert a phantom undo step into the operator's own
+  -- history purely as a side effect of travelling forward.
+  change._retrace_reintegration = true
+  change._retrace_fresh = nil
+  change._rewind_restored = true
+  change.review_error = nil
+  change.status = "pending"
+  local blocks = vim.deepcopy(rec.blocks or {})
+  change._parked_review = {
+    staged_text = rec.open_text,
+    blocks = blocks,
+    pending_signature = block_signature(blocks),
+    model_hunks = vim.deepcopy(rec.model_hunks or {}),
+    model_source = rec.model_source,
+    -- EVERY hunk pending. The decisions went with the rewind; none of them
+    -- is sealed, because none of them stands any more.
+    sealed_decisions = {},
+  }
+  local item = { change = change, opts = rec.opts, owner = rec.owner }
+  change._parked_item = item
+  remember_batch_item(st, item)
+  table.insert(st.queue, 1, item)
+  rewind_lifecycle("undo.rewind_restored", rec, { hunks = #blocks })
+  notify_one_line(
+    "yana: redo crossed back over the proposal insertion in "
+      .. tostring(rec.rel)
+      .. " -- the review is open again with every hunk pending",
+    vim.log.levels.INFO
+  )
+  vim.schedule(function()
+    process_next_for(rec.opts)
+  end)
+end
+
+--- Reconcile the FINAL state of one watched path against its insert boundary.
+--- `observed` is true only when this reconcile was triggered by an actual
+--- LINE CHANGE in the buffer (`on_lines`). A reconcile triggered merely by
+--- ENTERING a buffer may classify GONE and may restore, but must never
+--- WITHDRAW.
+---
+--- WHY. The buffer-enter trigger exists for one case: a `:bwipeout` destroys
+--- the undo tree AND the `on_lines` callback with it, so nothing else can ever
+--- notice that the boundary has gone. It is not evidence that the operator
+--- travelled. Windows change buffers constantly during a cross-file redo walk
+--- -- the walk reopens reviews and jumps between files -- and each of those
+--- enters used to run a full reconcile which could withdraw a review the walk
+--- itself owns, mid-step. Measured under load as the r75 redo-paint family and
+--- the r113 reopen family going red while the same tree passed when quiet.
+--- A withdrawal is a destructive act and now requires a change actually
+--- observed in the bytes.
+rewind_reconcile = function(path, observed)
+  local rec = rewind_watch[path]
+  if not rec or rec.detached then
+    return
+  end
+  if rewind_suppress > 0 or rewind_held > 0 then
+    -- DROPPED, DELIBERATELY, AND MEASURED. `rewind_held` is the same fact for
+    -- a transaction that is not synchronous -- see HOLDS above. This looks like a hole -- an
+    -- operator crossing that lands inside one of Yana's own suppression
+    -- windows is never reconciled -- and re-arming it on the next tick was
+    -- tried. It is worse, and it is worse in the way that matters: the guard
+    -- exists precisely because Yana's `U`, its reject walk, its abort and the
+    -- cross-file register walk MOVE THE BUFFER THEMSELVES, often below the
+    -- insert boundary. Re-arming does not skip those edits, it merely
+    -- reconciles them one tick later, once the guard has dropped -- so the
+    -- reconciler withdraws or restores a review in the middle of a walk that
+    -- owns it. Measured: ten rows red across the r75 redo-paint family, the
+    -- r113 reopen family and ruling #100's silence rows.
+    --
+    -- The reconcile is not lost in practice: the guard is held only for the
+    -- duration of Yana's own transaction, and any later change to the buffer
+    -- -- including the operator's next keystroke -- schedules a fresh one that
+    -- reconciles the same final state.
+    return
+  end
+  local bufnr = rec.attached_to
+  if not (bufnr and bufnr > 0 and vim.api.nvim_buf_is_valid(bufnr) and vim.api.nvim_buf_is_loaded(bufnr)) then
+    bufnr = vim.fn.bufnr(path)
+    if not (bufnr and bufnr > 0 and vim.api.nvim_buf_is_loaded(bufnr)) then
+      return
+    end
+    rewind_attach(rec, bufnr)
+  end
+  local tree
+  pcall(vim.api.nvim_buf_call, bufnr, function()
+    tree = vim.fn.undotree()
+  end)
+  if type(tree) ~= "table" then
+    return
+  end
+  local cur = tree.seq_cur or 0
+
+  -- NV-8: absent from the tree altogether -- neither current nor abandoned.
+  -- The undo history was destroyed (cleared, or the buffer wiped and re-read).
+  -- Resync is impossible, so this is the one case that is named as drift.
+  if not undo_seq_present(tree.entries, rec.boundary_seq) then
+    rewind_drift(rec)
+    return
+  end
+
+  local live_hash = rewind_hash(diff.buffer_bytes_snapshot(bufnr))
+  local at_proposal = (live_hash ~= nil and live_hash == rec.open_hash)
+
+  local path_seqs = undo_path_to(tree.entries, cur)
+  if path_seqs == nil then
+    -- NV-4: `seq_cur` can be `target - 1` and need not name an undo header at
+    -- all, so the branch walk cannot answer. Fall back to the content hash
+    -- alone, which can only ever restore -- never withdraw on a guess.
+    if rec.withdrawn and at_proposal then
+      rewind_restore(rec)
+    end
+    return
+  end
+
+  local on_path = (cur == rec.boundary_seq)
+  if not on_path then
+    for _, s in ipairs(path_seqs) do
+      if s == rec.boundary_seq then
+        on_path = true
+        break
+      end
+    end
+  end
+
+  if on_path then
+    -- The insertion is applied. A REACHABLE destination whose sequence and
+    -- content hash both match is a resync, never a drift.
+    if rec.withdrawn and at_proposal then
+      rewind_restore(rec)
+    end
+    return
+  end
+
+  -- The boundary exists but the buffer is no longer downstream of it: the
+  -- insertion has been crossed backward, or a branch switch has moved off it.
+  if rec.withdrawn then
+    if at_proposal then
+      rewind_restore(rec)
+    end
+    return
+  end
+  if at_proposal then
+    -- Content-hash confirmation refuses: whatever the sequence numbers say,
+    -- the buffer still holds exactly the proposal, so nothing was withdrawn.
+    return
+  end
+  if not observed then
+    -- Entering a buffer is not evidence that the operator travelled -- see the
+    -- note on this function. Withdrawal waits for an observed line change.
+    return
+  end
+  rewind_withdraw(rec)
+end
+
+--- Post-review native redo: if the buffer landed on the withdrawn proposal,
+--- reopen directly. The deferred `on_lines` reconcile is often dropped while
+--- suppress/hold counters from the same press are still elevated (seed 87008).
+function M._rewind_try_restore_after_redo(path)
+  if type(path) ~= "string" then
+    return
+  end
+  local rec = rewind_watch[path]
+  if not rec or rec.detached or not rec.withdrawn then
+    return
+  end
+  local bufnr = rec.attached_to
+  if not (bufnr and bufnr > 0 and vim.api.nvim_buf_is_valid(bufnr)) then
+    bufnr = vim.fn.bufnr(path)
+  end
+  if not (bufnr and bufnr > 0 and vim.api.nvim_buf_is_loaded(bufnr)) then
+    return
+  end
+  local live_hash = rewind_hash(diff.buffer_bytes_snapshot(bufnr))
+  if live_hash ~= nil and live_hash == rec.open_hash then
+    rewind_restore(rec)
+  end
+end
+
+local rewind_augroup
+
+--- A `:bwipeout` (or any wipe-and-re-read) destroys the undo tree AND the
+--- `nvim_buf_attach` callback with it, so `on_lines` can never fire again for
+--- that path -- which is exactly the case where the boundary has gone and the
+--- operator most needs to be told. Re-attach to whatever buffer now holds a
+--- watched path and reconcile once, so the GONE classification is reached by
+--- the same code as every other one.
+---
+--- Scoped to watched paths only: a buffer Yana has never staged a proposal
+--- into never reaches past the first lookup.
+local function rewind_ensure_autocmd()
+  if rewind_augroup then
+    return
+  end
+  rewind_augroup = vim.api.nvim_create_augroup("YanaRewindWatch", { clear = true })
+  vim.api.nvim_create_autocmd({ "BufReadPost", "BufWinEnter", "BufEnter" }, {
+    group = rewind_augroup,
+    callback = function(args)
+      local buf = args.buf
+      if not (buf and vim.api.nvim_buf_is_valid(buf)) then
+        return
+      end
+      local name = vim.api.nvim_buf_get_name(buf)
+      if name == "" then
+        return
+      end
+      local abs = vim.fn.fnamemodify(name, ":p")
+      local rec = rewind_watch[abs]
+      if not rec or rec.detached then
+        return
+      end
+      if rec.attached_to ~= buf then
+        rewind_attach(rec, buf)
+      end
+      vim.schedule(function()
+        rewind_reconcile(abs)
+      end)
+    end,
+  })
+end
+
+--- Start (or refresh) the watch for a review that has just opened. Called
+--- once the state is live and `undo_open_seq` -- the sequence the proposal
+--- insertion landed on, and the ONLY boundary this mechanism has -- is known.
+function M._rewind_note_open(state)
+  local change = state and state.change
+  local bufnr = state and state.bufnr
+  if not (change and bufnr and vim.api.nvim_buf_is_valid(bufnr)) then
+    return
+  end
+  local path = change.path
+  if type(path) ~= "string" or path == "" then
+    return
+  end
+  if type(state.undo_open_seq) ~= "number" then
+    return
+  end
+  local open_text = state.staged_text or diff.buffer_bytes_snapshot(bufnr)
+  local open_hash = rewind_hash(open_text)
+  if open_hash == nil then
+    return
+  end
+  local blocks = {}
+  for i, block in ipairs(state.diff_blocks or {}) do
+    local copy = vim.deepcopy(block)
+    copy.incoming_extmark_id = nil
+    copy.incoming_extmark_ids = nil
+    copy.delete_extmark_id = nil
+    copy.authority_extmark_id = nil
+    copy.nav_fallback_stated = nil
+    blocks[i] = copy
+  end
+  local prev = rewind_watch[path]
+  local rec = {
+    path = path,
+    rel = change.rel or change.path,
+    workspace = change.review_workspace or (state.opts and state.opts.workspace) or vim.fn.getcwd(),
+    change = change,
+    opts = state.opts,
+    owner = (state.queue_item and state.queue_item.owner) or freeze_review_owner(state.opts),
+    boundary_seq = state.undo_open_seq,
+    open_hash = open_hash,
+    open_text = open_text,
+    -- The block list AS OPENED: every hunk, all pending. A restore reopens
+    -- from this, never from whatever survived the decisions the rewind took.
+    blocks = (prev and prev.change == change and prev.blocks) or blocks,
+    model_hunks = vim.deepcopy(state.model_hunks or {}),
+    model_source = state.model_source,
+    withdrawn = false,
+  }
+  if prev then
+    prev.detached = true
+  end
+  rewind_watch[path] = rec
+  rewind_attach(rec, bufnr)
+  rewind_ensure_autocmd()
+end
 function M.open(change, opts)
   if not change or not change.path then
     -- Not one of the named refusal paths, but still a `return false` with a
@@ -4638,6 +6509,12 @@ function M.open(change, opts)
     parked = nil
   end
   change._retrace_fresh = nil
+  -- One-shot, same pattern as `_retrace_fresh` just above: read now (before
+  -- the staging pcall below), then clear, so a LATER, genuinely different
+  -- reopen of this same change object never inherits a stale "already
+  -- staged" verdict from a press that has nothing to do with it.
+  local parked_already_staged = change._parked_already_staged
+  change._parked_already_staged = nil
   local blocks = stamp_model_index(M.build_diff_blocks(change.before or "", target), model)
   if parked then
     local parked_blocks = {}
@@ -4687,15 +6564,17 @@ function M.open(change, opts)
 
   local pre_stage_lines = vim.deepcopy(vim.api.nvim_buf_get_lines(bufnr, 0, -1, false))
   local stage_ok, stage_err = pcall(function()
-    -- See `open_review_buffer`'s own "RETRACE REINTEGRATION FAST PATH"
-    -- comment: when that fast path fired, the buffer was returned WITHOUT
-    -- being staged, and it already holds exactly `target` -- writing
-    -- `blocks` into it here would be the SAME phantom undo-tree entry that
-    -- fast path exists to avoid, on top of overwriting content that is
-    -- already correct. `highlight_blocks` alone still paints correctly:
+    -- See `open_review_buffer`'s own "RETRACE REINTEGRATION FAST PATH" and
+    -- "PARKED-ALREADY-STAGED FAST PATH" comments: when either fast path
+    -- fired, the buffer was returned WITHOUT being staged, and it already
+    -- holds exactly `target` (retrace) or `parked.staged_text` (an
+    -- ordinary parked reopen the buffer never moved since) -- writing
+    -- `blocks` into it here would be the SAME phantom undo-tree entry
+    -- either fast path exists to avoid, on top of overwriting content that
+    -- is already correct. `highlight_blocks` alone still paints correctly:
     -- `blocks`' positions were computed against `target`, which IS the
     -- buffer's current content in this path.
-    if not change._retrace_reintegration then
+    if not (change._retrace_reintegration or parked_already_staged) then
       insert_new_lines(bufnr, blocks)
       if parked and type(parked.staged_text) == "string" then
         vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, buffer_lines(parked.staged_text))
@@ -4829,11 +6708,11 @@ function M.open(change, opts)
 
   local maps = config.options.mappings.diff or {}
   local keys = {
-    maps.ours or "co",
-    maps.theirs or "ct",
-    maps.all_theirs or "ca",
+    maps.ours or "cr",
+    maps.theirs or "ca",
+    maps.all_theirs or "cf",
     maps.all_changes or "cA",
-    maps.both or "cb",
+    maps.reject_file or "cx",
     maps.next or "]x",
     maps.prev or "[x",
     -- Buffer-local for the review's lifetime only, and released with it by
@@ -4845,6 +6724,14 @@ function M.open(change, opts)
     "u",
     "U",
     "<C-r>",
+    -- Whole-review abort (cR): same code path as `:YanaAbortReview`. Also
+    -- hardcoded, same reasoning as u/U/<C-r> just above -- the operator's
+    -- vocabulary ruling (2026-08-25) names the letter. Buffer-local for the
+    -- review's lifetime, released by M.cleanup with the rest of `keys` on
+    -- any ordinary close; `M.abort_active` itself tears every affected
+    -- buffer's keys down by hand for its OWN close (its own path never
+    -- reaches M.cleanup's `keys` loop).
+    "cR",
   }
 
   local state = {
@@ -4877,7 +6764,21 @@ function M.open(change, opts)
     fcs_post_count = 0,
     winhl_restore = {},
     augroup = vim.api.nvim_create_augroup("YanaInlineDiff" .. change.id, { clear = true }),
+    -- RULING 75/73/57: whether the drift since `timeline_obs` was last set
+    -- includes anything OUTSIDE a pending hunk -- see `tl_capture_human_edit`.
+    -- Starts false: nothing has happened yet.
+    free_standing_edit = false,
   }
+  local initial_landing_block = blocks[1]
+  if change._retrace_land_model_index ~= nil then
+    for _, b in ipairs(blocks) do
+      if b.model_index == change._retrace_land_model_index then
+        initial_landing_block = b
+        break
+      end
+    end
+    change._retrace_land_model_index = nil
+  end
   ledger.mark(change_ledger(change, opts), "review_profile_state_allocated")
   stamp_review_workspace(change, opts)
   ledger.mark(change_ledger(change, opts), "review_profile_workspace_stamped")
@@ -4887,7 +6788,14 @@ function M.open(change, opts)
   attach_buffer_watch(state)
   ledger.mark(change_ledger(change, opts), "review_profile_buffer_watched")
   local st = pool_for(opts or {})
+  M._review_tabs_init_for_turn(st, change, opts or {})
   st.active = state
+  -- KI-1 / operator ruling 2026-08-24. Start watching this buffer's SINGLE
+  -- insert boundary now that `undo_open_seq` -- the sequence the proposal
+  -- insertion landed on -- is known and the state is live. See
+  -- `M._rewind_note_open` and the section header above it for why this is a
+  -- per-buffer `nvim_buf_attach` and not `TextChanged`.
+  M._rewind_note_open(state)
   -- The opening row. Recorded once the state is live, so tl_record can read the
   -- change off it, and after the buffer holds the staged content so the buffer
   -- epoch belongs to the tree the review is about to work in.
@@ -4928,20 +6836,27 @@ function M.open(change, opts)
     if state.hint_id then
       pcall(vim.api.nvim_buf_del_extmark, bufnr, HINT_NS, state.hint_id)
     end
+    -- Whole-review abort -- the operator ruling that `cR` rewinds every
+    -- file in the turn, not just this one -- is spelled out in full as
+    -- "abort review" at the end so
+    -- nothing reading this ribbon confuses it with `%s: reject file`
+    -- (`maps.reject_file`/cx) above it. `cR` is hardcoded, not `maps`-driven, same
+    -- as the keymap.set("cR", ...) below.
     local full_hint = string.format(
-      "[%s: OURS, %s: THEIRS, %s: ALL, %s: ALL FILES, %s: ABORT, %s: PREV, %s: NEXT]",
-      maps.ours or "co",
-      maps.theirs or "ct",
-      maps.all_theirs or "ca",
+      "[%s: accept hunk, %s: reject hunk, %s: accept file, %s: accept everything, %s: reject file, %s: prev, %s: next, %s: abort review]",
+      maps.theirs or "ca",
+      maps.ours or "cr",
+      maps.all_theirs or "cf",
       maps.all_changes or "cA",
-      maps.both or "cb",
+      maps.reject_file or "cx",
       maps.prev or "[x",
-      maps.next or "]x"
+      maps.next or "]x",
+      "cR"
     )
     local compact_hint = string.format(
       "[%s accept · %s reject · %s/%s hunks]",
-      maps.theirs or "ct",
-      maps.ours or "co",
+      maps.theirs or "ca",
+      maps.ours or "cr",
       maps.next or "]x",
       maps.prev or "[x"
     )
@@ -5046,8 +6961,11 @@ function M.open(change, opts)
     callback = function()
       state.fcs_post_count = (state.fcs_post_count or 0) + 1
       local buf_now = diff.buffer_bytes_snapshot(bufnr)
+      local did_reload = buf_now ~= nil and state.staged_text ~= nil and buf_now ~= state.staged_text
       local reload_unload_token = nil
-      if buf_now ~= nil and state.staged_text ~= nil and buf_now ~= state.staged_text then
+      if did_reload then
+        state.reload_restaging = true
+        state.watch_suspended = true
         reload_unload_token = (state.reload_unload_token or 0) + 1
         state.reload_unload_token = reload_unload_token
         state.ignore_next_reload_unload = reload_unload_token
@@ -5061,11 +6979,25 @@ function M.open(change, opts)
       end
       vim.schedule(function()
         log.guard("yana.inline_diff FileChangedShellPost", function()
+        local function release_reload_restaging()
+          vim.schedule(function()
+            state.reload_restaging = false
+            state.watch_suspended = false
+          end)
+        end
         local st = pool_for_state(state)
         if st.active ~= state then
+          state.reload_restaging = false
+          state.watch_suspended = false
+          return
+        end
+        if not did_reload then
+          state.reload_restaging = false
+          state.watch_suspended = false
           return
         end
         local function tear_down(reason, fp)
+          release_reload_restaging()
           state.change.review_error = reason
           -- Every teardown from this handler is the reloaded-file refusal
           -- class. The conflict branch below adds the fingerprint pair; the
@@ -5099,32 +7031,38 @@ function M.open(change, opts)
           return tear_down(disk_err or "the file changed on disk and was reloaded; the staged hunks are gone")
         end
         local base = change.disk_at_open or ""
-        local staged = state.staged_text
-        if disk_now == base then
-          -- Tier 1: an identical-content reload may still have replaced the
-          -- buffer with base bytes. Restore the review composition first, then
-          -- rebuild extmarks; rebuilding over reloaded base bytes is unsafe.
-          if staged then
-            local buf_now, buf_err = diff.buffer_bytes_snapshot(bufnr)
-            if buf_now == nil then
-              return tear_down(buf_err or "review buffer is not text-safe after reload")
-            end
-            if buf_now ~= staged then
-              break_undo_block(bufnr)
-              vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, buffer_lines(staged))
-              break_undo_block(bufnr)
-              vim.bo[bufnr].modified = false
-            end
-          end
-          render_blocks(bufnr, state.diff_blocks, {
-            site = "reload_identical",
-            model = state.model_hunks,
-            model_source = state.model_source,
-            change = change,
-            opts = state.opts,
-          })
-          return
-        end
+        local was_identical = disk_now == base
+        -- Root cause (closed here): a "content-identical" external reload
+        -- (e.g. `git checkout -- <file>` restoring exactly `disk_at_open`,
+        -- followed by `:checktime`) still routes through Neovim's OWN
+        -- autoread reload before this handler ever runs, and that reload
+        -- replaces the buffer wholesale. Every block's `authority_extmark_id`
+        -- either survives that round trip at its correct position or is
+        -- silently left pointing at the WRONG one -- `live_block_range`
+        -- cannot tell the difference, because a displaced extmark still
+        -- reads as "valid". The former "tier 1" branch trusted those old
+        -- extmarks unconditionally (it re-rendered `state.diff_blocks`
+        -- as-is), so a displaced one made `paint_spans_for_block` search the
+        -- wrong window, find nothing, and withdraw that hunk's band via
+        -- `authority_lost` -- while `state.diff_blocks`'s length, and
+        -- therefore the pending count, never moved. Worse, `:w`'s
+        -- `M._compose_buffer_owned_lines` reads the SAME stale extmark to
+        -- decide what to withhold, so the save silently substituted at the
+        -- wrong lines too: an agent hunk's bytes reached disk while the
+        -- pending count still claimed it was withheld (ruling 72 broken by
+        -- silence, not by decision).
+        --
+        -- The fix is the same one "tier 2" (a genuine outside-hunk disk
+        -- edit) already used: never trust a surviving extmark across a
+        -- reload. Recompose the file's bytes purely from the MODEL
+        -- (`block.start_line`/`old_lines`/`new_lines`, which `absorb_human_edits`
+        -- keeps current and which a buffer-replacing reload cannot perturb),
+        -- write that composition into the buffer, and only THEN rebuild every
+        -- block and its extmark fresh via `M.build_diff_blocks` against the
+        -- buffer that is now actually on screen. A content-identical reload
+        -- is simply the `disk_hunks == {}` case of the same recompose --
+        -- there is no longer a separate "tier 1" path for a stale extmark to
+        -- hide in.
         local composed, compose_err = apply_review_blocks_to_reloaded_disk(base, disk_now, state.diff_blocks)
         if not composed then
           -- The one branch here that HAS both sides of the disagreement:
@@ -5136,9 +7074,9 @@ function M.open(change, opts)
             { expected_fp = fingerprint(base), actual_fp = fingerprint(disk_now) }
           )
         end
-        -- Tier 2: outside-hunk disk edits are kept. The file's base evidence is
-        -- advanced before accept, otherwise the later CAS would refuse a merge
-        -- that this handler has already validated and staged.
+        -- Outside-hunk disk edits (or none at all) are kept. The file's base
+        -- evidence is advanced before accept, otherwise the later CAS would
+        -- refuse a merge that this handler has already validated and staged.
         --
         -- Sealed either side, like every other product-initiated edit to this
         -- buffer: the re-stage is one undo block of its own, so it neither
@@ -5183,12 +7121,20 @@ function M.open(change, opts)
         state.model_hunks = recomposed
         state.model_source = recomposed_source
         render_blocks(bufnr, state.diff_blocks, {
-          site = "reload_composed",
+          site = was_identical and "reload_identical" or "reload_composed",
           model = state.model_hunks,
           model_source = state.model_source,
           change = change,
           opts = state.opts,
         })
+        -- R8: the reload finished recomposing and repainting -- fired for
+        -- both the content-identical and the genuinely-recomposed case,
+        -- never for the two `tear_down(...)` refusal returns above (those
+        -- close the review as a refusal, not a settle; `finish_session` is
+        -- never reached from either, so no OTHER YanaReviewSettled follows
+        -- them either).
+        M._emit_review_settled(bufnr, change.turn_id or change.turn_gen, "reload")
+        release_reload_restaging()
         end)
       end)
     end,
@@ -5412,7 +7358,13 @@ function M.open(change, opts)
   end
 
 
-  local function reject_block_at(idx)
+  --- `redo_of` (ruling 75, one register): the id of the register row this
+  --- decision PUTS BACK after a cross-file `u` reverted it. The row already
+  --- exists and reads `reverted` only because the buffer head sits before it,
+  --- so the redo moves the head back onto that row instead of recording a
+  --- second row for the same hunk -- two rows for one decision made the next
+  --- `u` undo the same hunk twice (measured, r75_redo_after_cross_file_undo).
+  local function reject_block_at(idx, redo_of)
     local block = state.diff_blocks[idx]
     if not block then
       return
@@ -5429,10 +7381,8 @@ function M.open(change, opts)
       notify_one_line("yana: " .. change.review_error, vim.log.levels.WARN)
       return
     end
-    -- The human's text inside this hunk became part of it the instant it
-    -- landed there (decision 57, `absorb_human_edits`), so restoring the
-    -- hunk withdraws it too. Identical to what finish_session's reject-all
-    -- does for the same edit.
+    -- Interior human rows are never part of the proposal (ruling 2026-08-25);
+    -- reject restores the agent's old_lines and leaves those rows standing.
     local restored = reject_restoration(bufnr, block, start_line, end_line)
     record_decision(state, "reject_hunk", {
       hunk = idx,
@@ -5447,31 +7397,35 @@ function M.open(change, opts)
     -- to if this decision is taken back; the sync after the restoration seals
     -- it so nothing later can be added to the same block.
     local pre_seq = buf_undo_seq(bufnr)
-    -- Was anything ALREADY unaccounted-for dirty before this decision's own
-    -- edit? Captured before the write below so the answer is about the
-    -- buffer this reject inherited, not the one it is about to leave.
-    local pre_dirty = vim.bo[bufnr].modified
-    vim.api.nvim_buf_set_lines(bufnr, start_line - 1, end_line, false, restored)
-    break_undo_block(bufnr)
-    -- `nvim_buf_set_lines` unconditionally marks the buffer modified, unlike
-    -- accept (CORE: "accept moves no bytes", so it never dirties the buffer
-    -- at all). Nothing downstream of a per-hunk reject ever clears that flag
-    -- -- bulk reject-all and accept-all both compute a truthful one in
-    -- finish_session, but this per-hunk path (`co` on one hunk, leaving
-    -- siblings pending) returns straight to the still-open review. Left
-    -- alone, `modified` stays wrongly true for the rest of the review,
-    -- including any later `]x`/`[x` park+reopen, and open_review_buffer's
-    -- unsaved-edits guard reads that stale bit and refuses the reopen even
-    -- though the buffer holds nothing but this review's own decided and
-    -- still-pending hunks (MEASURED 2026-08-21, FIX-NAV lane: reject one
-    -- hunk, leave a sibling pending, `]x` away, `[x` back misfired
-    -- "buffer has unsaved edits unrelated to this review"). Reset only what
-    -- THIS decision dirtied: if the buffer was already carrying an
-    -- unaccounted-for edit before this reject ran, that edit is still there
-    -- afterward and the flag must keep saying so.
-    if not pre_dirty then
-      vim.bo[bufnr].modified = false
+    if redo_of then
+      -- REDO OF A WALK-REVERTED REJECT (ruling 75, one register). The
+      -- cross-file `u` took these bytes out with Neovim's own `:undo`, so the
+      -- tree's next state forward IS this rejection's bytes at the row's own
+      -- seq. Take them back with `:redo` -- writing them afresh would mint a
+      -- new seq on a new branch, which the register then read as the human's
+      -- edit and pruned every redo step behind it (measured,
+      -- r75_redo_replays_mixed_decisions_in_order).
+      local ok_redo = pcall(vim.api.nvim_buf_call, bufnr, function()
+        vim.cmd("silent redo")
+      end)
+      local now = vim.api.nvim_buf_get_lines(bufnr, start_line - 1, start_line - 1 + #restored, false)
+      if not ok_redo or not vim.deep_equal(now, restored) then
+        pcall(vim.api.nvim_buf_call, bufnr, function()
+          vim.cmd("silent undo " .. tonumber(pre_seq))
+        end)
+        change.review_error = "redo no longer matches the rejection it would put back"
+        notify_one_line("yana: " .. change.review_error, vim.log.levels.WARN)
+        return
+      end
+    else
+      vim.api.nvim_buf_set_lines(bufnr, start_line - 1, end_line, false, restored)
     end
+    break_undo_block(bufnr)
+    -- Truthful modified flag after a per-hunk reject (ruling 79): reset only
+    -- the dirtiness this restoration caused. Unrelated outside-hunk bytes keep
+    -- modified true; reject-only restoration with sibling pending hunks yields
+    -- false. Mirrors reject-all's recompute — do not force true here.
+    M._recompute_modified(bufnr, state.diff_blocks, change.path)
     local delta = #restored - replaced
     -- The anchor spans what the restoration LEFT in the buffer, so an
     -- un-decide can find the region again after the human has typed above it.
@@ -5488,7 +7442,14 @@ function M.open(change, opts)
       post_seq = buf_undo_seq(bufnr),
       anchor = anchor,
     }
-    do
+    if redo_of then
+      state.decisions[#state.decisions].timeline_id = redo_of
+      M._tl_head_row(state, redo_of, false)
+      M._retrace_forget_reverted(change, block.model_index or idx, redo_of)
+      -- The bytes moved by Yana's own hand: the next human-edit capture
+      -- measures from here, not from before the redo.
+      state.timeline_obs = tl_observe(bufnr)
+    else
       local obs = tl_observe(bufnr)
       obs.regime = "buffer"
       state.decisions[#state.decisions].timeline_id = tl_record(state, "hunk_rejected",
@@ -5503,6 +7464,14 @@ function M.open(change, opts)
     if snap then
       state.staged_text = snap
       state.latest_undo_seq = buf_undo_seq(bufnr)
+      -- Keep `change.after` in step with `state.staged_text` on EVERY per-hunk
+      -- reject that leaves the review open. When `modified` is recomputed
+      -- truthfully (ruling 79 / P118) it is often false after a reject with
+      -- sibling pending hunks; without this sync the parked reopen's
+      -- `existing_modified` gate misses and the reopen falls through to
+      -- fresh staging that overwrites still-pending siblings (r75 redo walk).
+      -- Retrace reintegration needs the same sync for its fast path.
+      change.after = snap
     end
     render_blocks(bufnr, state.diff_blocks, {
       site = "reject_hunk",
@@ -5511,11 +7480,18 @@ function M.open(change, opts)
       change = change,
       opts = state.opts,
     })
-    jump_to_block(bufnr, nearest_block(state.diff_blocks, bufnr, "next"))
+    -- R8: fired AFTER render_blocks (this hunk's paint) whether or not this
+    -- was the LAST hunk. If it was, `try_finalize` below closes the review
+    -- and finish_session's own tail fires a SECOND event named
+    -- `"reject_file"`/`"accept_file"`/`"abort"` -- a waiter for either name
+    -- still sees at least one, and a waiter for the specific file-level name
+    -- is not fooled by this hunk-level one.
+    M._emit_review_settled(bufnr, change.turn_id or change.turn_gen, "reject_hunk")
+    land_on(change.path, bufnr, nearest_block(state.diff_blocks, bufnr, "next"))
     try_finalize(state)
   end
 
-  local function accept_block_at(idx)
+  local function accept_block_at(idx, redo_of)
     local block = state.diff_blocks[idx]
     if not block then
       return
@@ -5531,6 +7507,26 @@ function M.open(change, opts)
     local at_seq = buf_undo_seq(bufnr)
     local start_line, _, range_err = live_block_range(bufnr, block)
     if not start_line then
+      -- UNTRUSTWORTHY AUTHORITY MARK: a mark this engine can no longer
+      -- resolve is STATED and REFUSED, never silently recovered. A prior
+      -- version of this branch tried to route around an invalidated mark by
+      -- matching the hunk's staged bytes against its last-known static
+      -- coordinates, and accepted through that match without saying
+      -- anything -- so a hunk this engine can no longer trust its own
+      -- position for was accepted (and, being the only pending hunk, the
+      -- whole review torn down) with no WARN and no `review_error` at all.
+      -- reject_block_at never had that bypass; this makes accept match it,
+      -- rather than adding a guard that only closes the one case the
+      -- fault-injection fixture injects. Investigated 2026-08-25: every
+      -- ordinary path that clears an authority mark (`highlight_blocks`,
+      -- `absorb_human_edits`, the reload-restage rebuild) recreates or
+      -- reports it before a decision's own `live_block_range` read ever
+      -- runs -- `tl_capture_human_edit` above flushes a pending absorb
+      -- synchronously, in the same tick, before this line. `:checktime`/
+      -- autoread reloads were measured (identical bytes, an outside-hunk
+      -- change, and a full rewrite) to leave the mark intact. No real
+      -- sequence was found that reaches this branch; it is a fault-
+      -- injection guard, not a reachable gap.
       change.review_error = range_err or "hunk invalidated"
       notify_one_line("yana: " .. change.review_error, vim.log.levels.WARN)
       return
@@ -5556,7 +7552,12 @@ function M.open(change, opts)
       post_seq = at_seq,
       anchor = anchor,
     }
-    do
+    if redo_of then
+      state.decisions[#state.decisions].timeline_id = redo_of
+      M._tl_head_row(state, redo_of, false)
+      M._retrace_forget_reverted(change, block.model_index or idx, redo_of)
+      state.timeline_obs = tl_observe(bufnr)
+    else
       local obs = tl_observe(bufnr)
       obs.regime = "buffer"
       state.decisions[#state.decisions].timeline_id = tl_record(state, "hunk_accepted",
@@ -5584,7 +7585,9 @@ function M.open(change, opts)
       change = change,
       opts = state.opts,
     })
-    jump_to_block(bufnr, nearest_block(state.diff_blocks, bufnr, "next"))
+    -- R8: see the matching comment in reject_block_at just above.
+    M._emit_review_settled(bufnr, change.turn_id or change.turn_gen, "accept_hunk")
+    land_on(change.path, bufnr, nearest_block(state.diff_blocks, bufnr, "next"))
     try_finalize(state)
   end
 
@@ -5604,15 +7607,37 @@ function M.open(change, opts)
     accept_block_at(idx)
   end
 
-  local function accept_all()
+  --- `redo_of` (ruling 75, one register): the id of the register row this
+  --- decision PUTS BACK after a cross-file `u` reverted it -- the same
+  --- contract `accept_block_at`'s own `redo_of` carries, generalised to the
+  --- whole file. Accept moves no bytes regardless of how many hunks it
+  --- covers, so this is exactly `accept_block_at`'s redo_of branch, done once
+  --- for every remaining hunk instead of one.
+  local function accept_all(redo_of)
     tl_capture_human_edit(state)
     record_decision(state, "accept_file", { hunks_remaining = #state.diff_blocks })
-    local obs = tl_observe(bufnr)
-    obs.regime = "buffer"
+    -- ONE FILE-LEVEL DECISION, ONE REGISTER ROW (ruling 75): every hunk this
+    -- ONE `ca` invocation accepts is named in `members` on a SINGLE
+    -- `file_accepted` row -- never one `hunk_accepted` row per hunk.
+    local members = {}
     for i, block in ipairs(state.diff_blocks) do
-      tl_record(state, "hunk_accepted", "accept hunk " .. tostring(block.model_index or i), obs)
+      members[#members + 1] = {
+        hunk = block.model_index or i,
+        old_count = #(block.old_lines or {}),
+        new_count = #(block.new_lines or {}),
+      }
     end
-    state.timeline_obs = obs
+    if redo_of then
+      M._tl_head_row(state, redo_of, false)
+      state.timeline_obs = tl_observe(bufnr)
+    else
+      local obs = tl_observe(bufnr)
+      obs.regime = "buffer"
+      obs.members = members
+      tl_record(state, "file_accepted",
+        "accept all " .. #members .. " hunk(s)", obs)
+      state.timeline_obs = obs
+    end
     state.diff_blocks = {}
     vim.api.nvim_buf_clear_namespace(bufnr, NS, 0, -1)
     vim.api.nvim_buf_clear_namespace(bufnr, AUTH_NS, 0, -1)
@@ -5696,6 +7721,10 @@ function M.open(change, opts)
       change = change,
       opts = state.opts,
     })
+    -- R8: `site` is already one of "native_undo"/"native_redo" (this
+    -- function's only two callers), so it doubles as the settle reason with
+    -- no extra parameter.
+    M._emit_review_settled(bufnr, change.turn_id or change.turn_gen, site)
   end
 
   local function native_undo()
@@ -5713,12 +7742,121 @@ function M.open(change, opts)
     rerender_after_history_move("native_undo")
   end
 
-  --- `<C-r>` inside an open review. It was not mapped at all, so redo moved the
-  --- buffer with the review none the wiser and the disagreement surfaced only
-  --- when the next decision was attempted. Redo stays the editor's own
-  --- operation — nothing here refuses it or rewrites it — but the review
-  --- repaints afterwards so what is on screen still describes what is in the
-  --- buffer.
+  --- The redo half of ONE popped decision (ruling 75, one register). Called
+  --- by `yana.timeline.retrace.redo` when the top of the cross-file redo
+  --- register is a decision THIS review popped (`pop_decision` pushed it
+  --- there). Returns true when the decision stands again, or false plus a
+  --- reason; the caller owns the message and the register entry.
+  ---
+  --- PRUNE RULE (Vim's own, row r75_new_action_prunes_redo): the buffer must
+  --- sit exactly where the undo left it. Anything typed since makes the popped
+  --- decision unreachable, and the caller drops it rather than replaying a
+  --- decision over bytes it never described.
+  local function redo_local(entry)
+    local stack = state.undone_decisions or {}
+    local top = stack[#stack]
+    if top == nil then
+      return false, "this review has no undone decision to put back"
+    end
+    if entry and entry.id ~= nil and top.timeline_id ~= nil and entry.id ~= top.timeline_id then
+      return false, "the register's next step is not this review's last undone decision"
+    end
+    local before = buf_undo_seq(bufnr)
+    if before == nil or top.pre_seq ~= before then
+      return false, "pruned"
+    end
+    if before ~= state.reload_restore_seq then
+      state.reload_redo_guard = nil
+      state.reload_restore_seq = nil
+    end
+    -- Accepting a hunk moves no buffer bytes, so taking that decision back
+    -- created no matching Neovim redo step. Restore only the review decision;
+    -- consuming the editor's next redo here would replay an unrelated human
+    -- edit and make the two histories disagree.
+    local after = before
+    if top.action ~= "accept" then
+      local ok, err = pcall(vim.api.nvim_buf_call, bufnr, function()
+        vim.cmd("silent redo")
+      end)
+      if not ok then
+        log.write("WARN", "yana.inline_diff redo: " .. tostring(err))
+        rerender_after_history_move("native_redo")
+        return false, tostring(err)
+      end
+      after = buf_undo_seq(bufnr)
+    end
+    if after ~= top.post_seq then
+      -- The redo went somewhere other than the state this decision produced,
+      -- so re-applying the decision would describe bytes that are not there.
+      -- Put the buffer back and refuse: BOTH owners unchanged is the contract.
+      pcall(vim.api.nvim_buf_call, bufnr, function()
+        vim.cmd("silent undo " .. tonumber(before))
+      end)
+      return false, "redo no longer matches the decision it would put back"
+    end
+    local redo_start, redo_end = live_block_range(bufnr, top.block)
+    if not redo_start then
+      pcall(vim.api.nvim_buf_call, bufnr, function()
+        vim.cmd("silent undo " .. tonumber(before))
+      end)
+      return false, "redo cannot recover that decision's hunk position"
+    end
+    -- Put the decision back beside its bytes. This is the exact inverse of
+    -- the re-adoption in pop_decision: the block leaves the list again, the
+    -- later blocks take their shift back, and the decision returns to the
+    -- stack it came off.
+    table.remove(stack)
+    -- A decided hunk holds no authority mark. `reject_block_at` and
+    -- `accept_block_at` both clear the block's extmarks before the decision
+    -- is recorded, and re-applying a decision has to do the same or the block
+    -- stays actionable while being resolved, caught by the review-state invariant,
+    -- which asks the authority marks rather than the decision list.
+    clear_extmarks(top.block)
+    top.anchor = park_anchor(top.block, redo_start, redo_end)
+    local blocks = state.diff_blocks
+    for i, b in ipairs(blocks) do
+      if b == top.block then
+        table.remove(blocks, i)
+        break
+      end
+    end
+    if (top.delta or 0) ~= 0 then
+      for i = top.idx, #blocks do
+        blocks[i].new_start_line = blocks[i].new_start_line + top.delta
+        blocks[i].new_end_line = blocks[i].new_end_line + top.delta
+      end
+    end
+    state.decisions[#state.decisions + 1] = top
+    -- ROW 112, the mirror of the pop: the decision stands again, so its
+    -- register row does too.
+    M._tl_head_row(state, top.timeline_id, false)
+    record_decision(state, "redo_decision", {
+      hunk = top.idx,
+      model_index = top.block.model_index,
+      redone = top.action,
+    })
+    local snap = diff.buffer_bytes_snapshot(bufnr)
+    if snap then
+      state.staged_text = snap
+      state.latest_undo_seq = buf_undo_seq(bufnr)
+    end
+    rerender_after_history_move("native_redo")
+    return true
+  end
+
+  --- `<C-r>` inside an open review. ONE register (ruling 75): every undone
+  --- step -- this review's own popped decisions, another file's, a
+  --- reintegrated one -- sits on `yana.timeline.retrace`'s redo stack in the
+  --- order it was undone, and this key replays the top of it, whichever file
+  --- it names. Only when that register has nothing for this press is redo
+  --- the editor's own operation, passed straight through and repainted.
+  ---
+  --- Before this, `<C-r>` consulted a per-review stack first and asked the
+  --- register only when the per-review stack was empty; the two disagreed
+  --- about order (a decision undone in THIS file was skipped for an older one
+  --- in another file) and a reintegrated undo's accept was announced as
+  --- redone without ever being re-applied (operator clips 2026-08-23
+  --- 12-41-06 and 12-43-32).
   local function redo_key()
     -- RULING 52 FIRST, and it is a LIFO question rather than a special case:
     -- the last thing `U` did was sweep the turn, so the first thing redo owes
@@ -5727,43 +7865,8 @@ function M.open(change, opts)
     if M._redo_staged_restores(state) then
       return
     end
-    local stack = state.undone_decisions or {}
-    local top = stack[#stack]
     local before = buf_undo_seq(bufnr)
-    -- Is the newest thing in this buffer's history a decision this review took
-    -- back? Only then does redo owe the review anything. Any other redo -- of
-    -- the operator's own typing, say -- is the editor's own operation and is
-    -- passed straight through, exactly as `u` does in the mirror case.
-    local owed = top ~= nil and before ~= nil and top.pre_seq == before
-    -- REINTEGRATION REDO PRIORITY (FIX-UNDO lane, this session), decided
-    -- BEFORE trying native `:redo` at all -- unlike a genuine review, a
-    -- reintegrated one's buffer IS the exact same tree retrace's own
-    -- cross-file bookkeeping already walked backward through. Trying
-    -- native `:redo` first (the code below does, for every other review)
-    -- can succeed on its own -- Neovim's tree genuinely has forward states
-    -- retrace's own earlier `:undo` calls put there -- which moves the
-    -- buffer WITHOUT retrace's redo_stack popping or its own
-    -- `sync_buffer_head` bookkeeping updating. The two mechanisms then
-    -- disagree about where the buffer is, and retrace's NEXT press pops an
-    -- entry for a position the buffer has already passed, re-issuing a
-    -- `:redo` that lands nowhere new -- measured 2026-08-21: exactly this,
-    -- as duplicate "redid hunk_accepted" presses that never reached b.py's
-    -- own entries at all. Going straight to retrace when nothing is
-    -- locally owed keeps ONE mechanism moving this buffer, never two.
-    if not owed and change._retrace_reintegration then
-      local retrace_ok, retrace = pcall(require, "yana.timeline.retrace")
-      local ok_tl, tl = pcall(require, "yana.timeline")
-      if retrace_ok and retrace.redo and ok_tl then
-        local known = tl.known_workspaces and tl.known_workspaces() or {}
-        if #known == 0 then
-          known = { vim.fn.getcwd() }
-        end
-        if retrace.redo(known) then
-          return
-        end
-      end
-    end
-    if not owed and state.reload_redo_guard and before == state.reload_restore_seq then
+    if state.reload_redo_guard and before == state.reload_restore_seq then
       undo_refuse("redo cannot reapply the transient buffer state used by reload")
       rerender_after_history_move("native_redo")
       return
@@ -5772,93 +7875,27 @@ function M.open(change, opts)
       state.reload_redo_guard = nil
       state.reload_restore_seq = nil
     end
-
-    -- Accepting a hunk moves no buffer bytes, so taking that decision back
-    -- creates no matching Neovim redo step. Restore only the review decision;
-    -- consuming the editor's next redo here would replay an unrelated human
-    -- edit and make the two histories disagree.
-    local after = before
-    if not (owed and top.action == "accept") then
-      local ok, err = pcall(vim.api.nvim_buf_call, bufnr, function()
-        vim.cmd("silent redo")
-      end)
-      if not ok then
-        log.write("WARN", "yana.inline_diff redo: " .. tostring(err))
-        rerender_after_history_move("native_redo")
+    local retrace_ok, retrace = pcall(require, "yana.timeline.retrace")
+    local ok_tl, tl = pcall(require, "yana.timeline")
+    if retrace_ok and retrace.redo and ok_tl then
+      local known = tl.known_workspaces and tl.known_workspaces() or {}
+      if #known == 0 then
+        known = { vim.fn.getcwd() }
+      end
+      if retrace.redo(known) then
         return
       end
-      after = buf_undo_seq(bufnr)
     end
-
-    if not owed and after == before then
-      -- A reintegrated review already tried retrace's own cross-file redo
-      -- BEFORE native `:redo` ran at all (see the check above, right after
-      -- `owed` -- this is the general refusal for a GENUINE review, whose
-      -- staging boundary is real and must not be reached past).
-      undo_refuse("there is no newer buffer state to redo inside this review")
-      rerender_after_history_move("native_redo")
-      return
-    end
-
-    if owed then
-      if after ~= top.post_seq then
-        -- The redo went somewhere other than the state this decision produced,
-        -- so re-applying the decision would describe bytes that are not there.
-        -- Put the buffer back and refuse: BOTH owners unchanged is the contract,
-        -- and a redo that moved one of them is the defect being fixed.
-        pcall(vim.api.nvim_buf_call, bufnr, function()
-          vim.cmd("silent undo " .. tonumber(before))
-        end)
-        undo_refuse("redo no longer matches the decision it would put back")
-        return
-      end
-      local redo_start, redo_end = live_block_range(bufnr, top.block)
-      if not redo_start then
-        pcall(vim.api.nvim_buf_call, bufnr, function()
-          vim.cmd("silent undo " .. tonumber(before))
-        end)
-        undo_refuse("redo cannot recover that decision's hunk position")
-        return
-      end
-      -- Put the decision back beside its bytes. This is the exact inverse of
-      -- the re-adoption in pop_decision: the block leaves the list again, the
-      -- later blocks take their shift back, and the decision returns to the
-      -- stack it came off.
-      table.remove(stack)
-      -- A decided hunk holds no authority mark. `reject_block_at` and
-      -- `accept_block_at` both clear the block's extmarks before the decision
-      -- is recorded, and re-applying a decision has to do the same or the block
-      -- stays actionable while being resolved, caught by the review-state invariant,
-      -- which asks the authority marks rather than the decision list.
-      clear_extmarks(top.block)
-      top.anchor = park_anchor(top.block, redo_start, redo_end)
-      local blocks = state.diff_blocks
-      for i, b in ipairs(blocks) do
-        if b == top.block then
-          table.remove(blocks, i)
-          break
-        end
-      end
-      if (top.delta or 0) ~= 0 then
-        for i = top.idx, #blocks do
-          blocks[i].new_start_line = blocks[i].new_start_line + top.delta
-          blocks[i].new_end_line = blocks[i].new_end_line + top.delta
-        end
-      end
-      state.decisions[#state.decisions + 1] = top
-      -- ROW 112, the mirror of the pop above: the decision stands again, so its
-      -- register row does too.
-      M._tl_head_row(state, top.timeline_id, false)
-      record_decision(state, "redo_decision", {
-        hunk = top.idx,
-        model_index = top.block.model_index,
-        redone = top.action,
-      })
-      local snap = diff.buffer_bytes_snapshot(bufnr)
-      if snap then
-        state.staged_text = snap
-        state.latest_undo_seq = buf_undo_seq(bufnr)
-      end
+    -- Nothing of Yana's to put back: the editor's own redo, repainted, and
+    -- the editor's own silence when there is nothing newer (operator ruling
+    -- 2026-08-23 night, ruling #100 extended to redo: a press Yana does
+    -- nothing for must look exactly as if Yana were not installed). `redo`
+    -- is run unsilenced so Neovim's own "Already at newest change" shows.
+    local ok, err = pcall(vim.api.nvim_buf_call, bufnr, function()
+      vim.cmd("redo")
+    end)
+    if not ok then
+      log.write("WARN", "yana.inline_diff redo: " .. tostring(err))
     end
     rerender_after_history_move("native_redo")
   end
@@ -5873,8 +7910,14 @@ function M.open(change, opts)
     -- REJECT: Neovim puts the agent's bytes back, by walking its own tree to
     -- the state that held them. Nothing here writes lines.
     if top.action == "reject" and top.pre_seq ~= nil then
-      local ok = pcall(vim.api.nvim_buf_call, bufnr, function()
-        vim.cmd("silent undo " .. tonumber(top.pre_seq))
+      -- SUPPRESSED (KI-1 ruling 2026-08-24): this is YANA's own `:undo {seq}`,
+      -- not the operator time travelling. Without the guard the rewind
+      -- reconciler reads Yana's own transaction as a crossing of the insert
+      -- boundary.
+      local ok = pcall(M._rewind_suppress, function()
+        vim.api.nvim_buf_call(bufnr, function()
+          vim.cmd("silent undo " .. tonumber(top.pre_seq))
+        end)
       end)
       if not ok then
         -- A reload past 'undoreload' clears the tree and the bookmark dies with
@@ -5940,6 +7983,24 @@ function M.open(change, opts)
     state.undone_decisions = state.undone_decisions or {}
     state.undone_decisions[#state.undone_decisions + 1] = top
     table.remove(state.decisions)
+    -- ONE REGISTER (ruling 75): the popped decision joins the cross-file redo
+    -- register in undo order, so `<C-r>` -- pressed here or in any other
+    -- file of the turn -- replays steps in the reverse of the order they were
+    -- undone, never this review's stack ahead of an older one elsewhere.
+    pcall(function()
+      local retrace = require("yana.timeline.retrace")
+      local ws = change.review_workspace or (state.opts and state.opts.workspace) or vim.fn.getcwd()
+      retrace.push_review_redo({
+        workspace = ws,
+        rel = change.rel or change.path,
+        id = top.timeline_id,
+        kind = top.action == "accept" and "hunk_accepted" or "hunk_rejected",
+        regime = "review",
+        bufnr = bufnr,
+        hunk = top.block and top.block.model_index or top.idx,
+        redo = redo_local,
+      })
+    end)
     -- ROW 112: one register. This decision's own timeline row now reads
     -- `reverted`, so the cross-file `u` never spends a press on it again.
     M._tl_head_row(state, top.timeline_id, true)
@@ -5980,6 +8041,9 @@ function M.open(change, opts)
       change = change,
       opts = state.opts,
     })
+    -- R8: this review's own decision was taken back and repainted.
+    M._emit_review_settled(bufnr, change.turn_id or change.turn_gen, "undo_decision")
+    land_on(change.path, bufnr, top.block)
     return true
   end
 
@@ -6042,52 +8106,11 @@ function M.open(change, opts)
         -- refusing by name -- is what #100 supersedes: it made `u`, a key
         -- shared with Neovim, print a line and move nothing, once per press,
         -- for the rest of the session.
-        if type(state.undo_pre_stage_seq) == "number"
-          and type(state.undo_open_seq) == "number"
-          and state.undo_pre_stage_seq == state.undo_open_seq
-        then
-          return M._withdraw_for_plain_undo(state, retrace_ok and retrace or nil)
-        end
-        -- ONE FLOOR, FOR EVERY REVIEW. A REINTEGRATION EXCEPTION used to sit
-        -- here: a review retrace itself reopened
-        -- (`change._retrace_reintegration`) skipped the refusal below and took
-        -- a plain `native_undo()` instead, on the reasoning that such a review
-        -- staged nothing and so had no staging boundary to protect. That
-        -- reasoning is wrong about what the boundary protects. It is not the
-        -- staging EDIT that must survive the press, it is the AGREEMENT
-        -- between the buffer and the hunk list this review is still painting:
-        -- a reintegrated review holds exactly the same pending hunks over
-        -- exactly the same lines, so undoing below the state it opened in
-        -- strips the proposal out from under a review that still claims to
-        -- describe it. MEASURED (operator screencast 2026-08-23 10:45,
-        -- ~/.local/state/nvim/yana.log:10688-10699, ~/code/nnDetection): the
-        -- fourth `u` after three cross-file presses had reopened a.py's three
-        -- hunks logged "hunk N no longer matches the buffer -- its highlight
-        -- is withdrawn" three times at site `native_undo`, tripped
-        -- render_check's `model_extent`, painted the ENTIRE buffer green as
-        -- one hunk, and left the register head a seq ahead of the buffer.
-        -- Reproduced as `tests/headless/r113_undo_past_register_floor.lua`.
-        --
-        -- THE EXCEPTION'S OWN JUSTIFICATION IS GONE, not merely outvoted. It
-        -- named one case: the reload-survival suite case (and its
-        -- `undo_after_reject_reaches_pre_turn` sibling) counting plain-`u`
-        -- presses down to the pre-turn buffer, which it claimed "got stuck
-        -- refusing the instant its own first reintegration opened". Since the
-        -- reopen rework (df2d8d9) those cases no longer reach a reintegrated
-        -- review at all: instrumented at this exact branch and run through
-        -- that suite row on its own, all six cases pass
-        -- with ZERO hits here
-        -- (lane floor-green evidence, probe log, 2026-08-23).
-        -- Nothing in the tree now asks for undo to walk out from under an open
-        -- review, so the refusal below is the whole rule again -- and it is a
-        -- rule rather than a marker test, which is what stops the next
-        -- reopen-shaped review from needing an exception of its own.
-        --
-        -- The way past this floor is what the message names: decide the hunks.
-        -- `co`/`ct`/`cb` close the review, and then `u` is the editor's own
-        -- again (retrace's post-review hook) and reaches the pre-turn file.
-        undo_refuse("that is as far back as undo goes inside this review")
-        return
+        -- KI-1 amendment (2026-08-24): no review-open undo floor remains.
+        -- Once the cross-file register is exhausted, crossing the proposal
+        -- insertion with `u` MUST withdraw the whole review silently and then
+        -- hand the press to plain Neovim undo.
+        return M._withdraw_for_plain_undo(state, retrace_ok and retrace or nil)
       end
       return native_undo()
     end
@@ -6117,8 +8140,11 @@ function M.open(change, opts)
       end
     end
     if state.undo_open_seq ~= nil then
-      local ok = pcall(vim.api.nvim_buf_call, bufnr, function()
-        vim.cmd("silent undo " .. tonumber(state.undo_open_seq))
+      -- SUPPRESSED (KI-1 ruling 2026-08-24): `U` is Yana's own transaction.
+      local ok = pcall(M._rewind_suppress, function()
+        vim.api.nvim_buf_call(bufnr, function()
+          vim.cmd("silent undo " .. tonumber(state.undo_open_seq))
+        end)
       end)
       if not ok then
         undo_refuse("undo history no longer reaches the state this review opened in")
@@ -6283,20 +8309,45 @@ function M.open(change, opts)
     -- A save whose composition already equals the bytes on disk writes nothing
     -- at all, so the common case -- pending hunks, no human edit -- never
     -- restamps the file and never goes stale in the first place.
-    vim.api.nvim_create_autocmd("BufWriteCmd", {
+    -- ONE registration for every write path Neovim offers from this buffer
+    -- (ruling 72/87, "saving a copy to another path" keeps hunk ownership
+    -- scoped to the requested range): BufWriteCmd (bare `:w`, `:w newname`, `:wq`, `:update`,
+    -- and -- because Vim renames the buffer to the new name BEFORE firing
+    -- this event -- `:saveas newname` too), FileWriteCmd (`:{range}w file`,
+    -- a write that is not the whole buffer), and FileAppendCmd (`:w >>file`).
+    -- One callback, branching only on what each event's own semantics
+    -- require (the write's line range, and whether it appends) -- there is
+    -- no per-command special case beyond this one `nvim_create_autocmd` call
+    -- naming the three events.
+    vim.api.nvim_create_autocmd({ "BufWriteCmd", "FileWriteCmd", "FileAppendCmd" }, {
       buffer = bufnr,
       group = state.augroup,
-      callback = function()
-       log.guard("yana.inline_diff BufWriteCmd", function()
+      callback = function(ev)
+       log.guard("yana.inline_diff " .. ev.event, function()
         -- <amatch> is the write's actual target (the argument to `:w`, or
-        -- the buffer's own name for a bare `:w`) — resolve it before
-        -- deciding whether this is a write to the reviewed file itself.
+        -- the buffer's own name for a bare `:w`). "Own" is the REVIEW's
+        -- identity, `change.path` -- not the buffer's live name -- so that
+        -- `:saveas newname` (which renames the buffer to `newname` before
+        -- this fires) is correctly read as writing somewhere OTHER than the
+        -- file this review is anchored on, and falls through to the same
+        -- withheld-copy handling as `:w <other-path>` (ruling 78) rather
+        -- than silently overwriting the stale original path.
         local target = vim.fn.expand("<amatch>")
-        local own = diff.abs_path(vim.api.nvim_buf_get_name(bufnr))
+        local own = diff.abs_path(change.path)
         if target ~= "" then
           target = diff.abs_path(target)
         end
         local to_own = (target == "" or target == own)
+
+        -- FileWriteCmd/FileAppendCmd set the '[ / '] marks to the exact line
+        -- range being written (measured against real nvim; BufWriteCmd sets
+        -- them to the whole buffer, so reading them unconditionally needs no
+        -- per-event branch). Clip to the buffer's current extent defensively.
+        local total = vim.api.nvim_buf_line_count(bufnr)
+        local q1 = math.max(1, vim.fn.line("'["))
+        local q2 = math.min(total, math.max(q1, vim.fn.line("']")))
+        local is_full_range = (q1 <= 1 and q2 >= total)
+        local is_append = (ev.event == "FileAppendCmd")
 
         -- Binary is already safe: buffer_bytes_snapshot refuses a binary
         -- buffer or one holding NUL bytes (diff.lua:563-570), and this bails
@@ -6312,44 +8363,72 @@ function M.open(change, opts)
         end
 
         local composed, withheld, skip_reason, skipped =
-          M._compose_buffer_owned_lines(bufnr, state.diff_blocks)
+          M._compose_buffer_owned_lines(bufnr, state.diff_blocks, { q1, q2 })
         if skip_reason then
           -- One screen line, aggregated: several separate notifies would wedge
           -- a `--clean` editor on the hit-enter prompt (issue-log row 81).
-          notify_one_line(
-            string.format(
-              "yana: save left %d hunk(s) in the file -- %s",
-              skipped,
-              tostring(skip_reason)
-            ),
-            vim.log.levels.WARN
+          local skip_msg = string.format(
+            "yana: save left %d hunk(s) in the file -- %s",
+            skipped,
+            tostring(skip_reason)
           )
+          notify_one_line(skip_msg, vim.log.levels.WARN)
+          if to_own and is_full_range and not is_append then
+            notify_one_line("yana: not written — pending hunks could not be mapped safely", vim.log.levels.WARN)
+            return
+          end
         end
         local bytes = M._encode_buffer_lines(bufnr, composed)
         local withheld_msg =
           string.format("yana: wrote buffer-owned lines only — %d hunks withheld", withheld)
+        local authority_lost = 0
+        for _, b in ipairs(state.diff_blocks or {}) do
+          if b.authority_lost then
+            authority_lost = authority_lost + 1
+          end
+        end
 
-        if not to_own then
-          -- Ruling 78: `:w <other-path>` follows ruling 71's stated REASON,
-          -- not the letter of `:w`. The copy withholds the same hunk lines and
-          -- says how many. The reviewed file is not touched on this branch.
-          --
+        -- Only a FULL-BUFFER write of the review's OWN identity, that does
+        -- not append, is "the ordinary save" the bookkeeping below is about.
+        -- Everything else -- a different target (`:w <other-path>`, ruling
+        -- 78; `:saveas`, above), a partial range even to the reviewed file's
+        -- own name (Vim's own E140 already marks that as unusual), or an
+        -- append to anywhere -- withholds and writes the composed slice
+        -- verbatim and never touches `change.*`: none of them is a claim
+        -- that the review's anchor file now equals the buffer.
+        if not (to_own and is_full_range and not is_append) then
           -- The target directory must already exist. `diff.write_file` would
           -- `mkdir -p` it, and this is the one branch whose path is arbitrary
           -- text the human just typed: a mistyped `:w /tpm/x` must refuse the
           -- way Vim refuses it, not silently create `/tpm`.
           local dir = vim.fn.fnamemodify(target, ":h")
-          if dir == "" or vim.fn.isdirectory(dir) ~= 1 then
+          if target == "" or dir == "" or vim.fn.isdirectory(dir) ~= 1 then
             notify_one_line(
-              "yana: could not write copy to " .. target .. ": no such directory " .. dir,
+              "yana: could not write to " .. target .. ": no such directory " .. tostring(dir),
               vim.log.levels.WARN
             )
             return
           end
-          local ok, err = diff.write_file(target, bytes)
+          local out_bytes = bytes
+          if is_append then
+            -- Vim's own `:w >>file` refuses (E212) when `file` does not
+            -- already exist rather than creating it; once this event is
+            -- registered Vim's default handling never runs, so that refusal
+            -- has to be reproduced here.
+            local existing = diff.read_file_bytes(target)
+            if existing == nil then
+              notify_one_line(
+                "yana: could not append to " .. target .. ": no such file or directory",
+                vim.log.levels.WARN
+              )
+              return
+            end
+            out_bytes = existing .. out_bytes
+          end
+          local ok, err = diff.write_file(target, out_bytes)
           if not ok then
             notify_one_line(
-              "yana: could not write copy to " .. target .. ": " .. tostring(err),
+              "yana: could not write to " .. target .. ": " .. tostring(err),
               vim.log.levels.WARN
             )
             return
@@ -6360,6 +8439,16 @@ function M.open(change, opts)
           if withheld > 0 then
             notify_one_line(withheld_msg, vim.log.levels.WARN)
           end
+          return
+        end
+        if authority_lost > 0 then
+          notify_one_line(
+            string.format(
+              "yana: not written — %d pending hunk(s) no longer match the buffer",
+              authority_lost
+            ),
+            vim.log.levels.WARN
+          )
           return
         end
 
@@ -6477,7 +8566,12 @@ function M.open(change, opts)
     })
   end
 
-  local function reject_all()
+  --- `redo_of` (ruling 75, one register): mirrors `accept_all`'s own -- the
+  --- id of the register row this decision puts back. Only meaningful on the
+  --- fresh whole-file branch below (`#state.decisions == 0`); the
+  --- with-prior-decisions sweep is always a fresh series of per-hunk `co`
+  --- steps and has no file-level row of its own to redo.
+  local function reject_all(redo_of)
     tl_capture_human_edit(state)
     record_decision(state, "reject_file", { hunks_remaining = #state.diff_blocks })
     -- A hunk already decided is a RECORDED decision and stands. This record
@@ -6509,9 +8603,15 @@ function M.open(change, opts)
       end
       return all_rejected
     end
+    -- ONE FILE-LEVEL DECISION, ONE REGISTER ROW (ruling 75): `finish_session`'s
+    -- bulk-reject branch below reads this flag to seal the WHOLE restoration
+    -- into one undo-tree entry and record exactly one `file_rejected` row,
+    -- rather than one `hunk_rejected` row (and one undo block) per hunk.
     state.timeline_bulk_reject = true
+    state.timeline_bulk_redo_of = redo_of
     local ok = finish_session(state, false)
     state.timeline_bulk_reject = nil
+    state.timeline_bulk_redo_of = nil
     return ok
   end
 
@@ -6763,6 +8863,29 @@ function M.open(change, opts)
           -- staging once its bytes are on disk.
           change_i._parked_review = nil
           change_i._parked_item = nil
+          -- CLEAR PAINTED BANDS. The active review's own buffer gets its
+          -- incoming/authority/hint namespaces cleared once, below, after
+          -- this whole loop (on `bufnr`/`state.bufnr`) -- but this accept is
+          -- for a change that was never `state`, so that clear never
+          -- touches its buffer. A parked review keeps its pending hunks
+          -- painted on purpose while parked (ROW 112, `park_and_open_state`'s
+          -- `retrace_repaint`), and nothing else is responsible for taking
+          -- that paint back off when accept-everything (not a park+reopen)
+          -- is what resolves it. Measured: after a redo walk across several
+          -- files left one file active and a second merely parked with its
+          -- own still-pending hunk, `cA` correctly zeroed every pending
+          -- count but left the parked file's green bands on screen, still
+          -- describing hunks that had just been accepted
+          -- (r75_four_file_walk_mirror's `[cA] ... no bands left`). Any
+          -- buffer this change happens to have loaded (parked, or merely
+          -- opened earlier in the turn) gets the same three-namespace clear
+          -- the active file's own accept already does.
+          local band_bufnr = parked_bufnr or vim.fn.bufnr(path, false)
+          if band_bufnr and band_bufnr > 0 and vim.api.nvim_buf_is_valid(band_bufnr) then
+            vim.api.nvim_buf_clear_namespace(band_bufnr, NS, 0, -1)
+            vim.api.nvim_buf_clear_namespace(band_bufnr, AUTH_NS, 0, -1)
+            vim.api.nvim_buf_clear_namespace(band_bufnr, HINT_NS, 0, -1)
+          end
           notify_owner(item.opts.on_accept, change_i, "on_accept")
           -- No `diff.reload_file(path)` here any more. shadow/apply.lua now
           -- reconciles this buffer itself, against the stat its own write left
@@ -6871,6 +8994,21 @@ function M.open(change, opts)
 
   ledger.mark(change_ledger(change, opts), "review_profile_actions_ready")
 
+  -- The review's own decision primitives, reachable from
+  -- `yana.timeline.retrace.redo` so a reintegrated undo's accept/reject can be
+  -- put back through the SAME code path the keys use (ruling 75, one
+  -- register). Per-state, never global: the retrace module finds the review
+  -- by (workspace, rel) and calls these on it.
+  state._ops = {
+    accept_block_at = accept_block_at,
+    reject_block_at = reject_block_at,
+    -- RULING 75: the file-level twins, each taking the same `redo_of` a
+    -- reintegrated file-level row's redo needs (`retrace.redo_file_decision`).
+    accept_all = accept_all,
+    reject_all = reject_all,
+    redo_local = redo_local,
+  }
+
   M._test = {
     -- Re-exposed here because this assignment REPLACES the table (see FAULT).
     fault = FAULT,
@@ -6900,6 +9038,8 @@ function M.open(change, opts)
       return state.undo_open_seq
     end,
     accept_everything = accept_everything,
+    prompt_close_owned_tabs = M.prompt_close_owned_tabs,
+    review_tabs_state_path = M.review_tabs_state_path,
   }
 
   local km = { buffer = bufnr, nowait = true, silent = true }
@@ -6913,11 +9053,22 @@ function M.open(change, opts)
     end
   end
   if not opts.preview then
-    vim.keymap.set({ "n", "v" }, maps.ours or "co", guarded("yana.inline_diff reject_hunk", reject_hunk), vim.tbl_extend("force", km, { desc = "yana: reject hunk (ours)" }))
-    vim.keymap.set({ "n", "v" }, maps.theirs or "ct", guarded("yana.inline_diff accept_hunk", accept_hunk), vim.tbl_extend("force", km, { desc = "yana: accept hunk (theirs)" }))
-    vim.keymap.set({ "n", "v" }, maps.all_theirs or "ca", guarded("yana.inline_diff accept_all", accept_all), vim.tbl_extend("force", km, { desc = "yana: accept all hunks" }))
+    vim.keymap.set({ "n", "v" }, maps.ours or "cr", guarded("yana.inline_diff reject_hunk", reject_hunk), vim.tbl_extend("force", km, { desc = "yana: reject hunk (ours)" }))
+    vim.keymap.set({ "n", "v" }, maps.theirs or "ca", guarded("yana.inline_diff accept_hunk", accept_hunk), vim.tbl_extend("force", km, { desc = "yana: accept hunk (theirs)" }))
+    vim.keymap.set({ "n", "v" }, maps.all_theirs or "cf", guarded("yana.inline_diff accept_all", accept_all), vim.tbl_extend("force", km, { desc = "yana: accept all hunks" }))
     vim.keymap.set({ "n", "v" }, maps.all_changes or "cA", guarded("yana.inline_diff accept_everything", accept_everything), vim.tbl_extend("force", km, { desc = "yana: accept ALL changes (whole turn)" }))
-    vim.keymap.set({ "n", "v" }, maps.both or "cb", guarded("yana.inline_diff reject_all", reject_all), vim.tbl_extend("force", km, { desc = "yana: reject file" }))
+    vim.keymap.set({ "n", "v" }, maps.reject_file or "cx", guarded("yana.inline_diff reject_all", reject_all), vim.tbl_extend("force", km, { desc = "yana: reject file" }))
+    -- cR: whole-review abort. SAME code path as `:YanaAbortReview` -- both
+    -- call M.abort_active, which shows the consequence dialog before
+    -- touching anything (operator ruling 2026-08-25). Hardcoded, not a
+    -- `maps.xxx` dial (see the `keys` table above); not wrapped by
+    -- `guarded()` above either: M.abort_active needs `opts` (this review's
+    -- pool), which none of the zero-argument decision primitives above carry.
+    vim.keymap.set({ "n", "v" }, "cR", function()
+      log.guard("yana.inline_diff abort_active", function()
+        M.abort_active(opts)
+      end)
+    end, vim.tbl_extend("force", km, { desc = "yana: abort the whole review (undo everything, confirmed first)" }))
     -- `u` and `U`, buffer-local and only while this review is open. `u` hands
     -- to Neovim's own undo whenever the newest thing in the tree is the
     -- human's edit, and takes a decision back only when the newest thing is
@@ -6977,6 +9128,10 @@ function M.open(change, opts)
       change = change,
       opts = opts,
     })
+    -- R8: fired AFTER the Rung-1 render check above, not before -- an
+    -- observer polling for "review open" must see a review the invariant has
+    -- already accepted, never one still mid-paint.
+    M._emit_review_settled(bufnr, change.turn_id or change.turn_gen, "open")
     -- The first-hunk landing does NOT happen here. This callback is queued
     -- (via vim.schedule) strictly before the one below that calls focus_buf /
     -- tabnew, and vim.schedule preserves registration order -- so at this
@@ -7020,7 +9175,7 @@ function M.open(change, opts)
       -- win_for_buf(bufnr) inside jump_to_block is guaranteed to find it.
       -- Landing here -- after the attach, in the same tick -- rather than in
       -- the earlier schedule is the fix; see the comment there.
-      jump_to_block(bufnr, state.diff_blocks[1])
+      land_on(change.path, bufnr, initial_landing_block)
     else
       -- Same identity guard the preview branch above carries, and it was
       -- missing here: this closure fires a tick after the open, by which time
@@ -7059,7 +9214,7 @@ function M.open(change, opts)
       -- hunk's live-authority start line (nav_start_line / live_block_range
       -- -- the same path ]x/[x use via jump_to_block), not a stale stored
       -- line -- keeping the drift-precision this call already relied on.
-      jump_to_block(bufnr, state.diff_blocks[1])
+      land_on(change.path, bufnr, initial_landing_block)
       -- One screen line, always. Without noice, vim.notify is a plain echo:
       -- anything wider than `columns` raises a hit-enter prompt, which blocks
       -- the main loop and every queued vim.schedule behind it — the review
@@ -7070,8 +9225,8 @@ function M.open(change, opts)
       local banner = string.format(
         "yana: review %s — %s accept · %s reject",
         change.rel,
-        maps.theirs or "ct",
-        maps.ours or "co"
+        maps.theirs or "ca",
+        maps.ours or "cr"
       )
       notify_one_line(banner, vim.log.levels.INFO)
     end
@@ -7130,6 +9285,7 @@ function M.discard_for_owner(owner, opts)
     end
   end
   st.queue = kept
+  M._rewind_forget_owner(owner)
   announce_state()
   if cleared_active then
     process_next_for(opts)
@@ -7141,6 +9297,10 @@ end
 -- outlive the claim release.
 function M.discard_pool(opts)
   local st = pool_for(opts or {})
+  local tabs_path = review_tabs_state_path(opts or {})
+  if tabs_path then
+    pcall(vim.fn.delete, tabs_path)
+  end
   if st.active then
     pcall(M.cleanup, st.active)
     st.active = nil
@@ -7149,6 +9309,8 @@ function M.discard_pool(opts)
   st.batched = {}
   st.order = {}
   st.order_seq = 0
+  st.review_tabs = nil
+  M._rewind_forget_owner(nil)
   announce_state()
 end
 
@@ -7295,7 +9457,9 @@ function M.focus_active(opts)
   if not st.active then
     return false
   end
-  focus_buf(st.active.change.path, st.active.bufnr)
+  if not land_on(st.active.change.path, st.active.bufnr, nil) then
+    focus_buf(st.active.change.path, st.active.bufnr)
+  end
   return true
 end
 
@@ -7309,6 +9473,290 @@ function M.active_state(opts)
     end
   end
   return nil
+end
+
+function M.review_tabs_state_path(opts)
+  return review_tabs_state_path(opts or {})
+end
+
+local function review_tabs_pending_paths(st, owned)
+  local pending = {}
+  local function mark_if_pending(c)
+    if not c or not c.path then
+      return
+    end
+    local abs = diff.abs_path(c.path)
+    if not owned[abs] then
+      return
+    end
+    local blocks = (c._parked_review and c._parked_review.blocks) or {}
+    if c.status == "pending" then
+      pending[abs] = c.rel or c.path
+      return
+    end
+    if c.status ~= "accepted" and c.status ~= "rejected" and #blocks > 0 then
+      pending[abs] = c.rel or c.path
+    end
+  end
+  for _, item in ipairs(st.order or {}) do
+    mark_if_pending(item and item.change)
+  end
+  if st.active then
+    mark_if_pending(st.active.change)
+  end
+  return pending
+end
+
+local function review_tabs_load_owned_record(st, opts)
+  local path = review_tabs_state_path(opts)
+  if not path then
+    return nil, "unknown"
+  end
+  local rec = read_json_file(path)
+  if type(rec) ~= "table" or rec.turn_key == nil or type(rec.owned) ~= "table" then
+    return nil, "unknown"
+  end
+  local owned = {}
+  for abs, entry in pairs(rec.owned) do
+    if type(abs) ~= "string" or type(entry) ~= "table" or type(entry.tab_id) ~= "number" then
+      return nil, "unknown"
+    end
+    local tab = select(1, tab_for_path(abs))
+    if not tab or tab ~= entry.tab_id then
+      return nil, "unknown"
+    end
+    owned[abs] = { tab_id = tab, rel = entry.rel or abs }
+  end
+  return {
+    path = path,
+    turn_key = tostring(rec.turn_key),
+    owned = owned,
+  }, nil
+end
+
+local function review_tabs_prompt_yes(on_choice)
+  local fired = false
+  local picked_yes = nil
+  local select_returned = false
+  local function choice_is_yes(choice, idx)
+    if idx == 1 then
+      return true
+    end
+    if idx == 2 then
+      return false
+    end
+    if type(choice) == "number" then
+      if choice == 1 then
+        return true
+      end
+      if choice == 2 then
+        return false
+      end
+      return nil
+    end
+    if type(choice) == "string" then
+      if choice:find("Yes", 1, true) then
+        return true
+      end
+      if choice:find("No", 1, true) then
+        return false
+      end
+      return nil
+    end
+    if type(choice) == "table" then
+      if type(choice.label) == "string" and choice.label:find("Yes", 1, true) then
+        return true
+      end
+      if type(choice.label) == "string" and choice.label:find("No", 1, true) then
+        return false
+      end
+      if type(choice.text) == "string" and choice.text:find("Yes", 1, true) then
+        return true
+      end
+      if type(choice.text) == "string" and choice.text:find("No", 1, true) then
+        return false
+      end
+      if type(choice[1]) == "string" and choice[1]:find("Yes", 1, true) then
+        return true
+      end
+      if type(choice[1]) == "string" and choice[1]:find("No", 1, true) then
+        return false
+      end
+    end
+    return nil
+  end
+  local function schedule_once(fn)
+    vim.schedule(fn)
+  end
+
+  local function fire_once(yes)
+    if fired then
+      return
+    end
+    fired = true
+    picked_yes = yes and true or false
+    if on_choice and select_returned then
+      schedule_once(function()
+        on_choice(picked_yes)
+      end)
+    end
+  end
+  vim.ui.select({
+    "Yes - close tabs opened by this review",
+    "No - keep review tabs open",
+  }, {
+    prompt = "Close tabs opened by this review?",
+  }, function(choice, idx)
+    local yes = choice_is_yes(choice, idx)
+    if yes == nil then
+      -- A cancelled prompt is still a settled answer under the review-apply
+      -- contract: leave tabs open, but do not strand the turn claim.
+      fire_once(false)
+      return
+    end
+    fire_once(yes)
+  end)
+  select_returned = true
+  if fired then
+    return { status = "answered", yes = picked_yes }
+  end
+  return { status = "prompted" }
+end
+
+local function review_tabs_owned_snapshot(owned)
+  local snap = {}
+  for abs, entry in pairs(owned or {}) do
+    snap[abs] = { tab_id = entry.tab_id, rel = entry.rel or abs }
+  end
+  return snap
+end
+
+local function review_tabs_record_matches(path, expected_turn_key, expected_owned)
+  local rec = read_json_file(path)
+  if type(rec) ~= "table" or tostring(rec.turn_key or "") ~= tostring(expected_turn_key or "") then
+    return false
+  end
+  if type(rec.owned) ~= "table" then
+    return false
+  end
+  for abs, entry in pairs(expected_owned or {}) do
+    local got = rec.owned[abs]
+    if type(got) ~= "table" or type(got.tab_id) ~= "number" or got.tab_id ~= entry.tab_id then
+      return false
+    end
+  end
+  for abs, _ in pairs(rec.owned) do
+    if expected_owned[abs] == nil then
+      return false
+    end
+  end
+  return true
+end
+
+function M.prompt_close_owned_tabs(opts)
+  opts = opts or {}
+  local st = pool_for(opts)
+  local rec = review_tabs_load_owned_record(st, opts)
+  if not rec then
+    -- Unknown ownership is a fail-closed control path, not a product fault.
+    -- Keep it silent so clean turns do not append warning lines to yana.log.
+    st.review_tabs = nil
+    return { ok = false, reason = "unknown_ownership", closed = {}, refused = {} }
+  end
+  if vim.tbl_isempty(rec.owned) then
+    pcall(vim.fn.delete, rec.path)
+    st.review_tabs = nil
+    return { ok = true, reason = "none_owned", closed = {}, refused = {} }
+  end
+  local captured_turn_key = rec.turn_key
+  local captured_owned = review_tabs_owned_snapshot(rec.owned)
+  local settled = nil
+
+  local function finalize_once(result)
+    if settled then
+      return
+    end
+    settled = result
+    if opts and type(opts.after_close) == "function" then
+      pcall(opts.after_close, result)
+    end
+  end
+
+  local function clear_live_owner_if_same_turn()
+    if st.review_tabs and tostring(st.review_tabs.turn_key or "") == tostring(captured_turn_key) then
+      st.review_tabs = nil
+    end
+  end
+
+  local function apply_choice(yes)
+    if settled then
+      return
+    end
+    if not review_tabs_record_matches(rec.path, captured_turn_key, captured_owned) then
+      notify_one_line("yana: stale close-tabs choice ignored", vim.log.levels.WARN)
+      finalize_once({ ok = false, reason = "stale_ownership", closed = {}, refused = {} })
+      return
+    end
+
+    if not yes then
+      pcall(vim.fn.delete, rec.path)
+      clear_live_owner_if_same_turn()
+      finalize_once({ ok = true, reason = "declined", closed = {}, refused = {} })
+      return
+    end
+
+    local pending = review_tabs_pending_paths(st, captured_owned)
+    for abs, entry in pairs(captured_owned) do
+      local tab = select(1, tab_for_path(abs))
+      if not tab or tab ~= entry.tab_id then
+        notify_one_line("yana: stale close-tabs choice ignored", vim.log.levels.WARN)
+        finalize_once({ ok = false, reason = "stale_ownership", closed = {}, refused = {} })
+        return
+      end
+    end
+
+    local closed, refused = {}, {}
+    for abs, entry in pairs(captured_owned) do
+      local rel = entry.rel or abs
+      local tab = entry.tab_id
+      if tab then
+        if pending[abs] then
+          refused[rel] = true
+          notify_one_line("yana: keeping tab open for pending hunks in " .. rel, vim.log.levels.WARN)
+        else
+          local switched = pcall(vim.api.nvim_set_current_tabpage, tab)
+          if switched then
+            local closed_ok = pcall(vim.cmd, "tabclose")
+            if closed_ok then
+              closed[rel] = true
+            end
+          end
+          if not switched then
+            notify_one_line("yana: failed to focus tab for " .. rel .. "; leaving open", vim.log.levels.WARN)
+          elseif not closed[rel] then
+            notify_one_line("yana: failed to close tab for " .. rel .. "; leaving open", vim.log.levels.WARN)
+          end
+        end
+      end
+    end
+    pcall(vim.fn.delete, rec.path)
+    clear_live_owner_if_same_turn()
+    finalize_once({ ok = true, reason = "closed", closed = closed, refused = refused })
+  end
+
+  local prompt = review_tabs_prompt_yes(apply_choice)
+  if settled then
+    return settled
+  end
+  if prompt.status == "answered" then
+    apply_choice(prompt.yes)
+    return settled or { ok = false, reason = "prompt_unresolved", closed = {}, refused = {} }
+  end
+  if prompt.status == "prompted" then
+    return { ok = true, reason = "prompted", closed = {}, refused = {} }
+  end
+
+  return settled or { ok = false, reason = "prompt_unresolved", closed = {}, refused = {} }
 end
 
 function M.rerender(state)
@@ -7438,44 +9886,72 @@ function M.close_active(opts)
   return true
 end
 
---- Abort the open review: put the buffer back to the file as it was BEFORE any
---- hunk appeared, and close the review in the same act.
+--- One sibling file's share of a whole-review abort (operator ruling
+--- 2026-08-25). `change` is a turn-mate of the review being aborted — either
+--- still queued (never opened: `M.open` is the only writer of proposal
+--- bytes into a buffer, so an unopened file's buffer, if it exists at all
+--- via a pre-opened owned tab, already holds nothing but plain disk text)
+--- or PARKED (opened once, staged, then set aside — `change._parked_review`
+--- and `change.undo_pre_stage_seq` both survive that, because parking
+--- deliberately leaves the buffer staged so reopening is instant).
 ---
---- WHY THIS IS NOT UNDO. The operator's request, 2026-08-19: *"undo should go
---- back to the state right BEFORE the hunks appeared not land me in the middle
---- of hunk creation process"*. Raw `u` cannot deliver that, and the reason is
---- structural rather than a missing key. Undo walks Neovim's tree one state at
---- a time, and between the pre-turn file and the review there are several: each
---- rejected hunk's restoration, whatever the operator typed, and the staging.
---- Walking them is what "landing in the middle" IS. Worse, undoing into the
---- staging while the review is still open strips the agent's proposal out of a
---- buffer whose hunk list still claims to describe it, which is why `u` refuses
---- at that floor rather than doing it.
----
---- So this is a TRANSACTION, not a bigger undo: the decision state is unwound
---- first, then the buffer is moved in ONE jump to the pre-staging bookmark, then
---- the review is closed and its marks and keymaps released. At no point is
---- there a buffer without a review or a review without its buffer.
----
---- `U` remains what it was — take back every decision and return to the review
---- AS OPENED, hunks still staged, still deciding. This goes one bookmark
---- further and ends the review. Both are kept because they answer different
---- questions: "let me start these decisions again" and "take this whole thing
---- away".
----
---- SAFETY. Nothing here writes the real tree, and nothing needs to: no decision
---- is durable while a review is open (`finish_session` is the single writer and
---- it also closes). Aborting after the review has closed is not this operation
---- and is refused — by then the applier has moved the real file and the answer
---- is the journaled revert, not a buffer undo.
----
---- Recoverable: the jump is `:undo {seq}`, so `<C-r>` still reaches the
---- proposal until the tree is otherwise disturbed.
-function M.abort_active(opts)
-  local st = pool_for(opts or {})
-  local state = st.active
-  if not state then
-    notify_one_line("yana: no review is open to abort", vim.log.levels.WARN)
+--- A parked file's buffer genuinely holds proposal bytes and needs the same
+--- bookmarked `:undo {seq}` jump `M.abort_active` gives the active file —
+--- against ITS OWN bookmark, because a seq number from one buffer's undo
+--- tree means nothing on another's. An unopened file has no bookmark and
+--- skips the jump; there is nothing on its buffer to rewind.
+--- Either way the paint (all four yana namespaces) and any retrace
+--- undo/redo maps `M.cleanup` may have installed at park time both go, so
+--- every buffer this abort ever touches ends up with Neovim's own `u`/
+--- `<C-r>` — the same bar `M.cleanup`'s `_abort_no_retrace` branch holds the
+--- active file to.
+local function abort_rewind_sibling(st, change)
+  if not change or not change.path then
+    return
+  end
+  local abs = diff.abs_path(change.path)
+  local bufnr = vim.fn.bufnr(abs, false)
+  if bufnr and bufnr > 0 and vim.api.nvim_buf_is_valid(bufnr) then
+    if change.undo_pre_stage_seq ~= nil then
+      pcall(M._rewind_suppress, function()
+        vim.api.nvim_buf_call(bufnr, function()
+          vim.cmd("silent undo " .. tonumber(change.undo_pre_stage_seq))
+        end)
+      end)
+    end
+    vim.api.nvim_buf_clear_namespace(bufnr, NS, 0, -1)
+    vim.api.nvim_buf_clear_namespace(bufnr, AUTH_NS, 0, -1)
+    vim.api.nvim_buf_clear_namespace(bufnr, ANCHOR_NS, 0, -1)
+    vim.api.nvim_buf_clear_namespace(bufnr, HINT_NS, 0, -1)
+    for _, mode in ipairs({ "n", "v" }) do
+      pcall(vim.keymap.del, mode, "u", { buffer = bufnr })
+      pcall(vim.keymap.del, mode, "<C-r>", { buffer = bufnr })
+    end
+  end
+  M._rewind_forget_path(change.path)
+  queue_remove_change(st, change)
+  -- Same status a review the operator withdraws by hand always lands on
+  -- (`M._withdraw_for_plain_undo`'s ruling #100 comment): nothing of this
+  -- file's proposal survives, byte for byte the outcome IS a reject, and
+  -- `pending_hunk_count_for`/the panel's own pending tally both key off
+  -- `status`, never off whether a dialog happened to fire on this exact file.
+  change.status = "rejected"
+  change.review_error = nil
+  change._parked_review = nil
+  change._parked_item = nil
+  change._parked_already_staged = nil
+end
+
+--- The Yes half of `M.abort_active`'s dialog. Everything that changes state
+--- lives here, and only here — the caller has already shown the consequence
+--- and gotten "Yes" back before this runs.
+local function perform_whole_review_abort(st, state, turn_changes)
+  if st.active ~= state then
+    -- The review moved on while the dialog was open (a real-usage race; the
+    -- headless shim answers synchronously so this never fires under test).
+    -- Refuse rather than rewind a review that is no longer the one the
+    -- operator was just shown.
+    notify_one_line("yana: abort cancelled — the review changed before you answered", vim.log.levels.WARN)
     return false
   end
   local bufnr = state.bufnr
@@ -7483,6 +9959,22 @@ function M.abort_active(opts)
     notify_one_line("yana: the review's buffer is gone; nothing to put back", vim.log.levels.WARN)
     return false
   end
+
+  -- SIBLINGS FIRST, active file last. Order does not matter to the buffers
+  -- themselves (each rewinds against its own bookmark, on its own tree) but
+  -- it matters to the claim: marking every sibling non-pending BEFORE
+  -- `finish_session` resolves the active file means the panel's own
+  -- `on_close` (pending == 0 across `p.changes`) fires true the instant the
+  -- active file closes, instead of waiting on siblings `finish_session`
+  -- never touches. That single existing check is what closes the owned
+  -- tabs and releases the turn claim — this function does not reach into
+  -- ui.lua to do either by hand.
+  for _, sibling in ipairs(turn_changes) do
+    if sibling ~= state.change then
+      abort_rewind_sibling(st, sibling)
+    end
+  end
+
   if state.undo_pre_stage_seq == nil then
     -- Never guess a sequence number. Without the bookmark this cannot know
     -- where the file ended and the proposal began, and jumping to the wrong
@@ -7494,8 +9986,16 @@ function M.abort_active(opts)
     return false
   end
 
-  local ok = pcall(vim.api.nvim_buf_call, bufnr, function()
-    vim.cmd("silent undo " .. tonumber(state.undo_pre_stage_seq))
+  -- SUPPRESSED (KI-1 ruling 2026-08-24). An abort deliberately lands BELOW
+  -- the insert boundary, which is exactly the shape the rewind reconciler
+  -- reacts to -- so Yana's own abort transaction must not be mistaken for the
+  -- operator time travelling. The watch is dropped outright below: the
+  -- operator withdrew this review by hand, and a later `:later` must not
+  -- resurrect it.
+  local ok = pcall(M._rewind_suppress, function()
+    vim.api.nvim_buf_call(bufnr, function()
+      vim.cmd("silent undo " .. tonumber(state.undo_pre_stage_seq))
+    end)
   end)
   if not ok then
     -- A reload past 'undoreload' clears the tree and the bookmark dies with it.
@@ -7529,8 +10029,136 @@ function M.abort_active(opts)
   -- this operation exists to prevent.
   state.diff_blocks = {}
   state.decisions = {}
+  M._rewind_forget_path(state.change and state.change.path)
+  -- ABORT RELEASES THE RETRACE MAPS (row `r_abort_releases_u_and_cr_maps`):
+  -- this review closed by
+  -- undoing every decision, so there is no decision left anywhere for a
+  -- cross-file retrace to walk back into. `M.cleanup` (called inside
+  -- `finish_session`, shortly) checks this flag and skips installing the
+  -- retrace `u`/`<C-r>` it installs on every OTHER close — leaving Neovim's
+  -- own undo/redo in this buffer too, same as every sibling just got above.
+  state._abort_no_retrace = true
   finish_session(state, false)
-  notify_one_line("yana: review aborted — the file is back as it was before the hunks", vim.log.levels.INFO)
+  notify_one_line(
+    "yana: review aborted — every file is back as it was before the hunks",
+    vim.log.levels.INFO
+  )
+  return true
+end
+
+--- Abort the WHOLE review: every file it touched — the active buffer and any
+--- parked or still-queued sibling — rewinds to its pre-stage state in one
+--- act, behind a confirmation dialog that discloses the consequence first.
+--- (Operator ruling 2026-08-25, superseding the single-file abort below it
+--- replaced: "on abort, every accept/reject is undone and all buffers
+--- return to the pre-review state, behind a confirmation dialog that
+--- explains the consequence.")
+---
+--- WHY THIS IS NOT UNDO. The operator's request, 2026-08-19: *"undo should go
+--- back to the state right BEFORE the hunks appeared not land me in the middle
+--- of hunk creation process"*. Raw `u` cannot deliver that, and the reason is
+--- structural rather than a missing key. Undo walks Neovim's tree one state at
+--- a time, and between the pre-turn file and the review there are several: each
+--- rejected hunk's restoration, whatever the operator typed, and the staging.
+--- Walking them is what "landing in the middle" IS. Worse, undoing into the
+--- staging while the review is still open strips the agent's proposal out of a
+--- buffer whose hunk list still claims to describe it, which is why `u` refuses
+--- at that floor rather than doing it.
+---
+--- So this is a TRANSACTION, not a bigger undo: the decision state is unwound
+--- first, then each buffer is moved in ONE jump to its own pre-staging
+--- bookmark, then the review is closed and its marks and keymaps released. At
+--- no point is there a buffer without a review or a review without its buffer.
+---
+--- `U` remains what it was — take back every decision and return to the review
+--- AS OPENED, hunks still staged, still deciding. This goes one bookmark
+--- further and ends the review. Both are kept because they answer different
+--- questions: "let me start these decisions again" and "take this whole thing
+--- away".
+---
+--- SAFETY. Nothing here writes the real tree, and nothing needs to: no decision
+--- is durable while a review is open (`finish_session` is the single writer and
+--- it also closes). Aborting after the review has closed is not this operation
+--- and is refused — by then the applier has moved the real file and the answer
+--- is the journaled revert, not a buffer undo.
+---
+--- Recoverable: each jump is `:undo {seq}`, so `<C-r>` still reaches that
+--- file's proposal until its tree is otherwise disturbed -- right up until the
+--- Yes-abort itself releases the key back to Neovim (see `M.cleanup` above).
+function M.abort_active(opts)
+  local st = pool_for(opts or {})
+  local state = st.active
+  if not state then
+    notify_one_line("yana: no review is open to abort", vim.log.levels.WARN)
+    return false
+  end
+  local bufnr = state.bufnr
+  if not bufnr or not vim.api.nvim_buf_is_valid(bufnr) then
+    notify_one_line("yana: the review's buffer is gone; nothing to put back", vim.log.levels.WARN)
+    return false
+  end
+  if state.undo_pre_stage_seq == nil then
+    -- Never guess a sequence number. Without the bookmark this cannot know
+    -- where the file ended and the proposal began, and jumping to the wrong
+    -- state would take the operator's own work with it.
+    notify_one_line(
+      "yana: cannot abort — this review has no pre-staging bookmark, so the file before the hunks is not identifiable",
+      vim.log.levels.WARN
+    )
+    return false
+  end
+
+  -- SCOPE + DISCLOSURE, read-only. Every file this turn ever staged (the
+  -- active buffer, plus any sibling parked or still queued behind it) --
+  -- computed and counted BEFORE the dialog fires, and before anything below
+  -- is allowed to touch a byte, so what "Yes" discloses is exactly what
+  -- "Yes" is about to do.
+  local turn_changes = review_tabs_collect_turn_changes(st, state.change)
+  local file_count = #turn_changes
+  local accepted_count, rejected_count = 0, 0
+  local function tally(list)
+    for _, d in ipairs(list or {}) do
+      if d.action == "accept" then
+        accepted_count = accepted_count + 1
+      elseif d.action == "reject" then
+        rejected_count = rejected_count + 1
+      end
+    end
+  end
+  tally(state.sealed_decisions)
+  tally(state.decisions)
+  for _, c in ipairs(turn_changes) do
+    if c ~= state.change and type(c._parked_review) == "table" then
+      tally(c._parked_review.sealed_decisions)
+    end
+  end
+
+  local prompt = string.format(
+    "Abort the whole review? %d file%s in this review — %d hunk%s accepted, %d hunk%s rejected — "
+      .. "will ALL be undone, including your own edits made during the review.",
+    file_count,
+    file_count == 1 and "" or "s",
+    accepted_count,
+    accepted_count == 1 and "" or "s",
+    rejected_count,
+    rejected_count == 1 and "" or "s"
+  )
+
+  -- `vim.ui.select`, the same mechanism the close-tabs prompt uses (see
+  -- `review_tabs_prompt_yes` above), item 1 "Yes", item 2 "No" -- so a test
+  -- (or a picker plugin) can auto-answer without knowing anything about
+  -- abort specifically. "No" and a dismissed prompt both reach `choice ==
+  -- nil` here and this function has not mutated a single field by then:
+  -- that IS the no-op contract, not a separate branch enforcing it.
+  vim.ui.select({
+    "Yes - abort the whole review",
+    "No - keep reviewing",
+  }, { prompt = prompt }, function(choice)
+    if type(choice) ~= "string" or choice:sub(1, 3) ~= "Yes" then
+      return
+    end
+    perform_whole_review_abort(st, state, turn_changes)
+  end)
   return true
 end
 
@@ -7563,5 +10191,7 @@ M._test.discard_pool = M.discard_pool
 M._test.discard_for_owner = M.discard_for_owner
 M._test.process_next = M.process_next
 M._test.owners_match = owners_match
+M._test.prompt_close_owned_tabs = M.prompt_close_owned_tabs
+M._test.review_tabs_state_path = M.review_tabs_state_path
 
 return M

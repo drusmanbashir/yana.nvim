@@ -924,6 +924,10 @@ function M.accept_apply(pass, change, composed)
 		target = is_delete and "" or (composed or ""),
 		op_kind = is_delete and "delete" or "replace",
 		base_hash = change.base_hash,
+		-- WHEN that fingerprint was captured (shadow/ops.lua's producer read),
+		-- carried through so a stale-file refusal can tell a human edit from a
+		-- stale capture rather than punting on the distinction.
+		base_hash_captured_ts = change.base_hash_captured_ts,
 		-- The producer's before-state TAG travels with the fingerprint. Absence
 		-- and an empty file are different states, and only the tag separates
 		-- them at accept time.
@@ -1118,6 +1122,8 @@ function M.accept_standalone(panel, change, composed, opts)
 		target = is_delete and "" or (composed or ""),
 		op_kind = is_delete and "delete" or "replace",
 		base_hash = change.base_hash,
+		-- WHEN that fingerprint was captured, same reason as accept_apply above.
+		base_hash_captured_ts = change.base_hash_captured_ts,
 		base_state = change.base_state,
 		base_mode = change.base_mode,
 		base_link_target = change.base_link_target,
@@ -1169,6 +1175,7 @@ function M.scope_revert(panel, change)
 		path = change.path,
 		content = change.before,
 		base_hash = change.base_hash,
+		base_hash_captured_ts = change.base_hash_captured_ts,
 		base_state = change.base_state,
 		base_mode = change.base_mode,
 		base_link_target = change.base_link_target,

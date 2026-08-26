@@ -79,11 +79,15 @@ while IFS= read -r link; do
 done < <(cd "$tree" && find . -path './.git' -prune -o -type l -print)
 
 echo "VERIFY EXEMPT: scripts/release/forbidden-patterns.txt is the scanner registry"
-echo "VERIFY EXEMPT: NOTICE:4 is the audited upstream repository URL"
+echo "VERIFY EXEMPT: NOTICE's one audited upstream repository URL line"
 while IFS= read -r path; do
+	if forbidden_bytes_binary_path "$path"; then
+		continue
+	fi
 	# The byte scanner reads text line-wise, so an encoding that splits the
 	# identity across NUL bytes (UTF-16) or invalid UTF-8 would slip past it.
-	# No shipped file is binary; refuse both outright.
+	# Shipped binary assets are exempt by path class above; all text files
+	# still refuse both outright.
 	if [[ $(LC_ALL=C tr -dc '\0' <"$tree/$path" | wc -c) -gt 0 ]]; then
 		note_fail "NUL bytes in $path (binary or wide encoding is not scannable)"
 	fi
@@ -110,11 +114,18 @@ if [[ -n "$tag" && "$tag" != "v$version" ]]; then
 	note_fail "tag $tag does not equal v$version"
 fi
 
-grep -Fqx "Copyright (c) 2026 The Sigillite" "$tree/LICENSE" \
-	|| note_fail "upstream copyright holder missing from LICENSE"
-grep -Fqx "Copyright (c) 2026 Usman Bashir" "$tree/LICENSE" \
+# LICENSE is the unmodified Apache 2.0 text; its appendix carries only the
+# licensor's own copyright (Yana / Usman Bashir), per the Apache boilerplate.
+# Attribution for upstream-derived material is not an Apache LICENSE concern
+# -- it belongs in NOTICE, which is the Apache-idiomatic home for it, and
+# which already reproduces the upstream MIT licence text in full (satisfying
+# MIT's own requirement that its notice be retained somewhere in the
+# distribution). Both checks below therefore read NOTICE, not LICENSE.
+grep -Fq "Copyright 2026 Usman Bashir" "$tree/LICENSE" \
 	|| note_fail "Yana copyright holder missing from LICENSE"
-grep -Fqx "Yana copyright notice: Copyright (c) 2026 Usman Bashir" "$tree/NOTICE" \
+grep -Fqx "Copyright (c) 2026 The Sigillite" "$tree/NOTICE" \
+	|| note_fail "upstream copyright holder missing from NOTICE"
+grep -Fqx "Copyright 2026 Usman Bashir" "$tree/NOTICE" \
 	|| note_fail "Yana copyright notice missing from NOTICE"
 grep -Fqx "https://github.com/just-nibble/$(printf neo)$(printf cursor).git" "$tree/NOTICE" \
 	|| note_fail "audited upstream URL missing from NOTICE"

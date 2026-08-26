@@ -32,6 +32,17 @@ local notify_one_line = notify.one_line
 local M = {}
 
 local uv = vim.uv or vim.loop
+local ui_ns = vim.api.nvim_create_namespace("yana.ui")
+
+-- Native Neovim chrome only. Links keep Yana inside the active colorscheme;
+-- no palette, icon font, or decoration dependency is imposed on the user.
+for name, link in pairs({
+  YanaUserPrompt = "CursorLine",
+  YanaActivity = "DiagnosticInfo",
+  YanaMuted = "Comment",
+}) do
+  pcall(vim.api.nvim_set_hl, 0, name, { default = true, link = link })
+end
 
 ----------------------------------------------------------------------
 -- panel registry
@@ -307,6 +318,25 @@ local function scroll_to_bottom(p)
   end
 end
 
+local function decorate_append(p, first, last, kind)
+  if not buf_valid(p.conv_buf) then
+    return
+  end
+  local group = kind == "user" and "YanaUserPrompt"
+    or kind == "tool_note" and "YanaActivity"
+    or kind == "note" and "YanaMuted"
+    or nil
+  if not group then
+    return
+  end
+  for row = first, last do
+    pcall(vim.api.nvim_buf_set_extmark, p.conv_buf, ui_ns, row, 0, {
+      line_hl_group = group,
+      priority = 80,
+    })
+  end
+end
+
 -- The turn ledger for a panel's current (or named) turn. One hash lookup;
 -- creates the record if a callback arrives for a turn nothing opened.
 --
@@ -352,12 +382,16 @@ local function append(p, lines, kind)
     return
   end
   local count = vim.api.nvim_buf_line_count(p.conv_buf)
+  local first
   -- A fresh scratch buffer has a single empty line; overwrite it.
   if count == 1 and vim.api.nvim_buf_get_lines(p.conv_buf, 0, 1, false)[1] == "" then
+    first = 0
     set_lines(p, 0, 1, lines)
   else
+    first = count
     set_lines(p, count, count, lines)
   end
+  decorate_append(p, first, vim.api.nvim_buf_line_count(p.conv_buf) - 1, kind)
   ledger.note_append(turn_ledger(p), kind or "append", lines)
   scroll_to_bottom(p)
 end
@@ -793,16 +827,8 @@ local function liveness_text(p)
   return string.format(" · %s · %s since %s", fmt_duration(elapsed), fmt_duration(quiet), label)
 end
 
-local function mode_chip(p)
-  local mode = config.resolve_mode(p.mode)
-  local label = config.panel_mode(p.mode)
-  local locked = mode_locked(p) and " (locked)" or ""
-  local text = label .. locked
-  local hl = config.mode_hl_groups[mode]
-  if hl then
-    return string.format("%%#%s#%s%%*", hl, text:gsub("%%", "%%%%"))
-  end
-  return text
+local function display_mode(mode)
+  return ({ ask = "Ask", inline = "Inline", agentic = "Agent" })[mode] or "Inline"
 end
 
 -- Row 65 / row 68: a single-character ellipsis, and a UTF8-safe (display-cell,
@@ -868,7 +894,7 @@ end
 -- and the mode name itself still tells the operator what mode they are in.
 local function mode_chip(p, no_lock)
   local mode = config.resolve_mode(p.mode)
-  local label = config.panel_mode(p.mode)
+  local label = display_mode(mode)
   local locked = (not no_lock and mode_locked(p)) and " (locked)" or ""
   local text = label .. locked
   local hl = config.mode_hl_groups[mode]
@@ -893,19 +919,29 @@ local function state_word(p)
     -- doing NOW -- the fsyncs the operator is waiting on -- not that a turn is
     -- also in flight.
     local frame = o.ui.spinner[p.spinner.idx] or ""
-    left = frame .. " applying…"
+    left = frame .. " Applying"
   elseif p.busy then
     local frame = o.ui.spinner[p.spinner.idx] or ""
-    left = frame .. " thinking…"
+    left = frame .. " Thinking"
   elseif p.awaiting_exit then
-    left = p.pending_redirect and "⏳ redirecting…" or "⏳ stopping…"
+    left = p.pending_redirect and "Redirecting" or "Stopping"
   else
-    left = " yana"
-  end
-  if #panels > 1 then
-    left = left .. " [" .. panel_index(p) .. "]"
+    left = ""
   end
   return left
+end
+
+local function brand_chip(p)
+  local label = "YANA"
+  if #panels > 1 then
+    label = label .. " [" .. panel_index(p) .. "]"
+  end
+  return "%#Title#" .. label .. "%*"
+end
+
+local function activity_segment(p)
+  local state = state_word(p)
+  return state ~= "" and (" · " .. state) or ""
 end
 
 -- ESCAPE THE PERCENTS. p.title is the raw first line of the user's prompt,
@@ -955,18 +991,9 @@ end
 -- winbar of every turn. `overlay` is the surviving word for the confinement
 -- layer itself; `review`/`confined` say what happens inside it.
 local function confinement_segment()
-  if not config.overlay_mode() then
-    -- `agentic`: no overlay, no review -- the agent writes. Say so. The old
-    -- label here named the removed `preview` mode (ruling R-1), advertising a
-    -- diagnostic nobody can be in on the one surface every session shows.
-    return " · unconfined"
-  elseif config.review_mode_active() then
-    return " · overlay:review"
-  else
-    -- `ask`: confined like `inline`, but nothing is proposed so no review is
-    -- owed. Saying so beats saying nothing, which reads as "no overlay".
-    return " · overlay:confined"
-  end
+  -- Mode names already carry this distinction. Repeating implementation
+  -- vocabulary here made the header noisier without adding an action.
+  return ""
 end
 
 -- The untouchable prefix: state word, liveness, mode chip, model chip.
@@ -976,10 +1003,11 @@ end
 -- chip -- still never a mid-word cut, and never the field omitted outright.
 local function core_text(p, cap, no_lock)
   return string.format(
-    "%%#Title#%s%%*%s · %s · %s",
-    state_word(p),
-    liveness_text(p),
+    "%s · %s%s%s · %s",
+    brand_chip(p),
     mode_chip(p, no_lock),
+    activity_segment(p),
+    liveness_text(p),
     model_chip(p, cap)
   )
 end
@@ -1016,10 +1044,11 @@ local function winbar_text(p)
   -- recording actually showed as "over>": a real character Neovim itself
   -- paints for that fallback, not an OCR-misread `<`.
   return string.format(
-    "%%#Title#%s%%*%s · %s · %s%s%s%s%s%%<  · %s",
-    state_word(p),
-    liveness_text(p),
+    "%s · %s%s%s · %s%s%s%s%s%%<  · %s",
+    brand_chip(p),
     mode_chip(p),
+    activity_segment(p),
+    liveness_text(p),
     model_chip(p),
     pend,
     queued,
@@ -1027,6 +1056,18 @@ local function winbar_text(p)
     confinement,
     sess
   )
+end
+
+local function prompt_winbar_text(p)
+  local width = win_valid(p.prompt_win) and vim.api.nvim_win_get_width(p.prompt_win) or 0
+  local left = width > 0 and width < 24 and "Prompt" or "Send follow-up…"
+  if width > 0 and width < 36 then
+    return "%#Comment#  " .. left .. " %*"
+  end
+  local mode = display_mode(config.resolve_mode(p.mode))
+  local model = p.model_actual or (config.options.backend or "cursor")
+  model = trunc_display(model, 16):gsub("%%", "%%%%")
+  return string.format("%%#Comment#  %s %%*%%=%%#Comment# %s · %s  %%*", left, mode, model)
 end
 
 -- Returns the DISPLAY-CELL width nvim_eval_statusline would actually paint
@@ -1154,7 +1195,7 @@ local function update_winbar(p)
   end
   if win_valid(p.prompt_win) then
     pcall(function()
-      vim.wo[p.prompt_win].winbar = single_file_banner(p) or "%#Comment#  prompt — type your question %*"
+      vim.wo[p.prompt_win].winbar = single_file_banner(p) or prompt_winbar_text(p)
     end)
   end
 end
@@ -1247,13 +1288,13 @@ end
 ----------------------------------------------------------------------
 
 local function render_user(p, question, label)
-  local lines = { "## You", "" }
-  for _, l in ipairs(vim.split(question, "\n", { plain = true })) do
-    table.insert(lines, l)
+  local lines = { "" }
+  for i, l in ipairs(vim.split(question, "\n", { plain = true })) do
+    table.insert(lines, (i == 1 and "› " or "  ") .. l)
   end
   if label then
     table.insert(lines, "")
-    table.insert(lines, "_context: `" .. label .. "`_")
+    table.insert(lines, "  Context · " .. label)
   end
   table.insert(lines, "")
   append(p, lines, "user")
@@ -1284,6 +1325,17 @@ local function start_assistant_block(p)
   p.stream_seq_last = nil
   p.stream_gen = nil
   p.rendered_any = false
+  -- Pinned contract (row 63, predates this panel refactor): every turn's
+  -- assistant block opens with "## <backend> · <mode>", naming the ACTIVE
+  -- backend in its own canonical spelling. The panel rewrite blanked this to
+  -- an empty line with no comment and no replacement -- nothing in this
+  -- refactor's own additions (the new conversation-header wording in
+  -- modes.md) even talks about this line: that text is about the persistent
+  -- "YANA [n] · mode · model" WINBAR built by brand_chip/core_text, a
+  -- different surface, so it supplies no authority for dropping this one
+  -- either way. Restored with the same two helpers the rest of the file
+  -- still defines and uses (backend_label, config.panel_mode) -- nothing
+  -- about their shape changed.
   append(p, { "## " .. backend_label() .. " · " .. config.panel_mode(p.mode), "" }, "assistant_header")
   p.assistant_start = vim.api.nvim_buf_line_count(p.conv_buf)
 end
@@ -1344,13 +1396,35 @@ local function commit_stream(p)
 end
 
 render_note = function(p, text)
-  append(p, { "_" .. text .. "_", "" }, "note")
+  append(p, { "  " .. notify.flatten(text), "" }, "note")
+end
+
+local function tool_activity(name)
+  local lower = tostring(name or ""):lower()
+  if lower:find("edit", 1, true) or lower:find("write", 1, true) or lower:find("apply", 1, true) then
+    return "Edited"
+  end
+  if lower:find("shell", 1, true) or lower:find("command", 1, true)
+    or lower:find("exec", 1, true) or lower:find("run", 1, true)
+  then
+    return "Ran"
+  end
+  if lower:find("read", 1, true) or lower:find("search", 1, true)
+    or lower:find("grep", 1, true) or lower:find("glob", 1, true)
+    or lower:find("list", 1, true)
+  then
+    return "Explored"
+  end
+  return "Ran"
 end
 
 local function render_tool_note(p, name, payload)
   commit_stream(p)
   p.rendered_any = true
-  append(p, { "_⚙ " .. diff.tool_summary(name, payload) .. "_", "" }, "tool_note")
+  append(p, {
+    "✓ " .. tool_activity(name) .. " · " .. notify.flatten(diff.tool_summary(name, payload)),
+    "",
+  }, "tool_note")
   p.assistant_start = vim.api.nvim_buf_line_count(p.conv_buf)
 end
 
@@ -1358,16 +1432,16 @@ local function change_footer_text(change, _k)
   if change.status == "pending" then
     local maps = config.options.mappings.diff or {}
     return string.format(
-      "_Review in **file buffer**: `%s` reject hunk · `%s` accept hunk · `%s` accept all · `%s` accept all changes · `%s` reject file_",
-      maps.ours or "co",
-      maps.theirs or "ct",
-      maps.all_theirs or "ca",
+      "Review changes in file buffer: Reject hunk `%s` · Accept hunk `%s` · Accept file `%s` · Accept all `%s` · Reject file `%s`",
+      maps.ours or "cr",
+      maps.theirs or "ca",
+      maps.all_theirs or "cf",
       maps.all_changes or "cA",
-      maps.both or "cb"
+      maps.reject_file or "cx"
     )
   end
   if change.status == "accepted" then
-    return "_accepted — agent edit kept_"
+    return "Accepted · agent edit kept"
   end
   if change.status == "kept_unreviewed" then
     return "_kept unreviewed — agent edit kept, no consent recorded_"
@@ -1377,7 +1451,7 @@ local function change_footer_text(change, _k)
       .. notify.flatten(change.review_error or "real file unchanged; proposal was not reviewable")
       .. "_"
   end
-  return "_rejected — file restored to pre-edit content_"
+  return "Rejected · file restored to pre-edit content"
 end
 
 local function conv_base_line(p)
@@ -1637,7 +1711,14 @@ single_file_banner = function(p)
     return nil
   end
   local name = vim.fn.fnamemodify(sfm.real_path or sfm.copy_path or "file", ":t")
-  return "%#YanaSingleFileBanner# SINGLE-FILE MODE · agent EDITS only "
+  -- Operator ruling 2026-08-25: sentence case wins, matching the modes
+  -- module's "Display vocabulary" section -- this resolves the law-9b gap
+  -- that blocked the earlier same-commit spec text from being authority (see
+  -- tests/headless/sfm_banner.lua header). The old ALL-CAPS "EDITS" carried
+  -- real information (the restriction is on WRITES, not reads), so that
+  -- emphasis moves to a dedicated highlight (YanaSingleFileBannerEmphasis,
+  -- config.lua) on just that word, instead of living in the letters.
+  return "%#YanaSingleFileBanner# Single-file mode · agent %#YanaSingleFileBannerEmphasis#edits%#YanaSingleFileBanner# only "
     .. name
     .. " · multi-file/create/delete refused · :Yana --workspace DIR to widen %*"
 end
@@ -1854,8 +1935,16 @@ local function inline_review_opts(p, change)
   local apply_mode = config.review_mode_active()
   local journaled = config.overlay_mode()
   local ws = (change and change.review_workspace) or panel_claimed_workspace(p)
+  local review_tabs_path = nil
+  local turn = p.shadow_turn or (p.shadow_pass and p.shadow_pass.shadow_turn)
+  if turn and turn.claim_dir then
+    review_tabs_path = turn.claim_dir .. ".review-tabs.json"
+  end
   return {
     workspace = ws,
+    review_tabs = not (config.options.review and config.options.review.tabs == false),
+    review_tabs_state_path = review_tabs_path,
+    review_paths = p.shadow_pass and p.shadow_pass.paths or nil,
     review_owner = { panel_id = p.id, epoch = p.review_epoch },
     turn_pass = p.turn_pass,
     -- INTEGRATION NOTE (orchestrator, merging lane A with lane C). The two lanes
@@ -1983,10 +2072,29 @@ local function inline_review_opts(p, change)
         end
       end
       if pending == 0 and p.shadow_pass then
-        shadow_apply.finish_pass(p.shadow_pass)
-        -- Last hunk resolved: the review is closed, so the claim goes back.
-        release_shadow_turn(p, "review closed")
-        maybe_drain_queue(p)
+        local finalized = false
+        local function finish_review_turn_close()
+          if finalized then
+            return
+          end
+          finalized = true
+          shadow_apply.finish_pass(p.shadow_pass)
+          -- Last hunk resolved: the review is closed, so the claim goes back.
+          release_shadow_turn(p, "review closed")
+          maybe_drain_queue(p)
+        end
+        local close_result = nil
+        pcall(function()
+          local close_opts = vim.tbl_extend("force", inline_review_opts(p), {
+            after_close = function(_result)
+              finish_review_turn_close()
+            end,
+          })
+          close_result = require("yana.inline_diff").prompt_close_owned_tabs(close_opts)
+        end)
+        if not (type(close_result) == "table" and close_result.reason == "prompted") then
+          finish_review_turn_close()
+        end
       end
     end,
   }
@@ -3059,17 +3167,30 @@ local function finalize_shadow_turn_body(p, turn)
         -- every ordinary release after the first review this turn opened —
         -- measured: it did, and broke a same-panel second turn's review from
         -- ever opening (see tests/behaviour_suite.sh's redo-stage coverage).
+        --
+        -- IT IS ALSO WHAT THE LAUNCHER GATES ON, so it is a self-describing
+        -- record and not a list of names: schema, this editor's identity, the
+        -- turn, the workspace, an explicit count, the entries, and a checksum,
+        -- written atomically by preview.write_review_files. A bare list could
+        -- be empty, truncated or stale and still read back as a valid set that
+        -- happened not to name the file a challenger was staging — which is
+        -- exactly how a second editor overran a live review (adv/codex-6).
         if turn.claim_dir then
           local rels = {}
           for _, change in ipairs(changes) do
             rels[#rels + 1] = change.rel or change.path or "?"
           end
           pcall(function()
-            local f = io.open(turn.claim_dir .. ".review-files", "w")
-            if f then
-              f:write(table.concat(rels, "\n"))
-              f:close()
-            end
+            preview_module().write_review_files(
+              turn.claim_dir,
+              -- The directory the overlay is MOUNTED at, which is the base the
+              -- walk's relative paths were read against and the same path the
+              -- launcher was given as --workspace. `workspace` is the claim's
+              -- slug, and the two differ on a broad-root turn.
+              turn.broad_root or turn.workspace or p.cwd or vim.fn.getcwd(),
+              turn_gen,
+              rels
+            )
           end)
         end
         -- CORE requires control-plane writes to be walked, COUNTED and REPORTED
@@ -3334,9 +3455,9 @@ local function on_done(p, gen, code, stderr)
       end
       append(p, {
         "",
-        "_Ask mode cannot apply edits, and this chat's mode is locked. Press "
+        "_Ask mode cannot apply edits, and this conversation's mode is locked. Press "
           .. resend_hint
-          .. " to resend this prompt in a new agent chat._",
+          .. " to resend this prompt in a new Agent conversation._",
         "",
       })
     end
@@ -4627,7 +4748,21 @@ function M.pick_model()
       -- model should persist across restarts, that is a separate feature.
       local from_model = current
       local resolved = (choice.id == "auto") and nil or choice.id
+      local prev_actual_model = config.options.model
+      local model_changed = resolved ~= prev_actual_model
       config.options.model = resolved
+      -- A resolved model that DIFFERS from the previous session model
+      -- invalidates every open panel's vendor-confirmed model the same
+      -- way a backend switch does (see apply_backend_switch above): the
+      -- confirmation belongs to the vendor session that announced it, not
+      -- to the new request, so the chip must not keep asserting it. A
+      -- no-op re-pick of the SAME id changes nothing and must NOT clear a
+      -- live confirmation.
+      if model_changed then
+        for _, q in ipairs(panels) do
+          q.model_actual = nil
+        end
+      end
       -- EVERY open panel's winbar reflects the new session model
       -- immediately, not just the picking one -- the ruling's whole point.
       for _, q in ipairs(panels) do
@@ -4975,7 +5110,7 @@ function M.accept_change(change)
     if ws_opts then
       inline.focus_active(ws_opts)
     end
-    notify_one_line("yana: resolve hunks in file (`ct` accept · `co` reject · `ca` all)", vim.log.levels.INFO)
+    notify_one_line("yana: resolve hunks in file (`ca` accept · `cr` reject · `cf` all)", vim.log.levels.INFO)
     return false
   end
 end
@@ -5018,7 +5153,7 @@ function M.reject_change(change)
     if ws_opts then
       inline.focus_active(ws_opts)
     end
-    notify_one_line("yana: reject in file (`cb` reject file · `co` reject hunk)", vim.log.levels.INFO)
+    notify_one_line("yana: reject in file (`cx` reject file · `cr` reject hunk)", vim.log.levels.INFO)
     return false
   end
 end
@@ -5161,9 +5296,19 @@ function M.release_claim(workspace)
     )
     return false
   end
-  local ok, err = preview_module().release(
-    { claim_dir = status.claim_dir }
-  )
+  local claim_dir = status.claim_dir
+  local nonce = nil
+  do
+    local f = io.open(claim_dir .. "/nonce", "r")
+    if f then
+      nonce = (f:read("*l") or ""):gsub("%s+$", "")
+      f:close()
+      if nonce == "" then
+        nonce = nil
+      end
+    end
+  end
+  local ok, err = require("yana.shadow.jail").release_claim(claim_dir, nonce)
   if not ok then
     notify_one_line("yana: releasing the claim failed: " .. tostring(err), vim.log.levels.ERROR)
     return false
@@ -5449,7 +5594,7 @@ local function win_opts(win, is_prompt)
   vim.wo[win].foldcolumn = "0"
   vim.wo[win].winfixwidth = true
   if is_prompt then
-    vim.wo[win].winbar = "%#Comment#  prompt — type your question %*"
+    vim.wo[win].winbar = prompt_winbar_text(panel_for_buf(vim.api.nvim_win_get_buf(win)))
   end
 end
 
@@ -5918,13 +6063,9 @@ function M.resume(sess, opts)
     local ok, status = pcall(preview_module().claim_status, p.cwd or vim.fn.getcwd())
     if ok and status.held and status.review_open then
       local named = status.workspace
-      local rf = io.open(status.claim_dir .. ".review-files", "r")
-      if rf then
-        local raw = vim.trim(rf:read("*a") or "")
-        rf:close()
-        if raw ~= "" then
-          named = raw:gsub("\n", ", ")
-        end
+      local rels = preview_module().read_review_files(status.claim_dir)
+      if rels and #rels > 0 then
+        named = table.concat(rels, ", ")
       end
       append(p, {
         "_⚠ a review was left open when this workspace's editor last closed —",

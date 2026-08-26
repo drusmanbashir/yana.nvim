@@ -4,8 +4,8 @@ if vim.g.loaded_yana then
 end
 vim.g.loaded_yana = true
 
-if vim.fn.has("nvim-0.10.4") == 0 then
-  vim.notify("yana requires Neovim 0.10.4+", vim.log.levels.ERROR)
+if vim.fn.has("nvim-0.11.2") == 0 then
+  vim.notify("yana requires Neovim 0.11.2+", vim.log.levels.ERROR)
   return
 end
 
@@ -273,3 +273,41 @@ cmd("YanaDiffThemes", function()
     require("yana.diff_preview").open()
   end)
 end, { desc = "Live preview yana inline diff color themes" })
+
+-- Logging surface (LSP-shaped: same names/verbs as :LspLog / vim.lsp.log).
+-- WARN by default, same as vim.lsp.log -- these three commands are the
+-- opt-in switch and viewer; they add no new logging call site of their own.
+cmd("YanaLog", function()
+  log.guard("YanaLog", function()
+    log.open()
+  end)
+end, { desc = "Open the yana log file in a split (like :LspLog)" })
+
+cmd("YanaSetLogLevel", function(opts)
+  log.guard("YanaSetLogLevel", function()
+    local requested = opts.args
+    local ok = pcall(log.set_level, requested)
+    if not ok then
+      error(
+        "yana: invalid log level "
+          .. vim.inspect(requested)
+          .. " -- valid levels: "
+          .. table.concat(log.level_names(), ", "),
+        0
+      )
+    end
+    vim.notify("yana: log level set to " .. requested:upper(), vim.log.levels.INFO, { title = "Yana" })
+  end)
+end, {
+  nargs = 1,
+  complete = function()
+    return log.level_names()
+  end,
+  desc = "Set the yana log level (TRACE/DEBUG/INFO/WARN/ERROR/OFF)",
+})
+
+cmd("YanaLogLevel", function()
+  log.guard("YanaLogLevel", function()
+    vim.notify("yana: log level is " .. log.level_name(log.get_level()), vim.log.levels.INFO, { title = "Yana" })
+  end)
+end, { desc = "Print the current yana log level" })

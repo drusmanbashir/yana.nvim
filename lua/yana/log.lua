@@ -24,11 +24,24 @@ end
 
 M.path = log_path()
 
--- Mirrors vim.log.levels (TRACE=0..ERROR=3), plus OFF -- same names as
--- $VIMRUNTIME's vim.lsp.log.levels. M.levels.WARN is the number; use
--- NAME_TO_LEVEL/LEVEL_NAME below for number<->string in write()/set_level().
+-- Mirrors vim.log.levels (TRACE=0..ERROR=4 on this Neovim), plus OFF -- same
+-- names as $VIMRUNTIME's vim.lsp.log.levels (also TRACE=0..ERROR=4, OFF=5).
+-- M.levels.WARN is the number; use NAME_TO_LEVEL/LEVEL_NAME below for
+-- number<->string in write()/set_level().
+--
+-- OFF is taken from vim.log.levels itself when present (current Neovim
+-- already defines it, at 5) and computed as one past ERROR only as a
+-- fallback for a Neovim old enough to lack it. A HARDCODED `4` here used to
+-- collide with vim.log.levels.ERROR (also 4 on this build): OFF and ERROR
+-- would then share one numeric key, and in the LEVEL_NAME table literal
+-- below the later field silently wins, so LEVEL_NAME[4] became "OFF" and
+-- the "ERROR" entry vanished -- breaking both M.level_name(ERROR) and
+-- M.level_names()'s advertised set. Never re-hardcode this without first
+-- checking it cannot equal vim.log.levels.ERROR.
 M.levels = vim.deepcopy(vim.log.levels)
-M.levels.OFF = 4
+if M.levels.OFF == nil then
+  M.levels.OFF = (vim.log.levels.ERROR or 4) + 1
+end
 
 local LEVEL_NAME = {
   [vim.log.levels.TRACE] = "TRACE",
@@ -36,6 +49,7 @@ local LEVEL_NAME = {
   [vim.log.levels.INFO] = "INFO",
   [vim.log.levels.WARN] = "WARN",
   [vim.log.levels.ERROR] = "ERROR",
+  [M.levels.OFF] = "OFF",
 }
 local NAME_TO_LEVEL = {}
 for nr, name in pairs(LEVEL_NAME) do
@@ -44,6 +58,26 @@ end
 
 -- Minimum level that actually reaches disk. Matches vim.lsp.log's default.
 local current_level = vim.log.levels.WARN
+
+--- Human-readable name for a level number (TRACE..ERROR, plus OFF). Falls
+--- back to the raw number for anything else -- used by :YanaLogLevel and
+--- anywhere else that must report the CURRENT minimum back to a human
+--- rather than just comparing against it.
+function M.level_name(nr)
+  return LEVEL_NAME[nr] or tostring(nr)
+end
+
+--- Sorted list of every accepted level name ("DEBUG", "ERROR", "INFO",
+--- "OFF", "TRACE", "WARN"), for :YanaSetLogLevel's `complete=` and for
+--- naming the valid set in a refusal.
+function M.level_names()
+  local names = {}
+  for name in pairs(NAME_TO_LEVEL) do
+    names[#names + 1] = name
+  end
+  table.sort(names)
+  return names
+end
 
 local durable_unhealthy = false
 local durable_unhealthy_reason = nil
@@ -287,10 +321,22 @@ function M.recent(n)
   return out
 end
 
--- Open the log file in a split for inspection.
+-- Open the log file in a split for inspection (:YanaLog, like :LspLog).
+-- No record has been written yet on a fresh install/state root, or after
+-- rotation started a new file -- that is reported (never a raw Vim error
+-- about a missing file) and no split is opened, since there is nothing to
+-- show. When the file exists, the split lands non-modifiable (this is a
+-- log, not scratch) and jumps to the last line so the newest records are
+-- what the operator sees first, exactly like :LspLog.
 function M.open()
+  if not uv.fs_stat(M.path) then
+    vim.notify("yana: no log file yet at " .. M.path, vim.log.levels.INFO, { title = "Yana" })
+    return
+  end
   vim.cmd("split " .. vim.fn.fnameescape(M.path))
   vim.bo.filetype = "log"
+  vim.bo.modifiable = false
+  vim.cmd("normal! G")
 end
 
 return M

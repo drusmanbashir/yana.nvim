@@ -31,6 +31,14 @@ M.defaults = {
   -- Model to use. nil/"" => let cursor-agent pick (Auto). e.g. "claude-opus-5".
   model = nil,
 
+  -- Minimum level that reaches lua/yana/log.lua's durable log, same names
+  -- and default as vim.lsp.log ("TRACE"/"DEBUG"/"INFO"/"WARN"/"ERROR"/"OFF").
+  -- WARN is the default so an operator who sets nothing sees no change --
+  -- applied once at setup() by calling log.set_level(). :YanaSetLogLevel
+  -- changes it for the rest of the session without a restart; this option
+  -- only decides what a fresh session starts at.
+  log_level = "WARN",
+
   ----------------------------------------------------------------------
   -- BACKENDS -- the "zoo" the operator stocks (avante.nvim's `providers`
   -- table, applied to a CLI agent instead of an HTTP provider: a named
@@ -138,6 +146,55 @@ M.defaults = {
   --                        degrades honestly instead of reusing the
   --                        PREVIOUS backend's list under the new backend's
   --                        name -- exactly the confusion row 58 is about.
+  --   whoami_args            OPTIONAL. Tokens appended to `{cmd}` for a
+  --                        CHEAP, NON-INTERACTIVE credential check (health.lua's
+  --                        checkhealth auth probe: no network turn, no
+  --                        prompt, a short fixed timeout, run once per
+  --                        `:checkhealth yana`, never on the hot turn-submit
+  --                        path). By default the exit code judges the
+  --                        outcome: 0 means signed in, non-zero means not
+  --                        signed in; false/nil means this vendor has no
+  --                        cheap way to ask, so the row reports "unknown"
+  --                        rather than guessing either way. A new vendor
+  --                        declares its own probe here, in data --
+  --                        health.lua reads this field generically and
+  --                        contains no per-vendor branch. See
+  --                        `auth_output_patterns` below for the vendor whose
+  --                        exit code cannot be trusted at all.
+  --   auth_login_hint        OPTIONAL string, paired with `whoami_args`. The
+  --                        EXACT command the operator runs to sign in (e.g.
+  --                        "cursor-agent login"), shown as the remedy on a
+  --                        "NOT signed in" row. nil => the row falls back to
+  --                        naming the resolved binary and pointing at the
+  --                        vendor's own login/auth documentation, since
+  --                        guessing a login subcommand that turns out wrong
+  --                        would be worse than admitting it is not known.
+  --   auth_output_patterns   OPTIONAL table `{ signed_in = "<lua pattern>",
+  --                        signed_out = "<lua pattern>" }`, paired with
+  --                        `whoami_args`. Declares the vendor whose auth
+  --                        probe CANNOT be judged by exit code at all --
+  --                        cursor-agent's `status`/`whoami` exits 0 in BOTH
+  --                        the signed-in and signed-out state (VERIFIED,
+  --                        see VENDOR-AUTH-PROBES.md), distinguishable only
+  --                        by the message it prints. When declared, the
+  --                        exit code is IGNORED and the row instead matches
+  --                        each pattern (Lua `string.find`, plain pattern
+  --                        matching -- not a literal substring check)
+  --                        against the probe's captured stdout+stderr:
+  --                        `signed_in` alone matching -> OK; `signed_out`
+  --                        alone matching -> WARN with `auth_login_hint`;
+  --                        BOTH matching, NEITHER matching, or an absent key
+  --                        never matching -> "unknown", naming the
+  --                        ambiguity, never a guess in either direction.
+  --                        At least one of `signed_in`/`signed_out` must be
+  --                        given; each, if given, must be a non-empty
+  --                        string that compiles as a Lua pattern -- both
+  --                        checked at setup (M.normalize_backends), not
+  --                        discovered as a silent "unknown" the first time
+  --                        `:checkhealth` runs. nil (the default) leaves
+  --                        the exit-code judge in place unchanged -- every
+  --                        backend that does not declare this field behaves
+  --                        exactly as before this field existed.
   --
   -- Work order VENDORS (2026-08-21), fields added for codex and every future
   -- non-cursor vendor whose CLI genuinely differs in KIND, not just spelling:
@@ -199,6 +256,23 @@ M.defaults = {
       resume_flag = "--resume",
       ask_args = { "--mode", "ask" },
       list_models_args = { "--list-models" },
+      -- VENDOR-AUTH-PROBES.md (verified locally, real HOME + empty-HOME
+      -- simulation): `cursor-agent status` is real, fast, non-interactive,
+      -- no-browser -- but exits 0 in BOTH the signed-in and signed-out
+      -- state. Judged by exit code alone this probe cannot distinguish
+      -- them at all, which is why cursor had no auth row until
+      -- auth_output_patterns existed: `--list-models` is the only
+      -- exit-code-honest signal, but it is a real network round-trip
+      -- (disqualified by the "no network turn" checkhealth contract).
+      -- `status`'s OUTPUT does differ ("Logged in as <email>" vs.
+      -- "Not logged in", both confirmed live), so the discriminator judges
+      -- captured output instead of the exit code.
+      whoami_args = { "status" },
+      auth_login_hint = "cursor-agent login",
+      auth_output_patterns = {
+        signed_in = "Logged in as",
+        signed_out = "Not logged in",
+      },
     },
     -- Measured translation table: tests/bin/agent-shim-claude
     -- (branch cp/claude-backend), lifted into declarative form here. That
@@ -211,6 +285,12 @@ M.defaults = {
       allow_edits_args = { "--permission-mode", "acceptEdits" },
       select_model_flag = "--model",
       resume_flag = "--resume",
+      -- VENDOR-AUTH-PROBES.md (verified locally, real env + empty-HOME and
+      -- unset CLAUDE_CONFIG_DIR): `claude auth status` exits 0 when signed
+      -- in, 1 when not -- the exit-code default is honest here, no output
+      -- pattern needed.
+      whoami_args = { "auth", "status" },
+      auth_login_hint = "claude auth login",
       ask_args = nil, -- UNMAPPED, documented gap: claude's closest analogues
                        -- (--permission-mode plan|manual) block on an
                        -- interactive answer a headless -p turn has nobody to
@@ -272,28 +352,15 @@ M.defaults = {
       -- `codex exec debug models`.
       list_models_args = { "debug", "models" },
       list_models_format = "json_models",
+      -- VENDOR-AUTH-PROBES.md (verified locally, real env + empty-HOME and
+      -- empty CODEX_HOME): `codex login status` exits 0 ("Logged in using
+      -- ChatGPT") when signed in, 1 ("Not logged in") when not -- the
+      -- exit-code default is honest here, no output pattern needed.
+      whoami_args = { "login", "status" },
+      auth_login_hint = "codex login",
       close_stdin = true, -- piped stdin makes codex wait to read a
                            -- `<stdin>` block; a codex turn must be spawned
                            -- with stdin closed/empty.
-    },
-    -- Local Ollama (server-mode). The shim `yana-ollama-agent` (plugin
-    -- `bin/`) speaks cursor stream-json so no new stream_protocol is
-    -- needed. Bare `cmd` resolves to plugin `bin/` via M.resolve_cmd
-    -- (bundled), so `\am` / :YanaBackend list_models work without PATH.
-    -- Override with an absolute path if desired. Confinement: Yana's jail
-    -- wraps the shim; the Ollama daemon is a separate localhost service
-    -- outside that wrap (modes.md server-mode note). Default model when
-    -- dial is "auto": shim env YANA_OLLAMA_MODEL or qwen2.5-coder:7b.
-    ollama = {
-      cmd = "yana-ollama-agent",
-      noninteractive_flag = "-p",
-      stream_json_args = { "--output-format", "stream-json" },
-      allow_edits_args = { "--force" },
-      select_model_flag = "--model",
-      resume_flag = nil, -- shim has no session resume yet
-      ask_args = { "--mode", "ask" },
-      list_models_args = { "--list-models" },
-      close_stdin = true,
     },
   },
 
@@ -337,10 +404,9 @@ M.defaults = {
   -- Ask and agentic modes do not receive the rule.
   inline_exec_allowlist = nil,
 
-  -- Directories OUTSIDE the opened workspace that a turn may write, each one
-  -- confined, claimed and reviewed exactly like the workspace itself (see the
-  -- external-roots module doc). The opened workspace is always root 1
-  -- and is never listed here.
+  -- Extra directories that a turn may write. Turn start takes the union of the
+  -- opened workspace and these roots, then keeps only the maximal canonical
+  -- paths; an ancestor entry absorbs the opened workspace and becomes root 1.
   --
   -- THE SET IS OPERATOR-DECLARED AND NOTHING ELSE MAY WIDEN IT. CORE's
   -- cardinal principle is that nothing agent-influenced selects confinement
@@ -351,11 +417,10 @@ M.defaults = {
   -- names the `write_roots` line that would declare it.
   --
   -- Entries are absolute (a leading `~` is expanded here); everything else --
-  -- existence, overlap with the workspace or with each other, resolving inside
-  -- yana's own state root -- is checked at TURN START, where a bad entry
-  -- refuses the turn by name before the agent is launched. Each declared root
-  -- costs one more overlay mount and one more claim per turn (measured ~181 ms
-  -- per root on the reference box).
+  -- existence and resolving inside yana's own state root -- is checked at TURN
+  -- START, where a bad entry refuses by name before the agent is launched.
+  -- Overlap never refuses: the maximal root absorbs contained roots before any
+  -- claim or mount exists.
   write_roots = {},
 
   single_file = {
@@ -393,15 +458,39 @@ M.defaults = {
   -- absolute (a leading `~` is expanded), never derived from a turn.
   workspace_roots = {},
 
-  -- Buffer-local keys during inline hunk review (Avante replace_in_file parity).
+  -- Buffer-local keys during inline hunk review (Avante replace_in_file parity
+  -- for the OTHER five; `both` never was -- see F1 below).
   diff_keymaps = {
-    ours = "co",
-    theirs = "ct",
-    all_theirs = "ca",
+    theirs = "ca",
+    ours = "cr",
+    all_theirs = "cf",
     all_changes = "cA",
-    both = "cb",
+    -- F1 (2026-08-26): renamed from `both`. The key was named for Avante's
+    -- `replace_in_file` "keep both" choice, but yana's binding has only ever
+    -- meant reject-the-whole-file (`reject_all` in lua/yana/inline_diff.lua;
+    -- README/doc/yana.txt/`:checkhealth` all documented it as "reject
+    -- file"). `reject_file` is the real name; the value (`"cx"`) is
+    -- unchanged. `both` is still ACCEPTED as a deprecated alias -- see
+    -- `M.normalize_diff_reject_file_alias` below -- but is deliberately
+    -- ABSENT from this defaults table (and from
+    -- tests/fixtures/default_mappings_baseline.json), because it is not a
+    -- default any more, only a recognized legacy spelling of `reject_file`.
+    reject_file = "cx",
     next = "]x",
     prev = "[x",
+    -- NOT a dial: whole-review abort (cR, same code path as
+    -- `:YanaAbortReview`) is hardcoded in lua/yana/inline_diff.lua, same
+    -- treatment as `u`/`U`/`<C-r>` there -- the operator's vocabulary
+    -- ruling (2026-08-25) names the letter, and this lane adds no config
+    -- key for it (also keeps tests/fixtures/default_mappings_baseline.json
+    -- untouched otherwise: that fixture pins THIS table byte-for-byte,
+    -- minus the `both`->`reject_file` rename above).
+  },
+
+  review = {
+    -- Multi-file reviews (2+ files) open one tab per file and may offer to
+    -- close only the tabs they opened when the turn resolves.
+    tabs = true,
   },
 
   -- Inline diff: standard git colors via colorscheme DiffAdd/DiffDelete.
@@ -437,7 +526,7 @@ M.defaults = {
   -- does with this text, and does not exist yet.
   agent_instructions = [[
 {{YANA_WRITABLE_BOUNDARY}}
-Agent mode: when the user asks to populate, add, change, or give an example in a file, EDIT that file with the Edit File tool immediately — do not only reply in chat or ask whether to paste. Use minimal diffs at the referenced line numbers. When a visual selection is attached, prefer edits inside the stated edit zone; out-of-zone edits may be rejected or flagged before review. The user reviews each edit as inline hunks in the open file (co/ct/ca) before it is final. Propose edits only — never run compilers, test suites, or import/smoke checks; the user's hunk-by-hunk review is the validation step here, not a shell command. If validation like that is actually needed, say so and let the user switch to agentic mode, where it belongs.
+Agent mode: when the user asks to populate, add, change, or give an example in a file, EDIT that file with the Edit File tool immediately — do not only reply in chat or ask whether to paste. Use minimal diffs at the referenced line numbers. When a visual selection is attached, prefer edits inside the stated edit zone; out-of-zone edits may be rejected or flagged before review. The user reviews each edit as inline hunks in the open file (cr/ca/cf) before it is final. Propose edits only — never run compilers, test suites, or import/smoke checks; the user's hunk-by-hunk review is the validation step here, not a shell command. If validation like that is actually needed, say so and let the user switch to agentic mode, where it belongs.
 ]],
 
   selection_scope = {
@@ -615,6 +704,8 @@ Agent mode: when the user asks to populate, add, change, or give an example in a
     -- free. e.g. inline_edit = "<C-k>", inline_edit_normal = "<leader>ck"
     inline_edit = nil,
     inline_edit_normal = nil,
+    next_hunk = nil,
+    prev_hunk = nil,
   },
 
 	-- Paste an image (or an image file, or plain text) from the system
@@ -906,6 +997,46 @@ function M.normalize_inline_edit(ie)
   return out
 end
 
+--- Validates config.log_level against lua/yana/log.lua's own accepted name
+--- set (TRACE/DEBUG/INFO/WARN/ERROR/OFF) -- never a second hard-coded copy
+--- of that list -- and returns the canonical uppercase name. `nil` (an
+--- operator who set nothing) falls back to M.defaults.log_level ("WARN"),
+--- which is what keeps a bare setup({}) byte-identical to today. Any other
+--- non-string or unrecognised name is refused BY NAME at setup, naming the
+--- valid set, rather than silently keeping whatever level was already
+--- running.
+function M.normalize_log_level(value)
+  if value == nil then
+    return M.defaults.log_level
+  end
+  local log = require("yana.log")
+  if type(value) ~= "string" or log.levels[value:upper()] == nil then
+    error(
+      "yana: invalid config.log_level "
+        .. vim.inspect(value)
+        .. " -- valid levels: "
+        .. table.concat(log.level_names(), ", "),
+      0
+    )
+  end
+  return value:upper()
+end
+
+function M.normalize_review(review)
+  local base = vim.deepcopy(M.defaults.review or { tabs = true })
+  if review == nil then
+    return base
+  end
+  if type(review) ~= "table" then
+    error("review must be a table")
+  end
+  local out = vim.tbl_deep_extend("force", base, review)
+  if type(out.tabs) ~= "boolean" then
+    out.tabs = base.tabs
+  end
+  return out
+end
+
 -- Tokens Yana itself places at a fixed point via `resume_flag`/
 -- `select_model_flag`. No OTHER capability list may contain them -- an
 -- entry that tried would let its own "ask" or "allow_edits" or
@@ -1032,6 +1163,56 @@ local function optional_model_list(value, backend_name)
       label = m.id
     end
     out[#out + 1] = { id = m.id, label = label }
+  end
+  return out
+end
+
+-- OPTIONAL auth-probe output discriminator (`auth_output_patterns`): the
+-- vendor whose exit code cannot be trusted at all (cursor-agent `status`
+-- exits 0 either way) still needs a way to judge signed-in vs signed-out
+-- from captured output, without a per-vendor branch in health.lua. At
+-- least one of signed_in/signed_out must be declared; each, when declared,
+-- must compile as a Lua pattern -- caught here, at setup, rather than as a
+-- silent "unknown" the first time an operator runs :checkhealth.
+local function optional_output_patterns(value, backend_name, field)
+  if value == nil then
+    return nil
+  end
+  if type(value) ~= "table" then
+    error(
+      "yana: backends." .. backend_name .. "." .. field .. " must be a table "
+        .. '{ signed_in = "<lua pattern>", signed_out = "<lua pattern>" } (at least one key), or nil',
+      0
+    )
+  end
+  if value.signed_in == nil and value.signed_out == nil then
+    error(
+      "yana: backends." .. backend_name .. "." .. field .. " must declare at least one of signed_in/signed_out "
+        .. "-- a discriminator with neither key can never distinguish anything",
+      0
+    )
+  end
+  local out = {}
+  for _, key in ipairs({ "signed_in", "signed_out" }) do
+    local v = value[key]
+    if v ~= nil then
+      if type(v) ~= "string" or v == "" then
+        error(
+          "yana: backends." .. backend_name .. "." .. field .. "." .. key
+            .. " must be a non-empty string (a Lua pattern), or absent",
+          0
+        )
+      end
+      local compiles = pcall(string.find, "", v)
+      if not compiles then
+        error(
+          "yana: backends." .. backend_name .. "." .. field .. "." .. key
+            .. " is not a valid Lua pattern: " .. v,
+          0
+        )
+      end
+      out[key] = v
+    end
   end
   return out
 end
@@ -1184,6 +1365,18 @@ function M.normalize_backends(value)
       )
     end
 
+    -- `false` and `nil` are the same answer ("no cheap auth probe"),
+    -- normalized to nil the same way list_models_args is above.
+    if entry.whoami_args == false then
+      entry.whoami_args = nil
+    end
+    entry.whoami_args = optional_arglist(entry.whoami_args, name, "whoami_args")
+    if entry.whoami_args then
+      check_no_reserved_tokens(entry.whoami_args, name, "whoami_args")
+    end
+    entry.auth_login_hint = optional_flag(entry.auth_login_hint, name, "auth_login_hint")
+    entry.auth_output_patterns = optional_output_patterns(entry.auth_output_patterns, name, "auth_output_patterns")
+
     entry.models = optional_model_list(entry.models, name)
 
     entry.select_model_flag = optional_flag(entry.select_model_flag, name, "select_model_flag")
@@ -1294,9 +1487,11 @@ end
 ---               the pre-expansion string); `tried = false` means it was
 ---               skipped or empty, and `note` says why.
 --- Plugin root (…/yana), derived from this module's path — same shape as
---- shadow/jail.lua's repo_dir. Used so a shipped bare cmd like
---- `yana-ollama-agent` resolves to `bin/` without the operator putting the
---- plugin on PATH (required for `\am` list_models on a fresh install).
+--- shadow/jail.lua's repo_dir. Used so a shipped bare cmd naming a plugin
+--- `bin/` shim resolves there without the operator putting the plugin on
+--- PATH (required for `\am` list_models on a fresh install). No shipped
+--- backend currently ships such a shim; the mechanism stays for the next
+--- one that does.
 local function plugin_root()
   return debug.getinfo(1, "S").source:sub(2):gsub("/lua/yana/config%.lua$", "")
 end
@@ -1405,15 +1600,19 @@ function M.normalize_skill_dirs(dirs)
   return out
 end
 
---- Shape only. A `write_roots` entry that does not exist, overlaps another
---- root or lands inside the state root is a TURN-START refusal naming the root
---- (`shadow/preview.lua`'s resolve_roots), not a setup error: the directory may
---- legitimately appear after the editor started, and a refusal that names the
---- offending root at the moment a turn needs it is the actionable one.
+--- Shape only. A `write_roots` entry that does not exist or lands inside the
+--- state root is a TURN-START refusal naming the root (`shadow/preview.lua`'s
+--- resolve_roots), not a setup error: the directory may legitimately appear
+--- after the editor started, and a refusal that names the offending root at the
+--- moment a turn needs it is the actionable one.
 ---
---- Entries are sorted here, which is also the ACQUISITION order: claims are
---- taken in canonical-path order so two editors racing for overlapping root
---- sets attempt them in the same sequence and neither ends up holding half.
+--- Overlap is set arithmetic: turn start unions the opened workspace with every
+--- declared root and keeps only maximal canonical paths before claims or mounts
+--- exist. An ancestor root absorbs the opened workspace and becomes root 1.
+---
+--- Entries are sorted here. Acquisition order is fixed after maximal-set
+--- reduction, so two editors racing for the same final root set attempt claims
+--- in the same sequence and neither ends up holding half.
 function M.normalize_write_roots(roots)
   if roots == nil then
     return {}
@@ -1463,8 +1662,8 @@ function M.normalize_single_file(value)
   return out
 end
 
---- Shape only, exactly like `normalize_write_roots`: existence and the
---- ancestor/state-root questions are TURN-START refusals naming the directory
+--- Shape only, with the same delayed-validation pattern as write_roots:
+--- existence and ancestor/state-root questions are TURN-START refusals naming the directory
 --- (`shadow/preview.lua`'s `workspace_for_turn`/`broad_root_for`), because the
 --- directory may legitimately appear after the editor started.
 function M.normalize_workspace_roots(roots)
@@ -1669,6 +1868,62 @@ function M.normalize_mappings(next_options, opts)
   return next_options.mappings
 end
 
+-- Session-scoped (module-level upvalue, not per-call): the deprecation
+-- warning below must fire at most ONCE PER SESSION, not once per
+-- M.setup() call -- an editor config that legitimately re-runs setup() on
+-- every reload (or a test suite that calls it many times) must not turn one
+-- operator habit into a repeated nag.
+local warned_diff_both_deprecated = false
+
+--- F1: `diff_keymaps.both` / `mappings.diff.both` was the Avante-parity name
+--- for a binding that has only ever rejected the whole file
+--- (`reject_all` in lua/yana/inline_diff.lua) -- never Avante's "keep both"
+--- choice. `reject_file` is the real name (default unchanged: `"cx"`);
+--- `both` is still ACCEPTED as a deprecated alias for it.
+---
+--- Runs AFTER M.normalize_mappings, so `diff_group` (== the resolved
+--- `next_options.mappings.diff`, already merged against defaults and both
+--- legacy/new spellings) is the one authority this mutates in place.
+--- `opts` is the RAW pre-merge table the caller passed to setup() --
+--- needed here for the same reason M.normalize_mappings takes it: to tell
+--- "the operator wrote `both` explicitly" apart from "`both` is absent, so
+--- there is nothing to warn about or alias".
+---
+--- Resolution, mirroring M.normalize_mappings' own precedence style:
+---   * `both` not set by the operator anywhere  -> no-op, no warning;
+---     `reject_file` is whatever it already resolved to (the default `cx`
+---     when nothing else was set either).
+---   * `both` set, `reject_file` NOT set          -> `both`'s value becomes
+---     `reject_file`'s resolved value (the alias actually takes effect),
+---     and the warning fires once.
+---   * `both` set AND `reject_file` set           -> `reject_file` (the
+---     current name) wins, same as an explicit new spelling beats a legacy
+---     one elsewhere in this file; the warning still fires, because the
+---     operator still wrote the deprecated key and should stop.
+--- Either way, `both` itself never survives into the resolved table: it is
+--- not a real dial, only a recognized spelling of one decision already
+--- named `reject_file`.
+function M.normalize_diff_reject_file_alias(diff_group, opts)
+  opts = opts or {}
+  local user_mappings = type(opts.mappings) == "table" and opts.mappings or nil
+  local user_diff = (user_mappings and type(user_mappings.diff) == "table" and user_mappings.diff)
+    or (type(opts.diff_keymaps) == "table" and opts.diff_keymaps)
+    or nil
+  local both_value = user_diff and user_diff.both
+  if both_value ~= nil then
+    if not warned_diff_both_deprecated then
+      vim.notify("yana: diff_keymaps.both is deprecated; use reject_file", vim.log.levels.WARN)
+      warned_diff_both_deprecated = true
+    end
+    local reject_file_set = user_diff.reject_file ~= nil
+    if not reject_file_set then
+      diff_group.reject_file = both_value
+    end
+  end
+  diff_group.both = nil
+  return diff_group
+end
+
 --- Install configuration ATOMICALLY: nothing becomes effective until every
 --- validator has accepted.
 ---
@@ -1716,12 +1971,20 @@ function M.setup(opts)
   -- config outright. Mutates next_options.mappings.* and next_options.{
   -- diff_keymaps,keymaps,global_keymaps} in place; never raises.
   M.normalize_mappings(next_options, opts)
+  -- F1: `diff_keymaps.both` deprecated alias for `reject_file` -- must run
+  -- AFTER normalize_mappings (needs the group already reconciled) and
+  -- BEFORE anything reads `mappings.diff.reject_file` or the legacy
+  -- `diff_keymaps.reject_file` below. Mutates both in place, mirroring
+  -- normalize_mappings' own legacy/new sync so neither name can disagree.
+  M.normalize_diff_reject_file_alias(next_options.mappings.diff, opts)
+  next_options.diff_keymaps = next_options.mappings.diff
   -- Every validator runs against the candidate. Any of them may raise; none of
   -- them can leave a half-installed configuration behind.
   next_options.selection_scope = M.normalize_selection_scope(next_options.selection_scope)
   next_options.image_paste = M.normalize_image_paste(next_options.image_paste)
   next_options.redirect = M.normalize_redirect(next_options.redirect)
   next_options.inline_edit = M.normalize_inline_edit(next_options.inline_edit)
+  next_options.review = M.normalize_review(next_options.review)
   next_options.skill_dirs = M.normalize_skill_dirs(next_options.skill_dirs)
   next_options.artifact_dir_prefixes = M.normalize_artifact_dir_prefixes(next_options.artifact_dir_prefixes)
   next_options.write_roots = M.normalize_write_roots(next_options.write_roots)
@@ -1734,9 +1997,11 @@ function M.setup(opts)
   next_options.backend = M.normalize_backend(next_options.backend, next_options.backends)
   next_options.enable_agentic = next_options.enable_agentic == true
   next_options.mode = M.normalize_mode(next_options.mode, next_options.enable_agentic)
+  next_options.log_level = M.normalize_log_level(next_options.log_level)
   -- Only now does anything become effective.
   M.options = next_options
   M.apply_mode_highlights()
+  require("yana.log").set_level(next_options.log_level)
   return M.options
 end
 
@@ -1762,6 +2027,16 @@ function M.apply_mode_highlights()
     vim.api.nvim_set_hl(0, M.model_hl_group, hl)
   end
   vim.api.nvim_set_hl(0, "YanaSingleFileBanner", { link = "WarningMsg", bold = true, default = true, force = true })
+  -- Operator ruling 2026-08-25 (sentence case for the SFM banner, per the
+  -- modes module's "Display vocabulary" section): losing "EDITS" in caps lost
+  -- the emphasis that told the operator the restriction is on WRITES, not
+  -- reads. Carried here instead, as underline on top of the banner's own
+  -- warning colour, applied only to that one word.
+  vim.api.nvim_set_hl(
+    0,
+    "YanaSingleFileBannerEmphasis",
+    { link = "WarningMsg", bold = true, underline = true, default = true, force = true }
+  )
 end
 
 -- The cursor-agent permission mode for this turn. The panel argument is kept so

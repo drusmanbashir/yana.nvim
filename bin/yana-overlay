@@ -17,83 +17,33 @@ readonly MOUNT_MARKER_CONTENT=mounted
 readonly CGROUP_MOUNT=/sys/fs/cgroup
 readonly CGROUP_SLICE_NAME=yana.slice
 
-# ===================== Secret mask (the fixed safety contract "Secrets wall") =====================
+# ===================== Secret mask — RETIRED 2026-08-24 =====================
 #
-# CORE requires that an inline turn have NO READ ACCESS to credential stores and
-# key paths, and requires it as "a harness the agent cannot decline, per the
-# cardinal principle". Both halves are load bearing and both are met here by
-# MOUNTS, never by asking the agent to avoid a path:
+# Ruling 2026-08-24, "Yana confines writes, not reads" (ship-issue tracker,
+# issue 2): Yana's own secret mask is removed entirely. A turn reads exactly
+# what the operator's account can read, the same as running cursor-agent
+# directly outside Yana — the operator accepted in writing that a turn can
+# then read ~/.ssh/id_rsa. The compiled list this used to mask
+# (SECRET_MASK_DIRS/SECRET_MASK_FILES, ~17 credential paths) is gone, along
+# with every function that built or tore it down (build_secret_mask,
+# secret_mask_add, secret_mask_resolve_batch, secret_mask_cleanup) and
+# bin/yana-overlay-inner's --mask-dir/--mask-file support.
 #
-#   - A masked DIRECTORY is overmounted with an empty tmpfs. The real directory
-#     is not shadowed for the host; it is simply not reachable through this
-#     mount namespace.
-#   - A masked FILE is overmounted read-only with an empty regular file, so the
-#     path still stats as a regular file and its bytes are gone. bwrap's --file
-#     cannot be used for this: it CREATES rather than overmounts, and creation
-#     fails on the read-only root (measured).
+# Reason: a fixed list can only hide what someone thought to name — the
+# capsule-contract module doc already said a plain `--ro-bind / /` plus a
+# blacklist "cannot enforce basename masks or identity aliases without a
+# whole-host scan". The alternative built to close that — `ap/jail-
+# allowlist`, a minimal-filesystem read allow-list, working — was ruled out
+# too: it closes the leak but costs the agent sibling repos, system headers
+# and reference docs, and the operator ruled against running a second
+# confinement mechanism beside the agent's own ("dont try to be clever").
+# This supersedes the core contract doc's 2026-08-16 "Secrets wall" ruling;
+# see the core contract doc and the isolation module doc for the current
+# contract.
 #
-# WHY THE AGENT CANNOT DECLINE IT. bin/yana-overlay-inner execs the command
-# through `capsh --drop=all --caps=`, so the agent runs with an empty capability
-# set in every set including the bounding set. Measured inside this jail:
-# CapEff is 0000000000000000, `umount` of a mask returns 32 ("must be superuser
-# to unmount"), and mounting a fresh filesystem over one returns EPERM. Without
-# that capability drop the mask WOULD be declinable — measured too: the same
-# umount succeeds when a shell is run with the bwrap --cap-add set this launcher
-# passes, because those capabilities are for the inner mount helper and are meant
-# to die before the agent starts. So the capsh line in the inner script is part
-# of this control, not merely tidiness, and a change that keeps a capability
-# alive across the exec re-opens this door.
-#
-# WHAT THIS DOES NOT COVER, stated here rather than left to be discovered: an
-# arbitrary out-of-workspace `.env*` at a path nobody compiled, a hardlink to a
-# secret under an innocent basename, and a bind-mount alias of a secret
-# directory. A mount mask acts on the paths it is given, and finding those three
-# needs either a whole-host walk (which this product forbids) or the filtered
-# read-view broker of the capsule contract 4.3. That gap is real,
-# it is not closed by this profile, and tests/overlay_read_secret_gate.sh holds
-# it open as an EXPECTED-RED probe so nothing here reads as complete.
-readonly SECRET_PROFILE_VERSION=1
+# WRITE confinement below (the overlay, the claim, the review boundary) is
+# unchanged by this — only the READ mask is gone.
 
-# Compiled masks, relative to a secret root unless absolute. Directories first,
-# then files; the split is the mount mechanism, not a judgement about severity.
-readonly SECRET_MASK_DIRS=(
-	.ssh
-	.gnupg
-	.aws
-	.azure
-	.kube
-	.config/gcloud
-	.config/sops
-	.local/share/keyrings
-	.gnome2/keyrings
-	.password-store
-)
-readonly SECRET_MASK_FILES=(
-	.netrc
-	.pgpass
-	.docker/config.json
-	.git-credentials
-	.npmrc
-	.pypirc
-	.config/gh/hosts.yml
-)
-SECRET_MASK_ARGS=()
-# The same compiled masks, in the shape bin/yana-overlay-inner's --mask-dir /
-# --mask-file take instead of bwrap's own argv (WI-1's broad-root path mounts
-# them from inside the mount namespace, on top of the overlay, rather than as
-# outer bwrap args). Populated alongside SECRET_MASK_ARGS by secret_mask_add,
-# from the same resolved candidates, so the two representations can never
-# name a different set of paths.
-SECRET_MASK_DEST_DIRS=()
-SECRET_MASK_FILE_SRC=()
-SECRET_MASK_FILE_DST=()
-SECRET_MASK_EMPTY=""
-declare -A SECRET_MASK_OTHER_IDENTITIES=()
-SECRET_MASK_CAND=()
-SECRET_MASK_REAL=()
-SECRET_MASK_ID=()
-SECRET_MASK_APPLIED=0
-SECRET_MASK_ABSENT=0
 declare -A LAUNCH_PATH_IDENTITY=()
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -152,9 +102,10 @@ Usage:
                     [--exec-allow FILE]...
                     [--extra-root DIR --extra-upper DIR --extra-work DIR
                      [--extra-claim DIR]]... -- CMD [ARGS...]
+                    (--extra-claim names the root's review gate only; never acquired)
   yana-overlay release --claim DIR [--nonce TOKEN]
   yana-overlay force-release --claim DIR --reason TEXT
-  yana-overlay --print-secret-roots
+  yana-overlay sweep --claims-dir DIR
 
 Establish a kernel overlay at the workspace's real absolute path inside bwrap,
 run CMD confined with an empty capability set, and tear down. Fail closed: if
@@ -166,13 +117,13 @@ where DIR must be the workspace itself or an ancestor of it
 hunk — the open repo, a sibling repo, or a brand-new directory — with zero
 EROFS, because there is one overlay covering the whole broad root rather than
 one overlay per declared root. The overlay is mounted -o volatile (no
-per-copy-up fsync); the compiled secret masks and the ~/.cursor exception are
-mounted by yana-overlay-inner AFTER the overlay, so a mask cannot be shadowed
-by the broad-root mount covering the path it sits on. Omit --broad-root and
-this launcher's argv, mounts and messages are byte-identical to what they
-have always been: the single overlay sits at the workspace's own path, and
-masks and the exception are outer bwrap args, exactly as before this flag
-existed. --broad-root may not be combined with --extra-root.
+per-copy-up fsync); the ~/.cursor exception is mounted by yana-overlay-inner
+AFTER the overlay, so the bind is not shadowed by the broad-root mount
+covering the path it sits on. Omit --broad-root and this launcher's argv,
+mounts and messages are byte-identical to what they have always been: the
+single overlay sits at the workspace's own path, and the exception is an
+outer bwrap arg, exactly as before this flag existed. --broad-root may not
+be combined with --extra-root.
 
 The host tree is read-only with exactly one exception: ~/.cursor is bind-mounted
 read-write so cursor-agent can refresh its own credentials. Nothing else under
@@ -182,29 +133,21 @@ is a spec change (the isolation contract). Set YANA_OVERLAY_CURSOR_DIR
 to relocate the exception; the gate uses it so probes never touch real
 credentials.
 
-Credential stores named by the compiled secret profile (the fixed safety contract "Secrets
-wall") are masked inside the jail: named directories become an empty tmpfs and
-named files an empty read-only file. The agent cannot remove them — the inner
-script drops every capability before exec, so umount and mount both return
-EPERM. Set YANA_OVERLAY_SECRET_EXTRA_ROOT to mask a SECOND root as well;
-it is additive and can never disable the operator-home profile, which is why
-gates can use it without touching real credentials. Set
-YANA_OVERLAY_SECRET_REPORT=1 to have the applied/absent counts printed to
-stderr. Neither variable can turn masking off.
-
 An operator-declared write root beyond the workspace is passed as a repeated
-group: --extra-root starts a group and --extra-upper/--extra-work/--extra-claim
-attach to the group before them. Each root is mounted as its own overlay at its
-own real absolute path, with its own upper layer, work dir and claim, so its
-change set is separate and reviewable on its own. Roots must be disjoint from
-each other and from every turn layer. Nothing here infers a root: the set comes
-from the caller, which takes it from operator configuration only.
+group: --extra-root starts a group and --extra-upper/--extra-work attach to the
+group before them. Each root is mounted as its own overlay at its own real
+absolute path, with its own upper layer and work dir, so its change set is
+separate and reviewable on its own. Roots must be disjoint from each other and
+from every turn layer. Nothing here infers a root: the set comes from the
+caller, which takes it from operator configuration only.
 
-Claims are taken primary-first, then the extra roots in the order given. If ANY
-of them cannot be taken, every claim already taken is released by its own
-acquisition token and the launcher exits 65 naming the root that failed — the
-command never runs on a partial set, because a partial hold would wedge the
-operator's own workspace on behalf of a turn that never started.
+Declared roots are MOUNTED, never claimed. Only the opened workspace takes a
+turn claim. An optional --extra-claim on each group names the GLOBAL claim
+directory for that root so the launcher can run the file-set intersection gate
+against an open review there; it is not acquired.
+
+The primary turn claim is taken once. If it cannot be taken, the launcher exits
+65 and the command never runs.
 
 Claims are released explicitly (release / force-release), never by process exit.
 
@@ -226,18 +169,6 @@ Exit codes:
   67  overlay mount failed — command not run
   other  confined command exit code
 EOF
-}
-
-print_secret_roots() {
-	local home
-	home=$(operator_home)
-	local entry
-	for entry in "${SECRET_MASK_DIRS[@]}"; do
-		printf '%s/%s\n' "$home" "$entry"
-	done
-	for entry in "${SECRET_MASK_FILES[@]}"; do
-		printf '%s/%s\n' "$home" "$entry"
-	done
 }
 
 die_usage() {
@@ -285,7 +216,7 @@ path_is_prefix() {
 }
 
 # Ported from bin/yana-sandbox's components_below_root: counts path segments
-# below /, so / itself is 0 and /home/user is 2. validate_workspace_sanity
+# below /, so / itself is 0 and a two-segment path is 2. validate_workspace_sanity
 # uses it to refuse a workspace too shallow to be a real project directory.
 components_below_root() {
 	local p="${1%/}"
@@ -530,103 +461,6 @@ validate_root_identities() {
 	done
 }
 
-secret_mask_cleanup() {
-	[[ -n "$SECRET_MASK_EMPTY" ]] && rm -f "$SECRET_MASK_EMPTY" 2>/dev/null
-	SECRET_MASK_EMPTY=""
-	return 0
-}
-
-# secret_mask_resolve_batch — resolve and identify every existing candidate in
-# TWO subprocesses instead of two per path.
-#
-# WHY BATCHING RATHER THAN A CACHE. Measured on this box: 24 separate
-# `readlink`/`stat` spawns cost 32 ms, the same work batched costs 4 ms, and
-# process spawn is the whole of the difference. A cache would save the same
-# milliseconds and would additionally have to be INVALIDATED correctly — and the
-# thing being cached is a security list, where a stale answer is not a slow turn
-# but an unmasked credential store the day the operator first creates one. Work
-# that is not done cannot be stale. So the cost is removed rather than
-# remembered, and no persistent state is introduced for it.
-#
-# Fills SECRET_MASK_REAL and SECRET_MASK_ID, indexed alike. A batch whose output
-# does not line up with its input is DISCARDED and the per-path path is taken
-# instead: a fast answer that might be misaligned would mask the wrong inode.
-secret_mask_resolve_batch() {
-	SECRET_MASK_REAL=()
-	SECRET_MASK_ID=()
-	(( ${#SECRET_MASK_CAND[@]} > 0 )) || return 0
-
-	# The count check is the correctness guard, and it also covers the one input
-	# that would silently misalign a line-oriented batch: a root containing a
-	# newline. Any mismatch discards the batch entirely and redoes the work one
-	# path at a time — never patches up a partial result, because a mask paired
-	# with the wrong path masks the wrong inode.
-	local -a real=() ids=()
-	local c r
-	mapfile -t real < <(readlink -f -- "${SECRET_MASK_CAND[@]}" 2>/dev/null)
-	if (( ${#real[@]} != ${#SECRET_MASK_CAND[@]} )); then
-		real=()
-		for c in "${SECRET_MASK_CAND[@]}"; do real+=("$(realpath_safe "$c")"); done
-	fi
-	mapfile -t ids < <(stat -c '%d:%i' -- "${real[@]}" 2>/dev/null)
-	if (( ${#ids[@]} != ${#real[@]} )); then
-		ids=()
-		for r in "${real[@]}"; do
-			ids+=("$(stat -c '%d:%i' -- "$r" 2>/dev/null || true)")
-		done
-	fi
-	SECRET_MASK_REAL=("${real[@]}")
-	SECRET_MASK_ID=("${ids[@]}")
-}
-
-# secret_mask_add — one compiled entry, already resolved by the batch above.
-# `kind` is dir or file; `idx` indexes SECRET_MASK_REAL / SECRET_MASK_ID.
-#
-# THE OVERLAP CHECK IS AN AVAILABILITY GUARD, NOT A BOUNDARY, and it is written
-# to be cheap for that reason. Masking too MUCH cannot leak a secret; it can only
-# hide the workspace and break the turn visibly. So the expensive direction —
-# walking each mask's own ancestor chain to catch a bind alias of the workspace
-# mounted underneath a credential directory — is deliberately not walked per
-# mask. What is checked: both pathname directions on resolved paths, and the
-# mask's identity against the workspace/layer/exception ancestor chains computed
-# ONCE by the caller. The first version walked a fresh chain per entry and cost
-# 228 ms on every launch, which is over CORE's ~100 ms guard-work limit and was
-# measured breaking race_gate R8 by pushing twenty launches past the holder's
-# five-second window.
-secret_mask_add() {
-	local kind=$1 idx=$2
-	local path=${SECRET_MASK_REAL[$idx]}
-	local mask_id=${SECRET_MASK_ID[$idx]:-}
-
-	local other
-	for other in ${PROTECTED_PATHS[@]+"${PROTECTED_PATHS[@]}"} "$CURSOR_DIR"; do
-		[[ -n "$other" ]] || continue
-		if path_is_prefix "$path" "$other" || path_is_prefix "$other" "$path"; then
-			refuse "secret mask '$path' overlaps '$other' — a masked path may not contain or be contained by the workspace, the layer root or the writable-host exception"
-		fi
-	done
-	if [[ -n "$mask_id" && -n "${SECRET_MASK_OTHER_IDENTITIES[$mask_id]+set}" ]]; then
-		refuse "secret mask '$path' ($mask_id) contains the workspace, the layer root or the writable-host exception by filesystem identity despite disjoint pathnames"
-	fi
-
-	case "$kind" in
-		dir)
-			[[ -d "$path" ]] || { SECRET_MASK_ABSENT=$((SECRET_MASK_ABSENT + 1)); return 0; }
-			SECRET_MASK_ARGS+=(--tmpfs "$path")
-			SECRET_MASK_DEST_DIRS+=("$path")
-			;;
-		file)
-			[[ -f "$path" ]] || { SECRET_MASK_ABSENT=$((SECRET_MASK_ABSENT + 1)); return 0; }
-			SECRET_MASK_ARGS+=(--ro-bind "$SECRET_MASK_EMPTY" "$path")
-			SECRET_MASK_FILE_SRC+=("$SECRET_MASK_EMPTY")
-			SECRET_MASK_FILE_DST+=("$path")
-			;;
-		*)
-			refuse "internal: unknown secret mask kind '$kind'"
-			;;
-	esac
-	SECRET_MASK_APPLIED=$((SECRET_MASK_APPLIED + 1))
-}
 
 # resolve_state_root — same precedence as bin/yana-turn's $STATE_ROOT and
 # lua/yana/shadow/preview.lua's M.state_root(): YANA_STATE_ROOT, then
@@ -643,118 +477,6 @@ resolve_state_root() {
 	fi
 }
 
-# build_secret_mask — compose the mount arguments that implement CORE's secrets
-# wall. Runs before the claim is taken, so a failure to establish the enforcement
-# refuses before any durable state is touched and before the executable starts,
-# which is the cardinal principle's own wording.
-#
-# YANA_OVERLAY_SECRET_EXTRA_ROOT is ADDITIVE and can only ever hide more:
-# the operator home is masked whether or not it is set. It exists so gates can
-# plant a canary with known bytes without going anywhere near real credentials,
-# the same reason YANA_OVERLAY_CURSOR_DIR exists. An env var that could
-# REPLACE the operator home would be a security posture chosen by a keystroke,
-# which this project forbids by rule; the gate asserts the additivity directly by
-# observing that the real ~/.ssh is masked in the same run that the canary is.
-build_secret_mask() {
-	SECRET_MASK_ARGS=()
-	SECRET_MASK_DEST_DIRS=()
-	SECRET_MASK_FILE_SRC=()
-	SECRET_MASK_FILE_DST=()
-	SECRET_MASK_APPLIED=0
-	SECRET_MASK_ABSENT=0
-
-	local home=$OPERATOR_HOME
-	if [[ -z "$home" ]]; then
-		refuse "cannot resolve the operator home directory, so the secrets wall cannot be established — refusing before the agent starts"
-	fi
-
-	local -a roots=("$home")
-	if [[ -n "${YANA_OVERLAY_SECRET_EXTRA_ROOT:-}" ]]; then
-		roots+=("$YANA_OVERLAY_SECRET_EXTRA_ROOT")
-	fi
-
-	# Every ancestor identity of the three paths a mask must not swallow comes
-	# from the launch table. Membership is a Bash lookup, not a grep subprocess.
-	SECRET_MASK_OTHER_IDENTITIES=()
-	local other p identity
-	for other in ${PROTECTED_PATHS[@]+"${PROTECTED_PATHS[@]}"} "$CURSOR_DIR"; do
-		[[ -n "$other" && -e "$other" ]] || continue
-		p=$other
-		while :; do
-			identity=${LAUNCH_PATH_IDENTITY[$p]:-}
-			[[ -n "$identity" ]] \
-				|| refuse "cannot establish filesystem identity for the writable-host exception ($CURSOR_DIR), the workspace ($WORKSPACE) or the layer root ($LAYER_ROOT)"
-			SECRET_MASK_OTHER_IDENTITIES[$identity]=1
-			[[ "$p" == "/" ]] && break
-			p=${p%/*}
-			[[ -z "$p" ]] && p=/
-		done
-	done
-
-	# The empty file that masks secret FILES is created on the HOST, before bwrap
-	# starts (this whole function runs before the claim is taken). TMPDIR is
-	# operator/project-controlled and project-local scratch dirs under the
-	# workspace are common, so an arbitrary TMPDIR would mutate the real tree
-	# pre-confinement. Refuse closed rather than trust it, and use the resolved
-	# yana state root's own runtime scratch instead of $TMPDIR either way.
-	if [[ -n "${TMPDIR:-}" ]]; then
-		local tmpdir_real
-		tmpdir_real=$(realpath_safe "$TMPDIR")
-		local protected_tmp
-		for protected_tmp in ${PROTECTED_PATHS[@]+"${PROTECTED_PATHS[@]}"} "$CURSOR_DIR"; do
-			[[ -n "$protected_tmp" ]] || continue
-			if path_is_prefix "$protected_tmp" "$tmpdir_real"; then
-				refuse "TMPDIR ($TMPDIR) resolves inside the workspace, the layer root or the writable-host exception — unset TMPDIR or point it outside the confined tree before starting a turn"
-			fi
-		done
-	fi
-	local mask_run_dir
-	mask_run_dir="$(resolve_state_root)/run"
-	mkdir -p "$mask_run_dir" 2>/dev/null \
-		|| refuse "cannot create the state-root runtime directory '$mask_run_dir' used to mask secret files"
-	SECRET_MASK_EMPTY=$(mktemp "$mask_run_dir/yana-secret-mask.XXXXXX") \
-		|| refuse "cannot create the empty file used to mask secret files"
-	: >"$SECRET_MASK_EMPTY"
-	chmod 0444 "$SECRET_MASK_EMPTY" 2>/dev/null || true
-
-	# Pass 1: which compiled entries exist at all. Pure bash, no subprocess.
-	# An absent path is COUNTED and skipped rather than masked: bwrap cannot
-	# create a mount point on the read-only root, so masking an absent path
-	# would refuse every turn on a machine that simply has no ~/.aws. Nothing
-	# leaks by skipping — there is nothing at the path to read — and the cost is
-	# recorded as a limit in the isolation contract.
-	SECRET_MASK_CAND=()
-	local -a kinds=()
-	local root entry p
-	for root in "${roots[@]}"; do
-		[[ -n "$root" && -d "$root" ]] || continue
-		for entry in "${SECRET_MASK_DIRS[@]}"; do
-			p="${root%/}/$entry"
-			if [[ -e "$p" ]]; then SECRET_MASK_CAND+=("$p"); kinds+=(dir)
-			else SECRET_MASK_ABSENT=$((SECRET_MASK_ABSENT + 1)); fi
-		done
-		for entry in "${SECRET_MASK_FILES[@]}"; do
-			p="${root%/}/$entry"
-			if [[ -e "$p" ]]; then SECRET_MASK_CAND+=("$p"); kinds+=(file)
-			else SECRET_MASK_ABSENT=$((SECRET_MASK_ABSENT + 1)); fi
-		done
-	done
-
-	# Pass 2: resolve and identify them all at once, then decide per entry.
-	secret_mask_resolve_batch
-	local i
-	for i in "${!SECRET_MASK_CAND[@]}"; do
-		secret_mask_add "${kinds[$i]}" "$i"
-	done
-
-	# An observability seam, not a dial: it prints what was masked and cannot
-	# turn anything off. The gate reads it to distinguish "masked" from
-	# "there was nothing there", which is exactly the distinction that makes an
-	# absent canary meaningful.
-	if [[ -n "${YANA_OVERLAY_SECRET_REPORT:-}" ]]; then
-		echo "yana-overlay: secret mask profile=v$SECRET_PROFILE_VERSION applied=$SECRET_MASK_APPLIED absent=$SECRET_MASK_ABSENT" >&2
-	fi
-}
 
 ensure_bwrap() {
 	if [[ ! -x "$BWRAP" ]] && ! command -v "$BWRAP" >/dev/null 2>&1; then
@@ -804,7 +526,7 @@ validate_workspace_sanity() {
 	fi
 	depth=$(components_below_root "$ws_real")
 	if (( depth < 2 )); then
-		refuse "workspace '$ws_real' has fewer than 2 path components below root — pick a deeper directory (e.g. /home/user/project)"
+		refuse "workspace '$ws_real' has fewer than 2 path components below root — pick a deeper directory (a project folder inside your home directory)"
 	fi
 }
 
@@ -893,7 +615,7 @@ validate_paths() {
 
 	# The broad root (WI-1): an ancestor of the workspace, or the workspace
 	# itself, resolved and validated here so every later stage (the identity
-	# table, build_secret_mask, run_overlay) sees a canonical absolute path or
+	# table, run_overlay) sees a canonical absolute path or
 	# an empty string -- never the raw, unresolved --broad-root argument.
 	if [[ -n "$BROAD_ROOT" ]]; then
 		BROAD_ROOT=$(realpath_safe "$BROAD_ROOT")
@@ -1333,9 +1055,14 @@ classify_turn_liveness() {
 	#
 	# We address the CGROUP, never a pid list. cgroup.kill signals every member
 	# atomically, so nothing can fork out from under the kill and no pid can be
-	# reused between reading a list and acting on it.
-	local killed=1
+	# reused between reading a list and acting on it. Read cgroup.procs BEFORE
+	# writing cgroup.kill — wording only; the seal is still one rmdir.
+	local procs_before=""
+	local had_cgroup_kill=0
 	if [[ -e "$rec_cgroup/cgroup.kill" ]]; then
+		procs_before=$(tr '\n' ' ' <"$rec_cgroup/cgroup.procs" 2>/dev/null || true)
+		procs_before=${procs_before% }
+		had_cgroup_kill=1
 		if ! printf '1\n' >"$rec_cgroup/cgroup.kill" 2>/dev/null; then
 			# Fail closed and do NOT seal: a partial kill followed by a
 			# successful seal is the worst outcome available, because the claim
@@ -1343,8 +1070,6 @@ classify_turn_liveness() {
 			printf 'unknown the previous turn could not be terminated (writing %s failed)' "$rec_cgroup/cgroup.kill"
 			return 0
 		fi
-	else
-		killed=0
 	fi
 	# The seal. rmdir succeeds only on a cgroup holding no process and no
 	# child, and once it succeeds nothing can ever join that cgroup again, so
@@ -1353,8 +1078,8 @@ classify_turn_liveness() {
 	# all — never after a kill that failed.
 	if rmdir "$rec_cgroup" 2>/dev/null; then
 		record_sealed_cgroup "$rec_cgroup"
-		if (( killed )); then
-			printf 'dead the previous turn was terminated and its cgroup sealed'
+		if [[ -n "$procs_before" ]]; then
+			printf 'dead terminated (pids: %s) and sealed' "$procs_before"
 		else
 			printf 'dead liveness cgroup was empty and is now sealed'
 		fi
@@ -1365,7 +1090,7 @@ classify_turn_liveness() {
 	local procs=""
 	procs=$(tr '\n' ' ' <"$rec_cgroup/cgroup.procs" 2>/dev/null || true)
 	procs=${procs% }
-	if (( killed == 0 )); then
+	if (( had_cgroup_kill == 0 )); then
 		if [[ -n "$procs" ]]; then
 			printf 'alive processes of the previous turn are still running (pids: %s) and this kernel has no cgroup.kill (needs Linux 5.14 or newer) to terminate them' "$procs"
 		else
@@ -1497,6 +1222,9 @@ holder_is_live() {
 	local holder_file=$1
 	local holder_pid boot_id start_ticks
 	[[ -f "$holder_file" ]] || return 2
+	if [[ ! -r "$holder_file" ]]; then
+		return 2
+	fi
 	{
 		read -r holder_pid boot_id start_ticks _ _
 	} <"$holder_file"
@@ -1528,12 +1256,185 @@ holder_is_live() {
 # (release_claim `rm -f`s four known names and then bare-`rmdir`s, which fails
 # the moment the directory holds anything else).
 record_claim_reclaim() {
-	local reason=$1 detail=$2 stamp
+	local reason=$1 detail=$2 stamp claims_dir
 	printf -v stamp '%(%Y-%m-%dT%H:%M:%S%z)T' -1
+	claims_dir=${CLAIM%/*}
 	printf '%s reclaim %s %s claim=%s %s\n' "$stamp" "$$" "$reason" "$CLAIM" "$detail" \
-		>>"${CLAIM%/}/../reclaim.log" 2>/dev/null || true
+		>>"$claims_dir/reclaim.log" 2>/dev/null || true
 	return 0
 }
+
+claim_prefix_files() {
+	local claim=$1 path
+	for path in "$claim".*; do
+		[[ -f "$path" || -L "$path" ]] || continue
+		printf '%s\n' "$path"
+	done
+}
+
+sweep_claim_prefix_files() {
+	local claim=$1 sidecar
+	while IFS= read -r sidecar; do
+		[[ -n "$sidecar" ]] || continue
+		if ! rm -f -- "$sidecar" 2>/dev/null; then
+			echo "yana-overlay: sweep skipped sidecar that could not be removed: $sidecar" >&2
+		fi
+	done < <(claim_prefix_files "$claim")
+	return 0
+}
+
+sweep_orphan_claim_sidecars_for() {
+	local claim=$1 saved_claim=$CLAIM sidecar
+	[[ -n "$claim" && ! -d "$claim" ]] || return 0
+	while IFS= read -r sidecar; do
+		[[ -n "$sidecar" ]] || continue
+		CLAIM=$claim
+		record_claim_reclaim "orphan-sidecar" "sidecar=$sidecar"
+		if ! rm -f -- "$sidecar" 2>/dev/null; then
+			echo "yana-overlay: sweep skipped orphan sidecar that could not be removed: $sidecar" >&2
+		fi
+	done < <(claim_prefix_files "$claim")
+	CLAIM=$saved_claim
+	return 0
+}
+
+sweep_claim_dir() {
+	local claim=$1 reason=$2 detail=$3 saved_claim=$CLAIM
+	CLAIM=$claim
+	record_claim_reclaim "$reason" "$detail"
+	release_recorded_cgroup || true
+	rm -f "$claim/holder" "$claim/review-open" "$claim/liveness" "$claim/nonce" 2>/dev/null || true
+	if [[ -d "$claim" ]] && ! rmdir "$claim" 2>/dev/null; then
+		echo "yana-overlay: sweep skipped claim directory that could not be removed: $claim" >&2
+		CLAIM=$saved_claim
+		return 1
+	fi
+	sweep_claim_prefix_files "$claim"
+	CLAIM=$saved_claim
+	return 0
+}
+
+claim_holder_detail() {
+	local claim=$1
+	if [[ -r "$claim/holder" ]]; then
+		tr '\n' ' ' <"$claim/holder"
+	else
+		printf none
+	fi
+}
+
+sweep_claim_store() {
+	local claims_dir=$1 entry base slug claim live verdict detail saved_claim=$CLAIM
+	[[ -n "$claims_dir" && -d "$claims_dir" ]] || return 0
+	shopt -s nullglob
+	for entry in "$claims_dir"/*; do
+		base=${entry##*/}
+		claim="$claims_dir/$base"
+		if [[ -f "$entry" || -L "$entry" ]]; then
+			[[ "$base" == *.* ]] || continue
+			slug=${base%%.*}
+			[[ "$slug" =~ ^[0-9a-f]{16}$ ]] || continue
+			claim="$claims_dir/$slug"
+			if [[ ! -d "$claim" ]]; then
+				sweep_orphan_claim_sidecars_for "$claim"
+			fi
+			continue
+		fi
+		[[ -d "$entry" ]] || continue
+		[[ "$base" =~ ^[0-9a-f]{16}$ ]] || continue
+		[[ "$base" != *.* ]] || continue
+		CLAIM=$claim
+		if ! claim_reclaim_lock; then
+			echo "yana-overlay: sweep skipped claim currently being classified: $claim" >&2
+			continue
+		fi
+		trap 'claim_reclaim_unlock' EXIT
+		set +e
+		holder_is_live "$claim/holder"
+		live=$?
+		set -e
+		if (( live == 0 )); then
+			claim_reclaim_unlock
+			trap - EXIT
+			continue
+		fi
+		if (( live == 2 )); then
+			record_claim_reclaim "sweep-unknown-holder" "holder=$(claim_holder_detail "$claim")"
+			claim_reclaim_unlock
+			trap - EXIT
+			continue
+		fi
+		# AN OPEN REVIEW BELONGS TO AN EDITOR, AND THE SWEEP CANNOT JUDGE IT --
+		# WITH ONE EXCEPTION IT CAN PROVE.
+		#
+		# PRESERVE (the ordinary case). classify_turn_liveness below reaches its
+		# `dead` verdict by actively terminating the recorded cgroup and sealing
+		# it, and a turn's confined launcher legitimately exits between one-shot
+		# confined commands while the review stays open on someone's screen. From
+		# here a turn merely between commands is indistinguishable from one that
+		# is gone, and this sweep runs at EVERY turn start -- including a turn
+		# that merely declared a root it will never acquire. Deciding here
+		# reclaimed a live holder's claim on a root the new turn only mounts
+		# (tests/headless/r_declared_root_is_not_claimed.lua). Acquisition owns
+		# that decision: only take_claim has the incoming touched file set needed
+		# to choose disjoint-proceed, intersect-refuse, unknown-fail-closed or
+		# dead-editor reclaim.
+		#
+		# SWEEP (a proven reboot). If the claim's liveness record names a
+		# DIFFERENT boot than the one running now, every process and every cgroup
+		# of that boot is gone unconditionally -- absence is proof here and
+		# nowhere else -- so no kill and no cgroup seal is required to establish
+		# it, and control falls through to classify_turn_liveness, whose own
+		# boot-id branch reaches `dead` without terminating anything.
+		#
+		# This exception is NOT hygiene, it is correctness. take_claim only ever
+		# touches the claim it is acquiring, so a claim left by a crashed and
+		# rebooted machine on a root NOBODY EVER LAUNCHES AGAINST AGAIN is
+		# reachable by this sweep alone: preserve it unconditionally and it, its
+		# `<claim>.*` sidecars and its prefix files leak forever. And the leak
+		# bites: the isolation module records as an OPEN LIMIT (audit F8)
+		# that the workspace state slug is a bare (st_dev, st_ino) pair, so a
+		# later, UNRELATED workspace reusing that inode can inherit the stale
+		# claim -- and a review-open marker is exactly what makes take_claim
+		# refuse. A brand-new workspace would be refused for a review that never
+		# existed.
+		#
+		# FAIL CLOSED: a missing or unreadable boot id is NOT proof of a reboot,
+		# so it preserves. Only a boot id that is present, readable and different
+		# sweeps. Row: tests/headless/r_claim_orphan_sidecar_is_swept.lua.
+		if [[ -f "$claim/review-open" ]]; then
+			local rec_boot="" boot_now="" lkey lvalue
+			if [[ -f "$claim/liveness" ]]; then
+				while read -r lkey lvalue; do
+					[[ "$lkey" == "boot" ]] && rec_boot=$lvalue
+				done <"$claim/liveness"
+			fi
+			boot_now=$(read_boot_id)
+			if [[ -z "$rec_boot" || -z "$boot_now" || "$rec_boot" == "$boot_now" ]]; then
+				record_claim_reclaim "sweep-review-open-preserved" "holder=$(claim_holder_detail "$claim")"
+				claim_reclaim_unlock
+				trap - EXIT
+				continue
+			fi
+		fi
+		verdict=$(classify_turn_liveness 2>/dev/null) || verdict=""
+		detail=${verdict#* }
+		case "${verdict%% *}" in
+			dead)
+				sweep_claim_dir "$claim" "sweep-dead-holder" "holder=$(claim_holder_detail "$claim") liveness=${detail:-dead}"
+				;;
+			*)
+				record_claim_reclaim "sweep-unknown-holder" "holder=$(claim_holder_detail "$claim") liveness=${verdict:-unknown classifier produced no verdict}"
+				;;
+		esac
+		claim_reclaim_unlock
+		trap - EXIT
+	done
+	shopt -u nullglob
+	CLAIM=$saved_claim
+	return 0
+}
+
 
 # ---- Claim mutual exclusion -------------------------------------------------
 #
@@ -1554,67 +1455,250 @@ record_claim_reclaim() {
 # file as the commit point (see write_holder).
 CLAIM_LOCK_HELD=0
 
+reclaim_pending_for() {
+	local lock=$1
+	lock=${lock%%.stale.*}
+	printf '%s.pending' "$lock"
+}
+
+write_lock_pending() {
+	local lock=$1 pending boot_id start_ticks
+	pending=$(reclaim_pending_for "$lock")
+	boot_id=$(read_boot_id)
+	start_ticks=$(holder_start_ticks $$)
+	[[ -n "$boot_id" && -n "$start_ticks" ]] || return 1
+	printf '%s %s %s\n' "$$" "$boot_id" "$start_ticks" >"$pending" || return 1
+	return 0
+}
+
 write_lock_owner() {
 	local lock=$1 boot_id start_ticks
 	boot_id=$(read_boot_id)
 	start_ticks=$(holder_start_ticks $$)
-	[[ -n "$boot_id" && -n "$start_ticks" ]] || return 0
-	printf '%s %s %s\n' "$$" "$boot_id" "$start_ticks" >"$lock/owner" 2>/dev/null || true
+	[[ -n "$boot_id" && -n "$start_ticks" ]] || return 1
+	printf '%s %s %s\n' "$$" "$boot_id" "$start_ticks" >"$lock/owner" || return 1
 	return 0
 }
 
-# lock_owner_is_dead — 0 only when the lock names an owner that provably no
-# longer exists. A missing or unreadable owner file is NOT dead: a lock is
-# created by mkdir and stamped a moment later, so an unstamped lock may be one
-# being taken right now.
-lock_owner_is_dead() {
-	local lock=$1 rc
-	[[ -f "$lock/owner" ]] || return 1
+# lock_identity_is_dead — true only when the identity file names a process that
+# provably no longer exists. Missing or unreadable identity is NOT dead.
+lock_identity_is_dead() {
+	local identity_file=$1 rc
+	[[ -f "$identity_file" ]] || return 1
 	set +e
-	holder_is_live "$lock/owner"
+	holder_is_live "$identity_file"
 	rc=$?
 	set -e
 	(( rc == 1 ))
 }
 
-claim_reclaim_lock() {
-	local lock="${CLAIM}.reclaim" stolen
-	if mkdir "$lock" 2>/dev/null; then
-		write_lock_owner "$lock"
-		CLAIM_LOCK_HELD=1
-		return 0
+# lock_owner_is_dead — 0 only when the lock's owner or pending creator is
+# provably dead. An unstamped lock (no $lock/owner) breaks only when the
+# pending marker beside it names a dead creator; absent or unreadable pending
+# stays fail-closed.
+lock_owner_is_dead() {
+	local lock=$1 pending
+	pending=$(reclaim_pending_for "$lock")
+	if [[ -f "$lock/owner" ]]; then
+		lock_identity_is_dead "$lock/owner"
+		return $?
 	fi
-	# A lock left behind by a killed process would otherwise wedge this claim
-	# forever, which is the lockout this whole area exists to end. Break one
-	# ONLY when its owner is provably dead — never when it is merely unreadable
-	# — and break it by rename, so exactly one breaker can win and the losers
-	# see the lock already gone. While the owner is dead nobody holds the lock
-	# legitimately, so the instant of absence during the steal cannot hand two
-	# processes the same claim: whoever wins the following mkdir owns it, and
-	# everyone else fails and refuses.
-	lock_owner_is_dead "$lock" || return 1
-	stolen="${lock}.stale.$$"
-	mv "$lock" "$stolen" 2>/dev/null || return 1
-	if ! lock_owner_is_dead "$stolen"; then
-		# It came alive between the two looks; put it back untouched.
-		mv "$stolen" "$lock" 2>/dev/null || true
+	lock_identity_is_dead "$pending"
+}
+
+claim_reclaim_lock() {
+	local lock="${CLAIM}.reclaim" stolen pending
+	if [[ -d "$lock" ]]; then
+		lock_owner_is_dead "$lock" || return 1
+		stolen="${lock}.stale.$$"
+		mv "$lock" "$stolen" 2>/dev/null || return 1
+		if ! lock_owner_is_dead "$stolen"; then
+			mv "$stolen" "$lock" 2>/dev/null || true
+			return 1
+		fi
+		rm -f "$stolen/owner" 2>/dev/null || true
+		rmdir "$stolen" 2>/dev/null || true
+		rm -f "$(reclaim_pending_for "$stolen")" 2>/dev/null || true
+	fi
+	if ! write_lock_pending "$lock"; then
 		return 1
 	fi
-	rm -f "$stolen/owner" 2>/dev/null || true
-	rmdir "$stolen" 2>/dev/null || true
+	pending=$(reclaim_pending_for "$lock")
 	if mkdir "$lock" 2>/dev/null; then
-		write_lock_owner "$lock"
-		CLAIM_LOCK_HELD=1
+		if write_lock_owner "$lock"; then
+			rm -f "$pending" 2>/dev/null || true
+			CLAIM_LOCK_HELD=1
+			return 0
+		fi
+		rm -f "$lock/owner" 2>/dev/null || true
+		rmdir "$lock" 2>/dev/null || true
+		rm -f "$pending" 2>/dev/null || true
+		return 1
+	fi
+	rm -f "$pending" 2>/dev/null || true
+	return 1
+}
+
+claim_reclaim_unlock() {
+	local lock="${CLAIM}.reclaim" pending
+	pending=$(reclaim_pending_for "$lock")
+	rm -f "$lock/owner" "$pending" 2>/dev/null || true
+	rmdir "$lock" 2>/dev/null || true
+	CLAIM_LOCK_HELD=0
+}
+
+# force_release_claim_path — the turn-claim directory a human can pass to
+# force-release. Must name a path that exists on disk when printed; the turn
+# claim directory is authoritative, not a file-claim leaf.
+force_release_claim_path() {
+	local claim=$1
+	[[ -n "$claim" ]] || return 1
+	if [[ -d "$claim" ]]; then
+		printf '%s' "$claim"
 		return 0
 	fi
 	return 1
 }
 
-claim_reclaim_unlock() {
-	local lock="${CLAIM}.reclaim"
-	rm -f "$lock/owner" 2>/dev/null || true
-	rmdir "$lock" 2>/dev/null || true
-	CLAIM_LOCK_HELD=0
+# review_marker_names_this_launcher — true when the review-open marker names
+# this launcher or an ancestor of it (R9 D / overlay_turn_wiring).
+review_marker_names_this_launcher() {
+	local marker=$1
+	local pid boot_id start_ticks p ppid
+	[[ -f "$marker" ]] || return 1
+	{
+		read -r pid boot_id start_ticks _ _
+	} <"$marker"
+	[[ "$pid" =~ ^[0-9]+$ ]] || return 1
+	(( pid == $$ )) && return 0
+	p=$$
+	while (( p > 1 )); do
+		(( p == pid )) && return 0
+		ppid=$(awk '{ s = $0; sub(/^[^)]*\) /, "", s); split(s, f, " "); print f[2] }' "/proc/$p/stat" 2>/dev/null) || break
+		[[ "$ppid" =~ ^[0-9]+$ ]] || break
+		(( ppid == p )) && break
+		p=$ppid
+	done
+	return 1
+}
+
+# read_review_files_list — relative paths from the open review's sidecar.
+# Prints one path per line, or returns 1 when the set cannot be ESTABLISHED.
+#
+# "Readable" was the only question this used to ask, and that is not the
+# question the launch gate needs answered. It skipped blank lines and returned
+# success for any readable file, so an empty or garbled sidecar became an EMPTY
+# open set — a set that intersects nothing, so the gate at take_claim let a
+# challenger launch on the very file a live editor was reviewing. Proved five
+# ways on 2026-08-23 (adv/codex-6): empty, truncated mid-write, stale, naming a
+# deleted file, and naming a path outside the workspace, each rc 0 against a
+# holder whose review of alpha.py was open the whole time.
+#
+# So the sidecar is a RECORD that describes itself and this reads it as one:
+#
+#   yana-review-files 1
+#   editor <pid> <boot_id> <start_ticks>   -- identical to the review-open marker
+#   turn <turn>
+#   workspace <abs path the entries are relative to>
+#   count <N>
+#   file <present|absent> <rel>            -- exactly N of these
+#   sum <sha256 of every line above>
+#
+# Everything the old reader had to assume is now stated and checked, and
+# anything that cannot be established is UNKNOWN and refuses
+# (the claims-concurrency contract: anything unestablished is UNKNOWN):
+#
+#   * the checksum and the count make an empty, truncated or garbled record
+#     unreadable AS A RECORD rather than readable as a small set. Neither is a
+#     guard against one scenario: no partial write and no hand-edited list can
+#     satisfy both.
+#   * the editor line must equal the live `review-open` marker, so a record
+#     belonging to some other editor, or left over from an earlier review, is
+#     not this review's file set.
+#   * an entry outside the workspace, or whose presence on disk contradicts
+#     what the record observed, makes the RECORD untrustworthy — it is never
+#     dropped from the set, because a dropped entry is precisely how the set
+#     came to be missing the file that mattered.
+#   * count 0 while a review-open marker exists is a CONTRADICTION, not an
+#     empty set: an open review is a review of something.
+read_review_files_list() {
+	local claim=$1 ws=$2
+	local sidecar marker ident want have body line rest state rel resolved
+	local -a lines=() out=()
+	local i count mp mb mt live_ws
+	[[ -n "$claim" ]] || return 1
+	sidecar="${claim}.review-files"
+	marker="${claim}/review-open"
+	[[ -r "$sidecar" && -r "$marker" ]] || return 1
+	read -r mp mb mt _ <"$marker" || return 1
+	[[ -n "$mp" && -n "$mb" && -n "$mt" ]] || return 1
+	ident="$mp $mb $mt"
+	live_ws=$(realpath_safe "$ws" 2>/dev/null) || return 1
+	[[ -n "$live_ws" ]] || return 1
+	live_ws=${live_ws%/}
+	mapfile -t lines <"$sidecar" || return 1
+	# 5 header lines + at least one entry + the checksum.
+	(( ${#lines[@]} >= 7 )) || return 1
+	[[ ${lines[-1]} == "sum "* ]] || return 1
+	want=${lines[-1]#sum }
+	body=""
+	for (( i = 0; i < ${#lines[@]} - 1; i++ )); do
+		body+="${lines[$i]}"$'\n'
+	done
+	have=$(printf '%s' "$body" | sha256sum) || return 1
+	have=${have%% *}
+	[[ "$have" == "$want" ]] || return 1
+	[[ ${lines[0]} == "yana-review-files 1" ]] || return 1
+	[[ ${lines[1]} == "editor $ident" ]] || return 1
+	[[ ${lines[2]} == "turn "?* ]] || return 1
+	[[ ${lines[3]} == "workspace $live_ws" ]] || return 1
+	[[ ${lines[4]} == "count "* ]] || return 1
+	count=${lines[4]#count }
+	[[ "$count" =~ ^[0-9]+$ ]] || return 1
+	(( count > 0 )) || return 1
+	(( count == ${#lines[@]} - 6 )) || return 1
+	for (( i = 5; i < ${#lines[@]} - 1; i++ )); do
+		line=${lines[$i]}
+		[[ $line == "file "* ]] || return 1
+		rest=${line#file }
+		[[ $rest == *" "* ]] || return 1
+		state=${rest%% *}
+		rel=${rest#* }
+		[[ -n "$rel" && "$rel" != /* ]] || return 1
+		case "/$rel/" in
+			*/../*) return 1 ;;
+		esac
+		resolved=$(realpath -m -- "$live_ws/$rel" 2>/dev/null) || return 1
+		[[ "$resolved" == "$live_ws"/* ]] || return 1
+		case "$state" in
+			present) [[ -e "$live_ws/$rel" ]] || return 1 ;;
+			absent) [[ ! -e "$live_ws/$rel" ]] || return 1 ;;
+			*) return 1 ;;
+		esac
+		out+=("$rel")
+	done
+	printf '%s\n' "${out[@]}"
+	return 0
+}
+
+# incoming_files_from_upper — paths already staged in this turn's overlay upper.
+# An empty upper is a valid empty set (disjoint with any open review).
+incoming_files_from_upper() {
+	local upper=$1
+	[[ -n "$upper" && -d "$upper" ]] || return 0
+	find "$upper" \( -type f -o -type l \) 2>/dev/null | while IFS= read -r path; do
+		path=${path#"$upper"/}
+		[[ -n "$path" ]] || continue
+		printf '%s\n' "$path"
+	done
+	return 0
+}
+
+# file_sets_intersect — prints the sorted intersection, one path per line.
+file_sets_intersect() {
+	local a=$1 b=$2
+	[[ -n "$a" && -n "$b" ]] || return 0
+	comm -12 <(sort -u "$a") <(sort -u "$b")
 }
 
 take_claim() {
@@ -1628,6 +1712,7 @@ take_claim() {
 		refuse "workspace claim classification is in progress"
 	fi
 	trap 'claim_reclaim_unlock' EXIT
+	sweep_orphan_claim_sidecars_for "$CLAIM"
 	if mkdir "$CLAIM" 2>/dev/null; then
 		write_holder
 		claim_reclaim_unlock
@@ -1693,9 +1778,43 @@ take_claim() {
 		stale_record=$(tr '\n' ' ' <"$CLAIM/review-open" 2>/dev/null)
 		stale_record=${stale_record% }
 		if (( review_live == 0 )); then
-			claim_reclaim_unlock
-			trap - EXIT
-			refuse "workspace has an open overlay review in a running editor (holder: ${holder%% }) — finish or reject that review (:YanaReview then ct/co/cb, or :YanaAbortReview) or close that editor; if that editor cannot be found, clear it with: $0 force-release --claim '$CLAIM' --reason 'lost review editor' [review editor: ${stale_record:-none recorded}]"
+			local review_force_claim open_list incoming_list intersect_list intersect_named
+			review_force_claim=$(force_release_claim_path "$CLAIM") || review_force_claim=$CLAIM
+			if review_marker_names_this_launcher "$CLAIM/review-open"; then
+				claim_reclaim_unlock
+				trap - EXIT
+				refuse "workspace has an open overlay review in a running editor (holder: ${holder%% }) — finish or reject that review (:YanaReview then ct/co/cb, or :YanaAbortReview) or close that editor; if that editor cannot be found, clear it with: $0 force-release --claim '$review_force_claim' --reason 'lost review editor' [review editor: ${stale_record:-none recorded}]"
+			fi
+			open_list=$(mktemp)
+			incoming_list=$(mktemp)
+			intersect_list=$(mktemp)
+			trap 'rm -f "$open_list" "$incoming_list" "$intersect_list"; claim_reclaim_unlock' EXIT
+			if ! read_review_files_list "$CLAIM" "$WORKSPACE" >"$open_list"; then
+				claim_reclaim_unlock
+				trap - EXIT
+				rm -f "$open_list" "$incoming_list" "$intersect_list"
+				refuse "workspace has an open overlay review but its file set cannot be read (${CLAIM}.review-files is missing, unreadable, or not a complete and current record of this editor's open review) (holder: ${holder%% }) — refuse until the open review's paths are known; clear it with: $0 force-release --claim '$review_force_claim' --reason 'unreadable review file set' [review editor: ${stale_record:-none recorded}]"
+			fi
+			if [[ -n "$UPPER" && ! -d "$UPPER" ]]; then
+				claim_reclaim_unlock
+				trap - EXIT
+				rm -f "$open_list" "$incoming_list" "$intersect_list"
+				refuse "this turn's overlay upper is not readable, so its touched file set cannot be established (holder: ${holder%% }) — refusing before launch"
+			fi
+			incoming_files_from_upper "$UPPER" >"$incoming_list"
+			file_sets_intersect "$open_list" "$incoming_list" >"$intersect_list"
+			if [[ -s "$intersect_list" ]]; then
+				intersect_named=$(paste -sd ', ' "$intersect_list")
+				claim_reclaim_unlock
+				trap - EXIT
+				rm -f "$open_list" "$incoming_list" "$intersect_list"
+				refuse "open overlay review intersects this turn on: ${intersect_named} (holder: ${holder%% }) — finish or reject that review for the named file(s), or clear it with: $0 force-release --claim '$review_force_claim' --reason 'review intersects incoming files' [review editor: ${stale_record:-none recorded}]"
+			fi
+			rm -f "$open_list" "$incoming_list" "$intersect_list"
+			trap 'claim_reclaim_unlock' EXIT
+			# DISJOINT from another editor's open review: the per-file accept
+			# arbitration in shadow/apply.lua remains authoritative; do not block
+			# launch here.
 		fi
 		if (( review_live == 2 )); then
 			claim_reclaim_unlock
@@ -1725,9 +1844,18 @@ take_claim() {
 		# `<claim>.review-files` is a sibling of the claim, so both survive the
 		# reclaim for `preview.recover_layer` and for resume to name (an open
 		# review belongs to an editor, and that editor may be gone).
-		rm -f "$CLAIM/review-open" 2>/dev/null || true
-		record_claim_reclaim "dead-holder-review-open" "marker=[${stale_record:-empty}] holder=[${holder% }]"
-		echo "yana-overlay: cleared a review marker left by an editor that is no longer running (reason: dead-holder-review-open; was: ${stale_record:-empty})" >&2
+		#
+		# GUARDED, because falling through here is reached by a LIVE reviewer too.
+		# review_live == 0 with a disjoint file set proceeds past the branch above
+		# and used to land right here, deleting the review-open marker of an editor
+		# that is on screen with the review still open — after which the next
+		# challenger sees no marker at all and the file-set gate never runs. That
+		# is the same defect as a degraded file record, one level up.
+		if (( review_live == 1 )); then
+			rm -f "$CLAIM/review-open" 2>/dev/null || true
+			record_claim_reclaim "dead-holder-review-open" "marker=[${stale_record:-empty}] holder=[${holder% }]"
+			echo "yana-overlay: cleared a review marker left by an editor that is no longer running (reason: dead-holder-review-open; was: ${stale_record:-empty})" >&2
+		fi
 	fi
 	if (( live == 2 )); then
 		claim_reclaim_unlock
@@ -1751,6 +1879,18 @@ take_claim() {
 			refuse "the previous overlay turn's liveness cannot be established: ${detail:-the classifier produced no verdict} (holder: ${holder%% }) — reclaim requires force-release with a reason"
 			;;
 	esac
+	# A LIVE reviewer's marker is carried ACROSS the reclaim. The claim belongs
+	# to the previous TURN, which is dead and is what is being reclaimed here;
+	# the review-open marker belongs to an EDITOR that is still running with the
+	# review on screen, and release_claim has to remove it because rmdir refuses
+	# a non-empty directory. Losing it here left the workspace with an open
+	# review nothing recorded, so the next challenger's file-set gate never ran
+	# at all — a degraded record by deletion. The `.review-files` record is a
+	# sibling and already survives, so restoring the marker restores the pair.
+	local carried_review=""
+	if (( ${review_live:-9} == 0 )) && [[ -f "$CLAIM/review-open" ]]; then
+		carried_review=$(cat "$CLAIM/review-open" 2>/dev/null) || carried_review=""
+	fi
 	if ! release_claim force; then
 		claim_reclaim_unlock
 		trap - EXIT
@@ -1762,6 +1902,9 @@ take_claim() {
 		refuse "workspace claim could not be reclaimed (previous holder: ${holder%% })"
 	fi
 	write_holder
+	if [[ -n "$carried_review" ]]; then
+		printf '%s\n' "$carried_review" >"$CLAIM/review-open" 2>/dev/null || true
+	fi
 	claim_reclaim_unlock
 	trap - EXIT
 }
@@ -1804,36 +1947,62 @@ release_acquired_claims() {
 	ACQUIRED_NONCES=()
 }
 
-# take_claims — the whole declared set, primary first then the extra roots in
-# the order the caller passed them (canonical-path order, fixed by the caller so
-# two editors racing for an overlapping set attempt them in the same sequence
-# and neither ends up holding half of it).
-#
-# The primary is taken by take_claim itself, unchanged, so a single-root launch
-# refuses exactly as it always has. Each extra root's take_claim runs in a
-# subshell: every refusal path inside it releases the reclaim lock before it
-# refuses, so the only thing the subshell costs is the variable assignment --
-# the claim directory, holder and nonce it creates are filesystem state and
-# survive it, and $$ is still this process, so the holder record names the
-# launcher as it must.
+# check_open_review_file_set_gate — read-only launch gate for one root's claim
+# path. Declared write roots are mounted, never acquired; this is the only
+# cross-turn check run for them. Refuses when a live open review's file set
+# intersects the incoming upper for that root.
+check_open_review_file_set_gate() {
+	local claim=$1 ws=$2 upper=$3
+	[[ -n "$claim" && -n "$ws" ]] || return 0
+	[[ -f "$claim/review-open" ]] || return 0
+	local review_live stale_record holder
+	holder=unknown
+	if [[ -f "$claim/holder" ]]; then
+		holder=$(tr '\n' ' ' <"$claim/holder")
+		holder=${holder% }
+	fi
+	set +e
+	holder_is_live "$claim/review-open"
+	review_live=$?
+	set -e
+	stale_record=$(tr '\n' ' ' <"$claim/review-open" 2>/dev/null)
+	stale_record=${stale_record% }
+	if (( review_live != 0 )); then
+		return 0
+	fi
+	local review_force_claim open_list incoming_list intersect_list intersect_named
+	review_force_claim=$(force_release_claim_path "$claim") || review_force_claim=$claim
+	open_list=$(mktemp)
+	incoming_list=$(mktemp)
+	intersect_list=$(mktemp)
+	if ! read_review_files_list "$claim" "$ws" >"$open_list"; then
+		rm -f "$open_list" "$incoming_list" "$intersect_list"
+		refuse "declared write root has an open overlay review but its file set cannot be read (${claim}.review-files is missing, unreadable, or not a complete and current record of this editor's open review) (holder: ${holder}) — refuse until the open review's paths are known; clear it with: $0 force-release --claim '$review_force_claim' --reason 'unreadable review file set' [review editor: ${stale_record:-none recorded}]"
+	fi
+	if [[ -n "$upper" && ! -d "$upper" ]]; then
+		rm -f "$open_list" "$incoming_list" "$intersect_list"
+		refuse "this turn's overlay upper for a declared write root is not readable, so its touched file set cannot be established (holder: ${holder}) — refusing before launch"
+	fi
+	incoming_files_from_upper "$upper" >"$incoming_list"
+	file_sets_intersect "$open_list" "$incoming_list" >"$intersect_list"
+	if [[ -s "$intersect_list" ]]; then
+		intersect_named=$(paste -sd ', ' "$intersect_list")
+		rm -f "$open_list" "$incoming_list" "$intersect_list"
+		refuse "open overlay review intersects this turn on: ${intersect_named} (holder: ${holder}) — finish or reject that review for the named file(s), or clear it with: $0 force-release --claim '$review_force_claim' --reason 'review intersects incoming files' [review editor: ${stale_record:-none recorded}]"
+	fi
+	rm -f "$open_list" "$incoming_list" "$intersect_list"
+}
+
+# take_claims — the primary workspace turn claim, then read-only launch gates
+# for each declared write root. Declared roots are mounted, never acquired.
 take_claims() {
 	take_claim
 	remember_acquired_claim "$CLAIM"
-	local i claim out
-	for (( i = 0; i < ${#EXTRA_CLAIMS[@]}; i++ )); do
+	local i claim
+	for (( i = 0; i < ${#EXTRA_ROOTS[@]}; i++ )); do
 		claim=${EXTRA_CLAIMS[$i]}
 		[[ -n "$claim" ]] || continue
-		set +e
-		out=$( ( CLAIM="$claim" CLAIM_LOCK_HELD=0 take_claim ) 2>&1 )
-		rc=$?
-		set -e
-		if (( rc != 0 )); then
-			[[ -n "$out" ]] && echo "$out" >&2
-			release_acquired_claims  # all-or-nothing: a partial hold wedges the workspace
-			sealed_cgroups_cleanup
-			refuse "declared write root '${EXTRA_ROOTS[$i]}' could not be claimed — the turn takes every declared root or none, so the claims it had already taken have been released and the agent was not started"
-		fi
-		remember_acquired_claim "$claim"
+		check_open_review_file_set_gate "$claim" "${EXTRA_ROOTS[$i]}" "${EXTRA_UPPERS[$i]}"
 	done
 }
 
@@ -1967,13 +2136,15 @@ release_claim() {
 }
 
 force_release_claim() {
+	local log_line claims_dir
 	[[ -n "$CLAIM" ]] || die_usage "force-release requires --claim"
 	[[ -n "$FORCE_REASON" ]] || die_usage "force-release requires --reason"
 	CLAIM=$(realpath_safe "$CLAIM")
-	mkdir -p "${CLAIM%/*}"
-	printf '%s force-release %s %s\n' "$(date -Iseconds)" "$$" "$FORCE_REASON" >>"${CLAIM%/}/../force-release.log" 2>/dev/null \
-		|| printf '%s force-release %s %s\n' "$(date -Iseconds)" "$$" "$FORCE_REASON" >>"$CLAIM/force-release.log" 2>/dev/null || true
+	claims_dir="${CLAIM%/*}"
+	mkdir -p "$claims_dir"
 	release_claim force
+	log_line="$(printf '%s force-release %s %s\n' "$(date -Iseconds)" "$$" "$FORCE_REASON")"
+	printf '%s' "$log_line" >>"$claims_dir/force-release.log" 2>/dev/null || true
 }
 
 teardown_work() {
@@ -2007,8 +2178,8 @@ teardown_all_work() {
 run_overlay() {
 	# BROAD-ROOT PATH (PLAN-R1-capture.md WI-1, mount table §2 steps 2-6): ONE
 	# overlay mounted at the broad root rather than at WORKSPACE, -o volatile,
-	# with the compiled secret masks and the ~/.cursor exception mounted by
-	# yana-overlay-inner AFTER that overlay rather than as outer bwrap args --
+	# with the ~/.cursor exception mounted by yana-overlay-inner AFTER that
+	# overlay rather than as an outer bwrap arg --
 	# the fix for the packet's own trap, that a bind stacked before the
 	# overlay at a path under the broad root is invisible the instant the
 	# overlay covers it. Only reachable when --broad-root was given;
@@ -2020,13 +2191,7 @@ run_overlay() {
 	if [[ -n "$BROAD_ROOT" ]]; then
 		local mount_root=$BROAD_ROOT
 		local -a inner_args=("--broad-root" "$mount_root")
-		local d fi
-		for d in ${SECRET_MASK_DEST_DIRS[@]+"${SECRET_MASK_DEST_DIRS[@]}"}; do
-			inner_args+=("--mask-dir" "$d")
-		done
-		for (( fi = 0; fi < ${#SECRET_MASK_FILE_DST[@]}; fi++ )); do
-			inner_args+=("--mask-file" "${SECRET_MASK_FILE_SRC[$fi]}" "${SECRET_MASK_FILE_DST[$fi]}")
-		done
+		local d
 		inner_args+=("--cursor" "$CURSOR_DIR")
 		for d in ${EXEC_ALLOW[@]+"${EXEC_ALLOW[@]}"}; do
 			inner_args+=("--exec-allow" "$d")
@@ -2064,8 +2229,8 @@ run_overlay() {
 	# The primary keeps /tmp/yana/lower and /tmp/yana/layer, so a single-root
 	# launch (no --broad-root, no --extra-root) builds exactly the argv it
 	# always did; root i (2-based, the workspace being root 1) uses
-	# /tmp/yana/r<i>/lower and /tmp/yana/r<i>/layer. Masks and the ~/.cursor
-	# exception stay outer bwrap args here, exactly as before WI-1: this
+	# /tmp/yana/r<i>/lower and /tmp/yana/r<i>/layer. The ~/.cursor exception
+	# stays an outer bwrap arg here, exactly as before WI-1: this
 	# branch is the shape WI-2 deletes, and WI-1 must not add new per-root
 	# code to it.
 	local -a extra_binds=()
@@ -2094,7 +2259,6 @@ run_overlay() {
 		--ro-bind / / \
 		--bind "$CURSOR_DIR" "$CURSOR_DIR" \
 		--tmpfs /tmp \
-		${SECRET_MASK_ARGS[@]+"${SECRET_MASK_ARGS[@]}"} \
 		--ro-bind "$WORKSPACE" "$NEUTRAL_LOWER" \
 		--bind "$LAYER_ROOT" "$NEUTRAL_LAYER" \
 		--dir "$WORKSPACE" \
@@ -2195,7 +2359,7 @@ parse_run_args() {
 			--extra-claim)
 				[[ $# -ge 2 ]] || die_usage "--extra-claim requires a directory"
 				(( ${#EXTRA_ROOTS[@]} > 0 )) || die_usage "--extra-claim must follow an --extra-root"
-				EXTRA_CLAIMS[$(( ${#EXTRA_ROOTS[@]} - 1 ))]=$2
+				EXTRA_CLAIMS[$(( ${#EXTRA_ROOTS[@]} - 1 ))]=$(realpath_safe "$2")
 				shift 2
 				;;
 			--help|-h)
@@ -2249,6 +2413,30 @@ parse_claim_only_args() {
 	done
 }
 
+parse_sweep_args() {
+	CLAIMS_DIR=""
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+			--claims-dir)
+				[[ $# -ge 2 ]] || die_usage "--claims-dir requires a directory"
+				CLAIMS_DIR=$2
+				shift 2
+				;;
+			--help|-h)
+				usage
+				exit 0
+				;;
+			-*)
+				die_usage "unknown option: $1"
+				;;
+			*)
+				die_usage "unexpected argument: $1"
+				;;
+		esac
+	done
+	[[ -n "$CLAIMS_DIR" ]] || die_usage "sweep requires --claims-dir"
+}
+
 cmd_run() {
 	parse_run_args "$@"
 	[[ -n "$WORKSPACE" && -n "$UPPER" && -n "$WORK" ]] || die_usage "--workspace, --upper and --work are required"
@@ -2257,20 +2445,12 @@ cmd_run() {
 	for (( gi = 0; gi < ${#EXTRA_ROOTS[@]}; gi++ )); do
 		[[ -n "${EXTRA_UPPERS[$gi]}" && -n "${EXTRA_WORKS[$gi]}" ]] \
 			|| die_usage "--extra-root '${EXTRA_ROOTS[$gi]}' needs its own --extra-upper and --extra-work"
-		# A turn that claims a declared root must also claim its workspace. The
-		# turn's liveness cgroup is created by the FIRST acquisition, in this
-		# shell, and inherited by the subshells that take the rest; with no
-		# primary claim there would be no first acquisition here to create it,
-		# and each extra root would record a cgroup this process is not in.
-		[[ -z "${EXTRA_CLAIMS[$gi]}" || -n "$CLAIM" ]] \
-			|| die_usage "--extra-claim requires --claim: a turn that claims a declared root must claim its workspace too"
 	done
 
 	ensure_bwrap
 	OPERATOR_HOME=$(operator_home)
 	validate_paths
 	resolve_cursor_dir
-	build_secret_mask
 	if [[ -n "$NONCE_OUT" ]]; then
 		# Fail before touching the claim, not partway through building it.
 		local nonce_dir
@@ -2285,6 +2465,9 @@ cmd_run() {
 	sealed_file=$(sealed_cgroups_file)
 	mkdir -p "${sealed_file%/*}" 2>/dev/null || true
 	: >"$sealed_file" 2>/dev/null || true
+	if [[ -n "$CLAIM" ]]; then
+		sweep_claim_store "${CLAIM%/*}" || true
+	fi
 
 	# take_claims takes the primary claim and then every declared root's, in
 	# order, and captures the token EACH acquisition wrote. take_claim always
@@ -2295,7 +2478,7 @@ cmd_run() {
 	# mount-failure path below releases with.
 	take_claims
 
-	trap 'teardown_all_work; secret_mask_cleanup; sealed_cgroups_cleanup' EXIT
+	trap 'teardown_all_work; sealed_cgroups_cleanup' EXIT
 
 	# `run_overlay; local rc=$?` looks like it captures the exit status, but
 	# under `set -e` it never gets the chance to: a bare simple command that
@@ -2303,7 +2486,7 @@ cmd_run() {
 	# right there and `local rc=$?` -- and everything after it, including
 	# refuse_mount's classification and the claim release below -- never
 	# runs. Measured: a forced mount failure produced only the EXIT trap's
-	# teardown_work/secret_mask_cleanup, the raw kernel mount(2) error on
+	# teardown_work, the raw kernel mount(2) error on
 	# stderr, and no "overlay mount failed" text, for any run_overlay
 	# failure at all, mount or otherwise. `if run_overlay; then ... fi` is
 	# a context `set -e` exempts (the test part of an if), so this is the
@@ -2366,8 +2549,10 @@ main() {
 			force_release_claim
 			exit 0
 			;;
-		--print-secret-roots)
-			print_secret_roots
+		sweep)
+			shift
+			parse_sweep_args "$@"
+			sweep_claim_store "$(realpath_safe "$CLAIMS_DIR")" || true
 			exit 0
 			;;
 		""|-h|--help|help)

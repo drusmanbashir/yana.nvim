@@ -127,11 +127,11 @@ vim.api.nvim_set_current_win(win)
 vim.api.nvim_win_set_cursor(win, { state.hint_line or 1, 0 })
 vim.cmd("redraw")
 
--- Accept the (only) hunk -- "ct", the exact key the product's own
--- notification names ("yana: review notes.txt — ct accept · co reject").
+-- Accept the (only) hunk -- "ca", the exact key the product's own
+-- notification names ("yana: review notes.txt — ca accept · cr reject").
 -- Closing the review is what installs the retrace-aware u/<C-r> for this
 -- buffer (lua/yana/inline_diff.lua's "POST-REVIEW RETRACE" block).
-vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("ct", true, false, true), "x", false)
+vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("ca", true, false, true), "x", false)
 local closed = vim.wait(5000, function()
   return inline.active_state({ workspace = workspace }) == nil
 end, 25)

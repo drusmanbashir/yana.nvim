@@ -19,7 +19,7 @@ Yana's later implementation, documentation, tests, and release engineering
 include work by Dr Usman Bashir and other repository contributors, licensed
 under Apache 2.0.
 
---- Upstream MIT licence (github.com/just-nibble/neocursor) ---
+--- Upstream MIT licence text ---
 
 MIT License
 
@@ -96,6 +96,7 @@ Runtime provenance inventory:
 - post-fork original: `lua/yana/shadow/jail.lua`
 - post-fork original: `lua/yana/shadow/ops.lua`
 - post-fork original: `lua/yana/shadow/preview.lua`
+- post-fork original: `lua/yana/single_file.lua`
 - post-fork original: `lua/yana/timeline/edit_capture.lua`
 - post-fork original: `lua/yana/timeline/init.lua`
 - post-fork original: `lua/yana/timeline/record.lua`

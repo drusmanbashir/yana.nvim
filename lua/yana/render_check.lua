@@ -175,7 +175,33 @@ function M.evaluate(input)
     if block.model_span_new_count then
       model_new = block.model_span_new_count
     end
-    local applied = incoming and M.covered_rows(incoming) or 0
+    -- EXTENT IS SUMMED OVER EVERY SPAN, not read off the first one.
+    -- `incoming_extmark_id` is documented at inline_diff's set_incoming_paint
+    -- as staying the FIRST of `incoming_extmark_ids` -- navigation wants the
+    -- hunk's head. Measuring extent from that single mark scores a hunk the
+    -- human has typed inside at the width of its first span, so a CORRECTLY
+    -- painted 3-row hunk split 1+2 reported `expected 3, applied 1` and red
+    -- `model_extent`. Twenty-eight such lines sit in the operator's real
+    -- session log (`expected 2 applied 1`, `expected 3 applied 2`,
+    -- `expected 8 applied 1`), and every one of them was the check, not the
+    -- paint. The ownership half of this same fact is already handled twelve
+    -- lines above, where every id in the list is `claimed` so the extra spans
+    -- do not read as orphans; only the extent half was left reading one mark.
+    local applied = 0
+    local counted_any = false
+    for _, id in ipairs(block.incoming_extmark_ids or {}) do
+      local m = by_id[id]
+      if m then
+        applied = applied + M.covered_rows(m)
+        counted_any = true
+      end
+    end
+    -- Fallback: a block with no new lines paints ONE mark and never populates
+    -- the list (set_incoming_paint's `#block.new_lines == 0` branch returns
+    -- early), so the single-id field is the only witness there.
+    if not counted_any then
+      applied = incoming and M.covered_rows(incoming) or 0
+    end
     local hunk = {
       index = block.index,
       model_index = block.model_index,
@@ -473,6 +499,19 @@ function M.collect(desc)
       model_span_last = block.model_span_last,
       model_span_new_count = block.model_span_new_count,
       incoming_extmark_id = block.incoming_extmark_id,
+      -- Every incoming-paint extmark id for this block, not just the first.
+      -- `evaluate`'s MODEL EXTENT check sums `covered_rows` over this whole
+      -- list (and claims every id in it so an interior human row's gap does
+      -- not read the SECOND span as `leaked_decoration`) -- a hunk split by
+      -- an interior human row paints as several extmarks
+      -- (inline_diff.set_incoming_paint), and without this field `evaluate`
+      -- never sees past the first one. Omitting it here is exactly what let
+      -- a correctly-painted split hunk still log
+      -- "model_extent,leaked_decoration ... expected N ... applied 1" at
+      -- `buffer_watch` (PACKET-render-check-inhunk-false-alarm-20260826):
+      -- the CHANGELOG's fix landed in `evaluate` alone and never reached the
+      -- production data path, which goes through `collect` first.
+      incoming_extmark_ids = block.incoming_extmark_ids,
       delete_extmark_id = block.delete_extmark_id,
     }
   end

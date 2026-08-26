@@ -3,7 +3,63 @@
 All notable changes to Yana are documented here. Versions follow Semantic
 Versioning.
 
-## Unreleased
+## 0.1.0-alpha.5 - 2026-08-26
+
+### Added
+
+- README Usage now includes the in-repository review clip exported as
+  `assets/yana-review.gif`, with `assets/yana-review-still.png` available for
+  release/package consumers that need a still image.
+- Two review screencast takes landed as release assets: the first still/clip
+  pair and the full-flow take covering a red hunk, typing inside and above the
+  hunk, undo, and `cA`.
+- **`YanaReviewSettled` `User` autocmd** (`doautocmd User YanaReviewSettled`,
+  `data = { buf, turn, reason }`), fired exactly when a review-state
+  transition has fully applied — hunk accept/reject, file accept/reject,
+  undo/redo of a decision, review open, review close/abort, and reload. See
+  `:help yana-events`. Lets tests (and integrations) poll for a positive
+  product signal instead of guessing a fixed delay after a keypress.
+
+### Changed
+
+- **`diff_keymaps.both` renamed to `diff_keymaps.reject_file`** (default
+  unchanged: `"cx"`). The old name borrowed Avante's `replace_in_file`
+  "keep both" vocabulary for a binding that has only ever rejected the
+  whole file. `both` still works as a deprecated alias — it wins only when
+  `reject_file` is left unset — and warns once per session
+  (`yana: diff_keymaps.both is deprecated; use reject_file`) when an
+  operator sets it explicitly.
+- Multi-session peer sockets now use a short owned directory and stderr
+  listen-error reporting, so long matrix paths become a named INCONCLUSIVE
+  instead of a hidden socket-length failure.
+
+### Fixed
+
+- Release gates no longer pass silently when a headless test row exits 0 after
+  failing; rows now exit through `cquit`, and `tests/exit_path_gate.sh` rejects
+  the old false-green pattern.
+- `review_property_gate`, `inline_fcs_reload_gate`, and
+  `inline_playground_gate` now run hermetically and stop writing to the
+  operator's live `~/.local/state/nvim/yana.log`; `session_log_gate` remains
+  red only for already-existing operator log lines.
+- The internal render check's "wrong extent" comparison now sees every
+  incoming-paint span a hunk owns, not just the first, when it runs the way
+  `buffer_watch` and `:YanaRenderCheck` actually run it. A hunk split by a
+  human row typed in its middle painted correctly but still logged
+  `model_extent,leaked_decoration` — alpha.4's CHANGELOG entry for this class
+  fixed the check's pure evaluation logic but not the data-gathering step
+  that feeds it, so production never saw the multi-span data the fix needed.
+- Issue 30 and issue 32 are closed in the ledger.
+
+### Tests
+
+- `tests/all_gates.sh` now runs `--prove-red` and refuses a PASS from a gate
+  that cannot show its own planted failure path.
+- Blind-wait triage classified the fixed-delay sites: observable waits were
+  converted, fixture allowlists were named, and the remaining product-signal
+  work is parked.
+
+## 0.1.0-alpha.4 - 2026-08-26
 
 ### Added
 
@@ -13,6 +69,69 @@ Versioning.
   Mac option (`enable_agentic = true`, `mode = "agentic"`). `:checkhealth
   yana` names that split instead of "mount procfs". Birth-time probe uses
   Darwin `stat -f %B`. README Installation has a macOS section.
+- `:YanaLog` opens the session log, refusing gracefully when nothing has
+  been written yet (like `:LspLog`). `:YanaSetLogLevel {level}` sets the
+  active log level and refuses an unrecognised level by name without
+  changing the current one. `:YanaLogLevel` reports the level actually in
+  effect. `setup({ log_level = ... })` sets it at startup. `WARN` stays the
+  default.
+
+### Changed
+
+- Conversation-panel turn activity now reads in plain verbs —
+  `✓ Edited · edit <path>`, `✓ Ran · ...` — replacing the previous
+  gear-icon-prefixed jargon labels used for every tool call. The README's
+  lazy.nvim quick-start block is now a complete, copy-pasteable
+  configuration.
+- The single-file-mode winbar banner is now sentence case —
+  `Single-file mode · agent edits only <name> · ...` — instead of ALL CAPS.
+  The word "edits" keeps its own highlight so the write-only restriction
+  stays visible at a glance.
+- Refusal reports now carry a machine-readable reason code plus
+  category-specific evidence (the expected file state; for a stale-file
+  refusal, the exact time the base fingerprint was captured) in both the
+  turn journal and `yana.log`, instead of prose only. A refusal can now be
+  greped and diagnosed after the fact instead of re-run to reproduce.
+- **Reverses alpha.3's in-hunk rule.** A line you type inside a still-open
+  hunk is never claimed by that hunk's decision — neither accept nor reject
+  takes it, it stays yours, and the highlight band shows a gap at that row.
+  Only the lines the agent's own patch introduced are ever treated as
+  "yours" for that hunk's highlighting and accept/reject. Ownership above
+  and below the hunk is unchanged (tree-sitter still rules there).
+- The developer session-log gate's `--ack` now actually advances: it
+  re-verifies the current log prefix, lists every pending item since the
+  last acknowledgement, and refuses without `--yes`; `--ack --yes` freezes
+  the newly reviewed bytes and moves the offset forward. A prefix that no
+  longer verifies still refuses in both forms and never advances. Before
+  this, `--ack` was an unimplemented stub and a leftover marker file forced
+  the gate inconclusive permanently.
+
+### Fixed
+
+- The per-turn "## `<backend>` · `<mode>`" header at the top of each
+  assistant reply, and the `SINGLE-FILE MODE` winbar banner, no longer go
+  missing after the conversation-panel refresh — both had been silently
+  dropped by it.
+- A hunk with human-typed lines in its middle no longer trips a false
+  "wrong extent" internal render check during review.
+- The claim-store sweep's `reclaim.log` line said "the previous turn was
+  terminated" whenever the kernel offered `cgroup.kill`, even when the
+  cgroup was already empty; it now reports "terminated (pids: …)" only when
+  a process was actually there, and "was empty" otherwise.
+
+### Tests
+
+- 75 headless test rows exited 0 on failure because `:qa!` ran before
+  `os.exit`; they now exit non-zero via `:cquit`, and a new gate
+  `tests/exit_path_gate.sh` refuses the pattern.
+- `r_claim_orphan_sidecar_is_swept` reddened under machine load because its
+  "live" holder was a 2-second sleep; it now holds the claim until after
+  the assertion by construction.
+- The multi-session rows' peer spawn waited a fixed 15 s for the peer
+  Neovim's socket and `r_ms_holder_dies_reclaim` slept a fixed 500 ms for
+  the holder to die; both now poll the observable, bounded only by the
+  child process being alive, so machine load no longer reds them; five more
+  rows that sampled state once now poll it the same way.
 
 ## 0.1.0-alpha.3 - 2026-08-25
 

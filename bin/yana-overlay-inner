@@ -13,8 +13,7 @@ readonly MOUNT_MARKER_CONTENT=mounted
 if [[ ${1:-} == "--help" || ${1:-} == "-h" ]]; then
 	cat <<'EOF'
 Usage: yana-overlay-inner WORKSPACE COMMAND [ARGS...]
-       yana-overlay-inner --broad-root DIR [--mask-dir DST]...
-                           [--mask-file SRC DST]... [--cursor DIR]
+       yana-overlay-inner --broad-root DIR [--cursor DIR]
                            -- COMMAND [ARGS...]
        yana-overlay-inner --roots N ROOT... -- COMMAND [ARGS...]
 
@@ -25,13 +24,19 @@ shape tests/overlay_gate.sh drives this helper with directly.
 
 The second form is the broad-root shape (PLAN-R1-capture.md WI-1, "one
 broad-root overlay for fast, total capture"): ONE overlay is mounted at DIR
-with -o volatile, and then -- ON TOP of that overlay, in this order -- the
-compiled secret masks and the ~/.cursor writable exception are mounted at
-their own real absolute paths. Mounting them here, after the overlay, rather
-than as outer bwrap args before it, is the fix for the packet's own trap: a
-bind stacked before the overlay at a path under DIR is invisible the instant
-the overlay covers DIR. A failure mounting any of them is pre-agent, exactly
-like an overlay mount failure: fail closed, no marker, capsh never reached.
+with -o volatile, and then -- ON TOP of that overlay -- the ~/.cursor
+writable exception is mounted at its own real absolute path. Mounting it
+here, after the overlay, rather than as an outer bwrap arg before it, is the
+fix for the packet's own trap: a bind stacked before the overlay at a path
+under DIR is invisible the instant the overlay covers DIR. A failure
+mounting it is pre-agent, exactly like an overlay mount failure: fail
+closed, no marker, capsh never reached.
+
+Secret masking of any kind was RETIRED 2026-08-24 (ruling "Yana confines
+writes, not reads", ship-issue tracker issue 2): a turn now reads exactly
+what the operator's account can read, so this helper no longer accepts or
+mounts anything of that shape. See bin/yana-overlay's own
+"Secret mask — RETIRED" comment and the core contract doc.
 
 The third form mounts one overlay per operator-declared write root (the
 pre-broad-root shape, retained unchanged pending its own deletion). Root 1 is
@@ -43,9 +48,6 @@ EOF
 fi
 
 BROAD_ROOT=""
-MASK_DIRS=()
-MASK_FILE_SRC=()
-MASK_FILE_DST=()
 CURSOR_DIR=""
 ROOTS=()
 EXEC_ALLOW=()
@@ -69,17 +71,6 @@ if [[ ${1:-} == "--broad-root" ]]; then
 	shift
 	while [[ $# -gt 0 && "$1" != "--" ]]; do
 		case "$1" in
-			--mask-dir)
-				[[ $# -ge 2 ]] || { echo "yana-overlay-inner: --mask-dir requires a path" >&2; exit "$EXIT_USAGE"; }
-				MASK_DIRS+=("$2")
-				shift 2
-				;;
-			--mask-file)
-				[[ $# -ge 3 ]] || { echo "yana-overlay-inner: --mask-file requires SRC and DST" >&2; exit "$EXIT_USAGE"; }
-				MASK_FILE_SRC+=("$2")
-				MASK_FILE_DST+=("$3")
-				shift 3
-				;;
 			--cursor)
 				[[ $# -ge 2 ]] || { echo "yana-overlay-inner: --cursor requires a directory" >&2; exit "$EXIT_USAGE"; }
 				CURSOR_DIR=$2
@@ -169,28 +160,16 @@ mount_overlays() {
 	done
 }
 
-# mount_masks_and_cursor — packet mount table steps 4-5: the compiled secret
-# masks, then the ~/.cursor writable exception, both mounted ON TOP of the
-# overlay(s) mount_overlays just established. A no-op for the single-root and
-# --roots forms, which never populate MASK_DIRS/MASK_FILE_*/CURSOR_DIR --
-# those two call shapes still mount masks and the exception as outer bwrap
-# args, unchanged, exactly as before this file changed.
+# mount_cursor_exception — packet mount table step 5: the ~/.cursor writable
+# exception, mounted ON TOP of the overlay(s) mount_overlays just
+# established. A no-op for the single-root and --roots forms, which never
+# populate CURSOR_DIR -- those two call shapes still mount the exception as
+# an outer bwrap arg, unchanged, exactly as before this file changed.
 #
-# A masked FILE needs two mount(8) calls, not bwrap's one-shot --ro-bind: a
-# plain `mount --bind` is writable regardless of what is bound at the source,
-# so the read-only property has to be applied with a second remount.
-mount_masks_and_cursor() {
-	local dst src i
-	for dst in ${MASK_DIRS[@]+"${MASK_DIRS[@]}"}; do
-		mount -t tmpfs tmpfs "$dst" || exit "$EXIT_MOUNT"
-	done
-	i=0
-	for dst in ${MASK_FILE_DST[@]+"${MASK_FILE_DST[@]}"}; do
-		src=${MASK_FILE_SRC[$i]}
-		i=$(( i + 1 ))
-		mount --bind "$src" "$dst" || exit "$EXIT_MOUNT"
-		mount -o bind,remount,ro "$dst" || exit "$EXIT_MOUNT"
-	done
+# Secret masking (mount table steps 4) was RETIRED 2026-08-24 (ruling "Yana
+# confines writes, not reads", ship-issue tracker issue 2) -- this helper no
+# longer mounts anything over a compiled credential path.
+mount_cursor_exception() {
 	if [[ -n "$CURSOR_DIR" ]]; then
 		mount --bind "$CURSOR_DIR" "$CURSOR_DIR" || exit "$EXIT_MOUNT"
 		# ...AND MAKE IT WRITABLE. This bind's source is the path as this mount
@@ -208,16 +187,16 @@ mount_masks_and_cursor() {
 }
 
 mount_overlays
-mount_masks_and_cursor
+mount_cursor_exception
 
 # Markers are written only after the FULL set has mounted -- the overlay(s),
-# and now the masks and the cursor exception too, when this invocation has
-# any. yana-overlay reads them to tell a pre-agent mount failure (release the
-# claims; the agent never ran) from an agent that happened to exit 67 (touch
-# nothing). A partially mounted set must therefore read as a failure, so no
-# marker may exist until it is complete. This MUST happen before the exec
-# below, in either branch: once this script execs, nothing after that point
-# ever runs again in this process.
+# and now the cursor exception too, when this invocation has one. yana-overlay
+# reads them to tell a pre-agent mount failure (release the claims; the agent
+# never ran) from an agent that happened to exit 67 (touch nothing). A
+# partially mounted set must therefore read as a failure, so no marker may
+# exist until it is complete. This MUST happen before the exec below, in
+# either branch: once this script execs, nothing after that point ever runs
+# again in this process.
 for layer in "${LAYERS[@]}"; do
 	touch "${layer}/${MOUNT_MARKER}"
 	echo "$MOUNT_MARKER_CONTENT" >"${layer}/${MOUNT_MARKER}"

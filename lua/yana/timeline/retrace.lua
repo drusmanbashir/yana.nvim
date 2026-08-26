@@ -233,6 +233,22 @@ local function absorb_own_move(bufnr)
 	end
 end
 
+--- Post-review native redo can schedule `on_lines` while Yana's rewind
+--- suppress/hold counters are still up, so the deferred reconcile is dropped
+--- and a withdrawn review never restores. Try a direct restore once the redo
+--- has landed (property seed 87008 step 35).
+local function reconcile_withdrawn_after_native_redo(bufnr)
+	local ok_inline, inline = pcall(require, "yana.inline_diff")
+	if not ok_inline or type(inline._rewind_try_restore_after_redo) ~= "function" then
+		return
+	end
+	local name = vim.api.nvim_buf_get_name(bufnr)
+	if name == "" then
+		return
+	end
+	inline._rewind_try_restore_after_redo(vim.fn.fnamemodify(name, ":p"))
+end
+
 local function notify_drift(bufnr, head, cur, action)
 	local rel = vim.api.nvim_buf_get_name(bufnr)
 	local reason = "undo sequence drift: buffer is at seq "
@@ -381,6 +397,33 @@ local function reintegration_panel(ws)
 	return p
 end
 
+--- THE ONE SHAPE a review this module reopens (or brings forward from
+--- parked) must be handed, or `finish_session` falls through to the "legacy
+--- in-place accept path is removed" refusal — that fallback fires whenever
+--- `state.opts.shadow_apply` is missing, and every real-tree write this
+--- module's reopened reviews make must route through the journaled applier
+--- like any other (`shadow_apply.accept_standalone`, the SAME primitive a
+--- freshly-opened review from the panel uses).
+--- `reintegrate()` always built this inline; `redo_hunk_decision`'s
+--- park-and-bring-forward path (WIP commit 28636ea) built its OWN bare
+--- `{ workspace = ... }` instead and never wired shadow_apply in, so a
+--- redo that had to park the active review and bring a CLOSED file's review
+--- forward closed it again straight into that refusal (measured:
+--- "refused to accept bravo.py -- legacy direct-write path is removed",
+--- immediately followed by retrace's own "redid hunk_accepted in bravo.py",
+--- reporting success over a write that never happened). ONE constructor,
+--- used everywhere this module opens or reopens a review, so no third call
+--- site can drift from the other two again.
+local function retrace_review_opts(ws)
+	return {
+		workspace = ws,
+		shadow_apply = true,
+		on_shadow_accept = function(c, composed, ...)
+			return shadow_apply.accept_standalone(reintegration_panel(ws), c, composed, ...)
+		end,
+	}
+end
+
 --- THE BASE A REINTEGRATED REVIEW MUST DIFF AGAINST (issue-log row 112).
 --- Disk alone is not it. Ruling 87: accepting a hunk in an OPEN buffer writes
 --- NOTHING, so a file whose review closed with one hunk accepted and one
@@ -526,6 +569,55 @@ end
 --- would close this, not attempted here. Neither limit loses bytes or data:
 --- every row this lane touches still reverts correctly regardless of
 --- whether its paint stays fresh.
+--- YANA'S OWN TRANSACTION, ACROSS SCHEDULED WORK (KI-1, 2026-08-24).
+---
+--- The walk below is not synchronous. It moves the buffer itself (`walk.execute`
+--- reverses the bytes of the decision this press took back) and then does its
+--- reintegration and review reopen from `vim.schedule` callbacks, and a close
+--- inside the walk queues a queue advance that opens and stages the NEXT file
+--- a tick later again. Every one of those edits is Yana's own.
+---
+--- `inline._rewind_suppress` cannot cover that: it holds the rewind
+--- reconciler's guard for one frame and releases it on the next tick, so the
+--- walk's scheduled edits landed AFTER the release and the reconciler read
+--- them as the operator time travelling -- withdrawing a review the walk still
+--- owned, mid-step. Measured under the parallel gate as the r75 redo-paint and
+--- r113 reopen families; it passed on a quiet box, which is why it survived.
+---
+--- `inline._rewind_own_transaction` takes a TOKEN instead, released when the
+--- walk's own scheduled work has actually finished -- no timer and no duration
+--- anywhere in it. Deferred work started while the token is open joins it (see
+--- `walk_schedule` and inline_diff's HOLDS block), so the chain is covered
+--- however deep it goes.
+---
+--- NO SILENT DEGRADE. inline_diff is a sibling module of this one and always
+--- present; an inline_diff that loads but does not expose the seam is a
+--- WIRING ERROR, and the one thing it must not do is quietly run the walk
+--- unguarded -- a tree in that state measures nothing while looking like it
+--- passed (it cost this lane one whole verification run). It is asserted, by
+--- name, on the first walk. The only tolerated fallback is inline_diff not
+--- being loadable at all, which is not a state a walk can occur in anyway.
+local function yana_own_transaction(fn)
+	local inline = require("yana.inline_diff")
+	if type(inline._rewind_own_transaction) ~= "function" then
+		error("yana.timeline.retrace: yana.inline_diff has no _rewind_own_transaction -- "
+			.. "the rewind guard is not wired and this walk would run unguarded", 0)
+	end
+	return inline._rewind_own_transaction(fn)
+end
+
+--- `vim.schedule` for a piece of the walk's own deferred work: inside a walk
+--- it joins the walk's token, outside one it is exactly `vim.schedule`.
+--- Asserted for the same reason as `yana_own_transaction`.
+local function walk_schedule(fn)
+	local inline = require("yana.inline_diff")
+	if type(inline._rewind_schedule) ~= "function" then
+		error("yana.timeline.retrace: yana.inline_diff has no _rewind_schedule -- "
+			.. "the rewind guard is not wired and this walk's deferred work would escape it", 0)
+	end
+	return inline._rewind_schedule(fn)
+end
+
 local function reintegrate(ws, rel, before, after, reverted_ids)
 	-- REC-PLANT seam (`skip_reintegrate`, default off, see M._test.fault at the
 	-- top): the caller's byte and timeline revert has already happened; only the
@@ -554,13 +646,7 @@ local function reintegrate(ws, rel, before, after, reverted_ids)
 	end
 	local abs = abs_path(ws, rel)
 	local uv = vim.uv or vim.loop
-	local opts = {
-		workspace = ws,
-		shadow_apply = true,
-		on_shadow_accept = function(c, composed, ...)
-			return shadow_apply.accept_standalone(reintegration_panel(ws), c, composed, ...)
-		end,
-	}
+	local opts = retrace_review_opts(ws)
 	-- RULING 74 (AD:895): `u` after a review closes REOPENS THE ORIGINAL
 	-- review, same identity -- it does not manufacture a new one. LOOK UP the
 	-- change this workspace's pool already recorded for `rel` (the same set
@@ -646,6 +732,9 @@ local function reintegrate(ws, rel, before, after, reverted_ids)
 			-- nothing on disk (a never-opened create, reversed), so the
 			-- reintegrated mini-review is itself a create.
 			base_hash = hash.hash_bytes(before or ""),
+			-- Captured right here, from `before` read moments ago in this same
+			-- function: "now" is the true capture time, not a proxy.
+			base_hash_captured_ts = os.time(),
 			base_state = stat and "file" or "absent",
 			base_mode = stat and stat.mode or nil,
 			status = "pending",
@@ -706,7 +795,9 @@ local function reintegrate(ws, rel, before, after, reverted_ids)
 	-- the accept BEFORE undo even began) clobbered it milliseconds later.
 	-- Scheduling this callback AFTER that one (same FIFO queue) means it
 	-- always observes the pool in its true settled state.
-	vim.schedule(function()
+	-- `walk_schedule`, not `vim.schedule`: this reopen is the walk's own
+	-- work and must run while the walk still holds the rewind guard.
+	walk_schedule(function()
 		local active = inline.active_state and inline.active_state(opts)
 		local ok, result
 		if active and inline._park_and_open_state then
@@ -786,7 +877,188 @@ end
 ---   concern, not an engine one, and the engine's own regression coverage
 ---   (P113/P114/P115's `row_state`/byte assertions) depends on calling the
 ---   engine without it.
-function M.undo(workspace, opts)
+--- ONE REGISTER (ruling 75). A review that pops one of its own decisions on
+--- `u` pushes it here, onto the same LIFO the cross-file walk uses, so
+--- `<C-r>` replays steps in the reverse of the order they were undone no
+--- matter which file each came from. Keyed by the root set the review's
+--- workspace resolves to -- the same key `M.undo` pushes under.
+function M.push_review_redo(entry)
+	if type(entry) ~= "table" or type(entry.workspace) ~= "string" then
+		return
+	end
+	local roots = resolve_roots(entry.workspace)
+	local stack = redo_stack(roots_key(roots))
+	stack[#stack + 1] = entry
+end
+
+--- The OPEN review for (workspace, rel), with its decision primitives
+--- (`state._ops`, set by `inline_diff.M.open`). nil when no review is open on
+--- that file -- a redo that needs one refuses by name rather than guessing.
+local function open_review_ops(ws, rel)
+	local ok, inline = pcall(require, "yana.inline_diff")
+	if not ok or type(inline.active_state) ~= "function" then
+		return nil
+	end
+	local state = inline.active_state({ workspace = ws })
+	if type(state) ~= "table" or type(state.change) ~= "table" then
+		return nil
+	end
+	local srel = state.change.rel or state.change.path
+	if srel ~= rel or type(state._ops) ~= "table" then
+		return nil
+	end
+	return state
+end
+
+--- Re-apply a hunk decision (`hunk_accepted` / `hunk_rejected`) to the open
+--- review on `rel` through the review's own key path. Returns true, or false
+--- plus a reason.
+--- The step's target file's review is PARKED behind the active one (a
+--- 4-file walk leaves the last-reverted file active; the redo stack's top
+--- may name another). Bring that file's review forward exactly as the walk
+--- does on the way back (`reintegrate`'s takeover: park the active review,
+--- open the target's), then return its `state._ops`, or nil.
+--- Measured: "cannot redo charlie.py -- no open review" x12 on every 4-file
+--- scenario (adversarial ledger, codex-3 f01-f05).
+local function bring_review_forward(entry)
+	local ok_inline, inline = pcall(require, "yana.inline_diff")
+	if not (ok_inline and type(inline._find_change_for_rel) == "function") then
+		return nil
+	end
+	-- SAME OPTS `reintegrate()` uses (shadow_apply + on_shadow_accept), never
+	-- a bare `{ workspace = ... }` -- a review brought forward with
+	-- incomplete opts closes straight into finish_session's "legacy in-place
+	-- accept path is removed" refusal the moment its last hunk is redone,
+	-- which then reports success anyway (measured: "refused to accept
+	-- bravo.py -- legacy direct-write path is removed" immediately followed
+	-- by "redid hunk_accepted in bravo.py").
+	local opts = retrace_review_opts(entry.workspace)
+	local change = inline._find_change_for_rel(entry.rel, opts)
+	if type(change) ~= "table" then
+		return nil
+	end
+	local active = inline.active_state and inline.active_state(opts) or nil
+	local ok_p, res
+	if active ~= nil and active.change ~= change and type(inline._park_and_open_state) == "function" then
+		-- Something else is the active review: PARK it (never discard it --
+		-- the same primitive `]x`/`[x` navigation and `reintegrate()`'s own
+		-- takeover use) and bring this file's review forward in its place.
+		ok_p, res = pcall(inline._park_and_open_state, active, "next", {
+			change = change,
+			opts = opts,
+			owner = nil,
+			retrace_repaint = true,
+		})
+	end
+	if not (ok_p and res == true) and type(inline.review) == "function" then
+		-- Nothing is active (every review closed or parked), the target IS
+		-- already the active review, or the park-and-open attempt itself
+		-- failed -- `inline.review` is the same fallback `reintegrate()`
+		-- falls back to, and it resumes a change's own `_parked_review` when
+		-- it has one rather than starting over.
+		ok_p, res = pcall(inline.review, change, opts)
+	end
+	if ok_p then
+		return open_review_ops(entry.workspace, entry.rel)
+	end
+	return nil
+end
+
+--- PRUNE (Vim's own rule, row r75_new_action_prunes_redo): the buffer must
+--- still sit where the undo left it; typing since makes the step
+--- unreachable and the caller drops it. Asked of the register itself, not of
+--- Neovim's seq (an earlier redo of a later step legitimately moves the
+--- buffer): the step is reachable only while the buffer's head row still
+--- sits BEFORE it. Typing since the undo appended a `human_edit` row and
+--- moved the head onto it -- at or after this row -- so the step is gone,
+--- exactly as in Vim's own tree.
+local function redo_step_pruned(state, entry)
+	local head = timeline.buffer_head(state.bufnr)
+	local ok_e, entries = pcall(timeline.entries, entry.workspace, entry.rel)
+	if head ~= nil and head.id ~= nil and ok_e and type(entries) == "table" then
+		local head_i, entry_i
+		for i, e in ipairs(entries) do
+			if e.id == head.id then
+				head_i = i
+			end
+			if e.id == entry.id then
+				entry_i = i
+			end
+		end
+		if head_i ~= nil and entry_i ~= nil and head_i >= entry_i then
+			return true
+		end
+	end
+	-- Typing inside an open review is captured lazily (at its next
+	-- decision), so it may not be a row yet: the buffer having drifted off
+	-- Yana's own head is the same fact, read live.
+	local cur = timeline.observe_buffer(state.bufnr)
+	if head ~= nil and cur ~= nil and type(head.undo_seq) == "number"
+		and (head.buffer_epoch ~= cur.buffer_epoch or head.undo_seq ~= cur.undo_seq)
+	then
+		return true
+	end
+	return false
+end
+
+local function redo_hunk_decision(entry)
+	local state = open_review_ops(entry.workspace, entry.rel) or bring_review_forward(entry)
+	if state == nil then
+		return false, "no open review on " .. tostring(entry.rel) .. " to put that decision back into"
+	end
+	local hunk = tonumber(entry.hunk)
+	local idx = nil
+	local ok_inline, inline = pcall(require, "yana.inline_diff")
+	for i, b in ipairs(state.diff_blocks or {}) do
+		local n = b.model_index
+		if n == nil and ok_inline and type(inline._hunk_number_for_block) == "function" then
+			n = inline._hunk_number_for_block(state.change, b)
+		end
+		if hunk ~= nil and n == hunk then
+			idx = i
+			break
+		end
+	end
+	if idx == nil then
+		return false, "hunk " .. tostring(hunk) .. " is not pending in " .. tostring(entry.rel)
+	end
+	if redo_step_pruned(state, entry) then
+		return false, "pruned"
+	end
+	if entry.kind == "hunk_accepted" then
+		state._ops.accept_block_at(idx, entry.id)
+	else
+		state._ops.reject_block_at(idx, entry.id)
+	end
+	return true
+end
+
+--- The file-level twin of `redo_hunk_decision` (ruling 75): `entry.kind` is
+--- `file_accepted`/`file_rejected`, ONE row covering however many hunks the
+--- original `ca`/`cb` decided, so there is no `entry.hunk` to look up and no
+--- per-hunk index to find -- the whole file's own `accept_all`/`reject_all`
+--- primitive is asked to redo, exactly the way `redo_hunk_decision` asks
+--- `accept_block_at`/`reject_block_at`.
+local function redo_file_decision(entry)
+	local state = open_review_ops(entry.workspace, entry.rel) or bring_review_forward(entry)
+	if state == nil then
+		return false, "no open review on " .. tostring(entry.rel) .. " to put that decision back into"
+	end
+	if type(state._ops.accept_all) ~= "function" or type(state._ops.reject_all) ~= "function" then
+		return false, "this review has no file-level redo primitive"
+	end
+	if redo_step_pruned(state, entry) then
+		return false, "pruned"
+	end
+	if entry.kind == "file_accepted" then
+		state._ops.accept_all(entry.id)
+	else
+		state._ops.reject_all(entry.id)
+	end
+	return true
+end
+
+local function undo_impl(workspace, opts)
 	opts = opts or {}
 	local roots = resolve_roots(workspace)
 	local row, rerr, ws = next_undo_across(roots)
@@ -832,6 +1104,7 @@ function M.undo(workspace, opts)
 				diary_dir = row.diary_dir,
 				op_id = row.op_id,
 				never_opened = true,
+				reintegrated = opts.reintegrate == true,
 			}
 			local said = "yana: undid " .. row.rel .. " -- accepted without ever being opened, reverted by disk write"
 			log.write("WARN", said)
@@ -896,14 +1169,19 @@ function M.undo(workspace, opts)
 	end
 
 	local rkey = roots_key(roots)
-	for _, entry in ipairs(committed) do
-		redo_stack(rkey)[#redo_stack(rkey) + 1] = {
+	local function push_member(entry)
+		return {
 			workspace = ws,
 			rel = row.rel,
 			id = entry.id,
 			kind = entry.kind,
 			regime = entry.regime,
 			bufnr = bufnr,
+			-- The turn-start hunk number, from the row's own label, so a
+			-- `hunk_accepted`/`hunk_rejected` step can be re-applied to the
+			-- reopened review by hunk rather than by Neovim undo position
+			-- (an accept has none -- ruling 87).
+			hunk = tonumber(tostring(entry.label or ""):match("hunk (%d+)")),
 			-- Carried for a DURABLE entry (`M.entries` already returns
 			-- these on every row, never opener-specific) so `M.redo` can
 			-- redo an ordinary opened file's composed write the SAME way
@@ -912,7 +1190,19 @@ function M.undo(workspace, opts)
 			-- comment at its call site.
 			diary_dir = entry.diary_dir,
 			op_id = entry.op_id,
+			-- True when this undo reintegrated an open review. Redo must then
+			-- go through redo_hunk_decision / redo_file_decision. Engine-only
+			-- undos (P113) leave this false and redo via native `:redo`.
+			reintegrated = opts.reintegrate == true,
 		}
+	end
+	-- RULING 75: a file-level `ca`/`cb` decision is now ALWAYS exactly one
+	-- row (`file_accepted`/`file_rejected`), so `committed` never holds more
+	-- than one actionable entry for it and no grouping is needed here --
+	-- every entry this walk committed is pushed back individually, exactly
+	-- like any other kind of row.
+	for _, entry in ipairs(committed) do
+		redo_stack(rkey)[#redo_stack(rkey) + 1] = push_member(entry)
 	end
 
 	local said = "yana: undid " .. (last.label or last.kind or "the last decision") .. " in " .. row.rel
@@ -946,10 +1236,23 @@ function M.undo(workspace, opts)
 		-- the reopen would compose a review with nothing pending in it.
 		local reverted_ids = nil
 		for _, entry in ipairs(committed) do
-			local n = tonumber(tostring(entry.label or ""):match("hunk (%d+)"))
-			if n and (entry.kind == "hunk_accepted" or entry.kind == "hunk_rejected") then
+			if entry.kind == "hunk_accepted" or entry.kind == "hunk_rejected" then
+				local n = tonumber(tostring(entry.label or ""):match("hunk (%d+)"))
+				if n then
+					reverted_ids = reverted_ids or {}
+					reverted_ids[n] = entry.id
+				end
+			elseif (entry.kind == "file_accepted" or entry.kind == "file_rejected") and type(entry.members) == "table" then
+				-- RULING 75: a file-level row's byte-less half (accept moves no
+				-- bytes) needs the SAME override every hunk-level accept needs --
+				-- every hunk it covers, not just one.
 				reverted_ids = reverted_ids or {}
-				reverted_ids[n] = entry.id
+				for _, m in ipairs(entry.members) do
+					local n = tonumber(m.hunk)
+					if n then
+						reverted_ids[n] = entry.id
+					end
+				end
 			end
 		end
 		if buf_now ~= nil then
@@ -969,13 +1272,14 @@ end
 --- this refuses BY NAME rather than pretending. Returns false only when
 --- there is truly nothing in this dispatcher's own redo memory to try —
 --- callers fall through to plain buffer redo.
---- NAMED LIMIT (reintegration, this session): if `M.undo` reintegrated the
---- row this call is about to redo, that mini-review is left exactly as it
---- is -- undecided, still showing the now-stale hunk -- rather than closed
---- or refreshed. Out of scope for this lane's own job (the operator's
---- ruling under repair is "undo -- the hunk comes back", not redo); a later
---- lane can teach this call to discard or refresh that review the way
---- `reintegrate`'s own NAMED LIMITS comment already anticipates.
+--- REINTEGRATED ROWS (2026-08-23, operator clips 12-41-06 / 12-43-32): a
+--- `hunk_accepted`/`hunk_rejected` row `M.undo` reintegrated is put back
+--- THROUGH the reopened review's own accept/reject path (`redo_hunk_decision`
+--- -> `state._ops`, with `redo_of = row id` so the register reuses the row
+--- instead of minting a second one). A review's own popped decision
+--- (`regime = "review"`, pushed by `pop_decision`) replays via the closure it
+--- carried. Both sit on ONE LIFO with the walk's rows, so order is reverse
+--- undo order across files (ruling 75).
 --- The turn a redo-memory entry's row belongs to, read from the row's own
 --- durable stamp rather than from the in-memory entry: the memory predates
 --- the stamp and carrying a copy on it would be a second, drift-prone
@@ -996,7 +1300,7 @@ local function entry_turn_id(entry)
 	return nil
 end
 
-function M.redo(workspace)
+local function redo_impl(workspace)
 	local roots = resolve_roots(workspace)
 	local stack = redo_stack(roots_key(roots))
 	-- OPERATOR RULING #99, the `<C-r>` half: "`<C-r>` likewise never redoes
@@ -1025,6 +1329,10 @@ function M.redo(workspace)
 		log.write("INFO", "yana.timeline.retrace redo: cross-file redo stack empty -- press handed to plain Neovim redo")
 		return false
 	end
+	-- RULING 75: a file-level `ca`/`cb` decision is now ALWAYS one row, so it
+	-- reaches the ordinary `entry.kind == "file_accepted"/"file_rejected"`
+	-- dispatch below like any other single entry -- no compound-entry replay
+	-- is needed here any more.
 	if entry.regime == "durable" then
 		if entry.never_opened or (entry.diary_dir ~= nil and entry.op_id ~= nil) then
 			-- Ruling row 72(b)/ruling 52's own mechanism, generalised this
@@ -1082,11 +1390,93 @@ function M.redo(workspace)
 		lifecycle("redo.retrace_refused", { workspace = entry.workspace, rel = entry.rel, id = entry.id, reason = "durable redo not implemented" })
 		return true
 	end
+	-- A decision THIS session's open review popped itself (`pop_decision`
+	-- pushed it, ruling 75's one register). The review re-adopts its own
+	-- decision object, bytes and bookkeeping together; "pruned" means the
+	-- operator typed since the undo, so the step is unreachable (Vim's own
+	-- rule) and is dropped, and the press falls through to plain redo.
+	if entry.regime == "review" then
+		local ok_r, reason = false, "no redo closure"
+		if type(entry.redo) == "function" then
+			ok_r, reason = entry.redo(entry)
+		end
+		if ok_r then
+			local said = "yana: redid " .. (entry.kind or "the last undone step") .. " in " .. entry.rel
+			log.write("WARN", said)
+			notify.one_line(said, vim.log.levels.INFO)
+			lifecycle("redo.retrace", { workspace = entry.workspace, rel = entry.rel, id = entry.id, row_kind = entry.kind })
+			return true
+		end
+		if reason == "pruned" then
+			log.write("INFO", "yana.timeline.retrace redo: dropped pruned step " .. tostring(entry.id) .. " in " .. entry.rel)
+			return false
+		end
+		stack[#stack + 1] = entry
+		local msg = "yana: cannot redo " .. entry.rel .. " -- " .. tostring(reason)
+		log.write("WARN", msg)
+		notify.one_line(msg, vim.log.levels.WARN)
+		lifecycle("redo.retrace_refused", { workspace = entry.workspace, rel = entry.rel, id = entry.id, reason = reason })
+		return true
+	end
 	local bufnr, berr = ensure_buffer(entry.workspace, entry.rel, nil)
 	if not bufnr then
 		local msg = "yana: cannot redo " .. entry.rel .. " -- " .. tostring(berr)
 		log.write("WARN", msg)
 		notify.one_line(msg, vim.log.levels.WARN)
+		return true
+	end
+	-- A hunk decision the cross-file walk reverted and reintegrated as a
+	-- pending hunk: put it back THROUGH THE REVIEW (its own accept/reject
+	-- path -- bytes, decision row and paint together), never a bare
+	-- `:redo`, which moves no bytes for an accept and records nothing for
+	-- a reject. This is the path the "NAMED LIMIT (reintegration)" above
+	-- left unbuilt -- measured as "redid hunk_accepted" announced with the
+	-- hunk still pending (operator clip 2026-08-23 12-41-06).
+	--
+	-- Engine walk undos (P113) push with reintegrated=false: skip the review
+	-- path and fall through to native `:redo` + mark_reverted below.
+	if entry.reintegrated
+		and (entry.kind == "hunk_accepted" or entry.kind == "hunk_rejected" or entry.kind == "file_accepted" or entry.kind == "file_rejected")
+	then
+		local redoer = (entry.kind == "file_accepted" or entry.kind == "file_rejected") and redo_file_decision or redo_hunk_decision
+		local ok_h, reason = redoer(entry)
+		-- UNREACHABLE, not just PRUNED: "no open review ... to put that
+		-- decision back into" means `open_review_ops`/`bring_review_forward`
+		-- found nothing to reintegrate this decision into at all -- no
+		-- review is open or reopenable for this file, so there is no pending
+		-- UI state left to desync. That is the SAME shape as "pruned": the
+		-- operator has moved past this step by some other route (here: two
+		-- more bare `u` presses that retrace's own row-walk had nothing left
+		-- to claim, so `on_u_key` fell through to plain `:undo` -- see
+		-- `M.undo`'s own fallthrough just above -- walked past the
+		-- reintegrated review before it was ever shown). Treating ONLY
+		-- "pruned" as droppable and everything else as a hard,
+		-- stack-preserving refusal left this entry stuck on top of the redo
+		-- stack forever: every `<C-r>` re-popped the SAME entry, failed the
+		-- SAME way, and pushed it right back -- so a plain `:redo` that would
+		-- have walked the buffer's own intact undo tree forward (recovering
+		-- the operator's own typed line, two blocks past this one) was never
+		-- reached. Drop it and return false -- callers (redo_key / on_redo_key)
+		-- fall through to native `:redo` and MUST repaint (r75 paint rows).
+		local unreachable = reason == "pruned"
+			or (type(reason) == "string" and reason:match("^no open review") ~= nil)
+		if not ok_h and unreachable then
+			log.write("INFO", "yana.timeline.retrace redo: dropped unreachable step "
+				.. tostring(entry.id) .. " in " .. entry.rel .. " (" .. tostring(reason) .. ")")
+			return false
+		end
+		if not ok_h then
+			stack[#stack + 1] = entry
+			local msg = "yana: cannot redo " .. entry.rel .. " -- " .. tostring(reason)
+			log.write("WARN", msg)
+			notify.one_line(msg, vim.log.levels.WARN)
+			lifecycle("redo.retrace_refused", { workspace = entry.workspace, rel = entry.rel, id = entry.id, reason = reason })
+			return true
+		end
+		local said = "yana: redid " .. entry.kind .. " in " .. entry.rel
+		log.write("WARN", said)
+		notify.one_line(said, vim.log.levels.INFO)
+		lifecycle("redo.retrace", { workspace = entry.workspace, rel = entry.rel, id = entry.id, row_kind = entry.kind })
 		return true
 	end
 	local ok, err = pcall(vim.api.nvim_buf_call, bufnr, function()
@@ -1096,6 +1486,9 @@ function M.redo(workspace)
 		log.write("WARN", "yana.timeline.retrace redo: " .. tostring(err))
 	end
 	local ok_record, record = pcall(require, "yana.timeline.record")
+	if ok_record and type(record.mark_reverted) == "function" then
+		record.mark_reverted(entry.id, false)
+	end
 	if ok_record and type(record.sync_buffer_head) == "function" then
 		local ok_entries, entries = pcall(timeline.entries, entry.workspace, entry.rel)
 		if ok_entries then
@@ -1153,6 +1546,22 @@ end
 -- (below) in their place, buffer-local to exactly that buffer -- never a
 -- global `u` remap, never a buffer Yana has not itself reviewed.
 ----------------------------------------------------------------------
+
+--- The cross-file `u` walk. One press, one transaction: see
+--- `yana_own_transaction` above for why the token and not a suppression
+--- window.
+function M.undo(workspace, opts)
+	return yana_own_transaction(function()
+		return undo_impl(workspace, opts)
+	end)
+end
+
+--- The cross-file `<C-r>` walk, under the same token as `M.undo`.
+function M.redo(workspace)
+	return yana_own_transaction(function()
+		return redo_impl(workspace)
+	end)
+end
 
 --- `u` once a review has closed. See the seam comment above for the exact
 --- condition; this is only its implementation.
@@ -1227,6 +1636,7 @@ function M.on_redo_key(bufnr)
 			log.write("WARN", "yana.timeline.retrace native redo: " .. tostring(err))
 		end
 		absorb_own_move(bufnr)
+		reconcile_withdrawn_after_native_redo(bufnr)
 		return
 	end
 	local roots = timeline.known_workspaces()
@@ -1243,6 +1653,7 @@ function M.on_redo_key(bufnr)
 		end
 		absorb_own_move(bufnr)
 	end
+	reconcile_withdrawn_after_native_redo(bufnr)
 end
 
 --- ROW 74 (issue log, orchestrator ruling 2026-08-21): `u` pressed inside a

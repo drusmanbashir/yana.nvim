@@ -79,6 +79,12 @@ function M.review_open_for(workspace, rel)
 	return require("yana.timeline.record").review_open_for(workspace, rel)
 end
 
+--- Ownership, not gating: true while ANY review (reintegrated included) is
+--- open on `rel`'s buffer. See `record.review_owns_buffer`.
+function M.review_owns_buffer(workspace, rel)
+	return require("yana.timeline.record").review_owns_buffer(workspace, rel)
+end
+
 --- ADDITIVE (FIX-UNDO lane, 2026-08-21): the single most recent
 --- not-yet-reverted row across every file in this workspace, or nil when
 --- there is nothing left to undo. This is what cross-file `u`/`<C-r>` (once

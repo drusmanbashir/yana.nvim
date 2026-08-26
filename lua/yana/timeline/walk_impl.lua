@@ -70,8 +70,24 @@ end
 --- `reverted` are already undone, and `refused` rows never happened; neither
 --- is stepped again. `pending` rows STAY actionable so `execute` stops at
 --- them rather than silently crossing an unresolved record (T08).
+--- A MARKER (`review_opened`/`review_closed`) carries a real `undo_seq` so a
+--- walk can LAND on it as `_undo_to`'s target, but it is never itself a step
+--- to walk THROUGH: the operator never "did" a review opening, and
+--- reintegration re-opening a file mid-walk mints a fresh marker row into
+--- that file's own journal every time it happens, so `#entries` keeps
+--- growing while an OLDER target (chosen before those re-opens) stays fixed.
+--- Without this filter the newest-to-oldest sweep below (`ti + 1` up to
+--- `#entries`) swallows every marker minted since, and reports "redid
+--- review_opened in <file>" over a raw `:redo` that lands the buffer on
+--- whatever position that marker happened to record -- measured with a
+--- corrupted (negative) painted-row count once two reintegration cycles had
+--- piled two such markers onto one file's tail.
+local record = require("yana.timeline.record")
 local function actionable(entry)
 	if entry.state == "reverted" or entry.state == "refused" then
+		return false
+	end
+	if type(record.UNDOABLE_KIND) == "table" and not record.UNDOABLE_KIND[entry.kind] then
 		return false
 	end
 	if entry.regime == "durable" then
@@ -247,6 +263,9 @@ local function step_buffer(entry, bufnr, rel)
 		if ok_capture and type(capture.sync) == "function" then
 			capture.sync(bufnr)
 		end
+		if ok_rec and type(rec.mark_reverted) == "function" then
+			rec.mark_reverted(entry.id, true)
+		end
 		return true
 	end
 
@@ -291,6 +310,9 @@ local function step_buffer(entry, bufnr, rel)
 	local ok_record, record = pcall(require, "yana.timeline.record")
 	if ok_record and type(record.sync_buffer_head) == "function" then
 		record.sync_buffer_head(bufnr, destination)
+	end
+	if ok_record and type(record.mark_reverted) == "function" then
+		record.mark_reverted(entry.id, true)
 	end
 	local ok_capture, capture = pcall(require, "yana.timeline.edit_capture")
 	if ok_capture and type(capture.sync) == "function" then
@@ -387,6 +409,7 @@ function M.execute(workspace, rel, target_id, opts)
 		result.reason = plan.blocked_reason
 		return result
 	end
+
 
 	local sessions = {}
 	local bufnr = opts.bufnr

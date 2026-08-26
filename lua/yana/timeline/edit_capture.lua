@@ -50,7 +50,7 @@ local function emit(watch)
   if not vim.api.nvim_buf_is_valid(bufnr) then
     return
   end
-  if timeline.review_open_for(watch.workspace, watch.rel) then
+  if timeline.review_owns_buffer(watch.workspace, watch.rel) then
     -- Review owns the buffer and has its own watcher. Do not compete.
     watch.detached = true
     watches[bufnr] = nil
@@ -122,7 +122,7 @@ function M.attach(bufnr, workspace, rel)
   if type(bufnr) ~= "number" or not vim.api.nvim_buf_is_valid(bufnr) then
     return
   end
-  if timeline.review_open_for(workspace, rel) then
+  if timeline.review_owns_buffer(workspace, rel) then
     -- Do not attach while a review is open for this buffer. The review owns
     -- it and attach_buffer_watch is already observing on_lines there.
     return

@@ -219,12 +219,61 @@ local function reviewable(op)
 	return CONTENT_KINDS[op.kind] and op.detail == "file"
 end
 
+--- How many non-control-plane typed operations landed on each path, within
+--- ONE root's walk.
+---
+--- `bin/yana-changeset` `compare_path` only ever emits more than one record
+--- for the same `rel` in one shape: `upper_kind ~= lower_kind` — a file-type
+--- change, which pairs a `delete` of the old object with a `create` of the
+--- new one (never a rename: a rename's two records sit at TWO different
+--- rels, the disappearing and the appearing path — see the rename
+--- invariant). A count above 1 is therefore the producer's own signal that
+--- these operations are only meaningful together, independent of what kind
+--- either one carries.
+--- Keyed by (root, rel), never `rel` alone: `unreviewable_ops` is handed the
+--- FLATTENED, all-roots `typed` list `changes_from_session` returns, and two
+--- different roots holding a same-named path (the collision
+--- `changes_from_session`'s own docstring names) must never pair across that
+--- boundary. `classify_artifacts` calls this once per root's own `typed`
+--- slice, where every op already shares one root, so the key degrades to
+--- plain `rel` there with the same result either way.
+local function count_rel_ops(typed)
+	local counts = {}
+	for _, op in ipairs(typed or {}) do
+		if not op.control_plane then
+			local key = tostring(op.root_index or op.root or "") .. "\0" .. op.rel
+			counts[key] = (counts[key] or 0) + 1
+		end
+	end
+	return counts
+end
+
+local function rel_op_key(op)
+	return tostring(op.root_index or op.root or "") .. "\0" .. op.rel
+end
+
+--- Why a paired op is withheld — shared by `classify_artifacts` (which
+--- withholds it from `changes`) and `unreviewable_ops` (which names it),
+--- so the two never drift apart on which halves are paired.
+local PAIRED_REFUSAL_REASON = "part of a paired filesystem change (file-type "
+	.. "change) — the matching half has no applier route, so neither half is "
+	.. "offered as an independent review decision"
+
 --- Turn decoded records into typed operations with absolute paths.
 function M.typed_ops(workspace, upper)
 	local records, err = M.read_records(workspace, upper)
 	if not records then
 		return nil, err
 	end
+	-- WHEN the producer's classifying read ran. `M.read_records` just spawned
+	-- `bin/yana-changeset`, which lstats/reads the LOWER layer synchronously and
+	-- returns; the producer itself stamps no time, so this is the tightest
+	-- capture-time proxy available without changing that wire format — taken
+	-- immediately after the subprocess returns, an upper bound on the read time
+	-- that is off by at most the subprocess's own runtime. This is the field a
+	-- stale-file refusal needs to tell a human edit from a stale capture, and
+	-- today nothing upstream of this line records it at all.
+	local base_hash_captured_ts = os.time()
 	local ops = {}
 	-- Proven once: a bare-repository workspace exposes control-plane files at its
 	-- root with no `.git` segment. Independent of the producer.
@@ -278,6 +327,7 @@ function M.typed_ops(workspace, upper)
 				detail = rec[3],
 				extra = rec[4],
 				base_evidence = evidence,
+				base_hash_captured_ts = base_hash_captured_ts,
 			}
 		end
 	end
@@ -857,6 +907,12 @@ function M.classify_artifacts(typed, changes, _base_evidence, tracked)
 		excluded[op.rel] = true
 	end
 
+	-- Scoped to THIS call's `typed` list, which is one root's walk (see
+	-- `changes_from_session`): a pair's two halves always share a root, so
+	-- this never reaches across a different root's claim to exclude an
+	-- unrelated file that merely shares a relative path.
+	local paired_rel = count_rel_ops(typed)
+
 	for _, op in ipairs(typed or {}) do
 		if not op.control_plane then
 			local canonical, canonical_error = manifest.validate_rel(op.rel)
@@ -865,31 +921,47 @@ function M.classify_artifacts(typed, changes, _base_evidence, tracked)
 			local root = named_root or virgin_root
 			local root_kind = named_kind or (virgin_root and "virgin" or nil)
 			local safety_root = (named_kind == "product" and named_root) or virgin_root
-			-- A regular-file delete outside an artifact root remains an explicit
-			-- review decision. Inside an artifact root it would be silently
-			-- excluded, so trackedness must authorize that exclusion.
-			local is_destructive = op.kind == "opaque" or op.kind == "delete"
-			local safe = canonical
-			if is_destructive then
-				safe = safe
-					and safety_root ~= nil
-					and (tracked.status == "repo" or tracked.status == "no_repo")
-					and not inside_submodule(tracked, op.rel)
-					and not tracked_at_or_below(tracked, op.rel)
-			end
-			if not safe then
-				op.refusal_reason = canonical and "unsafe destructive artifact operation" or canonical_error
-				op.status = "system_refused"
-				op.retention_strength = "recovered"
-				unsafe[#unsafe + 1] = op
-			elseif root then
-				add_group(root, root_kind, op)
-			elseif not reviewable(op) then
-				op.refusal_reason = "inline review cannot represent this operation"
+			-- A path outside any artifact root that carries MORE THAN ONE typed
+			-- operation this turn is a file-type change pair (see
+			-- `count_rel_ops`), and the module's invariant — "file/symlink type
+			-- changes are compound operations with one decision; half-acceptance
+			-- is forbidden" — applies before anything else gets a say. Inside an
+			-- artifact root the existing bulk `add_group` below already decides
+			-- both halves together (one group, one accept/refuse), so this only
+			-- has work to do where that protection does not already reach.
+			if not root and (paired_rel[rel_op_key(op)] or 0) > 1 then
+				op.refusal_reason = PAIRED_REFUSAL_REASON
 				op.status = "system_refused"
 				op.retention_strength = "momentary"
 				individual[#individual + 1] = op
 				excluded[op.rel] = true
+			else
+				-- A regular-file delete outside an artifact root remains an explicit
+				-- review decision. Inside an artifact root it would be silently
+				-- excluded, so trackedness must authorize that exclusion.
+				local is_destructive = op.kind == "opaque" or op.kind == "delete"
+				local safe = canonical
+				if is_destructive then
+					safe = safe
+						and safety_root ~= nil
+						and (tracked.status == "repo" or tracked.status == "no_repo")
+						and not inside_submodule(tracked, op.rel)
+						and not tracked_at_or_below(tracked, op.rel)
+				end
+				if not safe then
+					op.refusal_reason = canonical and "unsafe destructive artifact operation" or canonical_error
+					op.status = "system_refused"
+					op.retention_strength = "recovered"
+					unsafe[#unsafe + 1] = op
+				elseif root then
+					add_group(root, root_kind, op)
+				elseif not reviewable(op) then
+					op.refusal_reason = "inline review cannot represent this operation"
+					op.status = "system_refused"
+					op.retention_strength = "momentary"
+					individual[#individual + 1] = op
+					excluded[op.rel] = true
+				end
 			end
 		end
 	end
@@ -924,11 +996,29 @@ end
 local function changes_for_root(session, root, upper, typed)
 	local changes = {}
 	local root_index = root.index or 1
+	-- A path with more than one typed op this turn is a file-type change
+	-- pair (`count_rel_ops`): the producer's before-evidence for the
+	-- content-kind half of such a pair tags the LOWER object's real kind
+	-- (a symlink, a directory — whatever the pair is turning it from or
+	-- into), not "absent" or "file", because that half's own record
+	-- deliberately carries the SAME lower-layer observation as its sibling
+	-- delete/create. `evidence_from_op` reads exactly that tag and, quite
+	-- correctly, refuses a whole-file comparison against a non-file real
+	-- path -- but a refusal returned here is a HARD one: it aborts
+	-- `changes_for_root` and therefore `changes_from_session` for the WHOLE
+	-- turn, not just this path, so a companion content edit sharing the
+	-- turn would be refused right along with it. `classify_artifacts`
+	-- already withholds a paired op from the review for the correct,
+	-- named reason (`PAIRED_REFUSAL_REASON`); this path must never reach
+	-- `evidence_from_op` in the first place and manufacture a SECOND,
+	-- unrelated-sounding refusal that takes the rest of the turn down
+	-- with it.
+	local rel_counts = count_rel_ops(typed)
 	for _, op in ipairs(typed) do
 		-- `create dir`, `create symlink` and a whiteout over a directory are
 		-- typed operations with no whole-file content, so they cannot become
 		-- review changes. They stay in `typed` and are reported by format_lines.
-		if reviewable(op) then
+		if reviewable(op) and (rel_counts[rel_op_key(op)] or 0) <= 1 then
 			-- The absolute path the operation is ABOUT. Once the walk is
 			-- regrouped by touched repository, `root.workspace .. "/" .. op.rel`
 			-- is the same string -- but `op.path` is the one the producer built
@@ -993,6 +1083,7 @@ local function changes_for_root(session, root, upper, typed)
 				base_state = ev.kind,
 				base_hash = ev.hash,
 				base_mode = ev.mode,
+				base_hash_captured_ts = op.base_hash_captured_ts,
 				after_mode = after_mode,
 				shadow_apply = true,
 				status = "pending",
@@ -1079,9 +1170,14 @@ function M.changes_from_session(session, context)
 end
 
 function M.unreviewable_ops(typed)
+	-- `typed` here is `changes_from_session`'s third return: every root's
+	-- ops, flattened. `count_rel_ops`/`rel_op_key` key by (root, rel), so a
+	-- pairing found in one root's walk cannot reach into another root that
+	-- happens to hold the same relative path.
+	local paired = count_rel_ops(typed)
 	local out = {}
 	for _, op in ipairs(typed or {}) do
-		if not op.control_plane and not reviewable(op) then
+		if not op.control_plane and (not reviewable(op) or (paired[rel_op_key(op)] or 0) > 1) then
 			out[#out + 1] = op
 		end
 	end

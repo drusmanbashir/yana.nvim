@@ -197,11 +197,18 @@ end
 --- True when two absolute paths are the same directory or one contains the
 --- other. Pathnames only: the launcher repeats the same question by filesystem
 --- identity, which is what catches a bind alias, and refuses there.
+local function contains_path(root, path)
+	if not root or root == "" or not path or path == "" then
+		return false
+	end
+	return path == root or path:sub(1, #root + 1) == root .. "/"
+end
+
 local function paths_overlap(a, b)
 	if not a or not b or a == "" or b == "" then
 		return false
 	end
-	return a == b or a:sub(1, #b + 1) == b .. "/" or b:sub(1, #a + 1) == a .. "/"
+	return contains_path(a, b) or contains_path(b, a)
 end
 
 --- Every root this turn may write, in the order their claims are taken.
@@ -213,9 +220,10 @@ end
 --- against anything a turn produced. A root read out of workspace content or
 --- agent output is a defect, not a configuration.
 ---
---- Refusals name the root, and they happen at TURN START, before the agent is
---- launched: a turn that would silently drop half its work is refused instead,
---- which is the whole reported defect (packets/redrow-multiroot-20260820.md).
+--- The resolved set is the maximal canonical path set from `{workspace} ∪
+--- write_roots`: if one path contains another, the larger path absorbs the
+--- smaller. This happens before any claim or mount is built. Refusals name only
+--- non-overlap invalid roots, and happen at TURN START before launch.
 ---
 --- Returns `roots` (a list of absolute paths, the workspace first, the declared
 --- roots after it in canonical-path order) or `nil, reason`.
@@ -224,7 +232,8 @@ function M.resolve_roots(workspace, declared)
 	local primary_real = uv.fs_realpath(primary) or primary
 	local state_root = uv.fs_realpath(M.state_root()) or M.state_root()
 
-	local extras, seen = {}, {}
+	local candidates = { primary_real }
+	local seen = { [primary_real] = true }
 	for _, entry in ipairs(declared or {}) do
 		local real = uv.fs_realpath(entry)
 		if not real then
@@ -237,9 +246,6 @@ function M.resolve_roots(workspace, declared)
 		if vim.fn.isdirectory(real) ~= 1 then
 			return nil, string.format("declared write root '%s' is not a directory", entry)
 		end
-		-- The turn's own machinery is not a work root. A root at or inside the
-		-- state root would hand the agent the very layers, claims and journals
-		-- its own change set is read from.
 		if paths_overlap(real, state_root) then
 			return nil,
 				string.format(
@@ -248,33 +254,40 @@ function M.resolve_roots(workspace, declared)
 					state_root
 				)
 		end
-		if paths_overlap(real, primary_real) or paths_overlap(real, primary) then
-			return nil,
-				string.format(
-					"declared write root '%s' overlaps the opened workspace (%s) — the workspace is always root 1 and is never listed in write_roots",
-					entry,
-					primary
-				)
-		end
-		for _, other in ipairs(extras) do
-			if paths_overlap(real, other) then
-				return nil,
-					string.format(
-						"declared write root '%s' overlaps declared write root '%s' — roots must be disjoint (equal, ancestor or descendant is refused)",
-						entry,
-						other
-					)
-			end
-		end
 		if not seen[real] then
 			seen[real] = true
-			extras[#extras + 1] = real
+			candidates[#candidates + 1] = real
 		end
 	end
-	table.sort(extras)
 
-	local roots = { primary }
-	vim.list_extend(roots, extras)
+	local maximal = {}
+	for _, candidate in ipairs(candidates) do
+		local contained = false
+		for _, other in ipairs(candidates) do
+			if other ~= candidate and contains_path(other, candidate) then
+				contained = true
+				break
+			end
+		end
+		if not contained then
+			maximal[#maximal + 1] = candidate
+		end
+	end
+	table.sort(maximal)
+
+	local primary_scope = primary_real
+	for _, root in ipairs(maximal) do
+		if contains_path(root, primary_real) then
+			primary_scope = root
+			break
+		end
+	end
+	local roots = { primary_scope }
+	for _, root in ipairs(maximal) do
+		if root ~= primary_scope then
+			roots[#roots + 1] = root
+		end
+	end
 	return roots
 end
 
@@ -290,13 +303,13 @@ end
 ---
 --- Chosen, in order:
 ---   1. `capture_root`, the operator's explicit choice;
----   2. a SINGLE `write_roots` entry that is an ancestor of the workspace --
----      the narrowing override the external-roots module doc describes (an
----      entry that is a SIBLING of the workspace is a declared write root in
----      the older sense and is left to `resolve_roots`);
----   3. `$HOME/code` when it is an ancestor of the resolved workspace;
----   4. `$HOME` when it is;
----   5. the workspace itself.
+---   2. `$HOME/code` when it is an ancestor of the resolved workspace;
+---   3. `$HOME` when it is;
+---   4. the workspace itself.
+---
+--- `write_roots` is resolved separately as a maximal set. When an ancestor
+--- write_root absorbs the opened workspace, that ancestor becomes root 1 rather
+--- than a `broad_root` override.
 ---
 --- THE STATE ROOT IS NEVER INSIDE IT. yana's layers, claims and journals are
 --- the evidence this turn's review is read from; an overlay covering them
@@ -310,31 +323,12 @@ end
 --- anything a turn produced.
 ---
 --- Returns the absolute broad root, or nil plus a reason.
-local function contains_path(root, path)
-	if not root or root == "" or not path or path == "" then
-		return false
-	end
-	return path == root or path:sub(1, #root + 1) == root .. "/"
-end
-
 function M.broad_root_for(workspace, declared)
 	local ws = diff.abs_path(workspace)
 	local ws_real = uv.fs_realpath(ws) or ws
 	local state = uv.fs_realpath(M.state_root()) or M.state_root()
 
 	local override, override_key = config.options.capture_root, "capture_root"
-	if not override and type(declared) == "table" and #declared == 1 then
-		local only = uv.fs_realpath(declared[1]) or declared[1]
-		-- A STRICT ancestor only. An entry EQUAL to the workspace says nothing
-		-- ("the workspace is always root 1 and is never listed in
-		-- `write_roots`") and keeps the named refusal `resolve_roots` has always
-		-- raised for it; an entry that is a sibling is a declared write root in
-		-- the older sense and is left to `resolve_roots` too.
-		if only ~= ws_real and only ~= ws and contains_path(only, ws_real) then
-			override, override_key = declared[1], "write_roots"
-		end
-	end
-
 	if override then
 		local real = uv.fs_realpath(override)
 		if not real or vim.fn.isdirectory(real) ~= 1 then
@@ -488,6 +482,7 @@ function M.begin_turn(opts)
 	if not jail.available() then
 		return nil, jail.OVERLAY_UNAVAILABLE_MSG
 	end
+	pcall(jail.sweep_claim_store, M.state_root() .. "/claims")
 
 	local candidate = workspace_candidate(opts)
 	local flags = opts.single_file_flags or {}
@@ -549,19 +544,17 @@ function M.begin_turn(opts)
 	if not broad_root then
 		return nil, broad_why
 	end
-	-- A single `write_roots` entry that is an ancestor of the workspace IS the
-	-- broad root, not a second root to mount and claim.
-	if broad_why == "write_roots" then
-		declared = {}
-	end
-
 	local root_paths, roots_err = M.resolve_roots(workspace, declared)
 	if not root_paths then
 		return nil, roots_err
 	end
-	-- One kernel mount. A configured capture root and a declared write root are
-	-- two answers to the same question, and the launcher refuses the pair in
-	-- the same words (`--broad-root cannot be combined with --extra-root`).
+	local opened_workspace = workspace
+	local primary_workspace = root_paths[1] or workspace
+	if primary_workspace ~= workspace then
+		broad_root = primary_workspace
+	end
+	-- One configured capture root cannot be combined with extra roots: the broad
+	-- root already covers every directory beneath it.
 	if #root_paths > 1 and config.options.capture_root then
 		return nil,
 			string.format(
@@ -571,7 +564,7 @@ function M.begin_turn(opts)
 			)
 	end
 
-	local turn_dir = M.turn_dir(workspace, stream, turn_id)
+	local turn_dir = M.turn_dir(primary_workspace, stream, turn_id)
 	local private_dir = turn_dir .. "/private"
 	-- A panel-local turn id can be reused after an editor restart. Never let a
 	-- same-id durable refusal from that earlier process authenticate this turn.
@@ -581,25 +574,22 @@ function M.begin_turn(opts)
 
 	-- A stale layer root from a turn that died mid-flight would make the
 	-- overlay refuse this one ("layer root must contain only upper/, work/").
-	local layer_dir = M.layer_dir(workspace, stream, turn_id)
+	local layer_dir = M.layer_dir(primary_workspace, stream, turn_id)
 	pcall(vim.fn.delete, layer_dir, "rf")
 	vim.fn.mkdir(layer_dir .. "/upper", "p")
 	vim.fn.mkdir(layer_dir .. "/work", "p")
 
-	-- One layer and one claim per declared root. Root 1 is the workspace and
-	-- keeps the layer built above, so a single-root turn creates exactly what it
-	-- always created; each extra root gets the same treatment under its own
-	-- workspace slug, which is also what makes its claim collide with another
-	-- editor's claim on that same repository, as it must.
+	-- One layer per resolved root; one turn claim on the opened workspace only.
+	-- Declared write roots are mounted, never acquired.
 	local roots = {
 		{
 			index = 1,
 			primary = true,
-			workspace = workspace,
+			workspace = primary_workspace,
 			layer_dir = layer_dir,
 			upper_dir = layer_dir .. "/upper",
 			work_dir = layer_dir .. "/work",
-			claim_dir = M.claim_dir(workspace),
+			claim_dir = M.claim_dir(primary_workspace),
 			-- Filled in by capture_root_nonces once the launcher has committed
 			-- this root's claim; empty until then, because the token is minted
 			-- by the acquisition and the editor is not the acquirer.
@@ -625,7 +615,8 @@ function M.begin_turn(opts)
 	end
 
 	local session = {
-		workspace = workspace,
+		workspace = primary_workspace,
+		opened_workspace = opened_workspace,
 		-- The ONE directory this turn's overlay is mounted at, and the base the
 		-- finalize walk's relative paths are read against. Equal to `workspace`
 		-- when nothing broader was chosen, which is byte-for-byte the turn yana
@@ -639,7 +630,7 @@ function M.begin_turn(opts)
 		private_dir = private_dir,
 		layer_dir = layer_dir,
 		upper_dir = layer_dir .. "/upper",
-		claim_dir = M.claim_dir(workspace),
+		claim_dir = M.claim_dir(primary_workspace),
 		-- What this turn will have to take the claim AWAY from, observed before
 		-- the launcher runs. A claim directory still on disk at this moment
 		-- belongs to a turn that never released -- the editor that owned it died
@@ -647,10 +638,10 @@ function M.begin_turn(opts)
 		-- it reclaimed it, and that is a lifecycle event the operator's log had
 		-- no row for. Two stats and one short read, and only when the directory
 		-- is there at all: nothing is added to the path a free workspace takes.
-		reclaimed_from = stale_claim_evidence(M.claim_dir(workspace)),
-		-- roots[1] IS the primary, and the four fields above are its aliases, so
-		-- every caller written before declared write roots reads exactly what it
-		-- read before and nothing about a single-root turn changes.
+		reclaimed_from = stale_claim_evidence(M.claim_dir(primary_workspace)),
+			-- roots[1] IS the primary, and the four fields above are its aliases.
+			-- When a declared ancestor absorbs the opened workspace, these aliases
+			-- deliberately follow the absorbing root's claim/mount identity.
 		roots = roots,
 		refused_bytes = 0,
 		refused_retained = {},
@@ -673,9 +664,9 @@ function M.begin_turn(opts)
 		generation = opts.generation or opts.turn_gen or 0,
 		stream = stream,
 		turn_id = turn_id,
-		workspace = workspace,
-		claim_dir = session.claim_dir,
-	})
+			workspace = opened_workspace,
+			claim_dir = session.claim_dir,
+		})
 	return session, nil
 end
 
@@ -1068,19 +1059,10 @@ function M.arm_review_open(session, on_marked)
 		local own = claim_is_ours() or waited >= limit
 		if own and jail.mark_review_open(claim_dir) then
 			-- The claim exists and is this turn's, which is exactly the moment
-			-- every root's acquisition token is readable: the launcher takes the
-			-- whole declared set before the agent starts.
+			-- the launcher's acquisition token is readable: the launcher takes
+			-- the primary workspace claim before the agent starts. Declared write
+			-- roots are mounted only and carry no turn claim of their own.
 			pcall(M.capture_root_nonces, session)
-			-- EVERY root's review marker, not just the workspace's. The marker is
-			-- what tells the next editor that a review is open on a claim whose
-			-- turn process has legitimately exited; without one on a declared
-			-- root, that root's claim would look abandoned while its hunks are
-			-- still on screen.
-			for _, root in ipairs(M.session_roots(session)) do
-				if root.claim_dir and root.claim_dir ~= claim_dir then
-					pcall(jail.mark_review_open, root.claim_dir)
-				end
-			end
 			session.review_open_marked = true
 			-- The claim is this turn's now. If a previous turn's claim was still
 			-- on disk when this one began, the launcher took it away from a dead
@@ -1129,12 +1111,11 @@ end
 --- Close the review this turn's claim was held for. Called from every path
 --- that finishes or abandons a review — never from agent process exit alone,
 --- which the module forbids while a review is still open.
---- Close the review this turn's claims were held for -- EVERY root's, not just
---- the workspace's. A root whose release fails does not stop the others: the
---- claims-and-concurrency contract's guarantee is that a claim always releases,
---- and holding root 3 back because root 2 refused would wedge a workspace over
---- a failure that has nothing to do with it. The first failure is what the
---- caller is told about.
+--- Close the review this turn's claim was held for. Called from every path
+--- that finishes or abandons a review — never from agent process exit alone,
+--- which the module forbids while a review is still open.
+--- Only the primary workspace claim is released here. Declared write roots are
+--- mounted, never acquired.
 function M.release(session)
 	if not session or session.released then
 		return true
@@ -1158,13 +1139,19 @@ function M.release(session)
 		})
 	end
 	local ok_all, first_err = true, nil
-	for _, root in ipairs(M.session_roots(session)) do
-		if root.claim_dir and root.claim_dir ~= "" then
-			local ok, err = jail.release_claim(root.claim_dir)
-			if not ok then
-				ok_all = false
-				first_err = first_err or err
-			end
+	if session.claim_dir and session.claim_dir ~= "" then
+		local nonce = nil
+		local roots = M.session_roots(session)
+		local primary = roots[1]
+		if primary and type(primary.nonce) == "string" and primary.nonce ~= "" then
+			nonce = primary.nonce
+		elseif type(session.nonce) == "string" and session.nonce ~= "" then
+			nonce = session.nonce
+		end
+		local ok, err = jail.release_claim(session.claim_dir, nonce)
+		if not ok then
+			ok_all = false
+			first_err = err
 		end
 	end
 	if session.turn_pass then
@@ -1182,6 +1169,116 @@ function M.release(session)
 		session.turn_pass = nil
 	end
 	return ok_all, first_err
+end
+
+--- THE OPEN REVIEW'S FILE SET, AS A RECORD THAT DESCRIBES ITSELF.
+---
+--- `<claim>.review-files` is what `bin/yana-overlay` reads to decide whether a
+--- second turn may launch beside an open review. Until 2026-08-23 it was a bare
+--- newline-separated list written with a plain `io.open(..., "w")`, and an
+--- adversarial run (adv/codex-6) proved five ways that costs the protection:
+--- an empty file, a file caught mid-write, a stale list, a list naming a file
+--- that is gone, and a list naming a path outside the workspace ALL read back
+--- as a well-formed set that simply does not contain the file the holder is
+--- really reviewing — so a challenger staging that file intersected nothing and
+--- launched (rc 0) while a live editor held the review open.
+---
+--- None of those are readable-versus-unreadable questions, which is the only
+--- question the old pair of writer and reader could ask. So the record now says
+--- what it is: a schema line, the EDITOR IDENTITY the `review-open` marker
+--- already carries (`jail.editor_identity`, not a second identity scheme), the
+--- turn, the workspace the entries are relative to, an explicit COUNT, one
+--- `file <state> <rel>` line per entry, and a sha256 over everything above it.
+--- The reader can then establish "complete, current, and mine" instead of
+--- inferring it, and anything it cannot establish is UNKNOWN and refuses
+--- (the claims-concurrency contract: anything unestablished is UNKNOWN).
+---
+--- `<state>` is `present` or `absent`, the writer's own observation of the
+--- entry in the workspace at the moment the review opened, so a reviewed file
+--- that the turn CREATES (legitimately absent from the workspace) is a recorded
+--- fact rather than an anomaly, and an entry that has since appeared or
+--- vanished contradicts the record instead of quietly leaving the set.
+---
+--- Written atomically -- temp file in the same directory, flushed, renamed --
+--- so a reader never sees half a record. Best effort and decides nothing here:
+--- a write that fails leaves the launcher refusing, which is the safe half.
+local function review_files_body(claim_dir, workspace, turn, rels)
+	local ident = jail.editor_identity()
+	if not ident then
+		return nil
+	end
+	local ws = diff.abs_path(workspace)
+	if not ws or ws == "" then
+		return nil
+	end
+	ws = ws:gsub("/+$", "")
+	local out = {
+		"yana-review-files 1",
+		"editor " .. ident,
+		"turn " .. tostring(turn or "unknown"),
+		"workspace " .. ws,
+		"count " .. tostring(#rels),
+	}
+	for _, rel in ipairs(rels) do
+		local state = (vim.uv or vim.loop).fs_stat(ws .. "/" .. rel) and "present" or "absent"
+		out[#out + 1] = "file " .. state .. " " .. rel
+	end
+	return table.concat(out, "\n") .. "\n"
+end
+
+--- Write the record for this claim. Returns true when the record landed.
+function M.write_review_files(claim_dir, workspace, turn, rels)
+	if not claim_dir or claim_dir == "" then
+		return false
+	end
+	local body = review_files_body(claim_dir, workspace, turn, rels or {})
+	if not body then
+		return false
+	end
+	local path = claim_dir .. ".review-files"
+	local tmp = path .. ".tmp." .. tostring(vim.fn.getpid())
+	local f = io.open(tmp, "w")
+	if not f then
+		return false
+	end
+	f:write(body)
+	f:write("sum " .. vim.fn.sha256(body) .. "\n")
+	f:flush()
+	f:close()
+	local uv = vim.uv or vim.loop
+	local ok = uv.fs_rename(tmp, path)
+	if not ok then
+		pcall(os.remove, tmp)
+		return false
+	end
+	return true
+end
+
+--- The entries of a record, for NAMING what was left open after a restart.
+--- Nil when the file is not a record this reader understands: the launcher is
+--- the party that decides on it, and it decides for itself.
+function M.read_review_files(claim_dir)
+	if not claim_dir or claim_dir == "" then
+		return nil
+	end
+	local f = io.open(claim_dir .. ".review-files", "r")
+	if not f then
+		return nil
+	end
+	local raw = f:read("*a") or ""
+	f:close()
+	local lines = vim.split(raw, "\n", { plain = true })
+	if lines[1] ~= "yana-review-files 1" then
+		return nil
+	end
+	local rels = {}
+	for _, line in ipairs(lines) do
+		local rel = line:match("^file %a+ (.+)$")
+		if rel then
+			rels[#rels + 1] = rel
+		end
+	end
+	return rels
 end
 
 --- Explicit, logged override for a claim left behind by a crashed editor.

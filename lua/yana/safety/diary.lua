@@ -474,6 +474,9 @@ end
 --- a licence to destroy a file nothing had read. The evidence is taken by the
 --- producer's own classifying read; if it did not reach the applier intact, the
 --- honest answer is that drift cannot be judged, which is a refusal.
+--- Returns `ok`, and on failure the human reason plus a THIRD value naming
+--- which check failed (`evidence_check`) and the value it rejected
+--- (`evidence_rejected` — a tag, a truncated fingerprint, never raw content).
 local function evidence_complete(op)
 	local tag = op.base_state
 	if tag ~= "absent" and tag ~= "file" and tag ~= "link" then
@@ -482,12 +485,19 @@ local function evidence_complete(op)
 				.. ": this change carries no recorded before-state (found "
 				.. tostring(tag)
 				.. "), so whether the real file is the one the change was prepared against cannot be judged"
-				.. " — refusing; nothing was changed. Re-run the turn to produce evidence for it"
+				.. " — refusing; nothing was changed. Re-run the turn to produce evidence for it",
+			{ evidence_check = "missing_base_state", evidence_rejected = tag == nil and "nil" or tostring(tag) }
 	end
 	if type(op.base_hash) ~= "string" or #op.base_hash ~= 64 or not op.base_hash:match("^%x+$") then
 		return false,
 			tostring(op.path)
-				.. ": this change carries no usable before-fingerprint — refusing; nothing was changed"
+				.. ": this change carries no usable before-fingerprint — refusing; nothing was changed",
+			{
+				evidence_check = "malformed_base_hash",
+				-- Truncated, and only when it is a hash-shaped string at all: no
+				-- content ever crosses this boundary.
+				evidence_rejected = type(op.base_hash) == "string" and op.base_hash:sub(1, 16) or type(op.base_hash),
+			}
 	end
 	if (tag == "file" or tag == "link") and op.base_mode == nil then
 		return false,
@@ -495,12 +505,14 @@ local function evidence_complete(op)
 				.. ": this change records a "
 				.. tag
 				.. " before-state but no mode for it, so a mode-only human change cannot be seen"
-				.. " — refusing; nothing was changed"
+				.. " — refusing; nothing was changed",
+			{ evidence_check = "missing_base_mode", evidence_rejected = "nil" }
 	end
 	if tag == "link" and (type(op.base_link_target) ~= "string" or op.base_link_target == "") then
 		return false,
 			tostring(op.path)
-				.. ": this change records a symlink before-state but no target for it — refusing; nothing was changed"
+				.. ": this change records a symlink before-state but no target for it — refusing; nothing was changed",
+			{ evidence_check = "missing_base_link_target", evidence_rejected = tostring(op.base_link_target) }
 	end
 	return true
 end
@@ -724,7 +736,15 @@ function M.restore_workspace_bytes(opts)
 	local base_state = opts.base_state
 	local base_mode = opts.base_mode
 	local base_link_target = opts.base_link_target
+	-- When the caller hands no `base_hash`, this function derives one from a
+	-- FRESH read taken right here — so "now" IS the true capture time, not a
+	-- proxy. When the caller supplies its own `base_hash`, only that caller
+	-- knows when it was taken, so its own `base_hash_captured_ts` (possibly
+	-- nil) travels through unchanged rather than being overwritten with this
+	-- function's own clock.
+	local base_hash_captured_ts = opts.base_hash_captured_ts
 	if base_hash == nil then
+		base_hash_captured_ts = base_hash_captured_ts or os.time()
 		if state.kind == "absent" then
 			base_hash = M.empty_hash()
 			base_state = base_state or "absent"
@@ -750,6 +770,7 @@ function M.restore_workspace_bytes(opts)
 		base_state = base_state,
 		base_mode = base_mode,
 		base_link_target = base_link_target,
+		base_hash_captured_ts = base_hash_captured_ts,
 		-- The mode to INSTALL, distinct from `base_mode` which is the mode the
 		-- drift check expects to find. A checkpoint restore carries the pre-turn
 		-- mode here so `chmod_temp` sets it on the temp before the rename; without
@@ -1487,6 +1508,59 @@ local function journaled_restore(session, op, displaced_path, path, reason, opts
 	return true, nil, restored_record
 end
 
+--- THE DECLARED VOCABULARY, and the only place a value is admitted to it.
+---
+--- The logging module's own refusal `reason_code` vocabulary table is the
+--- authority this mirrors. A category meaning "something else" is the one
+--- that grows to swallow every future refusal shape nobody named yet, so
+--- `record_refusal` below refuses to write a row for any code not listed
+--- here — the same discipline `tests/lib/log_assert.lua`'s
+--- `REQUIRED_QUALIFIERS` applies to a test's own usage errors.
+local REASON_CODES = {
+	generic_pre_apply = true,
+	evidence_error = true,
+	delete_target_absent = true,
+	observe_failed = true,
+	stale_file = true,
+}
+
+--- THE SOLE WRITER of a `kind = "refused"` journal row, across all five
+--- categories. `fields.reason_code` is REQUIRED and must be declared above;
+--- an undeclared code is a programmer error in the CALLER, not a user-facing
+--- condition one more retry could fix, so this raises rather than silently
+--- widening the vocabulary one string literal at a time.
+---
+--- Returns the fields actually written (with `op_id`/`path` merged in), so a
+--- caller can hand the SAME table back as its structured third return value
+--- rather than keeping two copies that can drift apart.
+---
+--- Mutation seam (gate): `strip_refusal_evidence` reproduces the PRE-this-delta
+--- shape of every category except `stale_file` (which already carried its
+--- fingerprint pair) — `kind`, `op_id`, `path`, `reason` prose, `ts`, and
+--- nothing else. Every one of the five test rows this delta adds reds under
+--- it, because every one of them asserts a field this strips.
+local function record_refusal(session, op, fields)
+	local code = fields and fields.reason_code
+	if not REASON_CODES[code] then
+		error("diary.lua: refusing to write a refusal row with an undeclared reason_code: " .. tostring(code), 0)
+	end
+	local out = fields
+	if M._test.fault.strip_refusal_evidence then
+		out = { reason = fields.reason, reason_code = fields.reason_code }
+	end
+	local row = { kind = "refused", op_id = op.op_id, path = op.path, ts = os.time() }
+	for k, v in pairs(out) do
+		row[k] = v
+	end
+	local ok, err = append_jsonl(journal_path(session), row)
+	if not ok then
+		return nil, err
+	end
+	out.op_id = op.op_id
+	out.path = op.path
+	return out
+end
+
 --- THE DRIFT CHECK, ONE SYSCALL BEFORE THE ACT.
 ---
 --- CORE: "The human's change is detected per touched path, by content
@@ -1509,13 +1583,19 @@ end
 --- exposed by Neovim's libuv — see the note at the top of this file) removes
 --- the gap. It shrinks the window from the whole check/copy/journal/write
 --- sequence to one instruction.
-local function refuse_if_substituted(session, op, path, state)
+local function refuse_if_substituted(session, op, path, state, reason_code)
+	-- REQUIRED, NOT DEFAULTED. A category that silently falls back to "something
+	-- else" is the one that grows to swallow every future refusal shape nobody
+	-- named yet — every caller must classify itself.
+	assert(type(reason_code) == "string" and reason_code ~= "", "refuse_if_substituted requires a reason_code")
 	local repath, rerr = resolve_target(session.workspace, op.path, op.raw_rel)
 	local reason
+	local sub_kind
 	if not repath or repath ~= path then
 		reason = tostring(op.path)
 			.. ": "
 			.. tostring(rerr or "the target no longer resolves to the location that was checked")
+		sub_kind = "resolve_mismatch"
 	else
 		local now = uv.fs_lstat(path)
 		if state.kind == "absent" then
@@ -1523,39 +1603,49 @@ local function refuse_if_substituted(session, op, path, state)
 				reason = path
 					.. ": this path did not exist when the change was checked and something has created it since"
 					.. " — refusing; your file is untouched"
+				sub_kind = "appeared"
 			end
 		elseif not now then
 			reason = path .. ": this file was removed after its contents were checked — refusing; nothing was written"
+			sub_kind = "removed"
 		elseif now.type ~= "file" then
 			reason = path
 				.. ": this file was replaced by a "
 				.. tostring(now.type)
 				.. " after its contents were checked — refusing; it is left exactly as found"
+			sub_kind = "type_changed"
 		elseif now.dev ~= state.dev or now.ino ~= state.ino then
 			reason = path
 				.. ": this path resolves to a different object than the one whose contents were checked"
 				.. " — refusing; it is left exactly as found"
+			sub_kind = "identity_changed"
 		else
 			local content = read_bytes(path)
 			if content == nil then
 				reason = path .. ": this file became unreadable after its contents were checked — refusing"
+				sub_kind = "unreadable"
 			elseif hash_bytes(content) ~= state.hash then
 				reason = M.refusal_message(path)
+				sub_kind = "content_drift"
 			end
 		end
 	end
 	if not reason then
 		return nil
 	end
-	append_jsonl(journal_path(session), {
-		kind = "refused",
-		op_id = op.op_id,
-		path = op.path,
+	local now_st = uv.fs_lstat(path)
+	-- EVIDENCE ONLY, never a comparison input: detection above stays BY CONTENT
+	-- (CORE). `st_ino`/`st_mtime` are here so a same-bytes-new-inode or a
+	-- clock-skew story can be tested from the record instead of guessed at.
+	local detail = record_refusal(session, op, {
 		reason = reason,
+		reason_code = reason_code,
+		sub_kind = sub_kind,
 		checked = "immediately before the write",
-		ts = os.time(),
+		st_ino = now_st and now_st.ino or nil,
+		st_mtime = now_st and now_st.mtime and now_st.mtime.sec or nil,
 	})
-	return reason
+	return reason, detail
 end
 
 local function record_temp_identity(session, op, tmp_path)
@@ -1652,9 +1742,9 @@ local function apply_delete(session, op, path, displaced_path, state)
 	end
 
 	-- NOTHING BETWEEN THIS CHECK AND THE UNLINK.
-	local sub = refuse_if_substituted(session, op, path, state)
+	local sub, sub_detail = refuse_if_substituted(session, op, path, state, "generic_pre_apply")
 	if sub then
-		return false, sub
+		return false, sub, sub_detail
 	end
 
 	local un_ok, un_err = uv.fs_unlink(path)
@@ -1791,20 +1881,28 @@ local function apply_operation(session, op, opts)
 		return false, perr
 	end
 
+	-- Mutation/negative-row seam (gate) ONLY: simulates a FUTURE call site
+	-- passing an undeclared `reason_code` -- the shape a code review, not a
+	-- user, is supposed to catch. `record_refusal` is the sole writer and must
+	-- refuse (raise) rather than silently widen the vocabulary.
+	if M._test.fault.inject_bad_reason_code then
+		record_refusal(session, op, { reason = "test-injected", reason_code = "not_a_declared_code" })
+	end
+
 	-- EVIDENCE FIRST, AND COMPLETE. Re-checked here and not only at intent time
 	-- because this also runs on a row replayed by a later process, which has no
 	-- caller to ask and must not fall back to comparing content alone.
 	if not M._test.fault.allow_untagged_base then
-		local ok_ev, ev_err = evidence_complete(op)
+		local ok_ev, ev_err, ev_info = evidence_complete(op)
 		if not ok_ev then
-			append_jsonl(journal_path(session), {
-				kind = "refused",
-				op_id = op.op_id,
-				path = op.path,
+			ev_info = ev_info or {}
+			local detail = record_refusal(session, op, {
 				reason = ev_err,
-				ts = os.time(),
+				reason_code = "evidence_error",
+				evidence_check = ev_info.evidence_check,
+				evidence_rejected = ev_info.evidence_rejected,
 			})
-			return false, ev_err
+			return false, ev_err, detail
 		end
 	end
 
@@ -1815,14 +1913,19 @@ local function apply_operation(session, op, opts)
 	-- cannot tell absence from an empty file.
 	if op.op_kind == "delete" and uv.fs_lstat(path) == nil then
 		local msg = "refusing to delete " .. path .. ": it is already gone — the file was removed since the turn started"
-		append_jsonl(journal_path(session), {
-			kind = "refused",
-			op_id = op.op_id,
-			path = op.path,
+		-- The child's own identity left no trace, but the parent directory's
+		-- does survive absence: evidence only, never a comparison input.
+		local parent_st = uv.fs_lstat(vim.fn.fnamemodify(path, ":h"))
+		local detail = record_refusal(session, op, {
 			reason = msg,
-			ts = os.time(),
+			reason_code = "delete_target_absent",
+			expected_state = op.base_state,
+			-- `st_ino` (the packet's own name for this evidence) IS
+			-- `parent_dir_ino` here: the child left no trace of its own, so the
+			-- parent directory's identity is the trace that survives.
+			st_ino = parent_st and parent_st.ino or nil,
 		})
-		return false, msg
+		return false, msg, detail
 	end
 
 	local need
@@ -1840,29 +1943,63 @@ local function apply_operation(session, op, opts)
 
 	local state, oerr = observe_state(path)
 	if not state then
-		append_jsonl(journal_path(session), {
-			kind = "refused",
-			op_id = op.op_id,
-			path = op.path,
+		-- The parent directory's own stat, not the target's: an observation
+		-- failure at THIS path is usually a permissions or mount fact the
+		-- directory it lives in can corroborate, and the raw errno/oerr string
+		-- travels in its own field rather than folded only into prose.
+		local parent_dir = vim.fn.fnamemodify(path, ":h")
+		local parent_st = uv.fs_lstat(parent_dir)
+		local detail = record_refusal(session, op, {
 			reason = oerr,
-			ts = os.time(),
+			reason_code = "observe_failed",
+			oerr = oerr,
+			parent_dev = parent_st and parent_st.dev or nil,
+			parent_ino = parent_st and parent_st.ino or nil,
+			parent_mode = parent_st and parent_st.mode or nil,
 		})
-		return false, oerr
+		return false, oerr, detail
 	end
 	local real = state.bytes or ""
 	local real_hash = state.kind == "file" and state.hash or hash_bytes("")
 	if not state_matches(op, state) then
 		local msg = state_refusal(op, path, state)
-		append_jsonl(journal_path(session), {
-			kind = "refused",
-			op_id = op.op_id,
-			path = op.path,
+		-- EVIDENCE ONLY, never comparison inputs: `state_matches` above is the
+		-- sole BY-CONTENT decision (CORE) and neither field below feeds
+		-- it. `st_ino`/`st_mtime` let a same-bytes-new-inode or a clock-skew
+		-- story be tested from the record instead of guessed at. `now_st` is a
+		-- SEPARATE read from the one `observe_state` took above (which never
+		-- captures mtime) — a benign extra lstat, not a second decision.
+		local now_st = uv.fs_lstat(path)
+		-- WHEN the turn-start fingerprint (`op.base_hash`) was captured. This is
+		-- the field whose absence blocked the 2026-08-21/22 diagnosis: a drift
+		-- refusal with no capture time cannot say whether the human's own edit
+		-- moved the file after a good capture, or whether the capture itself ran
+		-- late against the wrong bytes. Threaded from the producer's classifying
+		-- read (see M.intent / restore_workspace_bytes below); absent (nil) on
+		-- any caller that has not been updated to supply it, which is recorded
+		-- as absent, never guessed.
+		--
+		-- Mutation seam (gate), dedicated to this one field rather than the
+		-- shared `strip_refusal_evidence`: `omit_base_hash_captured_ts`
+		-- reproduces the pre-this-delta `stale_file` record exactly (it already
+		-- carried `expected_fp`/`actual_fp`), minus only the capture-time triad
+		-- this delta adds.
+		local cap_ts, cap_ino, cap_mtime = op.base_hash_captured_ts,
+			now_st and now_st.ino or nil,
+			now_st and now_st.mtime and now_st.mtime.sec or nil
+		if M._test.fault.omit_base_hash_captured_ts then
+			cap_ts, cap_ino, cap_mtime = nil, nil, nil
+		end
+		record_refusal(session, op, {
 			reason = msg,
+			reason_code = "stale_file",
 			expected_state = op.base_state,
 			found_state = state.kind,
 			expected_hash = op.base_hash,
 			found_hash = real_hash,
-			ts = os.time(),
+			base_hash_captured_ts = cap_ts,
+			st_ino = cap_ino,
+			st_mtime = cap_mtime,
 		})
 		-- THIRD RETURN: the structured mismatch. The journal already held the
 		-- reason class and both fingerprints, but the only thing that escaped
@@ -1874,10 +2011,16 @@ local function apply_operation(session, op, opts)
 		-- crosses this boundary.
 		return false, msg, {
 			reason = "stale_file",
+			reason_code = "stale_file",
+			path = op.path,
+			op_id = op.op_id,
 			expected_state = op.base_state,
 			found_state = state.kind,
 			expected_fp = type(op.base_hash) == "string" and op.base_hash:sub(1, 16) or nil,
 			actual_fp = type(real_hash) == "string" and real_hash:sub(1, 16) or nil,
+			base_hash_captured_ts = cap_ts,
+			st_ino = cap_ino,
+			st_mtime = cap_mtime,
 		}
 	end
 
@@ -1951,6 +2094,10 @@ local function apply_operation(session, op, opts)
 	-- user-addressable staging name exists at any point.
 	local tmp_path
 	local installed
+	-- Smuggled out of the `on_before_rename` closure below: `diff.write_file`
+	-- surfaces only `ok, err` from a failing callback, so the structured detail
+	-- travels on this upvalue rather than being lost at that boundary.
+	local sub_detail
 	local tmp_ok, tmp_err = diff.write_file(path, op.target, {
 		target_mode = target_mode,
 		on_temp_created = function(t)
@@ -1969,15 +2116,16 @@ local function apply_operation(session, op, opts)
 			if opts.inject_before_rename then
 				diff.write_file(path, opts.inject_before_rename)
 			end
-			local sub = refuse_if_substituted(session, op, path, state)
+			local sub, detail = refuse_if_substituted(session, op, path, state, "generic_pre_apply")
 			if sub then
+				sub_detail = detail
 				return false, sub
 			end
 			return true
 		end,
 	})
 	if not tmp_ok then
-		return false, tmp_err
+		return false, tmp_err, sub_detail
 	end
 	append_jsonl(journal_path(session), {
 		kind = "temp_cleaned",
@@ -2166,6 +2314,11 @@ function M.intent(opts)
 		base_mode = opts.base_mode,
 		base_link_target = opts.base_link_target,
 		target_mode = opts.target_mode,
+		-- WHEN the turn-start fingerprint (`base_hash` above) was taken. Carried
+		-- through to the journal's `intent` row (so a later replaying process
+		-- still has it) and from there to the stale-file refusal record. Nil
+		-- when the caller does not know — recorded as absent, not fabricated.
+		base_hash_captured_ts = opts.base_hash_captured_ts,
 	}
 
 	if not M._test.fault.allow_untagged_base then
@@ -2184,8 +2337,8 @@ function M.intent(opts)
 		return true
 	end
 
-	ok, err = apply_operation(session, op, {})
-	return ok, err
+	local ok2, err2, detail2 = apply_operation(session, op, {})
+	return ok2, err2, detail2
 end
 
 function M.apply_pending(opts)

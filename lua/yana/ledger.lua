@@ -774,11 +774,24 @@ end
 --- change identity, or the timestamps.
 local REFUSAL_FIELDS = {
   "reason",
+  -- The stable, greppable slug (`stale_file`, `evidence_error`,
+  -- `delete_target_absent`, `observe_failed`, `generic_pre_apply`) beside the
+  -- free-text `reason` prose, so a refusal is findable by vocabulary rather
+  -- than by matching a sentence.
+  "reason_code",
   "origin",
   "expected_fp",
   "actual_fp",
   "expected_state",
   "found_state",
+  -- WHEN the turn-start fingerprint (`expected_fp`) was captured -- the field
+  -- a `stale_file` refusal needs to tell a human edit from a stale capture.
+  "base_hash_captured_ts",
+  "st_ino",
+  "st_mtime",
+  "evidence_check",
+  "evidence_rejected",
+  "oerr",
   "retention_strength",
   "retained_path",
   "retention_error",

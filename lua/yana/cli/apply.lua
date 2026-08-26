@@ -329,6 +329,7 @@ local function cmd_apply(args)
 				path = target_path,
 				target = content,
 				base_hash = base_hash,
+				base_hash_captured_ts = ev.base_hash_captured_ts,
 				base_state = ev.base_state,
 				base_mode = ev.base_mode,
 				base_link_target = ev.base_link_target,

@@ -220,10 +220,10 @@ function M.wrap_cmd(argv, session)
 	-- also the launcher's claim order). A turn that declared none adds nothing
 	-- here, so its argv is exactly the argv this function has always built.
 	--
-	-- The launcher, not this function, decides what happens when a root cannot
-	-- be claimed: it takes the whole set or none of it, and exits 65 naming the
-	-- root. Nothing in this process may widen the set — it is read from the
-	-- session `preview.begin_turn` built out of operator configuration.
+	-- The launcher, not this function, decides what happens when the primary
+	-- claim cannot be taken: it exits 65 naming the holder. Declared write
+	-- roots are mounted only; their optional --extra-claim path is a read-only
+	-- launch gate, not an acquisition.
 	local roots = require("yana.shadow.ops").session_roots(session)
 	for i = 2, #roots do
 		local root = roots[i]
@@ -685,12 +685,51 @@ local function run_overlay_claim_cmd(args)
 	return true, nil
 end
 
+function M.sweep_claim_store(claims_dir)
+	if not claims_dir or claims_dir == "" then
+		return false, "no claims directory"
+	end
+	return run_overlay_claim_cmd({ "sweep", "--claims-dir", claims_dir })
+end
+
 --- Ordinary release: the review this claim was held for has closed.
-function M.release_claim(claim_dir)
+---
+--- The releaser MUST pass the acquisition nonce it captured at launch
+--- (`claims-concurrency.md`: "release --nonce TOKEN"). A mismatch declines
+--- under the lock before anything is deleted. Intention: destroy only the
+--- claim this releaser took.
+---
+--- Legacy decision (2026-08-25, audit F1): a releaser that has no nonce must
+--- not silently delete a claim that carries one — decline and name why. A
+--- claim with no nonce file at all is a pre-token acquisition; path-only
+--- release remains the only round-trip that acquisition ever had.
+function M.release_claim(claim_dir, nonce)
 	if not claim_dir or claim_dir == "" then
 		return false, "no claim directory"
 	end
-	return run_overlay_claim_cmd({ "release", "--claim", claim_dir })
+	local token = nonce
+	if type(token) ~= "string" or token == "" then
+		local f = io.open(claim_dir .. "/nonce", "r")
+		if f then
+			f:close()
+			return false, "claim not released: no acquisition token to release with"
+		end
+		token = nil
+	end
+	local args = { "release", "--claim", claim_dir }
+	if token then
+		vim.list_extend(args, { "--nonce", token })
+	end
+	local ok, err = run_overlay_claim_cmd(args)
+	-- Overlay declines (nonce mismatch, live holder, lock busy) with exit 0 so
+	-- yana-turn under set -e is not aborted after apply. Detect decline by the
+	-- claim still standing when we asked to release it.
+	if M.claim_held(claim_dir) then
+		local named = (type(err) == "string" and err ~= "") and err
+			or "claim not released: acquisition token mismatch or claim still held"
+		return false, named
+	end
+	return ok, err
 end
 
 --- Explicit, logged override. Only ever called from a deliberate user action —
@@ -710,7 +749,7 @@ end
 --- meaningless after a reboot, and the process start time makes it survive PID
 --- reuse — a recycled pid has different start ticks, so a stale record can
 --- never be mistaken for a live editor.
-local function editor_identity()
+function M.editor_identity()
 	local pid = vim.fn.getpid()
 	local boot = nil
 	do
@@ -744,6 +783,8 @@ local function editor_identity()
 	end
 	return string.format("%d %s %s", pid, boot, ticks)
 end
+
+local editor_identity = M.editor_identity
 
 --- Durable record that a review is open for this claim. Written while the
 --- agent is still running so a crash leaves the claim recoverable rather than
@@ -802,15 +843,14 @@ end
 --- turn, and a root whose token cannot be read keeps the value it had.
 function M.capture_root_nonces(session)
 	local roots = require("yana.shadow.ops").session_roots(session)
-	for _, root in ipairs(roots) do
-		if root.claim_dir and root.claim_dir ~= "" then
-			local f = io.open(root.claim_dir .. "/nonce", "r")
-			if f then
-				local token = (f:read("l") or ""):gsub("%s+$", "")
-				f:close()
-				if token ~= "" then
-					root.nonce = token
-				end
+	local root = roots[1]
+	if root and root.claim_dir and root.claim_dir ~= "" then
+		local f = io.open(root.claim_dir .. "/nonce", "r")
+		if f then
+			local token = (f:read("l") or ""):gsub("%s+$", "")
+			f:close()
+			if token ~= "" then
+				root.nonce = token
 			end
 		end
 	end

@@ -1,4 +1,4 @@
-*yana.txt*                         Yana                         version 0.1.0-alpha.2
+*yana.txt*                         Yana                         version 0.1.0-alpha.5
 
 ==============================================================================
 CONTENTS                                                        *yana-contents*
@@ -13,6 +13,7 @@ CONTENTS                                                        *yana-contents*
    Where a turn may run ................................. |yana-workspace|
    Single-file mode ..................................... |yana-single-file|
 8. Health .................................................... |yana-health|
+9. Events .................................................... |yana-events|
 
 ==============================================================================
 1. Introduction                                                      *yana*
@@ -23,18 +24,29 @@ a hunk, file, or turn.
 
 Two public entries reach the same pipeline:
 
-- the chat panel, opened with |:Yana|;
+- the conversation panel, opened with |:Yana|;
 - an inline edit over a line or visual selection, opened with |:YanaEdit|.
 
 ==============================================================================
 2. Install                                                   *yana-install*
 
-With lazy.nvim: >lua
+QUICK INSTALLATION WITH LAZY.NVIM ~
 
-    {
+Put this complete plugin specification in
+`~/.config/nvim/lua/plugins/yana.lua`: >lua
+
+    return {
       "drusmanbashir/yana.nvim",
       cmd = { "Yana", "YanaAsk", "YanaEdit", "YanaOpen" },
       build = "scripts/install-deps.sh",
+      opts = {
+        backend = "cursor",  -- "cursor", "claude", or "codex"
+        global_keymaps = {
+          toggle = "<leader>cc",
+          ask = "<leader>ca",
+          inline_edit = "<C-k>",
+        },
+      },
     }
 <
 `build` runs `scripts/install-deps.sh` once, at install and update. It only
@@ -50,7 +62,7 @@ Manually: >sh
     require("yana").setup({})
 <
 
-Requirements: Linux, Neovim 0.10.4+, cursor-agent. `scripts/install-deps.sh`
+Requirements: Linux, Neovim 0.11.2+, cursor-agent. `scripts/install-deps.sh`
 detects apt/dnf/pacman and prints one copy-paste command naming the real
 system packages for whatever's missing; with `--run` it offers to install
 them (and cursor-agent's own installer) after showing the exact command and
@@ -63,7 +75,7 @@ the full dependency list and |yana-health| for the same check post-install.
 Required:
 
 - Linux with user namespaces, overlayfs, and /proc
-- Neovim 0.10.4 or newer
+- Neovim 0.11.2 or newer
 - cursor-agent, installed and signed in
 - bash, bwrap, capsh (from libcap2-bin/libcap-utils, used to drop
   capabilities before the confined agent starts), python3, GNU
@@ -120,8 +132,8 @@ Run |:checkhealth| with `:checkhealth yana` after installation.
 :YanaReject         Reject the pending file change.
 
                                                     *:YanaNew* *:YanaNewPanel*
-:YanaNew            Start a new chat in the current panel.
-:YanaNewPanel       Open an additional panel with its own chat.
+:YanaNew            Start a new conversation in the current panel.
+:YanaNewPanel       Open an additional panel with its own conversation.
 
                                                     *:YanaSessions*
 :YanaSessions[!]    Resume a saved session; ! uses a new panel.
@@ -131,7 +143,8 @@ Run |:checkhealth| with `:checkhealth yana` after installation.
                     panel.
 
                                                     *:YanaMode*
-:YanaMode           Switch ask and inline while the chat is quiescent: no
+:YanaMode           Switch Ask, Edit, and enabled Agent modes while the
+                    conversation is quiescent: no
                     running turn and no pending or open review.
 
                                                     *:YanaModel*
@@ -179,6 +192,19 @@ The default mode is `inline`. Important options: >lua
     })
 <
 
+Review keys (accept/reject a hunk, a file, or the whole turn) live under
+`diff_keymaps` (default `ours="cr"`, `theirs="ca"`, `all_theirs="cf"`,
+`all_changes="cA"`, `reject_file="cx"`, `next="]x"`, `prev="[x"`). F1
+(2026-08-26): `reject_file` was named `both` (an Avante-parity name for a
+binding that has only ever rejected the whole file, not "keep both"); `both`
+still works as a deprecated alias and warns once per session, e.g.
+`diff_keymaps = { reject_file = "cx" }` to silence it.
+
+The panel displays configuration mode `ask` as "Ask", `inline` as "Inline", and
+`agentic` as "Agent". Its conversation winbar leads with Yana and the mode;
+the prompt winbar says "Send follow-up...". Progress rows use Thinking,
+Explored, Edited, and Ran. Review actions use Accept and Reject.
+
 Direct mode is described separately because it changes the safety boundary.
 
 Diagnostic environment variables are disabled by default:
@@ -207,11 +233,8 @@ none reads `config.options.cmd` directly to spawn or probe):
 
   1. `cmd`, if set — an explicit path or name always wins outright.
   2. The environment variable NAMED by `cmd_env` (default
-     `"YANA_AGENT_BIN"`), read lazily at resolve time. This is the same
-     indirection avante.nvim (github.com/yetone/avante.nvim) uses for
-     provider API keys via its `api_key_name` field
-     (lua/avante/config.lua, read by lua/avante/providers/init.lua's
-     E.parse_envvar): you name a variable your shell already exports, and
+     `"YANA_AGENT_BIN"`), read lazily at resolve time: you name a variable
+     your shell already exports, and
      yana reads it lazily — nothing secret or machine-specific is ever a
      default.
   3. `cursor-agent` resolved on `$PATH`.
@@ -326,7 +349,7 @@ under `$HOME` for these turns.
 
 BANNER. While a single-file turn is open, the prompt winbar shows:
 
-    SINGLE-FILE MODE · agent EDITS only <basename> · multi-file/create/delete refused · :Yana --workspace DIR to widen
+    Single-file mode · agent edits only <basename> · multi-file/create/delete refused · :Yana --workspace DIR to widen
 
 REFUSALS (verbatim; `<basename>` and `<rel>` are filled in by Yana):
 
@@ -353,9 +376,9 @@ REFUSALS (verbatim; `<basename>` and `<rel>` are filled in by Yana):
 `single-file mode: buffer differs from the composed review — decide again`
     Reconcile the real buffer with what you want, then decide again.
 
-ACCEPT, REJECT, UNDO. Accept (`ct`) lands the hunk in the real buffer and
+ACCEPT, REJECT, UNDO. Accept (`ca`) lands the hunk in the real buffer and
 marks it `modified`; the real disk file is unchanged until your `:w`. Reject
-(`co`) restores the pre-turn lines in the real buffer. After accept closes the
+(`cr`) restores the pre-turn lines in the real buffer. After accept closes the
 review, `u` in the real buffer may reopen the hunk for another decision
 (ruling 74); the review stays in the real buffer, not the scratch copy.
 
@@ -470,5 +493,29 @@ completions when your own blink.cmp config special-cases
 `vim.b.yana_prompt`, which health also reports as INFO.
 Turn startup uses the same required-dependency table and refuses before the
 agent starts when a required dependency is missing.
+
+==============================================================================
+9. Events                                                       *yana-events*
+
+                                                    *YanaReviewSettled*
+`doautocmd User YanaReviewSettled` fires exactly when a review-state
+transition has fully applied — paint, extmarks and the decision register all
+consistent for the buffer named in its `data`. Covers: hunk accept/reject,
+file accept/reject, undo/redo of a decision, review open, review close/
+abort, and reload. >lua
+
+    vim.api.nvim_create_autocmd("User", {
+      pattern = "YanaReviewSettled",
+      callback = function(args)
+        -- args.data = { buf = <bufnr>, turn = <turn id>, reason = <string> }
+      end,
+    })
+<
+`reason` names which transition settled; the complete set is `"open"`,
+`"accept_hunk"`, `"reject_hunk"`, `"accept_file"`, `"reject_file"`,
+`"abort"`, `"undo_decision"`, `"native_undo"`, `"redo_decision"`,
+`"native_redo"` and `"reload"`. Intended for tests and
+integrations that need to know a decision has taken effect, not a fixed
+delay guessed once and then either too short or too long.
 
 vim:tw=78:ts=8:noet:ft=help:norl:

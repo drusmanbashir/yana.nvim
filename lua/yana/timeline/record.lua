@@ -62,10 +62,46 @@ local KINDS = {
 	review_opened = true,
 	hunk_accepted = true,
 	hunk_rejected = true,
+	-- ONE FILE-LEVEL DECISION, ONE REGISTER ROW (ruling 75, review-apply.md
+	-- "File-level decisions are one register step"). `ca`/`cb` each write
+	-- exactly ONE of these -- never one hunk_accepted/hunk_rejected row per
+	-- hunk -- carrying `members` (the N hunks it covers). Picked over
+	-- reusing hunk_accepted/hunk_rejected with a `members` field so a
+	-- per-hunk row and a whole-file row can never be confused by any reader
+	-- that switches on `kind` alone (`_register_decisions`,
+	-- `walk_impl.actionable`, `retrace.redo`).
+	file_accepted = true,
+	file_rejected = true,
 	human_edit = true,
+	-- RULING 75/73/57: an edit absorbed into a still-pending hunk is not a
+	-- register step of its own -- it becomes part of whatever the hunk's own
+	-- decision does -- but it IS a real position in the buffer's own undo
+	-- tree, and the decision that follows it must be able to land back on
+	-- exactly that position rather than skipping past it to the file's
+	-- older history. Recorded as a MARKER, the same shape `review_opened`
+	-- already is: a real `undo_seq` so a walk can land ON it
+	-- (`walk_impl.M.plan`'s buffer-landing scan does not filter by kind),
+	-- but excluded from `UNDOABLE_KIND` below so it is never itself walked
+	-- as a step and never itself the target `next_undo` selects.
+	absorbed_edit = true,
 	save_marker = true,
 	review_closed = true,
 	applied = true,
+	-- KI-1, operator ruling 2026-08-24 ("whole-review rewind at the single
+	-- insert boundary"). Neovim time travel crossing a review's proposal
+	-- insertion BACKWARD withdraws the whole review and every decision in it.
+	-- That is not a rejection: the operator rejected nothing, the bytes the
+	-- decisions described were taken by the editor's own undo tree, and a
+	-- reader that could not tell the two apart would replay a rejection the
+	-- operator never made. Hyphenated because the ruling names the kind
+	-- exactly this way.
+	--
+	-- DELIBERATELY NOT IN `UNDOABLE_KIND` below. A withdrawal by rewind is
+	-- not an operator ACTION a press should take back -- taking it back would
+	-- mean undoing Neovim's own time travel, which Yana does not own. The way
+	-- back is the same way it came: cross the insertion forward again and the
+	-- review is restored (`inline_diff.lua`'s `rewind_restore`).
+	["rejected-by-rewind"] = true,
 }
 
 local EPOCH_VAR = "yana_timeline_epoch"
@@ -425,6 +461,53 @@ local function append_order_row(ws, row)
 	return true
 end
 
+--- Async twin of `append_order_row`, for `M.intent_async` only. The row's
+--- bytes are still appended before this function returns -- `uv.fs_write`
+--- with no callback is a blocking syscall, so line order in the pointer
+--- file is exactly call order, same guarantee the synchronous version gave.
+--- What moves off the caller is the pointer's OWN fsync: measured 2026-08-24
+--- (S1f), that one `flush.fsync` call was the entire 145 ms "post-open tail"
+--- overrun -- `append_row_async` above already keeps the per-path row's own
+--- flush off the review-open path for exactly this reason, and the pointer
+--- is the more disposable of the two (`M.intent`'s own comment: "a
+--- pointer-append failure costs the cross-file ORDER INDEX one entry ...
+--- never the decision itself"). `callback` receives the same (ok, err) shape
+--- `append_order_row` returned, so a caller logs a failure exactly as before,
+--- just later.
+--- The rare cold path -- this pointer file or its directory does not exist
+--- yet -- falls back to the synchronous function whole: that path also
+--- fsyncs the directory NAME, which only a nested off-loop callback could do
+--- safely here, and it runs at most once per workspace, never on the warm
+--- loop this function exists to keep fast.
+local function append_order_row_async(ws, row, callback)
+	local path = order_file(ws)
+	if uv.fs_stat(path) == nil then
+		local ok, err = append_order_row(ws, row)
+		callback(ok, err)
+		return
+	end
+	local line = vim.json.encode(row) .. "\n"
+	local fd, err = uv.fs_open(path, "a", 438)
+	if not fd then
+		callback(false, err)
+		return
+	end
+	local ok, werr = write_all_fd(fd, line)
+	if not ok then
+		uv.fs_close(fd)
+		callback(false, werr)
+		return
+	end
+	local called, req = pcall(uv.fs_fsync, fd, function(fsync_err)
+		uv.fs_close(fd)
+		callback(fsync_err == nil, fsync_err)
+	end)
+	if not called or not req then
+		uv.fs_close(fd)
+		callback(false, called and "could not queue fsync" or tostring(req))
+	end
+end
+
 -- ---------------------------------------------------------------------------
 -- Correlation ids and buffer observation helpers.
 -- ---------------------------------------------------------------------------
@@ -662,8 +745,80 @@ local function find_buffer(abs)
 	return nil
 end
 
+--- Every sequence on the path from the tree's ROOT to `target`, or nil when
+--- `target` names no state on the tree's CURRENT path. An `alt` list hangs off
+--- the entry it diverges from, so the entries before that entry are the prefix
+--- of any path found inside it -- hence the rollback to `mark` when an
+--- alternate branch turns out not to contain the target.
+---
+--- KI-1 / operator ruling 2026-08-24. This exists because "the seq exists" is
+--- not the same question as "the seq is on the branch this buffer is on":
+--- `undotree()` exposes abandoned branches, and `undo_time()` rotates branches
+--- as it travels so path membership changes DURING the command. Any test that
+--- wants to know where the buffer actually stands has to walk, not look up.
+local function undo_path_to(entries, target)
+	local acc = {}
+	if target == nil then
+		return nil
+	end
+	if target == 0 then
+		return acc
+	end
+	local function rec(list)
+		for _, e in ipairs(list or {}) do
+			if type(e.alt) == "table" and #e.alt > 0 then
+				local mark = #acc
+				if rec(e.alt) then
+					return true
+				end
+				for i = #acc, mark + 1, -1 do
+					acc[i] = nil
+				end
+			end
+			acc[#acc + 1] = e.seq
+			if e.seq == target then
+				return true
+			end
+		end
+		return false
+	end
+	if rec(entries) then
+		return acc
+	end
+	return nil
+end
+
+--- Is `seq` an ancestor of (or equal to) the state the buffer is on now?
+--- Answered by the explicit ancestor walk above, never by seq arithmetic.
+local function seq_on_current_path(tree, seq)
+	if seq == nil then
+		return false
+	end
+	local path = undo_path_to(tree.entries, tree.seq_cur or 0)
+	if path == nil then
+		-- `seq_cur` can be `target - 1` and need not name an undo header at
+		-- all, so the walk has no answer here. Say so rather than guessing.
+		return nil
+	end
+	if (tree.seq_cur or 0) == seq then
+		return true
+	end
+	for _, s in ipairs(path) do
+		if s == seq then
+			return true
+		end
+	end
+	return false
+end
+
 --- Depth-first exact search for a sequence number in an undo tree, alternate
 --- branches included. Seq 0 is the root and always present.
+---
+--- FALSE HERE IS "GONE" (KI-1, NV-8): the sequence is neither on the current
+--- branch nor on an abandoned one -- the undo history was cleared, trimmed or
+--- recreated. That is a different fact from "on an abandoned branch", which is
+--- still a REACHABLE time-travel destination (`:earlier`/`g-` rotate branches
+--- to reach it) and must never be reported as drift.
 local function seq_in_tree(tree, seq)
 	if seq == 0 then
 		return true
@@ -794,6 +949,15 @@ local function prepare_row(entry)
 		-- untouched underneath it.
 		session_id = SESSION_ID,
 		turn_id = turn_id_for(entry),
+		-- ONE FILE-LEVEL DECISION, ONE REGISTER ROW (ruling 75). `ca`/`cb`
+		-- each write exactly one `file_accepted`/`file_rejected` row (never a
+		-- run of per-hunk rows), so the walk needs no grouping logic at all --
+		-- `M.next_undo` targets this row's own predecessor exactly like any
+		-- other row. `members` names the hunks it covers, for the reopen
+		-- path (`inline_diff._register_decisions`) to paint them all pending
+		-- again. Optional and untyped beyond "an array": every other caller
+		-- omits it.
+		members = entry.members,
 	}
 	if regime == "durable" then
 		if entry.buffer_epoch ~= nil or entry.undo_seq ~= nil or entry.expected_hash ~= nil then
@@ -886,23 +1050,29 @@ function M.intent_async(entry, callback)
 	if not ok then
 		return nil, "timeline intent not queued for durability: " .. tostring(err)
 	end
-	-- Same secondary, non-fatal pointer append as `M.intent`. Done
-	-- synchronously even on this async path: the pointer file is tiny (one
-	-- JSON line) and this keeps the ordering guarantee simple -- the order
-	-- pointer for THIS row is on disk before the caller's `intent_async`
-	-- returns, never racing a later row's pointer append.
-	local pok, perr = append_order_row(
+	-- Same secondary, non-fatal pointer append as `M.intent`, but ALSO off
+	-- the caller now (measured 2026-08-24, S1f): the write below still lands
+	-- in call order before this function returns -- `append_order_row_async`
+	-- writes synchronously, only its fsync is deferred -- so the ordering
+	-- guarantee is unchanged; only the pointer's OWN durability wait, which
+	-- was the entire post-open tail overrun, now runs in a callback like the
+	-- primary row's above.
+	append_order_row_async(
 		ws,
 		-- The stamp goes on the POINTER too, not only the per-file journal:
 		-- `next_undo` decides the current turn from this file alone (it is the
 		-- one file that knows what happened LAST anywhere in the workspace),
 		-- and a pointer line without the pair would make that decision from
 		-- rows it cannot place.
-		{ seq = row.global_seq, rel = rel, id = row.id, kind = row.kind, session_id = row.session_id, turn_id = row.turn_id }
+		{ seq = row.global_seq, rel = rel, id = row.id, kind = row.kind, session_id = row.session_id, turn_id = row.turn_id },
+		function(pok, perr)
+			if not pok then
+				vim.schedule(function()
+					log_warn("timeline order pointer not durable for " .. tostring(rel) .. ": " .. tostring(perr))
+				end)
+			end
+		end
 	)
-	if not pok then
-		log_warn("timeline order pointer not durable for " .. tostring(rel) .. ": " .. tostring(perr))
-	end
 	-- The row is already appended at this point. Advance the in-memory cursor
 	-- now, in append order, not from the later fsync callback: a later hunk
 	-- event may update the head while this flush is still in flight, and the
@@ -919,6 +1089,30 @@ end
 --- Entries for one file, oldest first (journal append order), each with a
 --- state DERIVED at call time. Second return: an error string when the journal
 --- was damaged mid-file (the rows before the damage are still returned).
+-- EXPLICIT REVERTED MARKS (ruling 75, one register). A row's `reverted`
+-- state is derived from the buffer head below: rows AFTER the head row are
+-- reverted. That derivation cannot see a byte-less row (an accept, ruling
+-- 87): walking back a LATER row lands the head on the accept row itself, and
+-- the accept reads as done again -- measured in the operator's log
+-- (2026-08-23 12:36:56-12:37:00) as the same "undid accept hunk 1" walked
+-- three times with a human edit in between. So every row a walk or an
+-- in-review pop reverts is marked here by id, and a redo unmarks it; the
+-- derivation below is then the floor, never the whole answer. Session
+-- memory only: the marks describe this session's live undo trees, which do
+-- not survive it either.
+local reverted_marks = {}
+
+function M.mark_reverted(id, reverted)
+	if type(id) ~= "string" or id == "" then
+		return
+	end
+	reverted_marks[id] = reverted and true or nil
+end
+
+function M.is_marked_reverted(id)
+	return reverted_marks[id] == true
+end
+
 function M.entries(workspace, rel)
 	local ws = diff.abs_path(workspace or vim.fn.getcwd())
 	-- The REAL directory (never the SFM records root below), for every buffer
@@ -957,6 +1151,7 @@ function M.entries(workspace, rel)
 				-- turn is `next_undo`'s question, asked of the order pointer.
 				session_id = row.session_id,
 				turn_id = row.turn_id,
+				members = row.members,
 			}
 			if row.regime == "durable" then
 				e.state, e.state_detail = durable_state(row, summaries)
@@ -983,6 +1178,12 @@ function M.entries(workspace, rel)
 					out[i].state_detail = "timeline head is at older row " .. tostring(head.id)
 				end
 			end
+		end
+	end
+	for _, e in ipairs(out) do
+		if e.regime == "buffer" and reverted_marks[e.id] and e.state ~= "reverted" then
+			e.state = "reverted"
+			e.state_detail = "walked back this session (explicit mark)"
 		end
 	end
 	return out, err
@@ -1042,9 +1243,28 @@ end
 local UNDOABLE_KIND = {
 	hunk_accepted = true,
 	hunk_rejected = true,
+	-- RULING 75: the file-level twins of the two rows above -- see the
+	-- `file_accepted`/`file_rejected` note on `KINDS`.
+	file_accepted = true,
+	file_rejected = true,
 	human_edit = true,
 	applied = true,
 }
+
+--- Exported so `walk_impl.lua`'s `actionable()` can filter by the SAME set
+--- `next_undo`'s own cross-file scan already uses, rather than keeping a
+--- second copy that can drift. A marker row (`review_opened`/`review_closed`)
+--- carries a real `undo_seq` so the walk can LAND on it (`_undo_to`'s own
+--- target), but it is never itself something the operator did that a press
+--- should undo/redo -- reintegration re-opening a file mid-walk stamps a NEW
+--- `review_opened` row into that file's own journal, so a stale
+--- `plan.steps` sweep that does not filter by kind (bounded only by state and
+--- regime, `walk_impl.lua`'s pre-existing `actionable()`) picks up every
+--- marker minted since the original target was chosen and replays it as if it
+--- were a decision -- measured as "redid review_opened in alpha.py" with a
+--- corrupted (negative) painted-row count, on a walk that spanned two
+--- reintegration cycles before reaching its real target.
+M.UNDOABLE_KIND = UNDOABLE_KIND
 
 --- Returns nil when there is nothing left to undo anywhere in the workspace
 --- -- an empty pointer file, every row already reverted, or every remaining
@@ -1138,6 +1358,11 @@ function M.next_undo(workspace, exclude, gate)
 			for i, e in ipairs(list) do
 				if e.id == prow.id then
 					if e.state == "done" then
+						-- RULING 75: a file-level decision (`ca`/`cb`) is now ALWAYS
+						-- exactly one row (`file_accepted`/`file_rejected`), so
+						-- targeting its own immediate predecessor -- exactly what every
+						-- other kind of row already does -- reverts the whole decision
+						-- in one walk, with no grouping/floor-scan needed here.
 						local prev = list[i - 1]
 						return {
 							rel = rel,
@@ -1266,12 +1491,37 @@ function M.reachable(workspace, rel, id)
 			)
 		end
 	end
+	-- GONE vs ABANDONED (KI-1, operator ruling 2026-08-24, NV-2/NV-8). These
+	-- are two different answers and the old code gave them one name.
+	--
+	--   GONE      -- the sequence is nowhere in the tree at all. The history
+	--                was cleared, trimmed or recreated. Nothing can walk to
+	--                it, and this is the ONLY case that may be called drift.
+	--   ABANDONED -- the sequence is in the tree but not on the branch the
+	--                buffer is currently on. `:earlier`/`:later`/`g-`/`g+`
+	--                rotate branches and CAN reach it, so it stays reachable;
+	--                reporting it as drift would refuse a destination the
+	--                editor can plainly reach.
+	--
+	-- The content hash is what confirms the answer, exactly as the buffer-head
+	-- comparison above already does: "the seq exists" was never evidence, and
+	-- neither is "the seq is on this branch".
 	if not seq_in_tree(tree, target.undo_seq) then
 		return false, nil, string.format(
-			"undo seq %d is no longer in this buffer's tree (history reloaded or trimmed); row %s stays listed but cannot be walked",
+			"undo seq %d is GONE from this buffer's tree — not on the current branch and not on an abandoned one (history cleared, trimmed or recreated); row %s stays listed but cannot be walked",
 			target.undo_seq,
 			id
 		)
+	end
+	-- Present but off the current branch: reachable, and recorded as such so a
+	-- reader can tell this case from GONE without re-deriving it.
+	local on_path = seq_on_current_path(tree, target.undo_seq)
+	if on_path == false then
+		log_warn(string.format(
+			"undo seq %d for row %s is on an abandoned branch, not the current one: reachable by branch-rotating time travel, so it is NOT drift",
+			target.undo_seq,
+			id
+		))
 	end
 	if tree.seq_cur == target.undo_seq then
 		local now = buf_content_hash(buf)
@@ -1290,6 +1540,26 @@ end
 --- True while a review is OPEN for this file in this workspace. The inline
 --- engine's active state is the authority; lazily required so this storage
 --- module never drags the review UI into a headless reader.
+--- Is SOME review -- reintegrated or not -- open on `rel`'s buffer right
+--- now? This is the ownership question `edit_capture` asks (who watches the
+--- buffer's bytes), distinct from `review_open_for` below, which answers the
+--- register's gating question and deliberately exempts a reintegrated
+--- review. Conflating the two kept the post-review typing watch attached
+--- through a reintegrated review and recorded Yana's own redo as a
+--- `human_edit` row (measured, r75_redo_replays_mixed_decisions_in_order).
+function M.review_owns_buffer(workspace, rel)
+	local ok, inline = pcall(require, "yana.inline_diff")
+	if not ok then
+		return false
+	end
+	local ws = diff.abs_path(workspace or vim.fn.getcwd())
+	local change = inline.active_change({ workspace = ws })
+	if not change then
+		return false
+	end
+	return change.path ~= nil and rel ~= nil and diff.abs_path(change.path) == diff.abs_path(ws .. "/" .. rel)
+end
+
 function M.review_open_for(workspace, rel)
 	local ok, inline = pcall(require, "yana.inline_diff")
 	if not ok then

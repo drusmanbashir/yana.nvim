@@ -43,6 +43,7 @@ end
 
 local function parse_common(args)
 	local workspace, upper, changes_out, json = nil, nil, nil, false
+	local write_roots = {}
 	local i = 1
 	while i <= #args do
 		local v
@@ -57,24 +58,44 @@ local function parse_common(args)
 				v, i = parse_flag(args, i, "--changes-out")
 				if v then
 					changes_out = v
-				elseif args[i] == "--json" then
-					json = true
-					i = i + 1
 				else
-					die_usage("unknown argument: " .. tostring(args[i]))
+					v, i = parse_flag(args, i, "--write-root")
+					if v then
+						write_roots[#write_roots + 1] = v
+					elseif args[i] == "--json" then
+						json = true
+						i = i + 1
+					else
+						die_usage("unknown argument: " .. tostring(args[i]))
+					end
 				end
 			end
 		end
 	end
-	if not workspace or not upper then
-		die_usage("--workspace and --upper are required")
+	if not workspace then
+		die_usage("--workspace is required")
 	end
 	return {
 		workspace = diff.abs_path(workspace),
-		upper = diff.abs_path(upper),
+		upper = upper and diff.abs_path(upper) or nil,
 		changes_out = changes_out and diff.abs_path(changes_out) or nil,
+		write_roots = write_roots,
 		json = json,
 	}
+end
+
+--- Declared write roots through the SAME resolver the editor uses
+--- (`config.normalize_write_roots` + `preview.resolve_roots`), including
+--- maximal-set absorption. No second implementation (audit F7).
+local function resolve_cli_roots(opts)
+	local config = require("yana.config")
+	local preview = require("yana.shadow.preview")
+	local declared = config.normalize_write_roots(opts.write_roots or {})
+	local roots, err = preview.resolve_roots(opts.workspace, declared)
+	if not roots then
+		return nil, err
+	end
+	return roots
 end
 
 local function load_ops(opts)
@@ -122,7 +143,7 @@ local function evidence_from_op(op, fp)
 		return nil, "the producer recorded no before-state for this operation"
 	end
 	if ev.state == "absent" then
-		return { rel = op.rel, hash = fp, base_state = "absent" }
+		return { rel = op.rel, hash = fp, base_state = "absent", base_hash_captured_ts = op.base_hash_captured_ts }
 	end
 	if ev.state == "file" or ev.state == "link" then
 		local mode = tonumber(ev.mode or "", 8)
@@ -139,6 +160,7 @@ local function evidence_from_op(op, fp)
 				base_state = "link",
 				base_mode = mode,
 				base_link_target = ev.target,
+				base_hash_captured_ts = op.base_hash_captured_ts,
 			}
 		end
 		-- The AFTER mode, when this operation is a `chmod+modify` compound.
@@ -167,7 +189,14 @@ local function evidence_from_op(op, fp)
 				return nil, "the producer recorded an unreadable after-mode for this operation"
 			end
 		end
-		return { rel = op.rel, hash = fp, base_state = "file", base_mode = mode, after_mode = after_mode }
+		return {
+			rel = op.rel,
+			hash = fp,
+			base_state = "file",
+			base_mode = mode,
+			after_mode = after_mode,
+			base_hash_captured_ts = op.base_hash_captured_ts,
+		}
 	end
 	return nil,
 		"the real path is a "
@@ -199,6 +228,9 @@ end
 
 local function cmd_finish(args)
 	local opts = parse_common(args)
+	if not opts.upper then
+		die_usage("finish requires --upper")
+	end
 	if not opts.changes_out then
 		die_usage("finish requires --changes-out DIR")
 	end
@@ -347,6 +379,9 @@ end
 
 local function cmd_check_deletes(args)
 	local opts = parse_common(args)
+	if not opts.upper then
+		die_usage("check-deletes requires --upper")
+	end
 	local typed, err = load_ops(opts)
 	if not typed then
 		io.stderr:write("yana-turn: " .. tostring(err) .. "\n")
@@ -361,6 +396,25 @@ local function cmd_check_deletes(args)
 	end
 	if any then
 		os.exit(EXIT_REFUSE)
+	end
+	os.exit(0)
+end
+
+--- Resolve declared write roots the way the editor does. Prints one absolute
+--- path per line (maximal set). Refuses by name when resolution fails.
+local function cmd_resolve_roots(args)
+	local opts = parse_common(args)
+	local roots, err = resolve_cli_roots(opts)
+	if not roots then
+		io.stderr:write("yana-turn: " .. tostring(err) .. "\n")
+		os.exit(EXIT_REFUSE)
+	end
+	if opts.json then
+		io.stdout:write(vim.json.encode({ roots = roots }) .. "\n")
+	else
+		for _, root in ipairs(roots) do
+			io.stdout:write(root .. "\n")
+		end
 	end
 	os.exit(0)
 end
@@ -381,7 +435,7 @@ end
 
 local args = script_args()
 if #args == 0 then
-	die_usage("subcommand required (finish|check-deletes)")
+	die_usage("subcommand required (finish|check-deletes|resolve-roots)")
 end
 
 local sub = args[1]
@@ -390,6 +444,8 @@ if sub == "finish" then
 	cmd_finish(args)
 elseif sub == "check-deletes" then
 	cmd_check_deletes(args)
+elseif sub == "resolve-roots" then
+	cmd_resolve_roots(args)
 else
 	die_usage("unknown subcommand: " .. tostring(sub))
 end

@@ -442,8 +442,13 @@ end
 
 --- Where durable turn records live. One directory, so a restart has one place
 --- to look and does not have to guess which panel it lost.
+---
+--- Same resolver as claims and layers (`shadow/preview.state_root`): YANA_STATE_ROOT,
+--- then XDG_STATE_HOME/yana, then the default. Never a second answer to "where
+--- is state" (audit F6, 2026-08-25).
 function M.state_dir()
-  return vim.fn.stdpath("state") .. "/yana/turns"
+  local preview = require("yana.shadow.preview")
+  return preview.state_root() .. "/turns"
 end
 
 --- Write the turn record. Durable BEFORE the process can die, not after: a
@@ -564,7 +569,14 @@ function M.resume_turn(opts)
       local release = opts.release
       if release == nil then
         local ok, jail = pcall(require, "yana.shadow.jail")
-        release = ok and jail.release_claim or nil
+        -- Closed reviews are cleaned after inspect proved them non-open.
+        -- force-release is correct here: the turn record carries no nonce, and
+        -- a bare release_claim would decline a claim that still has one (F1).
+        release = ok
+            and function(claim_dir)
+              return jail.force_release_claim(claim_dir, "resume: review closed")
+            end
+          or nil
       end
       if release and rec.claim_dir and rec.claim_dir ~= "" then
         pcall(release, rec.claim_dir)
