@@ -1,3 +1,5 @@
+<p align="center"><img src="assets/yana-logo-wide.svg" alt="yana" width="480"></p>
+
 # Yana
 
 Yana was built after using the existing Neovim agent plugins and finding their
@@ -15,7 +17,7 @@ way the editor's own undo should. Nothing reaches disk until you say so.
 - Accept or reject one hunk, one file, or the whole turn
 - Undo your last decision — across files — and the hunk comes back where you can see it; redo it
 - Reset the whole turn with one key
-- Switch which agent answers — Cursor, Claude, or Codex — and which model, mid-chat
+- Switch which agent answers — Cursor, Claude, or Codex — and which model, mid-chat (Claude and Codex are experimental — see Installation)
 - Keep your unsaved typing: an accept never overwrites it
 - After a crash, the dead turn's lock on the project is released so the next editor is not blocked (pending hunks are NOT restored)
 - Resume a past chat, with its open review intact
@@ -32,7 +34,7 @@ way the editor's own undo should. Nothing reaches disk until you say so.
 
 ## Installation
 
-**Required:** Linux for confined `ask` / `inline` (glibc — musl/Alpine does not work, see Known issues). macOS can run **agentic** only (see below). Neovim 0.11.2+; one agent CLI signed in: `cursor-agent`, `claude`, or `codex`.
+**Required:** Linux for confined `ask` / `inline` (glibc — musl/Alpine does not work, see Known issues). macOS can run **agentic** only (see below). Neovim 0.11.2+; one agent CLI signed in: `cursor-agent`, or, **experimental**, `claude` or `codex`.
 
 ### Quick installation with lazy.nvim
 
@@ -63,7 +65,27 @@ The same ready-to-use file is in
 
 ### System requirements
 
-Install the system packages:
+**Get Neovim 0.11.2+ first.** `apt` on Ubuntu 24.04 and older installs an
+older Neovim (0.9.5 on a stock Ubuntu 24.04 image, verified) with no warning
+that it is below Yana's floor — `:checkhealth yana` catches it, but only
+after you have already tried to run Yana. On Debian/Ubuntu, Neovim's own
+install docs ([neovim.io/doc/install](https://neovim.io/doc/install/))
+document two ways to get 0.11.2+:
+
+- **AppImage** (no install, no root):
+  ```sh
+  curl -LO https://github.com/neovim/neovim/releases/latest/download/nvim-linux-x86_64.appimage
+  chmod u+x nvim-linux-x86_64.appimage
+  ./nvim-linux-x86_64.appimage
+  ```
+- **The `neovim-ppa/unstable` PPA** (not maintained by the Neovim team; gives you `apt upgrade` for Neovim going forward):
+  ```sh
+  sudo add-apt-repository ppa:neovim-ppa/unstable
+  sudo apt-get update
+  sudo apt-get install neovim
+  ```
+
+Then install the system packages:
 
 **Debian / Ubuntu**
 ```sh
@@ -74,6 +96,11 @@ sudo apt-get install -y bubblewrap libcap2-bin python3 util-linux findutils gawk
 ```sh
 sudo dnf install -y bubblewrap libcap python3 util-linux findutils gawk glibc-common hostname
 ```
+Fedora/RHEL is tested in a container with SELinux labelling disabled. With
+SELinux enforcing on a desktop, bubblewrap may need the `container_use_devices`
+or an equivalent boolean; if `:checkhealth yana` reports `bwrap:userns`
+failing with a permission error and the sysctl remedy does not apply, check
+`ausearch -m avc -ts recent` first.
 
 **Arch**
 ```sh
@@ -112,12 +139,40 @@ with any mainstream distro already. `scripts/install-deps.sh` (still in the repo
 checks the complete list against your actual machine and prints only what's
 really missing; `:checkhealth yana` does the same check after `setup()` has run.
 
-Then install whichever agent CLI you plan to use — `claude` and `codex` have
-their own installers (see each vendor's docs); `cursor-agent`:
+Then install whichever agent CLI you plan to use. All three are selectable
+with `backend = "cursor" | "claude" | "codex"`, but only `cursor` is
+exercised end-to-end by this repo's own test suite (real spawn + stream +
+apply, against a fake binary standing in for the vendor); `claude` and
+`codex` are wired the same way in code but have no such coverage here yet
+(config-shape and stream-parsing tests only) — treat them as **experimental**
+until that changes.
 
-```sh
-curl https://cursor.com/install -fsS | bash
-```
+- **`cursor-agent`** — install line from Cursor's own docs
+  ([cursor.com/docs/cli/installation](https://cursor.com/docs/cli/installation)):
+  ```sh
+  curl https://cursor.com/install -fsS | bash
+  ```
+  What you need: a Cursor account. Sign in with `cursor-agent login`, or set
+  `CURSOR_API_KEY`.
+
+- **`claude`** (Claude Code CLI) — **experimental**, not verified end-to-end
+  in this repo's tests. Install line from Anthropic's own docs
+  ([code.claude.com/docs/en/setup](https://code.claude.com/docs/en/setup)):
+  ```sh
+  curl -fsSL https://claude.ai/install.sh | bash
+  ```
+  What you need: an Anthropic Pro/Max/Team/Enterprise/Console account. Sign
+  in by running `claude` and following the browser prompt, or set
+  `ANTHROPIC_API_KEY`.
+
+- **`codex`** (OpenAI Codex CLI) — **experimental**, not verified
+  end-to-end in this repo's tests. Install line from OpenAI's own package
+  ([npmjs.com/package/@openai/codex](https://www.npmjs.com/package/@openai/codex)):
+  ```sh
+  npm install -g @openai/codex
+  ```
+  What you need: an OpenAI account (ChatGPT Plus/Pro/Business/Edu/Enterprise).
+  Sign in with `codex login`, or set `OPENAI_API_KEY`.
 
 ### Environment variables
 
@@ -506,7 +561,16 @@ data on disk — `:w` always withholds pending agent lines):
   silent fallback). **Agentic** works if you set `enable_agentic = true` and
   `mode = "agentic"` — the agent writes the real tree, with no overlay and no
   review. Windows is still unsupported. The compatibility matrix remains
-  Linux containers.
+  Linux containers. macOS is not exercised by any environment test; the Darwin refusal text is
+  covered by a headless unit row, not by a real Mac.
+- **WSL2 is untested.** Nothing in the compatibility matrix runs a WSL2
+  kernel. Ubuntu under WSL2 ships the same AppArmor user-namespace
+  restriction as Ubuntu 24.04 desktop, so expect the `bwrap:userns`
+  remedy from `:checkhealth yana`; whether overlayfs behaves under WSL2's
+  kernel has not been measured. Reports welcome.
+- **Only x86_64 is tested.** The compatibility matrix installs the x86_64
+  Neovim tarball. aarch64 Linux is expected to work (nothing in Yana is
+  architecture-specific) but has not been run.
 - **Redo of a write that already reached disk does nothing.** Once a decision
   has been written out, `<C-r>` past that boundary silently leaves the file at
   its turn-start bytes rather than redoing (`lua/yana/timeline/retrace.lua`,
@@ -515,7 +579,8 @@ data on disk — `:w` always withholds pending agent lines):
 - **musl-based Linux (Alpine) does not work** with the official Neovim tarball:
   it is built against glibc and fails to load with `fcntl64: symbol not found`.
   This is Neovim's packaging, not Yana — but until a musl build is used, Alpine
-  is out. Verified in the compatibility matrix (cell `alpine320`).
+  is out. Verified in the compatibility matrix (cell `alpine320`). This is an open, named gap: Yana cannot print a cleaner refusal because
+  Neovim itself fails to start before any plugin code runs.
 - **REPL / SLIME integration is known to work only under the kitty terminal.**
   The whole suite (vim-slime / iron.nvim / neopyter routing, cells, traceback
   jump, REPL tail into the prompt) is being integrated as a `yana.repl` module

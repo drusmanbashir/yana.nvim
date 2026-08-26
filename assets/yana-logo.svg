@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" role="img" aria-label="Yana — undo arrow retracing steps">
+  <title>Yana — undo arrow retracing steps</title>
+  <defs>
+    <linearGradient id="g5" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0F766E"/>
+      <stop offset="100%" stop-color="#14B8A6"/>
+    </linearGradient>
+  </defs>
+  <rect x="32" y="32" width="448" height="448" rx="96" fill="url(#g5)"/>
+  
+  <path d="M180,208 C186,138 258,92 330,116 C410,142 442,228 410,296 C380,360 300,388 234,362"
+        fill="none" stroke="#FFFFFF" stroke-width="46" stroke-linecap="round"/>
+  <polygon points="120,182 200,172 176,248" fill="#FF7A67"/>
+
+</svg>
