@@ -3,6 +3,21 @@
 All notable changes to Yana are documented here. Versions follow Semantic
 Versioning.
 
+## 0.1.0-alpha.8 - 2026-09-13
+
+Supersedes the unpublished 0.1.0-alpha.7 tag. The alpha.7 public tag was
+created, but its export omitted the public Docker smoke harness while still
+shipping `tests/release/gate.sh`; alpha.8 includes that harness so a fresh
+public clone can run the full release gate.
+
+### Fixed
+
+- **The public release export now includes the Docker six-turn smoke harness**
+  (`tests/release/container_smoke.sh`,
+  `tests/release/container_smoke_run.sh`, and
+  `tests/release/Dockerfile.container-smoke`). This keeps
+  `tests/release/gate.sh` runnable from a public clone.
+
 ## 0.1.0-alpha.7 - 2026-09-13
 
 First public release of this line. 0.1.0-alpha.6 was pushed and withdrawn
@@ -392,4 +407,3 @@ without a tag or GitHub release; everything listed under 0.1.0-alpha.6 ships in
 - **The agent runs as the invoking user; root is never exposed to it**: the sandbox launched with `bwrap --unshare-user --uid 0 --gid 0`, so every turn's agent ran as root. Electron-based CLIs refuse outright ("You are trying to start Cursor as a super user which isn't recommended..."), and everything a turn wrote came back root-owned. The launcher now passes the invoking `--uid`/`--gid`, so the namespace maps exactly one uid and uid 0 does not exist inside the sandbox to be reached. Because bwrap reaches a non-zero sandbox uid through an intermediate user namespace — leaving its mount namespace owned by an ancestor, where CAP_SYS_ADMIN does not satisfy `may_mount()` — `yana-overlay-inner` now re-execs itself under `unshare --mount` and mounts into a mount namespace of its own. `unshare` (util-linux) joins `bwrap` and `capsh` as a required executable. Capabilities are still dropped in full before the agent starts.
 
 - **Vendor CLI state directory failures**: fixed "Read-only file system (os error 30)" when vendor CLIs (codex, claude, cursor) wrote their state directories at startup, which happens before the prompt is read and so refused the whole turn. The launcher binds each declared `state_dirs` entry read-write. They are staged inside bwrap's private `/tmp` and mounted onto their real paths after the overlay — so the write reaches the REAL host directory instead of the turn's disposable upper layer, where a refreshed credential would be discarded at release and the next turn would re-authenticate forever. The `~/.cursor` exception was corrected the same way, and for the same reason.
-

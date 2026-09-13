@@ -273,12 +273,15 @@ scripts/release/neovim-matrix.txt
 scripts/release/verify.sh
 scripts/release/yana-ui.pin
 tests/headless/lib/hunks.lua
+tests/release/Dockerfile.container-smoke
 tests/release/agent_path_smoke.lua
 tests/release/blink_gate.sh
 tests/release/blink_smoke.lua
 tests/release/confined_turn_gate.sh
 tests/release/confined_turn_smoke.lua
 tests/release/container_six_turns.lua
+tests/release/container_smoke.sh
+tests/release/container_smoke_run.sh
 tests/release/dependency_gate.sh
 tests/release/dependency_smoke.lua
 tests/release/fake-cursor-agent

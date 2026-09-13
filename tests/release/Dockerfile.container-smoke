@@ -1,0 +1,52 @@
+# Minimal release-artifact container: pinned base + pinned Neovim tarball.
+# Build context is NOT a git checkout: only `export/` (scripts/release/export.sh
+# output) and `container_smoke_run.sh` (host test harness).
+#
+# BASE_IMAGE / NVIM_* are supplied by tests/release/container_smoke.sh.
+ARG BASE_IMAGE=ubuntu:24.04@sha256:33ceb71981b602c1a7443a53469e4dba065f7503eab3078a2d7a57a2ab987517
+FROM ${BASE_IMAGE}
+
+ARG NVIM_VERSION=0.12.4
+ARG NVIM_URL=https://github.com/neovim/neovim/releases/download/v0.12.4/nvim-linux-x86_64.tar.gz
+ARG NVIM_SHA256=012bf3fcac5ade43914df3f174668bf64d05e049a4f032a388c027b1ebd78628
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates curl git tar \
+        python3 \
+        bubblewrap libcap2-bin \
+        procps \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN set -eux; \
+    curl -fL -o /tmp/nvim.tar.gz "$NVIM_URL"; \
+    echo "${NVIM_SHA256}  /tmp/nvim.tar.gz" | sha256sum -c -; \
+    mkdir -p /opt/nvim; \
+    tar -xzf /tmp/nvim.tar.gz -C /opt/nvim --strip-components=1; \
+    rm /tmp/nvim.tar.gz; \
+    ln -s /opt/nvim/bin/nvim /usr/local/bin/nvim; \
+    nvim --version | head -1; \
+    test "$(nvim --version | head -1)" = "NVIM v${NVIM_VERSION}"
+
+# Scratch for overlay turns must live outside /tmp (bwrap tmpfs-masks /tmp).
+RUN mkdir -p /var/yana/scratch && chmod 1777 /var/yana/scratch
+
+# Build context is never a Yana git checkout: only export/ and the inner runner.
+# yana-ui.nvim comes from the public repository at the export's own pin, cloned
+# anonymously inside this build by the export's fetch script.
+COPY export/ /opt/yana-export/
+COPY container_smoke_run.sh /opt/container_smoke_run.sh
+RUN /opt/yana-export/scripts/release/fetch-yana-ui.sh /opt/yana-ui
+RUN chmod 755 /opt/container_smoke_run.sh \
+    && chmod 755 /opt/yana-export/tests/release/six_turns_agent \
+    && test -f /opt/yana-export/lua/yana/init.lua \
+    && test -f /opt/yana-export/tests/release/smoke.lua \
+    && test -f /opt/yana-export/tests/release/container_six_turns.lua \
+    && test ! -e /opt/yana-export/.git \
+    && test ! -d /opt/yana-export/spec \
+    && test -d /opt/yana-ui/lua/yana_ui \
+    && command -v bwrap >/dev/null \
+    && command -v python3 >/dev/null
+WORKDIR /opt
+ENTRYPOINT ["/opt/container_smoke_run.sh"]
+CMD ["positive"]
