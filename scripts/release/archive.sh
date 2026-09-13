@@ -25,34 +25,17 @@ mkdir -p "$out"
 (
 	cd "$tree"
 	printf '%s\n' LICENSE NOTICE README.md CHANGELOG.md VERSION
-	find assets doc docs lua plugin bin -type f -print
+	find doc lua plugin bin -type f -print
 ) | LC_ALL=C sort -u >"$list"
-
-# verify.sh proved the export's links; the tarball is a different file set, so
-# every local link in an archived .md must also name an archive member.
-# shellcheck source=lib/doc_links.sh
-source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/doc_links.sh"
-while IFS= read -r doc; do
-	while IFS= read -r target; do
-		grep -Fqx -- "$(doc_links_resolve "$doc" "$target")" "$list" \
-			|| { echo "archive: dead local link in $doc: $target" >&2; exit 1; }
-	done < <(doc_links_targets "$tree/$doc")
-done < <(grep -E '\.md$' "$list")
 
 # Archive modes come from the filesystem, so an accidental chmod between
 # export and build would ship silently (both comparison builds see the same
-# drifted mode). Enforce the Git mode shape while tolerating the checkout
-# umask's group-write bit, which tar normalizes away below. Executable
-# classes: bin launchers (bin/yana-*, bin/yanad) and overlay shell helpers
-# (bin/lib/yana-overlay/*.sh). Non-executable: bin/lib/yanad/*.py and every
-# other archive member.
+# drifted mode). Enforce the Git mode shape — the exact executable set is the
+# bin helpers and nothing else — while tolerating the checkout umask's
+# group-write bit, which tar normalizes away below.
 while IFS= read -r member; do
 	mode=$(stat -c %a "$tree/$member")
 	case $member in
-	bin/lib/yanad/*.py)
-		[[ "$mode" == 644 || "$mode" == 664 ]] \
-			|| { echo "archive: $member must be mode 644, found $mode" >&2; exit 1; }
-		;;
 	bin/*)
 		[[ "$mode" == 755 || "$mode" == 775 ]] \
 			|| { echo "archive: $member must be mode 755, found $mode" >&2; exit 1; }

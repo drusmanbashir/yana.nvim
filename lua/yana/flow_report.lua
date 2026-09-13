@@ -468,6 +468,15 @@ local function section_outcome(L, out)
       pc.stuck and " — **DESYNC**" or ""
     )
   end
+  if L.session_check then
+    local sc = L.session_check
+    out[#out + 1] = string.format(
+      "- session registry: row %s, transcript %s%s",
+      yes(sc.registry_row),
+      yes(sc.transcript),
+      sc.missing and " — **MISSING ROW**" or ""
+    )
+  end
   out[#out + 1] = ""
 end
 

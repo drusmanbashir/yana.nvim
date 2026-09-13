@@ -10,22 +10,15 @@ local function ui()
   return require("yana.ui")
 end
 
-local SETUP_MISSING_MSG = "yana.setup() has not run — load the plugin (lazy) or call setup()"
-
-local function require_setup()
-  if config.setup_done() then
-    return true
-  end
-  require("yana.notify").one_line(SETUP_MISSING_MSG, vim.log.levels.WARN)
-  return false
-end
-
--- Wraps a plain message so Neovim's own top-level uncaught-error formatter (interactive
--- :lua, init.lua sourcing, `-l` script execution -- all of them route an uncaught error
--- through it) renders a clean one-liner instead of a full Lua stack traceback. Lua's
--- debug.traceback, which that formatter calls internally, only appends "stack
--- traceback:" when the thrown value IS a plain string; a non-string, non-nil value is
--- returned untouched. __tostring/__concat keep the object reading as `msg` everywhere a
+-- Wraps a plain message so Neovim's own top-level uncaught-error formatter
+-- (interactive :lua, init.lua sourcing, `-l` script execution -- all of
+-- them route an uncaught error through it) renders a clean one-liner
+-- instead of a full Lua stack traceback. Lua's debug.traceback, which that
+-- formatter calls internally, only appends "stack traceback:" when the
+-- thrown value IS a plain string; a non-string, non-nil value is returned
+-- untouched. __tostring/__concat keep the object reading as `msg`
+-- everywhere a caller -- including a plugin manager's own pcall-and-report
+-- wrapper around setup() -- coerces it to text.
 local function clean_error(msg)
   return setmetatable({ message = msg }, {
     __tostring = function(self)
@@ -43,59 +36,141 @@ local function clean_error(msg)
   })
 end
 
--- THE COMPOSITION ROOT. The one place that decides which build of yana this
--- session is, and the only place allowed to load a debug module.
+-- Optional. Plugin works with defaults without calling setup().
+-- Global hunk navigation (`]x` / `[x`) is opt-in, and opting in must not COST
+-- the user the key. Yana owns it only for as long as it has a review to
+-- navigate; the rest of the time the press has to land wherever it would have
+-- landed if Yana had never mapped anything.
 --
--- `factory` -- the default, every user, every gate, every release -- takes the
--- early return below, so no `yana.debug_*` chunk is ever loaded into the
--- process and `package.loaded` proves it (`tests/yana_debug_profile_gate.sh`).
--- `debugger` is the SAME factory build with the modules named in
--- `config.debug_modules` attached on top; each one is `yana.debug_<name>` and
--- gets exactly one `attach(log)` call, with the factory logger handed to it so
--- its lines go into the SAME file, through the SAME append path, in event order.
+-- Neovim has one global mapping slot per lhs, so Yana's `vim.keymap.set`
+-- necessarily evicts whatever was there. The fallthrough is therefore two
+-- halves, and it needs both:
 --
--- Loading is separated from attaching on purpose: every module is resolved and
--- type-checked BEFORE any of them observes anything, so a misspelt name fails
--- setup with nothing half-attached behind it.
+--   1. `install_nav_map` snapshots (maparg dict form) the mapping it is about
+--      to evict, so the mapping that existed when Yana took the key can be put
+--      back. It re-snapshots on EVERY setup, and never records one of Yana's
+--      own mappings as the fallback, so a mapping installed after the first
+--      setup -- lazy.nvim orders plugins, not us -- is picked up the next time
+--      Yana takes the key rather than being lost to a capture-once.
+--   2. `stand_aside` resolves the press through the real mapping stack instead
+--      of replaying a remembered rhs: Yana's own mapping is deleted, the
+--      snapshot (if any) is mapset back, and the key is fed with `feedkeys`
+--      in remap mode. Buffer-local mappings, <buffer> ftplugin maps and
+--      anything installed after Yana all get their ordinary precedence, and
+--      with nothing mapped at all the key does its plain Neovim thing.
 --
--- The `yana.profile` row is written LAST, and it is the first line of the log:
--- it names the profile that is actually running and the modules that actually
--- attached, never the ones that were asked for. Evidence readers refuse a log
--- whose first line is not this one (`tests/headless/xrec/record.sh`).
-local function compose_profile()
-  local profile = config.options.profile
-  if profile ~= "debugger" then
-    log.lifecycle_info("yana.profile", { profile = profile, modules = {} })
-    return
-  end
-  local names, mods = config.options.debug_modules or {}, {}
-  for _, name in ipairs(names) do
-    local mod = "yana.debug_" .. name
-    local ok, loaded = pcall(require, mod)
-    if not ok then
-      error(clean_error("yana: config.debug_modules names " .. vim.inspect(name)
-        .. ", which does not load as `" .. mod .. "`: " .. tostring(loaded)))
-    end
-    if type(loaded) ~= "table" or type(loaded.attach) ~= "function" then
-      error(clean_error("yana: " .. mod .. " is not a debug module: it must return a table with "
-        .. "one `attach(log)` function"))
-    end
-    mods[#mods + 1] = loaded
-  end
-  for _, mod in ipairs(mods) do
-    mod.attach(log)
-  end
-  log.lifecycle_info("yana.profile", { profile = profile, modules = names })
+-- Recursion is not possible during the replay because Yana's mapping is not
+-- installed while the fed key is resolved; the `aside` flag covers the
+-- pathological case of a fallback that feeds the same key back at us, by
+-- replaying that one without remapping.
+--
+-- IDENTITY: "is the mapping I'm about to evict one of MINE?" is answered by
+-- object identity of the installed Lua function, never by reading `desc`.
+-- Two things break a description guess and neither is exotic: (a) `maparg()`
+-- resolves the CURRENT BUFFER's mapping first when one exists, so calling
+-- setup() while focused on a review buffer -- which owns a BUFFER-LOCAL
+-- `]x`/`[x` of its own, desc "yana: next hunk" -- silently substitutes that
+-- buffer-local mapping for the actual global one; and (b) nothing stops a
+-- user's own mapping from having a `desc` that happens to start with
+-- "yana:". `get_global_map` below reads only the global mapping table
+-- (`nvim_get_keymap`, which -- unlike `maparg()` -- never merges in a
+-- buffer-local shadow), and `entry.owned` is a set of the actual handler
+-- function objects Yana itself has ever installed for that lhs, so "is this
+-- mine" is answered by "did I put this exact function there", which is true
+-- for exactly the mappings Yana installed and nothing else, regardless of
+-- what any mapping's desc says.
+local nav_maps = {}
+
+local function nav_map_key(lhs)
+  return "n\0" .. lhs
 end
 
--- Validate Neovim version, apply config, wire keymaps/commands, log startup.
+--- The GLOBAL mapping for `lhs`, or nil. Deliberately not `maparg()`: maparg
+--- resolves the current buffer's mapping first when the buffer has one, so
+--- reading it while focused on a review buffer (which owns a buffer-local
+--- ]x/[x) returns the review's mapping instead of the real global one.
+--- `nvim_get_keymap` only ever lists global mappings, so it can't be fooled
+--- by whatever buffer happens to be current.
+local function get_global_map(lhs)
+  local want = vim.api.nvim_replace_termcodes(lhs, true, false, true)
+  for _, m in ipairs(vim.api.nvim_get_keymap("n")) do
+    if vim.api.nvim_replace_termcodes(m.lhs, true, false, true) == want then
+      return m
+    end
+  end
+  return nil
+end
+
+local function install_nav_map(lhs, desc, handler)
+  local key = nav_map_key(lhs)
+  local entry = nav_maps[key] or {}
+  entry.owned = entry.owned or {}
+  local prev = get_global_map(lhs)
+  if prev and entry.owned[prev.callback] then
+    -- Re-taking a key one of Yana's OWN previously-installed global
+    -- handlers still holds (a second setup() call, or Yana retaking the
+    -- key after standing aside): keep the fallback recorded the first
+    -- time rather than overwriting it with ourselves.
+    prev = entry.saved
+  else
+    entry.saved = prev
+  end
+  entry.owned[handler] = true
+  entry.aside = entry.aside or false
+  nav_maps[key] = entry
+  vim.keymap.set("n", lhs, handler, { silent = true, desc = desc })
+end
+
+local function stand_aside(lhs, desc, handler)
+  local entry = nav_maps[nav_map_key(lhs)] or {}
+  local keys = vim.api.nvim_replace_termcodes(lhs, true, false, true)
+  if entry.aside then
+    pcall(vim.api.nvim_feedkeys, keys, "nx", false)
+    return
+  end
+  entry.aside = true
+  pcall(vim.keymap.del, "n", lhs)
+  if entry.saved then
+    pcall(vim.fn.mapset, entry.saved)
+  end
+  local ok, err = pcall(vim.api.nvim_feedkeys, keys, "mtx", false)
+  entry.aside = false
+  -- Take the key back whatever happened, and re-snapshot while doing it: if
+  -- the fallback that just ran installed a new mapping, that is the one Yana
+  -- must stand aside to next time.
+  install_nav_map(lhs, desc, handler)
+  if not ok then
+    error(err, 0)
+  end
+end
+
+--- One opted-in global nav key. `direction` is "next" or "prev".
+local function set_nav_keymap(lhs, direction, desc)
+  local handler
+  handler = function()
+    log.guard("yana global keymap " .. direction .. "_hunk", function()
+      local ok, reason = require("yana.inline_diff").navigate_active_review(direction)
+      if not ok and reason == "no-review" then
+        stand_aside(lhs, desc, handler)
+      end
+    end)
+  end
+  install_nav_map(lhs, desc, handler)
+end
+
 function M.setup(opts)
   local deps = require("yana.dependencies")
   if vim.fn.has("nvim-" .. deps.minimum_neovim) == 0 then
-    -- Below the floor: refuse cleanly, not with a crash dump. Catch it, surface it once
-    -- on the real error channel, then re-raise via clean_error() so nothing downstream
-    -- decorates it -- setup() still genuinely does not return to an unprotected caller,
-    -- it just does so without the traceback. Nothing past this block runs.
+    -- Below the floor: refuse cleanly, not with a crash dump. The error()
+    -- call below is the single source of truth for the documented message
+    -- (tests/matrix_gate.sh's negative row greps it verbatim from this
+    -- file) but is caught right here instead of left to propagate:
+    -- Neovim always appends a full stack traceback to an uncaught PLAIN
+    -- STRING error reaching its own top-level handler, in every calling
+    -- context. Catch it, surface it once on the real error channel, then
+    -- re-raise via clean_error() so nothing downstream decorates it --
+    -- setup() still genuinely does not return to an unprotected caller, it
+    -- just does so without the traceback. Nothing past this block runs.
     local _, raw = pcall(function()
       error("yana requires Neovim " .. deps.minimum_neovim .. "+", 0)
     end)
@@ -105,24 +180,25 @@ function M.setup(opts)
   end
 
   config.setup(opts)
-  compose_profile()
 
-  -- Hand-authored setup{} values for write_roots etc. stay; this merges only the picker
-  -- keys.
-  pcall(function()
-    local persisted = require("yana.persisted_state")
-    persisted.apply_model_selection(config.options)
-    if persisted.apply_write_roots(config.options) then
-      config.options.write_roots = config.normalize_write_roots(config.options.write_roots)
-    end
-  end)
+  -- Warm per-vendor model catalogues in the background so \am / :YanaModel
+  -- never wait on a fresh CLI spawn after the first load. Skipped under the
+  -- hermetic test env (those rows stub list_models / assert argv themselves).
+  if not (vim.env.YANA_HERMETIC_ROOT and vim.env.YANA_HERMETIC_ROOT ~= "") then
+    vim.schedule(function()
+      pcall(function()
+        require("yana.agent").prefetch_model_lists()
+      end)
+    end)
+  end
 
-  -- One canonical STARTUP event: the resolved configuration this session actually runs
-  -- with, not what was declared. Reproduction needs the operator's exact environment
-  -- (which agent binary resolve_cmd() found on THIS machine's PATH, whether the overlay
-  -- sandbox is present) and that is never available after the fact, so this is the
-  -- logging-guidance case where logging WINS over re-deriving it. Read-only:
-  -- resolve_cmd/available are queries, not decisions, so this never changes what
+  -- One canonical STARTUP event: the resolved configuration this session
+  -- actually runs with, not what was declared. Reproduction needs the
+  -- operator's exact environment (which agent binary resolve_cmd() found on
+  -- THIS machine's PATH, whether the overlay sandbox is present) and that is
+  -- never available after the fact, so this is the logging-guidance case
+  -- where logging WINS over re-deriving it. Read-only: resolve_cmd/available
+  -- are queries, not decisions, so this never changes what setup() returns.
   do
     local ok_jail, jail_available = pcall(function()
       return require("yana.shadow.jail").available()
@@ -159,7 +235,6 @@ function M.setup(opts)
   -- final, so it lives here alongside global_keymaps below.
   if config.options.image_paste and config.options.image_paste.enable then
     vim.api.nvim_create_user_command("YanaPasteImage", function()
-      require("yana.recovery_entry").schedule(vim.fn.getcwd())
       log.guard("YanaPasteImage", function()
         M.paste_image()
       end)
@@ -168,7 +243,7 @@ function M.setup(opts)
     pcall(vim.api.nvim_del_user_command, "YanaPasteImage")
   end
 
-  local gk = config.options.mappings
+  local gk = config.options.global_keymaps or {}
   if gk.toggle and gk.toggle ~= "" then
     vim.keymap.set("n", gk.toggle, function()
       log.guard("yana global keymap toggle", function()
@@ -195,7 +270,9 @@ function M.setup(opts)
       end)
     end, { silent = true, desc = "yana: ask about selection" })
   end
-  -- Visual mode only: the selection IS the argument.
+  -- Inline edit is visual-first: the selection IS the argument, so the visual
+  -- map is the primary one and the normal-mode map (current line) is opt-in
+  -- under its own key. See config.global_keymaps for why they are separate.
   if gk.inline_edit and gk.inline_edit ~= "" then
     vim.keymap.set("x", gk.inline_edit, function()
       log.guard("yana global keymap inline_edit (visual)", function()
@@ -203,34 +280,45 @@ function M.setup(opts)
       end)
     end, { silent = true, desc = "yana: inline edit selection" })
   end
+  if gk.inline_edit_normal and gk.inline_edit_normal ~= "" then
+    vim.keymap.set("n", gk.inline_edit_normal, function()
+      log.guard("yana global keymap inline_edit (line)", function()
+        require("yana.inline_edit").open_line()
+      end)
+    end, { silent = true, desc = "yana: inline edit current line" })
+  end
+  if gk.next_hunk and gk.next_hunk ~= "" then
+    set_nav_keymap(gk.next_hunk, "next", "yana: next review hunk")
+  end
+  if gk.prev_hunk and gk.prev_hunk ~= "" then
+    set_nav_keymap(gk.prev_hunk, "prev", "yana: previous review hunk")
+  end
 
-  -- Capture set empty → one-line notify naming :YanaRoots (never a window). Deferred so
-  -- setup() itself stays non-blocking.
+  -- Crash recovery runs on startup, deferred so it never delays `setup`, and
+  -- guarded so a recovery failure cannot cost the user their editor. It is a
+  -- read followed by a decision: the claim of every retained turn is inspected
+  -- before anything is cleaned up.
   vim.schedule(function()
-    log.guard("yana capture-set empty notify", function()
-      require("yana.ui_roots").maybe_notify_on_empty()
+    log.guard("yana turn resume", function()
+      M.resume_turns()
     end)
   end)
 
   return config.options
 end
 
--- Open the yana panel, creating it if none exists.
 function M.open()
   ui().open()
 end
 
--- Close every open yana panel.
 function M.close()
   ui().close()
 end
 
--- Toggle the yana panel open or closed.
 function M.toggle()
   ui().toggle()
 end
 
--- Start a new chat in the current panel, cancelling any in-flight turn.
 function M.new_chat()
   ui().new_chat()
 end
@@ -240,15 +328,7 @@ function M.new_panel()
   ui().open_new_panel()
 end
 
-function M.next_panel()
-  ui().next_panel()
-end
-
-function M.prev_panel()
-  ui().prev_panel()
-end
-
--- Permanently stop and remove the associated panel (cursor panel, else MRU/open).
+-- Permanently stop and remove the panel containing the current buffer.
 function M.quit_current()
   return ui().quit_current()
 end
@@ -258,27 +338,36 @@ function M.quit_all()
   return ui().quit_all()
 end
 
--- List attachable sessions owned by the live daemon.
+-- Pick a previous session to view/resume. opts.new_panel opens it in a
+-- fresh panel so several sessions can run side by side.
 function M.sessions(opts)
-  return ui().list_live_sessions(opts)
+  ui().pick_session(opts)
 end
 
--- Recover one daemon-kept review, or reopen the recovery picker with no id.
-function M.recover(id)
-  return ui().recover(id)
+-- Resume the most recent session for this cwd (or a specific session id).
+function M.resume(id, opts)
+  ui().resume_last(id, opts)
 end
 
--- Cycle the panel's mode, renewing the session if it's locked.
+-- Recover the turns a crash left behind.
+--
+-- This is the PRODUCTION resume path, not a simulation of one: it runs on the
+-- shipping startup path, and the ordering it returns is the ordering that
+-- really ran. Every retained turn's claim is INSPECTED first; cleanup only
+-- touches what the inspection reported as released, so a review that was open
+-- when the editor died still has its claim and its state when it comes back.
+function M.resume_turns(opts)
+  return require("yana.turn_lifecycle").resume_turn(opts)
+end
+
 function M.toggle_mode()
   ui().toggle_mode()
 end
 
--- Open a picker to choose the model for the current backend.
 function M.pick_model()
   ui().pick_model()
 end
 
--- Open a picker to switch backend for this Neovim session.
 function M.pick_backend()
   ui().pick_backend()
 end
@@ -289,27 +378,22 @@ function M.pick_vendor_then_model()
   ui().pick_vendor_then_model()
 end
 
--- Show this session's file changes as a side-by-side diff.
 function M.show_changes()
   ui().show_changes()
 end
 
--- Pick a pending change and open its inline review.
 function M.review_changes()
   ui().review_changes()
 end
 
--- Pick a pending change and accept it.
 function M.accept_changes()
   ui().accept_changes()
 end
 
--- Pick a pending change and reject it.
 function M.reject_changes()
   ui().reject_changes()
 end
 
--- Cancel the in-flight agent turn, or report there's nothing to stop.
 function M.stop()
   ui().stop()
 end
@@ -336,7 +420,6 @@ function M.paste_image()
   ui().paste_image()
 end
 
--- Open the live playground for inline diff-highlight themes.
 function M.diff_themes()
   require("yana.diff_preview").open()
 end
@@ -344,9 +427,6 @@ end
 -- Ask about an explicit line range in a buffer.
 -- buf 0 means current buffer. question may be nil (just attach context).
 function M.ask_range(buf, l1, l2, question)
-  if not require_setup() then
-    return
-  end
   local context = require("yana.context")
   if buf == 0 then
     buf = vim.api.nvim_get_current_buf()
@@ -357,18 +437,12 @@ end
 
 -- Ask with no explicit selection (uses current file as context).
 function M.ask(question)
-  if not require_setup() then
-    return
-  end
   ui().ask(nil, question)
 end
 
 -- Inline edit ("Ctrl-K") over an explicit line range. buf 0 means current
 -- buffer. instruction may be nil, in which case the instruction float opens.
 function M.edit_range(buf, l1, l2, instruction)
-  if not require_setup() then
-    return
-  end
   require("yana.inline_edit").open(buf, l1, l2, instruction)
 end
 

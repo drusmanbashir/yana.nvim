@@ -12,10 +12,16 @@
 -- touched by the migration.
 local M = {}
 
+local EXPECTED_PRODUCER = "yana-changeset-v1"
+
 local diff = require("yana.diff")
-local control_plane = require("yana.safety.control_plane")
-local log = require("yana.log")
+local config = require("yana.config")
 local hash = require("yana.safety.hash")
+local control_plane = require("yana.safety.control_plane")
+local claim_identity = require("yana.claim_identity")
+local log = require("yana.log")
+local manifest = require("yana.manifest")
+local uv = vim.uv or vim.loop
 
 M._test = {
 	fault = {},
@@ -100,31 +106,881 @@ function M.record_control_plane_refusals(scope, typed)
 	return cp_count
 end
 
--- Test-only: clear the per-scope control-plane WARN dedup cache.
 function M._test.reset_control_plane_warn_recorded()
 	control_plane_warn_recorded = {}
 end
 
+local function changeset_bin()
+	local src = debug.getinfo(1, "S").source:sub(2)
+	local repo = src:gsub("/lua/yana/shadow/ops%.lua$", "")
+	return repo .. "/bin/yana-changeset"
+end
 
-local ops_decode = require("yana.shadow.ops_decode")
-M.decode = ops_decode.decode
-M.read_records = ops_decode.read_records
-M.typed_ops = ops_decode.typed_ops
-M.session_roots = ops_decode.session_roots
-M.typed_ops_from_session = ops_decode.typed_ops_from_session
-M._test.repo_root_for = ops_decode._test.repo_root_for
+--- Decode the producer's stdout.
+---
+--- Wire format (bin/yana-changeset `encode_record`): the fields of one
+--- record joined by a single NUL, then TWO NULs. Splitting the stream on NUL
+--- therefore yields the fields followed by one empty piece per record, and an
+--- empty piece is the record terminator. Fields are raw bytes: a path may hold
+--- anything but NUL, which is why this is not a line protocol.
+function M.decode(data)
+	local records = {}
+	local fields = {}
+	local pos = 1
+	local n = #data
+	while pos <= n + 1 do
+		local nul = data:find("\0", pos, true)
+		if not nul then
+			break
+		end
+		local chunk = data:sub(pos, nul - 1)
+		pos = nul + 1
+		if chunk == "" then
+			if #fields > 0 then
+				records[#records + 1] = fields
+				fields = {}
+			end
+		else
+			fields[#fields + 1] = chunk
+		end
+	end
+	if #fields > 0 then
+		records[#records + 1] = fields
+	end
+	return records
+end
 
-local count_rel_ops = ops_decode.count_rel_ops
-local reviewable = ops_decode.reviewable
-local rel_op_key = ops_decode.rel_op_key
-local walks_for_session = ops_decode.walks_for_session
+--- Run the producer over one turn's upper layer.
+--- Returns a list of records, each `{ kind, rel, extra... }`.
+function M.read_records(workspace, upper)
+	local bin = changeset_bin()
+	if vim.fn.filereadable(bin) ~= 1 then
+		return nil, "yana-changeset not found at " .. bin
+	end
+	if vim.fn.isdirectory(upper) ~= 1 then
+		-- No upper layer means no confined turn ran. That is not "no changes":
+		-- refuse rather than report a clean turn on missing evidence.
+		return nil, "no overlay upper layer at " .. tostring(upper)
+	end
+	local meta_out = vim.fn.fnamemodify(upper, ":h") .. "/changeset.meta"
+	local result = vim.system({
+		bin,
+		"--workspace",
+		workspace,
+		"--upper",
+		upper,
+		"--meta-out",
+		meta_out,
+	}, { text = false }):wait()
+	if result.code ~= 0 then
+		local err = (result.stderr or "")
+		if type(err) ~= "string" then
+			err = ""
+		end
+		err = err:gsub("%s+$", "")
+		return nil, err ~= "" and err or ("yana-changeset failed (exit " .. tostring(result.code) .. ")")
+	end
+	local declared
+	if vim.fn.filereadable(meta_out) == 1 then
+		for _, line in ipairs(vim.fn.readfile(meta_out)) do
+			declared = declared or line:match("^#%s*(%S+)")
+		end
+	end
+	if declared ~= EXPECTED_PRODUCER then
+		return nil, "refusing a change set from an unknown producer: " .. tostring(declared)
+	end
+	return M.decode(result.stdout or "")
+end
 
-local ops_artifacts = require("yana.shadow.ops_artifacts")
-ops_artifacts.count_rel_ops = count_rel_ops
-ops_artifacts.reviewable = reviewable
-ops_artifacts.rel_op_key = rel_op_key
+--- Which typed operations the review payload can carry today.
+---
+--- The payload schema is whole-file content: `modify` (create or rewrite) and
+--- `delete`. Mode bits, symlink targets, directory creation and overlay opaque
+--- markers are real typed operations that the producer reports and the review
+--- surface has no representation for. They are NOT dropped silently — the
+--- manifest route could not even see them — they are carried into the report
+--- and named, so the gap is visible rather than invented away.
+local CONTENT_KINDS = {
+	create = true,
+	modify = true,
+	delete = true,
+}
 
-M.classify_artifacts = ops_artifacts.classify_artifacts
+--- ...and of those, only the ones whose object is a REGULAR FILE.
+---
+--- The producer tags every record with the kind of the object the operation
+--- acts on: the upper entry for a create or a modify, the lower object for a
+--- delete. A `create dir`, a `create symlink` and a whiteout over a directory
+--- are content-kind records with no whole-file content, so they belong in the
+--- report beside mode changes, not in the review. `create symlink` used to slip
+--- through this filter, be reviewed as a file, and take the symlink's TARGET
+--- bytes as its "after".
+local function reviewable(op)
+	return CONTENT_KINDS[op.kind] and op.detail == "file"
+end
+
+--- How many non-control-plane typed operations landed on each path, within
+--- ONE root's walk.
+---
+--- `bin/yana-changeset` `compare_path` only ever emits more than one record
+--- for the same `rel` in one shape: `upper_kind ~= lower_kind` — a file-type
+--- change, which pairs a `delete` of the old object with a `create` of the
+--- new one (never a rename: a rename's two records sit at TWO different
+--- rels, the disappearing and the appearing path — see the rename
+--- invariant). A count above 1 is therefore the producer's own signal that
+--- these operations are only meaningful together, independent of what kind
+--- either one carries.
+--- Keyed by (root, rel), never `rel` alone: `unreviewable_ops` is handed the
+--- FLATTENED, all-roots `typed` list `changes_from_session` returns, and two
+--- different roots holding a same-named path (the collision
+--- `changes_from_session`'s own docstring names) must never pair across that
+--- boundary. `classify_artifacts` calls this once per root's own `typed`
+--- slice, where every op already shares one root, so the key degrades to
+--- plain `rel` there with the same result either way.
+local function count_rel_ops(typed)
+	local counts = {}
+	for _, op in ipairs(typed or {}) do
+		if not op.control_plane then
+			local key = tostring(op.root_index or op.root or "") .. "\0" .. op.rel
+			counts[key] = (counts[key] or 0) + 1
+		end
+	end
+	return counts
+end
+
+local function rel_op_key(op)
+	return tostring(op.root_index or op.root or "") .. "\0" .. op.rel
+end
+
+--- Why a paired op is withheld — shared by `classify_artifacts` (which
+--- withholds it from `changes`) and `unreviewable_ops` (which names it),
+--- so the two never drift apart on which halves are paired.
+local PAIRED_REFUSAL_REASON = "part of a paired filesystem change (file-type "
+	.. "change) — the matching half has no applier route, so neither half is "
+	.. "offered as an independent review decision"
+
+--- Turn decoded records into typed operations with absolute paths.
+function M.typed_ops(workspace, upper)
+	local records, err = M.read_records(workspace, upper)
+	if not records then
+		return nil, err
+	end
+	-- WHEN the producer's classifying read ran. `M.read_records` just spawned
+	-- `bin/yana-changeset`, which lstats/reads the LOWER layer synchronously and
+	-- returns; the producer itself stamps no time, so this is the tightest
+	-- capture-time proxy available without changing that wire format — taken
+	-- immediately after the subprocess returns, an upper bound on the read time
+	-- that is off by at most the subprocess's own runtime. This is the field a
+	-- stale-file refusal needs to tell a human edit from a stale capture, and
+	-- today nothing upstream of this line records it at all.
+	local base_hash_captured_ts = os.time()
+	local ops = {}
+	-- Proven once: a bare-repository workspace exposes control-plane files at its
+	-- root with no `.git` segment. Independent of the producer.
+	local ws_bare = control_plane.workspace_is_bare(workspace)
+	for _, rec in ipairs(records) do
+		local kind, rel = rec[1], rec[2]
+		if kind and rel and (control_plane.is_control_plane(rel) or (ws_bare and control_plane.is_bare_entry(rel))) then
+			-- Control-plane refusal at the consumer, INDEPENDENT of the producer
+			-- (defense in depth). Even a forged or older producer
+			-- that emitted `create file .git/objects/…` cannot make it reviewable:
+			-- the kind is forced to the non-content `control-plane`, so
+			-- `reviewable()` is false and `changes_from_session` never offers it.
+			-- The path is still carried in `typed` (with its original kind kept)
+			-- so the turn report can count it — recorded, never offered.
+			ops[#ops + 1] = {
+				kind = "control-plane",
+				original_kind = kind,
+				rel = rel,
+				path = workspace .. "/" .. rel,
+				detail = rec[3],
+				extra = rec[4],
+				control_plane = true,
+			}
+		elseif kind and rel then
+			-- Trailing `key=value` fields are the producer's before-EVIDENCE for a
+			-- whole-file content operation, taken by the same observation that
+			-- classified it. They are carried verbatim; nothing downstream may
+			-- re-derive them from a later look at the real tree.
+			local evidence = nil
+			for i = 5, #rec do
+				-- Word keys, plus ONE hyphenated key by name. The producer's
+				-- compound-operation field is spelled `new-mode`, and `[%w_]+`
+				-- could never match it, so the after-mode of a `chmod+modify`
+				-- was parsed away here and BOTH readers of `ev["new-mode"]`
+				-- were dead code. Admitting hyphens generally would have let
+				-- `-` and `a--b` through as silently-ignored keys, so the one
+				-- field that needs one is named instead.
+				local key, value = rec[i]:match("^([%w_]+)=(.*)$")
+				if not key then
+					key, value = rec[i]:match("^(new%-mode)=(.*)$")
+				end
+				if key then
+					evidence = evidence or {}
+					evidence[key] = value
+				end
+			end
+			ops[#ops + 1] = {
+				kind = kind,
+				rel = rel,
+				path = workspace .. "/" .. rel,
+				detail = rec[3],
+				extra = rec[4],
+				base_evidence = evidence,
+				base_hash_captured_ts = base_hash_captured_ts,
+			}
+		end
+	end
+	table.sort(ops, function(a, b)
+		if a.rel == b.rel then
+			return a.kind < b.kind
+		end
+		return a.rel < b.rel
+	end)
+	return ops
+end
+
+local function upper_dir(session)
+	if session.upper_dir then
+		return session.upper_dir
+	end
+	if session.layer_dir then
+		return session.layer_dir .. "/upper"
+	end
+	return nil
+end
+
+--- Every root this turn wrote, in claim order, whatever shape the session is in.
+---
+--- A session from `preview.begin_turn` carries `roots`; a session built by hand
+--- -- the headless rows, the recovery paths and every caller that predates
+--- operator-declared write roots do exactly that -- carries only the primary's
+--- aliases. Both answer here, so a single-root turn reaches the identical code
+--- path either way and no caller has to know which shape it holds.
+function M.session_roots(session)
+	if type(session) ~= "table" then
+		return {}
+	end
+	if type(session.roots) == "table" and #session.roots > 0 then
+		return session.roots
+	end
+	local layer = session.layer_dir
+	return {
+		{
+			index = 1,
+			primary = true,
+			workspace = session.workspace,
+			layer_dir = layer,
+			upper_dir = upper_dir(session),
+			work_dir = layer and (layer .. "/work") or nil,
+			claim_dir = session.claim_dir,
+			nonce = session.nonce or "",
+		},
+	}
+end
+
+--- The upper layer of one root, however the root was built.
+local function root_upper(root)
+	if not root then
+		return nil
+	end
+	if root.upper_dir and root.upper_dir ~= "" then
+		return root.upper_dir
+	end
+	if root.layer_dir and root.layer_dir ~= "" then
+		return root.layer_dir .. "/upper"
+	end
+	return nil
+end
+
+--- The base a root's upper layer is keyed by.
+---
+--- WI-4: with a BROAD ROOT the turn has ONE overlay, mounted at an ancestor of
+--- the workspace, so every relative path in its upper is relative to THAT
+--- directory -- not to the workspace. Without one it is the workspace, which
+--- is byte-for-byte what this walk has always used.
+local function walk_base(session, root)
+	local primary = root and (root.primary == true or (root.index or 1) == 1)
+	if primary and session then
+		local broad = session.broad_root
+		if type(broad) == "string" and broad ~= "" then
+			return broad
+		end
+	end
+	return root and root.workspace or nil
+end
+
+--- WHICH REPOSITORY A TOUCHED PATH BELONGS TO.
+---
+--- Computed FROM THE WALK, never declared before the turn (PLAN-R1-capture.md
+--- §1): the nearest `.git` root at or above the path, bounded by the broad
+--- root. `.git` is a directory in an ordinary clone and a file in a worktree
+--- or submodule; `claim_identity.git_root` is the single implementation both
+--- this and claim identity ask, so a hunk can never be grouped under one
+--- repository and claimed under another.
+---
+--- With no repository above it the answer is the operator-visible unit that
+--- still exists: the turn's own workspace when the path is inside it,
+--- otherwise the outermost directory below the broad root that contains it
+--- (`~/code/newthing` for `~/code/newthing/a/b.txt`) -- the same "nearest
+--- repository, else the containing project" shape `jail.declarable_write_root`
+--- already uses for a refusal remedy.
+local function repo_root_for(abs, base, workspace)
+	if type(abs) ~= "string" or abs == "" then
+		return workspace or base
+	end
+	local dir = abs
+	if vim.fn.isdirectory(abs) ~= 1 then
+		dir = vim.fn.fnamemodify(abs, ":h")
+	end
+	local git = claim_identity.git_root(dir, base)
+	if git then
+		return git
+	end
+	if workspace and workspace ~= "" and (dir == workspace or dir:sub(1, #workspace + 1) == workspace .. "/") then
+		return workspace
+	end
+	if base and base ~= "" and dir ~= base and dir:sub(1, #base + 1) == base .. "/" then
+		local first = dir:sub(#base + 2):match("^([^/]+)")
+		if first then
+			return base .. "/" .. first
+		end
+	end
+	return base or dir
+end
+
+--- ONE WALK, REGROUPED BY TOUCHED REPOSITORY.
+---
+--- Returns a list of `{ root, upper, typed }`, one entry per repository the
+--- walk actually found something in, the turn's own workspace first and the
+--- rest in path order. Each `root` is the same descriptor shape
+--- `changes_for_root` has always been handed; `root.upper_prefix` is the
+--- repository's path relative to the upper layer's own base, which is what
+--- keeps `rel` repository-relative while the bytes are still read out of the
+--- one upper.
+---
+--- A turn with no broad root produces exactly one group, containing exactly
+--- the operations `typed_ops(workspace, upper)` has always produced, with the
+--- same `rel` values and the same index -- so a single-repository turn reaches
+--- identical code with identical results.
+local function walks_for_session(session)
+	local walks = {}
+	for _, root in ipairs(M.session_roots(session)) do
+		local upper = root_upper(root)
+		if not upper then
+			return nil, "turn has no overlay upper layer"
+		end
+		local base = walk_base(session, root)
+		local typed, err = M.typed_ops(base, upper)
+		if not typed then
+			return nil, err or "reading the change set failed"
+		end
+		if base == root.workspace then
+			-- Unchanged shape: one group, the root exactly as it was built.
+			for _, op in ipairs(typed) do
+				op.upper_rel = op.rel
+				op.root = root.workspace
+				op.root_index = root.index or 1
+			end
+			walks[#walks + 1] = {
+				root = {
+					index = root.index or 1,
+					primary = root.primary,
+					workspace = root.workspace,
+					upper_prefix = "",
+					claim_dir = root.claim_dir,
+				},
+				upper = upper,
+				typed = typed,
+			}
+		else
+			local groups, order = {}, {}
+			for _, op in ipairs(typed) do
+				local repo = repo_root_for(op.path, base, root.workspace)
+				local bucket = groups[repo]
+				if not bucket then
+					bucket = {}
+					groups[repo] = bucket
+					order[#order + 1] = repo
+				end
+				op.upper_rel = op.rel
+				-- `rel` is now relative to the operation's OWN repository, which
+				-- is what makes it unambiguous on the review surface and what the
+				-- journal for that repository is keyed by.
+				if op.path == repo then
+					op.rel = vim.fn.fnamemodify(op.path, ":t")
+				elseif op.path:sub(1, #repo + 1) == repo .. "/" then
+					op.rel = op.path:sub(#repo + 2)
+				end
+				bucket[#bucket + 1] = op
+			end
+			table.sort(order)
+			-- The turn's own workspace is always index 1 when it was touched, so
+			-- every change id a single-repository turn has ever minted is
+			-- unchanged; the other repositories take 2..N in path order.
+			local indexed = {}
+			local next_index = 2
+			for _, repo in ipairs(order) do
+				if repo == root.workspace then
+					indexed[repo] = 1
+				else
+					indexed[repo] = next_index
+					next_index = next_index + 1
+				end
+			end
+			local ordered = {}
+			for _, repo in ipairs(order) do
+				ordered[#ordered + 1] = repo
+			end
+			table.sort(ordered, function(a, b)
+				return indexed[a] < indexed[b]
+			end)
+			for _, repo in ipairs(ordered) do
+				local prefix = ""
+				if repo ~= base and repo:sub(1, #base + 1) == base .. "/" then
+					prefix = repo:sub(#base + 2)
+				end
+				for _, op in ipairs(groups[repo]) do
+					op.root = repo
+					op.root_index = indexed[repo]
+				end
+				walks[#walks + 1] = {
+					root = {
+						index = indexed[repo],
+						primary = repo == root.workspace,
+						workspace = repo,
+						upper_prefix = prefix,
+						claim_dir = repo == root.workspace and root.claim_dir or nil,
+					},
+					upper = upper,
+					typed = groups[repo],
+				}
+			end
+		end
+	end
+	return walks
+end
+
+M._test.repo_root_for = repo_root_for
+
+--- The typed operations of EVERY repository a turn wrote, each tagged with the
+--- repository it belongs to. Groups come first in index order, operations
+--- within a group in the order `typed_ops` already sorts them, so the report
+--- is deterministic.
+function M.typed_ops_from_session(session)
+	local walks, err = walks_for_session(session)
+	if not walks then
+		return nil, err
+	end
+	local out = {}
+	for _, walk in ipairs(walks) do
+		for _, op in ipairs(walk.typed) do
+			out[#out + 1] = op
+		end
+	end
+	return out
+end
+
+local function read_tree_bytes(root, rel)
+	local path = root .. "/" .. rel
+	if vim.fn.filereadable(path) ~= 1 then
+		return nil
+	end
+	return diff.read_file_bytes(path)
+end
+
+local function contains_nul(bytes)
+	return type(bytes) == "string" and bytes:find("\0", 1, true) ~= nil
+end
+
+--- The lower layer's TAGGED before-state for one touched path.
+---
+--- The before-state is "absent" or "a regular file with these bytes", and those
+--- are the only two the applier can act on. Mapping anything else onto the empty
+--- fingerprint — which is what `read_tree_bytes` returning nil used to mean —
+--- made a present-but-unreadable file indistinguishable from nothing-there, so
+--- an accepted deletion of it passed its check with an empty displaced copy and
+--- destroyed every byte. It also made an absent create target indistinguishable
+--- from a human-created empty file.
+---
+--- Anything present that is not a regular file refuses here rather than at
+--- accept: the applier's `resolve_target` rejects a symlink component including
+--- the final one, so a review built over such a path could only ever end in a
+--- refusal, and the honest place to say so is before the hunks are drawn.
+local function lower_state(path)
+	local st = uv.fs_lstat(path)
+	if not st then
+		return { kind = "absent" }
+	end
+	if st.type ~= "file" then
+		return nil,
+			path
+				.. ": the real path is a "
+				.. tostring(st.type)
+				.. ", not a regular file — refusing to review a whole-file change over it"
+	end
+	local content = diff.read_file_bytes(path)
+	if content == nil then
+		return nil,
+			path
+				.. ": the real file exists but could not be read, so the change has no before-state"
+				.. " to be reviewed or checked against — refusing"
+	end
+	return { kind = "file", bytes = content, hash = hash.hash_bytes(content), mode = st.mode }
+end
+
+local function mode_perm(mode)
+	return mode and (mode % 4096) or nil
+end
+
+local function mode_octal(mode)
+	if not mode then
+		return "?"
+	end
+	return string.format("%o", mode_perm(mode))
+end
+
+local function review_kind(op, ev)
+	if op.kind == "delete" then
+		return "delete"
+	end
+	if ev.kind == "absent" then
+		return "create"
+	end
+	return "modify"
+end
+
+--- The mode an inline accept installs, or nil to leave the target's alone.
+---
+--- This used to stat the overlay upper for ANY operation and hand the result to
+--- `shadow/apply.lua`, which passes it to the diary as `target_mode`. That is
+--- the same defect as the CLI applier's: a content-only edit carries no mode
+--- decision, so an accept that installs a mode read off the agent's copy is a
+--- chmod nobody proposed or reviewed. Copy-up usually makes that mode equal to
+--- the target's, which hides it — but "usually equal" is not the contract, and
+--- an agent that replaces a file rather than rewriting it (unlink-and-create,
+--- what `sed -i` and `mv` do) leaves an upper object created under the agent's
+--- umask, whose mode is then installed over the real file.
+---
+--- So: a mode is returned only when the producer DECLARED one.
+---   * `new-mode` is the producer's compound-operation field, appended to the
+---     record when the mode changed as well as the bytes. It is the only thing
+---     that makes a `chmod+modify` one whole decision, and dropping it would be
+---     the half-acceptance `the filesystem operations contract` forbids. A
+---     value that will not parse, or one outside the permission range, is not a
+---     declaration and does not become one.
+---   * A CREATE has no target whose mode could survive, so the upper object
+---     remains the only provenance there. `state=absent` is the producer's tag
+---     for exactly that case.
+---   * Everything else returns nil, and the journaled applier reads the real
+---     target immediately before the write (`safety/diary.lua`).
+local function after_mode_for(upper, op)
+	local ev = op.base_evidence
+	if type(ev) == "table" and ev["new-mode"] then
+		local parsed = tonumber(ev["new-mode"], 8)
+		if parsed and parsed == math.floor(parsed) and parsed >= 0 and parsed <= 4095 then
+			return parsed
+		end
+		return nil
+	end
+	if op.kind == "delete" then
+		return nil
+	end
+	if type(ev) ~= "table" or ev.state ~= "absent" then
+		return nil
+	end
+	if not upper then
+		return nil
+	end
+	-- `op.rel` is relative to the operation's own REPOSITORY once the walk has
+	-- been regrouped; `op.upper_rel` is the one the upper layer is keyed by.
+	local path = upper .. "/" .. (op.upper_rel or op.rel)
+	local st = uv.fs_lstat(path)
+	if st and st.type == "file" then
+		return mode_perm(st.mode)
+	end
+	return nil
+end
+
+--- The producer's before-EVIDENCE for one operation, read out of the record.
+---
+--- Nothing here observes the real tree. State, mode and fingerprint were taken
+--- by the read that CLASSIFIED the operation, they travel on the record, and
+--- this route's job is to carry them to the applier unchanged. Observing the
+--- workspace again to build them — which is what this function replaced — puts
+--- a window between classification and evidence, and a file created in that
+--- window becomes the recorded before-state of a change prepared against its
+--- absence. Absence and an empty file share the empty fingerprint, so the
+--- accept-time recheck then matches and the human's new file is overwritten.
+---
+--- Missing or malformed fields refuse by name. A record with no tag, or a file
+--- tag with no mode, cannot be compared at accept time, and the honest place to
+--- say so is before the hunks are drawn.
+local function evidence_from_op(op)
+	local fp = op.extra
+	if type(fp) ~= "string" or #fp ~= 64 or not fp:match("^%x+$") then
+		return nil,
+			op.path .. ": the change set carries no before-fingerprint for this " .. tostring(op.kind) .. " — refusing"
+	end
+	local ev = op.base_evidence
+	if type(ev) ~= "table" or ev.state == nil then
+		return nil,
+			op.path
+				.. ": the change set carries no recorded before-state for this "
+				.. tostring(op.kind)
+				.. ", so whether the real file is the one it was prepared against cannot be judged — refusing."
+				.. " Re-run the turn to produce evidence for it"
+	end
+	if ev.state == "absent" then
+		return { kind = "absent", hash = fp }
+	end
+	if ev.state == "file" then
+		local mode = tonumber(ev.mode or "", 8)
+		if not mode then
+			return nil,
+				op.path
+					.. ": the change set records a file before-state with no mode for it, so a mode-only human change"
+					.. " cannot be seen — refusing"
+		end
+		return { kind = "file", hash = fp, mode = mode }
+	end
+	return nil,
+		op.path
+			.. ": the real path is a "
+			.. tostring(ev.state == "link" and "symlink" or (ev.kind or ev.state))
+			.. ", not a regular file — refusing to review a whole-file change over it"
+end
+
+--- Cross-check the record against the tree as it is NOW — and only that.
+---
+--- The review needs the before-BYTES to draw hunks, so the lower layer is read
+--- here whatever happens. That later read may agree with the record or refuse
+--- it; it may never become the record. A mismatch is exactly the case this
+--- route exists to catch — the human saved between the producer's classifying
+--- read and the review — and it is a named refusal, not a re-basing.
+local function cross_check(path, ev)
+	local state, serr = lower_state(path)
+	if not state then
+		return nil, serr
+	end
+	if state.kind ~= ev.kind then
+		if ev.kind == "absent" then
+			return nil,
+				path
+					.. ": this file did not exist when the change set was produced and something has created it since"
+					.. " — refusing to review a change that would overwrite it"
+		end
+		return nil,
+			path
+				.. ": this file existed when the change set was produced and has been removed since"
+				.. " — refusing; re-run the turn to decide against the current tree"
+	end
+	if ev.kind == "absent" then
+		return state
+	end
+	if mode_perm(state.mode) ~= mode_perm(ev.mode) then
+		return nil,
+			path
+				.. ": this file's mode differs from the copy the change set was produced against"
+				.. " — refusing; both versions are kept"
+	end
+	if state.hash ~= ev.hash then
+		return nil,
+			path
+				.. ": this file differs from the copy the change set was produced against — your edit landed"
+				.. " between the agent's turn and this review; both versions are kept, re-run the turn to"
+				.. " diff against your current file"
+	end
+	return state
+end
+
+local PRODUCT_ARTIFACT_COMPONENTS = {
+	["node_modules"] = true,
+	["target"] = true,
+	["__pycache__"] = true,
+	["build"] = true,
+	["dist"] = true,
+	[".venv"] = true,
+	["CMakeFiles"] = true,
+	[".cache"] = true,
+	[".gradle"] = true,
+	["zig-out"] = true,
+}
+
+local function artifact_component_kind(component)
+	if PRODUCT_ARTIFACT_COMPONENTS[component] or component:match("%.egg%-info$") then
+		return "product"
+	end
+	for _, configured in ipairs(config.options.artifact_dir_prefixes or {}) do
+		local lua_pattern = { "^" }
+		for i = 1, #configured do
+			local char = configured:sub(i, i)
+			if char == "*" then
+				lua_pattern[#lua_pattern + 1] = ".*"
+			elseif char == "?" then
+				lua_pattern[#lua_pattern + 1] = "."
+			elseif char:match("[%^%$%(%)%%%.%[%]%+%-]") then
+				lua_pattern[#lua_pattern + 1] = "%" .. char
+			else
+				lua_pattern[#lua_pattern + 1] = char
+			end
+		end
+		lua_pattern[#lua_pattern + 1] = "$"
+		if component:match(table.concat(lua_pattern)) then
+			return "operator"
+		end
+	end
+	return nil
+end
+
+local function named_artifact_root(rel)
+	local prefix = {}
+	for component in rel:gmatch("[^/]+") do
+		prefix[#prefix + 1] = component
+		local kind = artifact_component_kind(component)
+		if kind then
+			return table.concat(prefix, "/"), kind
+		end
+	end
+	return nil
+end
+
+local function tracked_at_or_below(tracked, rel)
+	for path in pairs((tracked and tracked.paths) or {}) do
+		if path == rel or path:sub(1, #rel + 1) == rel .. "/" then
+			return true
+		end
+	end
+	return false
+end
+
+local function inside_submodule(tracked, rel)
+	for root in pairs((tracked and tracked.submodules) or {}) do
+		if rel == root or rel:sub(1, #root + 1) == root .. "/" then
+			return true
+		end
+	end
+	return false
+end
+
+--- Pure artifact/refusal classification. Filesystem and Git evidence are
+--- captured by the caller before the agent runs; this function only combines
+--- those facts with the producer's per-op base evidence.
+function M.classify_artifacts(typed, changes, _base_evidence, tracked)
+	tracked = tracked or { status = "unavailable", paths = {} }
+	local virgin = {}
+	for _, op in ipairs(typed or {}) do
+		if op.kind == "create"
+			and op.detail == "dir"
+			and op.base_evidence
+			and op.base_evidence.state == "absent"
+		then
+			virgin[#virgin + 1] = op.rel
+		end
+	end
+	table.sort(virgin, function(a, b)
+		return #a < #b or (#a == #b and a < b)
+	end)
+
+	local groups_by_root, groups = {}, {}
+	local unsafe, individual, excluded = {}, {}, {}
+	local function structural_root(rel)
+		for _, root in ipairs(virgin) do
+			if rel == root or rel:sub(1, #root + 1) == root .. "/" then
+				return root
+			end
+		end
+	end
+	local function add_group(root, root_kind, op)
+		local group = groups_by_root[root]
+		if not group then
+			group = { root = root, root_kind = root_kind, count = 0, kind_counts = {}, members = {} }
+			groups_by_root[root] = group
+			groups[#groups + 1] = group
+		end
+		group.count = group.count + 1
+		group.kind_counts[op.kind] = (group.kind_counts[op.kind] or 0) + 1
+		group.members[#group.members + 1] = op
+		op.status = "system_refused"
+		op.retention_strength = "momentary"
+		op.aggregate_root = root
+		excluded[op.rel] = true
+	end
+
+	-- Scoped to THIS call's `typed` list, which is one root's walk (see
+	-- `changes_from_session`): a pair's two halves always share a root, so
+	-- this never reaches across a different root's claim to exclude an
+	-- unrelated file that merely shares a relative path.
+	local paired_rel = count_rel_ops(typed)
+
+	for _, op in ipairs(typed or {}) do
+		if not op.control_plane then
+			local canonical, canonical_error = manifest.validate_rel(op.rel)
+			local named_root, named_kind = named_artifact_root(op.rel)
+			local virgin_root = structural_root(op.rel)
+			local root = named_root or virgin_root
+			local root_kind = named_kind or (virgin_root and "virgin" or nil)
+			local safety_root = (named_kind == "product" and named_root) or virgin_root
+			-- A path outside any artifact root that carries MORE THAN ONE typed
+			-- operation this turn is a file-type change pair (see
+			-- `count_rel_ops`), and the module's invariant — "file/symlink type
+			-- changes are compound operations with one decision; half-acceptance
+			-- is forbidden" — applies before anything else gets a say. Inside an
+			-- artifact root the existing bulk `add_group` below already decides
+			-- both halves together (one group, one accept/refuse), so this only
+			-- has work to do where that protection does not already reach.
+			if not root and (paired_rel[rel_op_key(op)] or 0) > 1 then
+				op.refusal_reason = PAIRED_REFUSAL_REASON
+				op.status = "system_refused"
+				op.retention_strength = "momentary"
+				individual[#individual + 1] = op
+				excluded[op.rel] = true
+			else
+				-- A regular-file delete outside an artifact root remains an explicit
+				-- review decision. Inside an artifact root it would be silently
+				-- excluded, so trackedness must authorize that exclusion.
+				local is_destructive = op.kind == "opaque" or op.kind == "delete"
+				local safe = canonical
+				if is_destructive then
+					safe = safe
+						and safety_root ~= nil
+						and (tracked.status == "repo" or tracked.status == "no_repo")
+						and not inside_submodule(tracked, op.rel)
+						and not tracked_at_or_below(tracked, op.rel)
+				end
+				if not safe then
+					op.refusal_reason = canonical and "unsafe destructive artifact operation" or canonical_error
+					op.status = "system_refused"
+					op.retention_strength = "recovered"
+					unsafe[#unsafe + 1] = op
+				elseif root then
+					add_group(root, root_kind, op)
+				elseif not reviewable(op) then
+					op.refusal_reason = "inline review cannot represent this operation"
+					op.status = "system_refused"
+					op.retention_strength = "momentary"
+					individual[#individual + 1] = op
+					excluded[op.rel] = true
+				end
+			end
+		end
+	end
+	table.sort(groups, function(a, b)
+		return a.root < b.root
+	end)
+	local reviewable_changes = {}
+	for _, change in ipairs(changes or {}) do
+		if not excluded[change.rel] then
+			reviewable_changes[#reviewable_changes + 1] = change
+		end
+	end
+	return {
+		changes = reviewable_changes,
+		groups = groups,
+		individual = individual,
+		unsafe = unsafe,
+	}
+end
 
 --- Build ONE root's inline review change objects.
 ---
@@ -140,10 +996,23 @@ M.classify_artifacts = ops_artifacts.classify_artifacts
 local function changes_for_root(session, root, upper, typed)
 	local changes = {}
 	local root_index = root.index or 1
-	-- `classify_artifacts` already withholds a paired op from the review for the correct,
+	-- A path with more than one typed op this turn is a file-type change
+	-- pair (`count_rel_ops`): the producer's before-evidence for the
+	-- content-kind half of such a pair tags the LOWER object's real kind
+	-- (a symlink, a directory — whatever the pair is turning it from or
+	-- into), not "absent" or "file", because that half's own record
+	-- deliberately carries the SAME lower-layer observation as its sibling
+	-- delete/create. `evidence_from_op` reads exactly that tag and, quite
+	-- correctly, refuses a whole-file comparison against a non-file real
+	-- path -- but a refusal returned here is a HARD one: it aborts
+	-- `changes_for_root` and therefore `changes_from_session` for the WHOLE
+	-- turn, not just this path, so a companion content edit sharing the
+	-- turn would be refused right along with it. `classify_artifacts`
+	-- already withholds a paired op from the review for the correct,
 	-- named reason (`PAIRED_REFUSAL_REASON`); this path must never reach
-	-- `evidence_from_op` in the first place and manufacture a SECOND, unrelated-sounding
-	-- refusal that takes the rest of the turn down with it.
+	-- `evidence_from_op` in the first place and manufacture a SECOND,
+	-- unrelated-sounding refusal that takes the rest of the turn down
+	-- with it.
 	local rel_counts = count_rel_ops(typed)
 	for _, op in ipairs(typed) do
 		-- `create dir`, `create symlink` and a whiteout over a directory are
@@ -160,7 +1029,7 @@ local function changes_for_root(session, root, upper, typed)
 				-- Mutation seam (gate): the pre-fix route, where the workspace was
 				-- observed AGAIN here, after classification, and that later look
 				-- became the recorded before-state.
-				state, err = ops_artifacts.lower_state(lower)
+				state, err = lower_state(lower)
 				if not state then
 					return nil, err
 				end
@@ -170,11 +1039,11 @@ local function changes_for_root(session, root, upper, typed)
 					mode = state.mode,
 				}
 			else
-				ev, err = ops_artifacts.evidence_from_op(op)
+				ev, err = evidence_from_op(op)
 				if not ev then
 					return nil, err
 				end
-				state, err = ops_artifacts.cross_check(lower, ev)
+				state, err = cross_check(lower, ev)
 				if not state then
 					return nil, err
 				end
@@ -183,8 +1052,8 @@ local function changes_for_root(session, root, upper, typed)
 			-- Bytes come out of the ONE upper layer, keyed by the path that
 			-- layer is keyed by (`upper_rel`), not by the repository-relative
 			-- `rel` the review shows.
-			local after = op.kind ~= "delete" and ops_artifacts.read_tree_bytes(upper, op.upper_rel or op.rel) or nil
-			local after_mode = ops_artifacts.after_mode_for(upper, op)
+			local after = op.kind ~= "delete" and read_tree_bytes(upper, op.upper_rel or op.rel) or nil
+			local after_mode = after_mode_for(upper, op)
 			local change = {
 				-- Root 1's ids are exactly the ids this function has always
 				-- minted. A second root may hold the same relative path, so its
@@ -204,7 +1073,7 @@ local function changes_for_root(session, root, upper, typed)
 				root_is_primary = root_index == 1,
 				turn_id = session.turn_id,
 				turn_gen = session.turn_gen,
-				kind = ops_artifacts.review_kind(op, ev),
+				kind = review_kind(op, ev),
 				before = op.kind == "delete" and (before or "") or before,
 				after = after,
 				-- The PRODUCER's tag, fingerprint and mode, carried unchanged.
@@ -214,18 +1083,15 @@ local function changes_for_root(session, root, upper, typed)
 				base_state = ev.kind,
 				base_hash = ev.hash,
 				base_mode = ev.mode,
-					base_hash_captured_ts = op.base_hash_captured_ts,
-					after_mode = after_mode,
-					-- R-b recovery reads proposal bytes only from this daemon-kept
-					-- turn layer; it never recomputes evidence from current disk.
-					upper_path = op.kind ~= "delete" and (upper .. "/" .. (op.upper_rel or op.rel)) or nil,
-					shadow_apply = true,
+				base_hash_captured_ts = op.base_hash_captured_ts,
+				after_mode = after_mode,
+				shadow_apply = true,
 				status = "pending",
 			}
 			-- Named refusal at ingestion: NUL bytes never become a review. The
 			-- real file stays unchanged and both byte strings stay on the change
 			-- record long enough to explain the refusal.
-			if ops_artifacts.contains_nul(change.before) or ops_artifacts.contains_nul(change.after) then
+			if contains_nul(change.before) or contains_nul(change.after) then
 				change.reason_class = "binary_content"
 				change.review_error = op.rel
 					.. ": binary_content — real file unchanged; proposal is not reviewable"
@@ -262,38 +1128,9 @@ function M.changes_from_session(session, context)
 	end
 
 	local all_typed = {}
-	local merged = { changes = {}, groups = {}, individual = {}, unsafe = {}, ignored = {} }
-	-- THE OPERATOR'S IGNORE LIST, applied here and nowhere else.
-	--
-	-- Here, because this is the one place that holds both a workspace-relative
-	-- `rel` and the upper-layer path its bytes live at, which is exactly what a
-	-- write-through needs. `classify_artifacts` is pure and stays pure: it reads
-	-- `op.ignored` and never asks what the operator configured.
-	--
-	-- NOT in single-file mode. That mode's whole contract is "only this one
-	-- tracked file may change", enforced by `apply_single_file_filter` further
-	-- down; letting a pattern write a second path through underneath it would
-	-- break the narrower promise to honour the wider one. An ignored path in an
-	-- SFM turn therefore keeps SFM's own refusal, which names the file.
-	local ignore = require("yana.ignore")
-	local ignore_active = not (session and session.single_file)
+	local merged = { changes = {}, groups = {}, individual = {}, unsafe = {} }
 	for _, walk in ipairs(walks) do
 		local root, upper, typed = walk.root, walk.upper, walk.typed
-		if ignore_active then
-			for _, op in ipairs(typed) do
-				if ignore.ignorable(op) and ignore.matches(op.rel, op.detail == "dir") then
-					op.ignored = true
-					merged.ignored[#merged.ignored + 1] = {
-						rel = op.rel,
-						kind = op.kind,
-						detail = op.detail,
-						root = root.workspace,
-						real_path = op.path,
-						upper_path = upper .. "/" .. (op.upper_rel or op.rel),
-					}
-				end
-			end
-		end
 		local changes, cerr = changes_for_root(session, root, upper, typed)
 		if not changes then
 			return nil, cerr
@@ -332,7 +1169,6 @@ function M.changes_from_session(session, context)
 	return merged.changes, nil, all_typed, merged
 end
 
--- Return typed ops with no review route: non-file kinds, or paired halves.
 function M.unreviewable_ops(typed)
 	-- `typed` here is `changes_from_session`'s third return: every root's
 	-- ops, flattened. `count_rel_ops`/`rel_op_key` key by (root, rel), so a
@@ -348,7 +1184,6 @@ function M.unreviewable_ops(typed)
 	return out
 end
 
--- Build {rel, class, hash} entries from typed ops for bundle recording.
 function M.classified_bundle_entries(typed)
 	local entries = {}
 	for _, op in ipairs(typed or {}) do
@@ -363,12 +1198,16 @@ end
 
 --- The mode half of a compound operation, spelled out for the operator.
 ---
---- A `chmod+modify` is ONE decision (`the filesystem operations contract`), and
---- accepting the bytes accepts the mode with them. That is the contract and it is not
---- in question — what was wrong is that the report said only `- **modify** \`tool.sh\`
---- _file_`, so the operator approved a mode change nothing had told them about. The
---- product cannot tell a deliberate `chmod` from a umask artifact left by an agent that
---- replaced the file instead of rewriting it; nothing on the wire separates them.
+--- A `chmod+modify` is ONE decision (`the filesystem operations contract`),
+--- and accepting the bytes accepts the mode with them. That is the contract and
+--- it is not in question — what was wrong is that the report said only
+--- `- **modify** \`tool.sh\` _file_`, so the operator approved a mode change
+--- nothing had told them about. The product cannot tell a deliberate `chmod`
+--- from a umask artifact left by an agent that replaced the file instead of
+--- rewriting it; nothing on the wire separates them. So it stops guessing and
+--- shows what it observed, and the operator — who knows what they asked for —
+--- decides. Disclosure replacing inference: the same move CORE already makes
+--- where side-effect provenance ships EMPTY rather than invented.
 local function mode_disclosure(op)
 	local ev = op.base_evidence
 	if type(ev) ~= "table" then
@@ -381,7 +1220,6 @@ local function mode_disclosure(op)
 	return string.format(" — mode %s → %s", before, after)
 end
 
--- Render ops as markdown preview lines, one bullet per operation.
 function M.format_lines(ops)
 	local lines = {}
 	if not ops or #ops == 0 then

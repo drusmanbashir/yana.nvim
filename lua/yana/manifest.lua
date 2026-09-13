@@ -4,7 +4,6 @@ local M = {}
 M.HEADER = "# yana-manifest-v2"
 M.HEADER_PATTERN = "^# yana%-manifest%-v2%s+(.+)$"
 
--- Reject an empty, absolute, backslashed, dotted, or control-char rel path.
 function M.validate_rel(rel)
 	if type(rel) ~= "string" or rel == "" then
 		return false, "empty relative path"
@@ -26,7 +25,6 @@ function M.validate_rel(rel)
 	return true
 end
 
--- Parse the manifest header line into {settle, raw}, or fail if malformed.
 function M.parse_header(line)
 	local meta = line:match(M.HEADER_PATTERN)
 	if not meta then
@@ -51,7 +49,6 @@ local function add_entry(map, h, rel, line_no)
 	return map
 end
 
--- Parse a v2 manifest file into a {rel: hash} map, validating every record.
 function M.read_file(path)
 	local f, err = io.open(path, "rb")
 	if not f then
@@ -109,7 +106,6 @@ function M.read_file(path)
 	return map
 end
 
--- Read a manifest as hash/rel entries, sorted by rel path.
 function M.read_lines(path)
 	local map, err = M.read_file(path)
 	if not map then
@@ -127,7 +123,6 @@ function M.read_lines(path)
 	return lines, nil, map._header
 end
 
--- Write entries to a v2 manifest file, validating each rel/hash first.
 function M.write_file(path, entries, opts)
 	opts = opts or {}
 	local settle = opts.settle or "none"
@@ -155,7 +150,6 @@ function M.write_file(path, entries, opts)
 	return true
 end
 
--- Write a null-separated list of validated staged rel paths.
 function M.write_staged_list(path, rels)
 	local f, err = io.open(path, "wb")
 	if not f then
@@ -174,7 +168,6 @@ function M.write_staged_list(path, rels)
 	return true
 end
 
--- Read and validate a null-separated staged rel-path list.
 function M.read_staged_list(path)
 	local f, err = io.open(path, "rb")
 	if not f then
@@ -280,7 +273,6 @@ function M.read_base_evidence(path)
 	return map
 end
 
--- Write validated base-evidence rows to path as JSONL.
 function M.write_base_evidence(path, rows)
 	local f, err = io.open(path, "w")
 	if not f then

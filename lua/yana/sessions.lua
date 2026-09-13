@@ -34,11 +34,6 @@ local function transcripts_dir()
   return data_dir() .. "/transcripts"
 end
 
-local function attachments_dir()
-  return data_dir() .. "/attachments"
-end
-
--- Return the on-disk path of the transcript file for session id.
 function M.transcript_path(id)
   return transcripts_dir() .. "/" .. id .. ".md"
 end
@@ -87,8 +82,16 @@ local function save_registry()
   f:close()
 end
 
--- Upsert a session entry. entry.id is required. fields: id, title, cwd, mode, model,
--- turns Monotonic tie-breaker for M.list()'s recency sort.
+-- Upsert a session entry. entry.id is required.
+-- fields: id, title, cwd, mode, model, turns
+-- Monotonic tie-breaker for M.list()'s recency sort. `os.time()` has 1s
+-- resolution; several sessions persisted inside one second (a fast synthetic
+-- replay, or just a quick real one -- issue log row 27 measured three
+-- sessions landing in the same wall-clock second) would otherwise sort in an
+-- order `table.sort` does not guarantee, since it is not stable. Lazily
+-- initialised from the highest `seq` already on disk, so a fresh process
+-- picking the registry back up after a restart keeps counting forward
+-- rather than colliding with rows an earlier process already wrote.
 local _seq = nil
 local function next_seq(reg)
   if not _seq then
@@ -103,7 +106,6 @@ local function next_seq(reg)
   return _seq
 end
 
--- Merge entry's fields into its registry row, stamp seq, save to disk.
 function M.record(entry)
   if not entry or not entry.id or entry.id == "" then
     return
@@ -116,9 +118,12 @@ function M.record(entry)
   cur.cwd = entry.cwd or cur.cwd
   cur.mode = entry.mode or cur.mode
   cur.model = entry.model or cur.model
-  -- Which backend (layer 1) issued this session's upstream id. Absent on rows written
-  -- before backends existed, and on CLI-discovered rows (M.discover tags those "cursor"
-  -- explicitly, since that discovery only ever reads cursor-agent's own chat store).
+  -- Which backend (layer 1) issued this session's upstream id. Absent on
+  -- rows written before backends existed, and on CLI-discovered rows
+  -- (M.discover tags those "cursor" explicitly, since that discovery only
+  -- ever reads cursor-agent's own chat store) -- M.resume treats an absent
+  -- backend as unknown-but-compatible rather than refusing it, since there
+  -- is no evidence it belongs to a different vendor.
   cur.backend = entry.backend or cur.backend
   cur.turns = entry.turns or cur.turns
   cur.updated_at = now
@@ -127,23 +132,30 @@ function M.record(entry)
   save_registry()
 end
 
--- Return the in-memory registry row for id, or nil if none.
 function M.get(id)
   return load_registry()[id]
 end
 
 --- The registry row for `id` READ BACK FROM DISK — never from `_cache`.
 ---
---- The per-turn consistency check cannot use `M.get`: `record()` fills the in-memory
---- cache BEFORE `save_registry()` attempts the file, so a registry the product could
---- not write still answers "row present". A check built on that compares the cache with
---- itself and can never fail, which is exactly what let a transcript exist on disk with
---- no registry row — a session that can be neither listed nor resumed. So this opens
---- the file every time and ignores the cache entirely, including the cache-priming
+--- The per-turn consistency check cannot use `M.get`: `record()` fills the
+--- in-memory cache BEFORE `save_registry()` attempts the file, so a registry
+--- the product could not write still answers "row present". A check built on
+--- that compares the cache with itself and can never fail, which is exactly
+--- what let a transcript exist on disk with no registry row — a session that
+--- can be neither listed nor resumed. So this opens the file every time and
+--- ignores the cache entirely, including the cache-priming `load_registry`.
 ---
---- Total and non-throwing — this runs off the end of a real turn and observation must
---- never break the turn it observes. One small read per persist: no watcher, no
---- per-event I/O.
+--- Returns `(present, status)`, status one of:
+---   `present`      the file parsed and holds a row for `id`
+---   `absent`       the file parsed and holds no row for `id`
+---   `no_file`      no registry file exists
+---   `unreadable`   it exists but could not be opened or read
+---   `unparseable`  it was read but is not a decodable JSON object
+--- Only `present` is consistent; an unreadable or unparseable registry is a
+--- failure, not a pass. Total and non-throwing — this runs off the end of a
+--- real turn and observation must never break the turn it observes. One small
+--- read per persist: no watcher, no per-event I/O.
 function M.registry_row_on_disk(id)
   if type(id) ~= "string" or id == "" then
     return false, "absent"
@@ -209,37 +221,6 @@ function M.load_transcript(id)
     return nil
   end
   return vim.split(raw, "\n", { plain = true })
-end
-
-function M.attachments_path(id)
-  return attachments_dir() .. "/" .. id .. ".json"
-end
-
-function M.save_attachments(id, attachments)
-  if not id or id == "" or type(attachments) ~= "table" then
-    return
-  end
-  vim.fn.mkdir(attachments_dir(), "p")
-  local f = io.open(M.attachments_path(id), "w")
-  if not f then
-    return
-  end
-  f:write(vim.json.encode(attachments))
-  f:close()
-end
-
-function M.load_attachments(id)
-  if not id or id == "" then
-    return nil
-  end
-  local f = io.open(M.attachments_path(id), "r")
-  if not f then
-    return nil
-  end
-  local raw = f:read("*a")
-  f:close()
-  local ok, decoded = pcall(vim.json.decode, raw)
-  return ok and type(decoded) == "table" and decoded or nil
 end
 
 ----------------------------------------------------------------------
@@ -311,11 +292,26 @@ end
 -- Scan ~/.cursor/chats/<md5(cwd)>/ for sessions the CLI knows about.
 -- Returns a list of { id, title, cwd, created_at, updated_at, external = true }.
 --
--- The CLI names its chat directory after a hash of the RAW cwd string it saw when the
--- chat started. On a case-insensitive mount (e.g. fs_realpath can fail (e.g.
+-- The CLI names its chat directory after a hash of the RAW cwd string it saw
+-- when the chat started. On a case-insensitive mount (e.g. a Linux CIFS/SMB
+-- share) the exact same directory can be entered with a different letter
+-- case from a different terminal/editor and hash to a different, equally
+-- "valid" name that this scan would never look in -- the session silently
+-- vanishes from discovery even though both spellings name one real
+-- directory. Hashing fs_realpath(cwd) instead of the bare argument fixes
+-- this whenever the kernel/filesystem driver resolves path components to
+-- their on-disk stored spelling during lookup (true for many
+-- case-insensitive-mount configurations), and also fixes the same defect
+-- shape for symlinked workspace paths and a cwd carrying "..", "." or a
+-- trailing slash -- all of which broke the raw-string hash identically.
+-- fs_realpath can fail (e.g. cwd no longer exists); the raw string is kept
+-- as a fallback rather than discovering nothing. This does not, and cannot,
+-- fix the case where the CLI itself hashed an uncanonicalized cwd on ITS
+-- side too (unverified, closed-source; PORT-11,
+-- packets/env-portability-adversarial-20260820.md).
 function M.discover(cwd)
   cwd = cwd or vim.fn.getcwd()
-  local base = config.options.sessions.chats_dir
+  local base = config.options.sessions.chats_dir or "~/.cursor/chats"
   base = vim.fn.expand(base)
   local canonical_cwd = uv.fs_realpath(cwd) or cwd
   local hash = md5_hex(canonical_cwd)
@@ -401,7 +397,7 @@ function M.list(cwd)
     return (a.seq or 0) > (b.seq or 0)
   end)
 
-  local max = config.options.sessions.max
+  local max = config.options.sessions.max or 50
   while #out > max do
     table.remove(out)
   end
@@ -487,12 +483,7 @@ function M.delete(id, cwd)
     pcall(vim.fn.delete, transcript)
     removed = true
   end
-  local attachments = M.attachments_path(id)
-  if uv.fs_stat(attachments) then
-    pcall(vim.fn.delete, attachments)
-    removed = true
-  end
-  local base = config.options.sessions.chats_dir
+  local base = config.options.sessions.chats_dir or "~/.cursor/chats"
   base = vim.fn.expand(base)
   local canonical_cwd = uv.fs_realpath(cwd) or cwd
   local hash = md5_hex(canonical_cwd)

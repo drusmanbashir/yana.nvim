@@ -7,6 +7,7 @@
 -- plays the NDJSON back through the real `jobstart`/`emit` pipeline, and the
 -- sidecar is the argv comparison target.
 --
+-- Why this is opt-in and why it never touches the log:
 --
 --   * It is per-event disk I/O, which the default configuration forbids
 --     (CTL-CLEAN: a clean turn leaves `yana.log` byte-identical). Gating
@@ -48,7 +49,6 @@ function Rec:note_model_actual(model)
   end
 end
 
--- Whether raw-stream recording is turned on (config option or env var).
 function M.enabled()
   return config.options.debug_record == true or env_enabled()
 end
@@ -238,13 +238,11 @@ function Rec:event(event_seq, obj, stale)
   return true
 end
 
--- Count one malformed raw stream line and its byte length.
 function Rec:note_decode_failure(bytes)
   self.malformed_raw_lines = self.malformed_raw_lines + 1
   self.malformed_raw_bytes = self.malformed_raw_bytes + (tonumber(bytes) or 0)
 end
 
--- Accumulate the total stderr byte length seen so far.
 function Rec:note_stderr(chunk)
   if type(chunk) == "string" then
     self.stderr_len = self.stderr_len + #chunk
@@ -271,13 +269,9 @@ function Rec:finish(info)
   meta.exit_code = info.code
   meta.stderr = info.stderr
   meta.stderr_len = info.stderr and #info.stderr or self.stderr_len
+  meta.stream_file = "stream.ndjson"
   meta.stream_lines = self.lines
   meta.stream_bytes = self.bytes
-  if self.bytes > 0 then
-    meta.stream_file = "stream.ndjson"
-  else
-    meta.stream_file = nil
-  end
   meta.write_errors = self.write_errors
   -- Honest degradation: a recording that lost bytes says so, and says how
   -- many. Replay treats `truncated` as "this stream is not the whole turn"
@@ -295,9 +289,13 @@ function Rec:finish(info)
   meta.malformed_raw_lines = self.malformed_raw_lines
   meta.malformed_raw_bytes = self.malformed_raw_bytes
   meta.pid = info.pid
-  -- LIVENESS EVIDENCE. `last_event` is the decoder's own description of the last
-  -- describable stream event (see agent.describe_event) and `stop_reason` is always
-  -- present — a stop that recorded its reason before signalling, or the exit code.
+  -- LIVENESS EVIDENCE. A turn that never finished is exactly the turn whose
+  -- sidecar has to say where it stopped and why: on 2026-08-20 an inline turn
+  -- ended on a nested-task start and sat mute for 11 minutes, and nothing on
+  -- disk named either fact. `last_event` is the decoder's own description of
+  -- the last describable stream event (see agent.describe_event) and
+  -- `stop_reason` is always present — a stop that recorded its reason before
+  -- signalling, or the exit code.
   meta.last_event = info.last_event
   meta.stop_reason = info.stop_reason
   meta.cpu_pct_at_stop = info.cpu_pct_at_stop
@@ -315,6 +313,9 @@ function Rec:finish(info)
   if not fd then
     return false
   end
+  -- The sidecar gets the same loop and the same honesty: a short sidecar write
+  -- used to be ignored outright and reported as a complete recording, leaving
+  -- an unparseable meta.json beside a stream that claimed to be faithful.
   local written, werr = write_all(fd, encoded)
   pcall(uv.fs_close, fd)
   if written < #encoded then
@@ -412,6 +413,8 @@ function M.read_turn_records(dir)
 end
 
 --- Append one JSON object as a line to `<private_dir>/stream.ndjson`.
+--- Confined-shell and refusal paths use this when no cursor-agent recorder
+--- is open (issue 24).
 function M.append_stream_line(private_dir, obj)
   if not M.enabled() or type(private_dir) ~= "string" or private_dir == "" then
     return false

@@ -34,12 +34,18 @@ local function probe_birth_time_support(dir)
   f:write("yana birth-time probe\n")
   f:close()
 
-  -- The probe file must be removed on EVERY path out of this function, even when `stat`
-  -- itself errors rather than merely returning a non-zero shell exit -- e.g. an
-  -- interrupted headless run, where vim.fn.system() can throw instead of returning. The
-  -- old code only reached `pcall(os.remove, path)` AFTER vim.fn.system() had already
-  -- returned, so a throw there skipped cleanup entirely and left the dotfile behind
-  -- (two such `.yana-birthcheck-*` files were found stray in this repo).
+  -- The probe file must be removed on EVERY path out of this function, even
+  -- when `stat` itself errors rather than merely returning a non-zero shell
+  -- exit -- e.g. an interrupted headless run, where vim.fn.system() can
+  -- throw instead of returning. The old code only reached
+  -- `pcall(os.remove, path)` AFTER vim.fn.system() had already returned, so
+  -- a throw there skipped cleanup entirely and left the dotfile behind (two
+  -- such `.yana-birthcheck-*` files were found stray in this repo).
+  -- Wrapping the stat call itself in a pcall means the removal below always
+  -- runs immediately after, regardless of whether the stat succeeded.
+  -- GNU `stat -c %w` is Linux/coreutils; Darwin stat uses `-f %B` (birth
+  -- epoch). Using the GNU form on macOS made this row a tool-mismatch, not
+  -- a filesystem signal.
   local uname = (vim.uv or vim.loop).os_uname()
   local stat_argv
   local stat_label
@@ -121,10 +127,13 @@ end
 -- Neovim 0.11 -- rather than something the user's own config or a
 -- plugin set up.
 --
--- Neovim's own bundled runtime Lua (its default keymaps among them, defined in
--- runtime/lua/vim/_core/defaults.lua) loads under a virtual "@vim/..." module-style
--- debug source; a user's init.lua or an installed plugin's Lua file always shows a real
--- filesystem path instead ("@/home/.../init.lua", "@/.../lazy/<plugin>/lua/...").
+-- Neovim's own bundled runtime Lua (its default keymaps among them, defined
+-- in runtime/lua/vim/_core/defaults.lua) loads under a virtual "@vim/..."
+-- module-style debug source; a user's init.lua or an installed plugin's Lua
+-- file always shows a real filesystem path instead ("@/home/.../init.lua",
+-- "@/.../lazy/<plugin>/lua/..."). Verified live against Neovim 0.12's stock
+-- `<C-s>` default: debug.getinfo(callback, "S").source is exactly
+-- "@vim/_core/defaults" (ruling: packets/ADJUDICATIONS-20260820.md #6).
 --
 -- Only Lua-callback mappings can be identified as built-ins this way; a
 -- foreign mapping with no callback (plain rhs, legacy :map) is never
@@ -141,22 +150,29 @@ local function is_builtin_mapping(map_info)
   return resolved and type(src) == "string" and src:match("^@vim/") ~= nil
 end
 
--- Only the prompt and panel keys of config.options.mappings are checked
--- here: it is the table that ships with real defaults out of the box (e.g. toggle_mode
--- = "<M-t>", terminal-dependent on some setups), so it is the one that can collide with
--- something the user's config or another plugin already bound.
+-- Only config.options.keymaps (buffer-local panel keymaps, config.lua:134)
+-- is checked here: it is the table that ships with real defaults out of the
+-- box (e.g. toggle_mode = "<M-t>", terminal-dependent on some setups), so it
+-- is the one that can collide with something the user's config or another
+-- plugin already bound. config.options.global_keymaps ships nil by default
+-- and, when set, is applied globally by require("yana").setup() before this
+-- check ever runs — checking it here would flag yana's OWN mapping as a
+-- false collision with itself.
 --
--- Buffer-local always wins inside yana's own buffers and never touches anything outside
--- them, so shadowing a Neovim BUILT-IN there is scoped and harmless: INFO, naming the
--- built-in, not WARN. A GLOBAL user/plugin mapping on the same lhs is a real, visible
--- behavior change the moment the user is inside yana's buffer, so that stays WARN.
+-- Severity split (ruling #6): EVERY entry here is buffer-local by
+-- construction -- ui.lua's apply_panel_keymaps() funnels all of them through
+-- its local map() helper, which always passes { buffer = buf } to
+-- vim.keymap.set (ui.lua:~3798) -- verified by reading that function, not
+-- assumed. Buffer-local always wins inside yana's own buffers and never
+-- touches anything outside them, so shadowing a Neovim BUILT-IN there is
+-- scoped and harmless: INFO, naming the built-in, not WARN. A GLOBAL
+-- user/plugin mapping on the same lhs is a real, visible behavior change
+-- the moment the user is inside yana's buffer, so that stays WARN.
 local function keymap_collision_row()
-  local km = config.options.mappings
+  local km = config.options.mappings.panel or {}
   local names = {}
-  for _, context in ipairs({ "prompt", "panel" }) do
-    for _, name in ipairs(require("yana.config_mappings").CONTEXTS[context]) do
-      names[#names + 1] = name
-    end
+  for name in pairs(km) do
+    names[#names + 1] = name
   end
   table.sort(names)
 
@@ -171,14 +187,14 @@ local function keymap_collision_row()
       if type(map_info) == "table" and next(map_info) ~= nil then
         if is_builtin_mapping(map_info) then
           shadows[#shadows + 1] = string.format(
-            "mappings.%s (%s) shadows Neovim's built-in %s inside yana's own buffers only (buffer-local); unaffected elsewhere",
+            "keymaps.%s (%s) shadows Neovim's built-in %s inside yana's own buffers only (buffer-local); unaffected elsewhere",
             name,
             lhs,
             describe_foreign_map(map_info)
           )
         else
           collisions[#collisions + 1] =
-            string.format("mappings.%s (%s) is already mapped to %s", name, lhs, describe_foreign_map(map_info))
+            string.format("keymaps.%s (%s) is already mapped to %s", name, lhs, describe_foreign_map(map_info))
         end
       end
     end
@@ -191,25 +207,31 @@ local function keymap_collision_row()
   if #collisions > 0 then
     warn(
       "panel keymap collision: " .. table.concat(collisions, "; "),
-      { "rebind the colliding entries with require('yana').setup({ mappings = { ... } }), or change the foreign mapping" }
+      { "rebind the colliding entries with require('yana').setup({ keymaps = { ... } }), or change the foreign mapping" }
     )
   elseif #shadows == 0 then
     ok("no panel keymap collisions detected (" .. checked .. " configured keymaps checked)")
   end
 end
 
--- A plugin cannot ship someone else's completion config for them, so this is docs + an
--- INFO row naming exactly what degrades without that private setup, never a shipped
--- default.
+-- PORT-13 (packets/env-portability-adversarial-20260820.md): yana ships no
+-- completion PROVIDER of its own -- keymaps.completion_menu's callback
+-- (ui.lua) does nothing but `pcall(require, "blink.cmp") and blink.show()`;
+-- scoping the resulting menu to yana's two sources (yana_commands,
+-- yana_mentions) for the prompt buffer only (vim.b.yana_prompt) is entirely
+-- the user's own blink.cmp config's job (config.lua's completion_menu
+-- comment). A plugin cannot ship someone else's completion config for them,
+-- so this is docs + an INFO row naming exactly what degrades without that
+-- private setup, never a shipped default.
 local function completion_menu_row()
-  local lhs = config.options.mappings.completion_menu
+  local lhs = config.options.mappings.panel and config.options.mappings.panel.completion_menu
   if not lhs or lhs == false then
     return
   end
   local found = pcall(require, "blink.cmp")
   if not found then
     info(
-      "blink.cmp not found: mappings.completion_menu ('"
+      "blink.cmp not found: keymaps.completion_menu ('"
         .. tostring(lhs)
         .. "') opens nothing (harmless no-op) — yana ships no completion UI of its own, so slash-command "
         .. "and @mention completion popups are unavailable without blink.cmp installed"
@@ -219,17 +241,23 @@ local function completion_menu_row()
   info(
     "blink.cmp found, but yana ships no completion source/provider registration of its own — it relies on "
       .. "YOUR blink.cmp config to scope suggestions to yana's prompt buffer (vim.b.yana_prompt). Without a "
-      .. "b:yana_prompt-aware provider config, mappings.completion_menu ('"
+      .. "b:yana_prompt-aware provider config, keymaps.completion_menu ('"
       .. tostring(lhs)
       .. "') may open blink's default (unrelated) providers, and blink's own InsertEnter autocmd may "
       .. "re-claim the same chord for its default action."
   )
 end
 
--- Absence of a known-good signal is NOT proof the terminal lacks the capability (tmux,
--- for one, can be configured to pass it through) -- so the caller below treats "not on
--- the allow-list" as "cannot confirm", not "definitely broken", and words the row that
--- way.
+-- Cheapest honest check for whether THIS terminal can tell <C-CR> (Ctrl+
+-- Enter) apart from plain <CR>: Neovim has no portable way to positively
+-- query the running terminal's keyboard-encoding capability from Lua (that
+-- would need an async CSI-u/Kitty-protocol query-and-response with a
+-- timeout), so this recognizes a short allow-list of terminals/multiplexer
+-- endpoints known to speak the Kitty keyboard protocol or an equivalent
+-- extended-key encoding by default. Absence of a known-good signal is NOT
+-- proof the terminal lacks the capability (tmux, for one, can be configured
+-- to pass it through) -- so the caller below treats "not on the allow-list"
+-- as "cannot confirm", not "definitely broken", and words the row that way.
 local function terminal_may_support_extended_keys()
   if vim.env.TERM == "xterm-kitty" or vim.env.KITTY_WINDOW_ID then
     return true -- kitty
@@ -246,12 +274,15 @@ local function terminal_may_support_extended_keys()
   return false
 end
 
--- mappings.steer's default ("<C-CR>") is indistinguishable from plain <CR> on many
--- terminals without the Kitty keyboard protocol or an equivalent (config.lua's steer
--- comment; PORT-15). Only fires while the default is still in place — a user who
--- already rebound steer has already solved this themselves.
+-- Ruling #6 (packets/ADJUDICATIONS-20260820.md): a keymap-shaped collision is
+-- surfaced via health and documented, never used to change a shipped
+-- default. keymaps.steer's default ("<C-CR>") is indistinguishable from
+-- plain <CR> on many terminals without the Kitty keyboard protocol or an
+-- equivalent (config.lua's steer comment; PORT-15). Only fires while the
+-- default is still in place — a user who already rebound steer has already
+-- solved this themselves.
 local function steer_key_row()
-  local lhs = config.options.mappings.steer
+  local lhs = config.options.mappings.panel and config.options.mappings.panel.steer
   if type(lhs) ~= "string" or lhs:lower() ~= "<c-cr>" then
     return
   end
@@ -259,7 +290,7 @@ local function steer_key_row()
     return
   end
   info(
-    "mappings.steer's default ('"
+    "keymaps.steer's default ('"
       .. lhs
       .. "') may not be distinguishable from <CR> in this terminal (TERM="
       .. tostring(vim.env.TERM)
@@ -291,22 +322,34 @@ end
 -- (optional) `auth_output_patterns` descriptor -- config.lua's
 -- `optional_output_patterns`, generic here too: no per-vendor branch.
 --
+--   * no auth_output_patterns declared (default, unchanged since row 117):
+--       exit 0                        -> "signed in"                  (ok)
+--       exit != 0                     -> "NOT signed in", names the
+--                                          exact fix command           (warn)
+--   * auth_output_patterns declared (a vendor whose exit code cannot be
+--     trusted at all -- cursor-agent's `status` exits 0 either way, see
+--     VENDOR-AUTH-PROBES.md): the exit code is IGNORED entirely and the
+--     probe's captured stdout+stderr is matched against each declared
+--     pattern instead --
+--       signed_in matches, signed_out does not -> "signed in"          (ok)
+--       signed_out matches, signed_in does not -> "NOT signed in",
+--                                                  names the fix command(warn)
+--       BOTH match, NEITHER matches, or the
+--       relevant key was not declared          -> "unknown", names WHY (info)
 --
+-- Independent of which judge ran, plus:
+--   * binary missing, no whoami_args
+--     declared, or the probe itself
+--     could not complete (spawn/wait
+--     error, or timeout)            -> "unknown", names WHY         (info)
+-- Never claims "signed in" without a positively-matching, completed probe
+-- -- every case neither judge can positively confirm renders as unknown,
+-- not as a guess in either direction.
 local function backend_auth_row(name, entry)
   local resolution = config.resolve_cmd(name)
   local resolved = vim.fn.exepath(resolution.value)
   if resolved == "" then
-    -- PRERELEASE-0.1.0-alpha.5-README-audit.md defect 3: names the vendor's
-    -- own install line here too, from the SAME `install_hint` field
-    -- dependencies.lua's configured_agent_row() reads for the panel's
-    -- missing-binary error -- one remedy table, two consumers, never a
-    -- second copy that can drift from the first.
-    local install_hint = entry.install_hint
-    local remedy = install_hint and ("install " .. name .. " (" .. install_hint .. ")")
-      or ("install " .. name .. " (see its own docs -- Yana ships no install_hint for this backend)")
-    info(
-      "auth (" .. name .. "): unknown — " .. tostring(resolution.value) .. " not found on PATH — " .. remedy
-    )
+    info("auth (" .. name .. "): unknown — " .. tostring(resolution.value) .. " not found on PATH")
     return
   end
   if not entry.whoami_args then
@@ -405,34 +448,17 @@ local function backend_auth_rows()
   end
 end
 
--- yana_ui (public repo drusmanbashir/yana-ui) is a hard dependency:
--- lua/yana/ui_grid.lua is "return require('yana_ui.grid')" with no
--- fallback, so its absence makes parts of the review UI raise rather than
--- merely degrade. That makes it an ERROR row, unlike the optional-plugin
--- rows above (completion_menu_row et al.), which only ever info/warn.
-local function yana_ui_row()
-  if pcall(require, "yana_ui") then
-    ok("yana_ui found: UI grid dependency satisfied")
-    return
-  end
-  err(
-    "yana_ui not found — parts of yana's UI (lua/yana/ui_grid.lua) require it and will raise without it",
-    { "add 'drusmanbashir/yana-ui' as a plugin dependency" }
-  )
-end
-
--- Run :checkhealth yana: deps, auth, keymaps, mode, log, and env checks.
 function M.check()
   start("yana")
 
-  yana_ui_row()
-
   for _, item in ipairs(dependencies.check(config.options.mode)) do
-    local body = item.message
-    if item.id == "exec:sqlite3" and item.level == "warn" then
-      body = tostring(item.message) .. " — external Cursor session titles unavailable"
+    local message = string.format("[%s] %s", item.id, item.message)
+    if item.id == "exec:sqlite3" and item.level ~= "ok" then
+      -- dependencies.lua correctly treats sqlite3 as optional (warn, not
+      -- error), but a silent optional-dependency miss is exactly how this
+      -- degradation went unnoticed: name what is actually lost.
+      message = message .. " — external Cursor session titles unavailable without it"
     end
-    local message = string.format("[%s] %s", item.id, body)
     if item.level == "ok" then
       ok(message)
     elseif item.level == "warn" then
@@ -450,7 +476,7 @@ function M.check()
 
   local mode = config.options.mode
   if mode == "agentic" then
-    warn("mode = 'agentic' is active: the agent writes files directly; there is no overlay, review, or diary.")
+    warn("mode = 'agentic': explicit enable_agentic opt-in is active. The agent writes files directly; there is no overlay, review, or diary.")
   elseif mode == "inline" and config.agent_needs_permission_flag() then
     warn(
       "mode = 'inline': the agent runs confined in the overlay and every change is reviewed before it reaches disk, "
@@ -459,17 +485,6 @@ function M.check()
     )
   else
     ok("default mode: " .. tostring(mode))
-  end
-  if mode == "inline" and config.options.sandbox.inline == "vendor-default" then
-    local backend = tostring(config.options.backend)
-    warn(
-      "inline vendor sandbox (" .. backend .. ") inherits its system-wide configuration through sandbox.inline = 'vendor-default'; "
-        .. "that vendor configuration may silently narrow Yana's declared write_roots.",
-      {
-        "Check the " .. backend .. " vendor configuration if a declared root is refused.",
-        "Or set sandbox.inline to an explicit vendor-neutral level in require('yana').setup().",
-      }
-    )
   end
   if config.options.approve_mcps then
     warn("approve_mcps = true: MCP servers are auto-approved (--approve-mcps).")

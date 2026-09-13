@@ -11,7 +11,6 @@
 -- Spec: the public command contract
 
 local log = require("yana.log")
-local views = require("yana.ui_panel_views")
 
 local M = {}
 
@@ -19,7 +18,7 @@ local function insert_paths(panel, paths)
 	if not panel or not paths or #paths == 0 then
 		return
 	end
-	require("yana.ui").insert_at_cursor(panel.prompt_buf, views.prompt(panel), table.concat(paths, " "))
+	require("yana.ui").insert_at_cursor(panel.prompt_buf, panel.prompt_win, table.concat(paths, " "))
 end
 
 local function relpath(name)
@@ -89,7 +88,6 @@ local function quickfix_paths()
 	return out
 end
 
--- Return the mention menu entries: file, buffers, quickfix, diagnostics.
 function M.get_mentions(panel)
 	return {
 		{

@@ -104,10 +104,14 @@ end
 
 --- The before-fingerprint the producer recorded for one touched path.
 ---
---- It is read out of the operation, never re-derived here. `yana-changeset` reads the
---- lower layer once, to decide the path changed at all, and emits the fingerprint of
---- exactly those bytes; on a content operation that value arrives as the record's
---- trailing field.
+--- It is read out of the operation, never re-derived here. `yana-changeset`
+--- reads the lower layer once, to decide the path changed at all, and emits the
+--- fingerprint of exactly those bytes; on a content operation that value arrives
+--- as the record's trailing field. Reading the lower layer a second time at this
+--- point would open a window for a human save to land between classification and
+--- evidence, so the accept-time recheck would compare the agent's result against
+--- the human's new bytes, match, and overwrite the save that CORE requires be
+--- refused by name.
 ---
 --- Missing or malformed evidence refuses. Incomplete base evidence is a named
 --- refusal in change-model, not something to fill in with a fresh read.
@@ -121,10 +125,14 @@ end
 
 --- The producer's before-EVIDENCE for one touched path, read out of the record.
 ---
---- The same rule as the fingerprint, for the same reason. Absence and an empty file
---- share a fingerprint, so the accept-time recheck matches and the human's new file is
---- overwritten — the exact failure the tag exists to prevent, with a smaller window
---- rather than none.
+--- The same rule as the fingerprint, for the same reason. State, type, mode and
+--- symlink target were observed by the read that classified the operation, and
+--- they travel on the record; observing the workspace again here would put a
+--- window between classification and evidence, and a file created in that window
+--- is recorded as the before-state of a change that was prepared against its
+--- absence. Absence and an empty file share a fingerprint, so the accept-time
+--- recheck matches and the human's new file is overwritten — the exact failure
+--- the tag exists to prevent, with a smaller window rather than none.
 ---
 --- Incomplete evidence refuses. A record with no tag, no mode where the state
 --- has one, or a lower object that is not a regular file cannot be compared at
@@ -155,12 +163,20 @@ local function evidence_from_op(op, fp)
 				base_hash_captured_ts = op.base_hash_captured_ts,
 			}
 		end
-		-- The AFTER mode, when this operation is a `chmod+modify` compound. The producer
-		-- decides that — it compares the two objects' modes in the one classifying pass and
-		-- appends `new-mode` to the same record — and the value is carried here verbatim,
-		-- never re-derived. Without it the change set records no mode decision at all, and
-		-- the applier has nothing to distinguish a deliberate chmod from an accept that must
-		-- leave the target's mode alone; `filesystem-operations.md` calls shipping the
+		-- The AFTER mode, when this operation is a `chmod+modify` compound.
+		-- The producer decides that — it compares the two objects' modes in the
+		-- one classifying pass and appends `new-mode` to the same record — and
+		-- the value is carried here verbatim, never re-derived. Without it the
+		-- change set records no mode decision at all, and the applier has
+		-- nothing to distinguish a deliberate chmod from an accept that must
+		-- leave the target's mode alone; `filesystem-operations.md` calls
+		-- shipping the content half without the mode half a forbidden
+		-- half-acceptance. A malformed value refuses rather than being dropped:
+		-- a compound whose mode half cannot be read is not a modify.
+		-- Parsed AND range-checked. `tonumber(x, 8)` accepts a leading sign and
+		-- has no upper bound, so a negative or oversized value would travel to
+		-- the applier as a mode and reach `fs_chmod`; permission bits are
+		-- 0..07777 and anything else is a malformed record, not a decision.
 		local after_mode = nil
 		if ev["new-mode"] ~= nil then
 			after_mode = tonumber(ev["new-mode"], 8)

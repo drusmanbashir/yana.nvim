@@ -15,15 +15,33 @@ end
 
 local log = require("yana.log")
 
--- Every command arms R-b recovery without delaying its original action. Each
--- body remains wrapped in log.guard, which logs and re-raises uncaught errors.
-local raw_cmd = vim.api.nvim_create_user_command
-local function cmd(name, callback, opts)
-  raw_cmd(name, function(args)
-    require("yana.recovery_entry").schedule(vim.fn.getcwd())
-    return callback(args)
-  end, opts)
-end
+-- Resume ordinary-edit capture when a file with an existing Yana timeline is
+-- opened in a later editor session. Files without timeline rows are untouched.
+local timeline_group = vim.api.nvim_create_augroup("YanaTimelineCapture", { clear = true })
+vim.api.nvim_create_autocmd("BufReadPost", {
+  group = timeline_group,
+  callback = function(args)
+    log.guard("Yana timeline BufReadPost", function()
+      local path = vim.api.nvim_buf_get_name(args.buf)
+      local workspace = require("yana.diff").abs_path(vim.fn.getcwd())
+      local abs = require("yana.diff").abs_path(path)
+      if not abs or abs:sub(1, #workspace + 1) ~= workspace .. "/" then
+        return
+      end
+      local rel = abs:sub(#workspace + 2)
+      local rows = require("yana.timeline").entries(workspace, rel)
+      if type(rows) == "table" and #rows > 0 then
+        require("yana.timeline.edit_capture").attach(args.buf, workspace, rel)
+      end
+    end)
+  end,
+})
+
+-- Every command handler body is wrapped in log.guard so an uncaught error
+-- (e.g. the E976 content-hash crash in ui.submit_panel) is written to the
+-- log file before it surfaces to the user exactly as before -- guard()
+-- re-raises, so :messages/E5108 behaviour on error is unchanged.
+local cmd = vim.api.nvim_create_user_command
 
 local function parse_yana_args(raw)
   local flags = {}
@@ -66,23 +84,34 @@ cmd("YanaClose", function()
   end)
 end, { desc = "Close the yana agent panel" })
 
+cmd("YanaTimeline", function()
+  log.guard("YanaTimeline", function()
+    require("yana.timeline.ui").open({})
+  end)
+end, { desc = "Show the timeline of review decisions and edits for this file" })
+
 cmd("YanaAbortReview", function()
   log.guard("YanaAbortReview", function()
     require("yana.inline_diff").abort_active({})
   end)
 end, { desc = "Abort the open review: put the file back as it was before the hunks appeared" })
 
-cmd("YanaReset", function()
-  log.guard("YanaReset", function()
-    local reset = require("yana.inline_diff").reset_active_review()
-    if reset == false then
-      require("yana.notify").one_line(
-        "yana: no open review here to reset",
-        vim.log.levels.INFO
-      )
-    end
+-- Cross-file retrace (FIX-UNDO lane, operator ruling 2026-08-21). While a
+-- file's OWN review is open, its buffer-local `u`/`U`/`<C-r>` stay exactly
+-- what they always were (inline_diff.lua, untouched). These commands cover
+-- the case those keys do not: retracing the operator's own action history
+-- ACROSS FILES, once at least one of them has closed.
+cmd("YanaUndo", function()
+  log.guard("YanaUndo", function()
+    require("yana.timeline.retrace").undo(vim.fn.getcwd())
   end)
-end, { desc = "Reset the whole turn: every file back to the state the review opened in" })
+end, { desc = "Undo the single most recent accept/reject/edit across every file in this workspace" })
+
+cmd("YanaRedo", function()
+  log.guard("YanaRedo", function()
+    require("yana.timeline.retrace").redo(vim.fn.getcwd())
+  end)
+end, { desc = "Step forward through the same cross-file history YanaUndo walked back" })
 
 cmd("YanaToggle", function()
   log.guard("YanaToggle", function()
@@ -103,31 +132,20 @@ cmd("YanaNewPanel", function()
   end)
 end, { desc = "Open an additional yana panel (parallel session)" })
 
-cmd("YanaNextPanel", function()
-  log.guard("YanaNextPanel", function()
-    yana().next_panel()
-  end)
-end, { desc = "Focus or rotate to the next yana panel" })
-
-cmd("YanaPrevPanel", function()
-  log.guard("YanaPrevPanel", function()
-    yana().prev_panel()
-  end)
-end, { desc = "Focus or rotate to the previous yana panel" })
-
--- With !, attachment opens in a new panel.
+-- With !, the picked session opens in a new panel instead of reusing the
+-- current one — handy for running several sessions at once.
 cmd("YanaSessions", function(opts)
   log.guard("YanaSessions", function()
     yana().sessions({ new_panel = opts.bang })
   end)
-end, { bang = true, desc = "Attach a session owned by the live yana daemon" })
+end, { bang = true, desc = "Pick a previous session to view/resume" })
 
-cmd("YanaRecover", function(opts)
-  log.guard("YanaRecover", function()
+cmd("YanaResume", function(opts)
+  log.guard("YanaResume", function()
     local id = (opts.args and opts.args ~= "") and opts.args or nil
-    yana().recover(id)
+    yana().resume(id, { new_panel = opts.bang })
   end)
-end, { nargs = "?", desc = "Recover a daemon-kept review after editor death" })
+end, { nargs = "?", bang = true, desc = "Resume the latest (or a specific) yana session" })
 
 cmd("YanaMode", function()
   log.guard("YanaMode", function()
@@ -142,8 +160,10 @@ cmd("YanaModel", function()
   end)
 end, { desc = "Pick the yana agent model (layer 2: within the active backend)" })
 
--- Layer 1 alone: which binary/account/bill. The panel `model` key runs the
--- backend-then-model picker; this command picks the backend without the model step.
+-- Layer 1: which binary/account/bill.
+-- A separate command from YanaModel on purpose -- switching the model and
+-- switching the backend are different actions with different consequences,
+-- and must never share a keystroke or a single cycling picker.
 cmd("YanaBackend", function()
   log.guard("YanaBackend", function()
     yana().pick_backend()
@@ -161,38 +181,6 @@ cmd("YanaRefusals", function()
     require("yana.ui").show_refusals()
   end)
 end, { desc = "List system-refused operations for the current Yana panel" })
-
-cmd("YanaIgnore", function(opts)
-  log.guard("YanaIgnore", function()
-    local ignore = require("yana.ignore")
-    local pattern = vim.trim(opts.args or "")
-    if pattern == "" then
-      local patterns = ignore.patterns()
-      local lines = {
-        "yana review ignore list — gitignore syntax, matched on the workspace-relative path",
-        "persisted file: " .. tostring(ignore.persisted_path()),
-      }
-      if #patterns == 0 then
-        lines[#lines + 1] = "  (empty — every path a turn writes is offered for review)"
-      else
-        for i, pat in ipairs(patterns) do
-          lines[#lines + 1] = string.format("  %d. %s", i, pat)
-        end
-      end
-      vim.notify(table.concat(lines, "\n"), vim.log.levels.INFO)
-      return
-    end
-    local ok, err = ignore.add(pattern)
-    if not ok then
-      require("yana.notify").safe("yana: " .. tostring(err), vim.log.levels.WARN)
-      return
-    end
-    require("yana.notify").safe(
-      "yana: ignoring `" .. pattern .. "` — matching paths are written through unreviewed from the next turn",
-      vim.log.levels.INFO
-    )
-  end)
-end, { nargs = "*", desc = "List or extend the review ignore list (gitignore syntax)" })
 
 cmd("YanaReview", function()
   log.guard("YanaReview", function()
@@ -260,18 +248,6 @@ cmd("YanaEdit", function(opts)
     end
   end)
 end, { nargs = "*", range = true, desc = "Inline edit the current line/selection (agent mode)" })
-
--- Capture set (write_roots): dialog with no arg; direct add with a directory.
--- Spec: modules/external-roots.md §CAPTURE SET — one command, both behaviours.
-cmd("YanaRoots", function(opts)
-  log.guard("YanaRoots", function()
-    require("yana.ui_roots").command(opts)
-  end)
-end, {
-  nargs = "?",
-  complete = "dir",
-  desc = "Edit the capture set (write_roots): dialog, or add <dir> directly",
-})
 -- Diagnostics. All three are pure reads plus one report file; none of them
 -- resolves a review, rerenders, or touches the real tree.
 cmd("YanaDump", function()
@@ -316,43 +292,22 @@ cmd("YanaSetLogLevel", function(opts)
         "yana: invalid log level "
           .. vim.inspect(requested)
           .. " -- valid levels: "
-          .. table.concat(log.config_level_names(), ", "),
+          .. table.concat(log.level_names(), ", "),
         0
       )
     end
-    vim.notify("yana: log level set to " .. log.get_config_level(), vim.log.levels.INFO, { title = "Yana" })
+    vim.notify("yana: log level set to " .. requested:upper(), vim.log.levels.INFO, { title = "Yana" })
   end)
 end, {
   nargs = 1,
   complete = function()
-    return log.config_level_names()
+    return log.level_names()
   end,
-  desc = "Set the yana log level (error|warn|info|debug); prefer :YanaLogLevel",
+  desc = "Set the yana log level (TRACE/DEBUG/INFO/WARN/ERROR/OFF)",
 })
 
-cmd("YanaLogLevel", function(opts)
+cmd("YanaLogLevel", function()
   log.guard("YanaLogLevel", function()
-    local requested = opts.args
-    if requested == nil or requested == "" then
-      vim.notify("yana: log level is " .. log.get_config_level(), vim.log.levels.INFO, { title = "Yana" })
-      return
-    end
-    local ok = pcall(log.set_level, requested)
-    if not ok then
-      error(
-        "yana: invalid log level "
-          .. vim.inspect(requested)
-          .. " -- valid levels: "
-          .. table.concat(log.config_level_names(), ", "),
-        0
-      )
-    end
-    vim.notify("yana: log level set to " .. log.get_config_level(), vim.log.levels.INFO, { title = "Yana" })
+    vim.notify("yana: log level is " .. log.level_name(log.get_level()), vim.log.levels.INFO, { title = "Yana" })
   end)
-end, {
-  nargs = "?",
-  complete = function()
-    return log.config_level_names()
-  end,
-  desc = "Print or set the yana log level (error|warn|info|debug)",
-})
+end, { desc = "Print the current yana log level" })

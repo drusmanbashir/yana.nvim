@@ -102,7 +102,7 @@ local function line_matches_marker(line, marker)
 end
 
 local function cell_scope(buf, selection)
-  local markers = scope_opts().cell_markers
+  local markers = scope_opts().cell_markers or { "# %%", "#%%" }
   local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
   local l1 = selection.l1
   local cell_start = nil
@@ -367,7 +367,6 @@ local function indent_scope(buf, selection)
   return widen_unstructured_scope(buf, selection, nil)
 end
 
--- Compute the edit-zone scope for selection in buf (treesitter, then indent).
 function M.compute(buf, selection)
   if not selection or not selection.l1 or not selection.l2 then
     return nil
@@ -383,7 +382,6 @@ function M.compute(buf, selection)
   return indent_scope(buf, selection)
 end
 
--- Return the enforcement mode (off/warn/reject) configured for scope.
 function M.enforcement_for(scope)
   local cfg = scope_opts()
   if cfg.enforce == "off" then
@@ -395,7 +393,6 @@ function M.enforcement_for(scope)
   return cfg.enforce or "reject"
 end
 
--- Build the human-readable edit-zone status line for scope.
 function M.describe(scope)
   if not scope then
     return nil
@@ -421,7 +418,6 @@ function M.describe(scope)
   return string.format("Context: %s, lines L%d–L%d.", label, scope.zone_l1, scope.zone_l2)
 end
 
--- Diff before/after text into changed line regions (insert/delete/modify).
 function M.changed_regions(before, after)
   local old_str = before or ""
   local new_str = after or ""
@@ -459,7 +455,6 @@ local function violation_message(scope, region, detail)
   )
 end
 
--- Check change's edits stay inside its scope; return ok, reason.
 function M.validate(change)
   if not change then
     return true
@@ -540,7 +535,6 @@ function M.validate(change)
   return true
 end
 
--- Call M.validate(change) and return its ok, reason results.
 function M.validate_or_raise(change)
   local ok, reason = M.validate(change)
   return ok, reason

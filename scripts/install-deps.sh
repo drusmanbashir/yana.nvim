@@ -5,12 +5,18 @@
 # distro; with --run, offers to run it (and the cursor-agent installer)
 # after showing the exact command and asking [y/N].
 #
+# Package-name mapping validated against live Ubuntu 24.04 (apt) and Fedora
+# (dnf) containers: packets/freshdep-audit-20260820.md Part 1b. The pacman
+# column follows that packet's Part 3 proposal but was NOT run against a
+# live Arch machine -- best-effort, not independently verified.
 #
 # Mirrors the required-executable list in lua/yana/dependencies.lua's
 # confined_executables and the same package-name table as its
 # EXEC_PACKAGE_HINT -- this script must run standalone, before Neovim (or
 # Lua) exists on a fresh clone, so it carries its own copy; keep both in
-# sync when either changes.
+# sync when either changes. Sqlite3/md5sum (optional session-discovery
+# helpers, not preflight blockers) are intentionally not checked here --
+# see `:checkhealth yana` for those.
 #
 # Uses only bash builtins and `command -v` to detect and report -- no
 # grep/sed/awk/find, since those are exactly the kind of thing this script
@@ -58,6 +64,13 @@ case "${1:-}" in
 		;;
 esac
 
+# Required executables for confined-mode turns (ask/inline), mirrored from
+# lua/yana/dependencies.lua's confined_executables, PLUS python3: this
+# installer runs once, before Neovim (and any config it would read) ever
+# loads, so it cannot know whether the operator's config will set
+# `inline_exec_allowlist` and make python3 a hard preflight blocker there
+# too -- it installs python3 unconditionally rather than have a later config
+# change silently need a second install pass.
 required=(
 	bash bwrap capsh python3 realpath sha256sum flock mount umount find stat
 	awk sed grep sort cut tr date hostname getent id mkdir mktemp rmdir chmod

@@ -1,4 +1,4 @@
-*yana.txt*                         Yana                         version 0.1.0-alpha.6
+*yana.txt*                         Yana                         version 0.1.0-alpha.5
 
 ==============================================================================
 CONTENTS                                                        *yana-contents*
@@ -37,11 +37,11 @@ Put this complete plugin specification in
 
     return {
       "drusmanbashir/yana.nvim",
-      dependencies = { "drusmanbashir/yana-ui" },
       cmd = { "Yana", "YanaAsk", "YanaEdit", "YanaOpen" },
+      build = "scripts/install-deps.sh",
       opts = {
         backend = "cursor",  -- "cursor", "claude", or "codex"
-        mappings = {
+        global_keymaps = {
           toggle = "<leader>cc",
           ask = "<leader>ca",
           inline_edit = "<C-k>",
@@ -49,32 +49,25 @@ Put this complete plugin specification in
       },
     }
 <
+`build` runs `scripts/install-deps.sh` once, at install and update. It only
+checks and reports; it never installs anything on its own.
+
 Manually: >sh
 
     git clone https://github.com/drusmanbashir/yana.nvim ~/.local/share/nvim/yana.nvim
+    ~/.local/share/nvim/yana.nvim/scripts/install-deps.sh
 <
 >lua
     vim.opt.runtimepath:prepend("~/.local/share/nvim/yana.nvim")
     require("yana").setup({})
 <
 
-Requirements: Linux, Neovim 0.11.2+, one agent CLI signed in: `cursor-agent`,
-or, EXPERIMENTAL, `claude` or `codex`. There is no installer script: install
-each system package and agent CLI yourself with the one-liners in
-|yana-requirements|, which also gives the other two agent CLIs' install lines;
-|yana-health| runs the same check post-install.
-
-`apt` on Ubuntu 24.04 and older installs a Neovim below the 0.11.2+ floor
-(0.9.5 on a stock Ubuntu 24.04 image, verified) with no warning of its own.
-On Debian/Ubuntu, Neovim's own install docs
-(https://neovim.io/doc/install/) document two ways to get 0.11.2+: the
-AppImage from the Releases page, or the `neovim-ppa/unstable` PPA (not
-maintained by the Neovim team): >sh
-
-    sudo add-apt-repository ppa:neovim-ppa/unstable
-    sudo apt-get update
-    sudo apt-get install neovim
-<
+Requirements: Linux, Neovim 0.11.2+, cursor-agent. `scripts/install-deps.sh`
+detects apt/dnf/pacman and prints one copy-paste command naming the real
+system packages for whatever's missing; with `--run` it offers to install
+them (and cursor-agent's own installer) after showing the exact command and
+asking [y/N] — it never runs anything silently. See |yana-requirements| for
+the full dependency list and |yana-health| for the same check post-install.
 
 ==============================================================================
 3. Requirements                                         *yana-requirements*
@@ -82,23 +75,8 @@ maintained by the Neovim team): >sh
 Required:
 
 - Linux with user namespaces, overlayfs, and /proc
-- Neovim 0.11.2 or newer (see |yana-install| for the Debian/Ubuntu
-  AppImage / neovim-ppa/unstable install path and the apt-floor warning)
-- one agent CLI, installed and signed in:
-  - `cursor-agent` — install: >sh
-        curl https://cursor.com/install -fsS | bash
-<   What you need: a Cursor account (`cursor-agent login`, or
-    $CURSOR_API_KEY).
-  - `claude` (Claude Code CLI) — EXPERIMENTAL. Install (Anthropic's own docs,
-    code.claude.com/docs/en/setup): >sh
-        curl -fsSL https://claude.ai/install.sh | bash
-<   What you need: an Anthropic Pro/Max/Team/Enterprise/Console account
-    (run `claude` and sign in via the browser prompt, or $ANTHROPIC_API_KEY).
-  - `codex` (OpenAI Codex CLI) — EXPERIMENTAL. Install
-    (npmjs.com/package/@openai/codex): >sh
-        npm install -g @openai/codex
-<   What you need: an OpenAI ChatGPT account (`codex login`, or
-    $OPENAI_API_KEY).
+- Neovim 0.11.2 or newer
+- cursor-agent, installed and signed in
 - bash, bwrap, capsh (from libcap2-bin/libcap-utils, used to drop
   capabilities before the confined agent starts), python3, GNU
   coreutils/findutils, util-linux mount tools, awk, sed, grep, hostname,
@@ -121,26 +99,6 @@ titles are unavailable (those sessions still list, shown as untitled).
 
 Run |:checkhealth| with `:checkhealth yana` after installation.
 
-PLATFORM WARNINGS ~
-
-- macOS is not tested on real hardware; the Darwin refusal path is covered
-  only by an automated test, not a real Mac.
-- WSL2 is untested. Yana has not been run against a WSL2 kernel. Ubuntu under
-  WSL2 ships the same AppArmor user-namespace restriction as Ubuntu 24.04
-  desktop, so expect the `bwrap:userns` remedy from `:checkhealth yana`;
-  whether overlayfs behaves under WSL2's kernel has not been measured. Reports
-  welcome.
-- Only x86_64 is tested. Testing installs the x86_64 Neovim tarball. aarch64
-  Linux is expected to work (nothing in Yana is architecture-specific) but
-  has not been run.
-- Fedora/RHEL is tested in a container with SELinux labelling disabled. With
-  SELinux enforcing on a desktop, bubblewrap may need the `container_use_devices`
-  or an equivalent boolean; if `:checkhealth yana` reports `bwrap:userns`
-  failing with a permission error and the sysctl remedy does not apply, check
-  `ausearch -m avc -ts recent` first.
-- musl-based Linux (Alpine) is an open, named gap: Yana cannot print a cleaner
-  refusal because Neovim itself fails to start before any plugin code runs.
-
 ==============================================================================
 4. Commands                                                 *yana-commands*
 
@@ -159,20 +117,12 @@ PLATFORM WARNINGS ~
 :[range]YanaEdit [instruction]
                     Request an inline edit of the current line or range.
 
+                                                    *:YanaTimeline*
+:YanaTimeline       Show the file's reachable review and edit timeline.
+
                                                     *:YanaRefusals*
 :YanaRefusals       List system-refused artifact operations, durable metadata
                     listings, and unsafe-turn recovery paths.
-
-                                                    *:YanaIgnore*
-:YanaIgnore         List the review ignore list and the per-machine file it is
-                    stored in.
-:YanaIgnore {pat}   Add one gitignore-syntax pattern to that file, effective
-                    immediately. A matching create/modify of a regular file is
-                    written through to the workspace at turn end and never
-                    offered for review; the turn reports the count and paths in
-                    one line. Merged with `review.ignore` from setup(). Never
-                    reaches .git/, .hg/ or .svn/, and never applies a delete,
-                    symlink retarget or mode change unreviewed.
 
                                                     *:YanaReview*
 :YanaReview         Open a pending inline review.
@@ -186,14 +136,11 @@ PLATFORM WARNINGS ~
 :YanaNewPanel       Open an additional panel with its own conversation.
 
                                                     *:YanaSessions*
-:YanaSessions[!]    Attach a session owned by the live yana daemon; ! uses a
-                    new panel. Sessions are resumable only while the daemon
-                    that owns them is alive — nothing resumes from disk once
-                    it dies.
+:YanaSessions[!]    Resume a saved session; ! uses a new panel.
 
-                                                    *:YanaRecover*
-:YanaRecover [id]   Recover a daemon-kept review after editor death; no id
-                    reopens the recovery picker.
+                                                    *:YanaResume*
+:YanaResume [id][!] Resume the given (or most recent) session; ! uses a new
+                    panel.
 
                                                     *:YanaMode*
 :YanaMode           Switch Ask, Edit, and enabled Agent modes while the
@@ -225,28 +172,33 @@ Minimal setup: >lua
     require("yana").setup({})
 <
 
-The default mode is `inline`, the first entry of `modes`. Important options: >lua
+The default mode is `inline`. Important options: >lua
 
     require("yana").setup({
       -- cmd / cmd_env: see |yana-machine-config|.
       model = nil,
-      modes = { "inline", "agentic", "ask" }, -- first starts; <M-t> cycles in order
+      mode = "inline",             -- "ask" or "inline"
       approve_mcps = false,
       -- Extra artifact-grouping names/globs; never a destructive-safety rule.
       artifact_dir_prefixes = {},
       -- Directories outside the opened workspace a turn may write.
       write_roots = {},
-      mappings = { toggle = false, ask = false, inline_edit = false },
+      global_keymaps = {
+        toggle = nil,
+        ask = nil,
+        inline_edit = nil,
+        inline_edit_normal = nil,
+      },
     })
 <
 
-Review keys (accept/reject a hunk, a file, or the whole turn) live in the flat
-`mappings` table (default `reject_hunk="cr"`, `accept_hunk="ca"`,
-`accept_file="cf"`, `accept_all="cA"`, `reject_file="cx"`, `next_hunk="]x"`,
-`prev_hunk="[x"`). They cannot be disabled: `false` and `""` both restore the default. The
-old `diff_keymaps` names (`ours`, `theirs`, `all_theirs`, `all_changes`,
-`next`, `prev`) and the deprecated `both` alias still translate onto these;
-`both` warns once per session.
+Review keys (accept/reject a hunk, a file, or the whole turn) live under
+`diff_keymaps` (default `ours="cr"`, `theirs="ca"`, `all_theirs="cf"`,
+`all_changes="cA"`, `reject_file="cx"`, `next="]x"`, `prev="[x"`). F1
+(2026-08-26): `reject_file` was named `both` (an Avante-parity name for a
+binding that has only ever rejected the whole file, not "keep both"); `both`
+still works as a deprecated alias and warns once per session, e.g.
+`diff_keymaps = { reject_file = "cx" }` to silence it.
 
 The panel displays configuration mode `ask` as "Ask", `inline` as "Inline", and
 `agentic` as "Agent". Its conversation winbar leads with Yana and the mode;
@@ -268,29 +220,24 @@ default run with no diagnostic writes is required.
 ==============================================================================
 6. Machine-specific configuration                       *yana-machine-config*
 
-Yana bakes in no usernames or absolute paths. Machine-specific executable
-locations are resolved fresh each time they are needed.
+Yana bakes in no usernames or absolute paths, and invents no environment
+variable of its own that you have to remember: everything machine-specific is
+a first-class `setup()` entry, resolved fresh each time it is needed rather
+than baked into a default.
 
 THE AGENT BINARY ~
-
-No environment setup is normally needed. Yana finds the built-in
-`cursor-agent`, `claude`, and `codex` command names through Neovim's `$PATH`.
-For a custom installation outside `$PATH`, set the matching optional variable:
-`YANA_CURSOR_BIN`, `YANA_CLAUDE_BIN`, or `YANA_CODEX_BIN`. Only variables that
-exist and are non-empty are used.
 
 `cursor-agent` is resolved by `require("yana.config").resolve_cmd()`, the
 single place this precedence is decided (every internal consumer asks it;
 none reads `config.options.cmd` directly to spawn or probe):
 
   1. `cmd`, if set — an explicit path or name always wins outright.
-  2. `YANA_CURSOR_BIN`, when it exists and is non-empty.
-  3. The environment variable NAMED by `cmd_env` (default
+  2. The environment variable NAMED by `cmd_env` (default
      `"YANA_AGENT_BIN"`), read lazily at resolve time: you name a variable
      your shell already exports, and
      yana reads it lazily — nothing secret or machine-specific is ever a
      default.
-  4. `cursor-agent` resolved on `$PATH`.
+  3. `cursor-agent` resolved on `$PATH`.
 
 `~` is expanded (like |expand()|) on whichever candidate wins. Example: >lua
 
@@ -306,7 +253,7 @@ none reads `config.options.cmd` directly to spawn or probe):
     })
 <
 
-`:checkhealth yana` reports exactly which step resolved (or
+`:checkhealth yana` reports exactly which of the three steps resolved (or
 that none did) along with every candidate it tried, so a fresh machine says
 *why* `cursor-agent` wasn't found, not just that it wasn't. See
 |yana-health|.
@@ -358,15 +305,15 @@ by the home rule, via `$HOME` and via your passwd entry), `/home/you/notes` is
 accepting it would put every sibling under the agent's write scope. Start
 Yana inside the project or folder you mean to change. When the file you mean
 to edit would otherwise be refused or is loose, huge, or explicitly pinned,
-Yana may run in |yana-single-file| instead.
+Yana may run in |yana-single-file| instead (ruling 94).
 
                                                         *yana-single-file*
-SINGLE-FILE MODE. When a turn would otherwise use a refused or oversized
-workspace, Yana runs the agent against a scratch copy of exactly ONE file.
-The review paints in your real buffer; the agent's confined writes land only
-in the scratch workspace; your `:w` writes the real file. Reads stay the
-jail's read-only view of the host. A file inside a git project below `$HOME`
-is never single-file, whatever its folder size.
+SINGLE-FILE MODE (ruling 94). When a turn would otherwise use a refused or
+oversized workspace, Yana runs the agent against a scratch copy of exactly ONE
+file. The review paints in your real buffer; the agent's confined writes land
+only in the scratch workspace; your `:w` writes the real file (ruling 87).
+Reads stay the jail's read-only view of the host (decision 94a). A file inside
+a git project below `$HOME` is never single-file, whatever its folder size.
 
 WHEN IT TRIGGERS. Checks run in this order; the first match wins:
 
@@ -392,7 +339,7 @@ SCRATCH COPY. Yana creates under the state root (`$XDG_STATE_HOME/nvim` by
 default, overridable with `YANA_STATE_ROOT`):
 
     <state_root>/single-file/<sha16>/ws/<basename>
-    <state_root>/single-file/<sha16>/records/     " scratch turn records
+    <state_root>/single-file/<sha16>/records/     " timeline journal
     <state_root>/single-file/<sha16>/meta.json    " real_path, real_workspace
 
 `<sha16>` is the first 16 hex digits of a hash of the file's real path. The
@@ -431,9 +378,9 @@ REFUSALS (verbatim; `<basename>` and `<rel>` are filled in by Yana):
 
 ACCEPT, REJECT, UNDO. Accept (`ca`) lands the hunk in the real buffer and
 marks it `modified`; the real disk file is unchanged until your `:w`. Reject
-(`cr`) restores the pre-turn lines in the real buffer. Once the review closes
-it stays closed: `u` in the real buffer is plain Neovim undo — bytes may move,
-no review reopens. The review lives in the real buffer, not the scratch copy.
+(`cr`) restores the pre-turn lines in the real buffer. After accept closes the
+review, `u` in the real buffer may reopen the hunk for another decision
+(ruling 74); the review stays in the real buffer, not the scratch copy.
 
 DISABLE OR FORCE. >lua
 
@@ -504,26 +451,15 @@ may change an individual binary proposal from durable recovery to momentary
 retention. It never grants destructive safety and never changes the
 authoritative change bundle.
 
-Direct `agentic` mode does not use the overlay, review, or diary. With the
-default `sandbox.agentic = "full"`, the selected agent CLI gets the same user
-permissions it gets in a terminal, including paths outside the opened
-workspace. Agentic is in the default `modes` and reached with `<M-t>`; leave it
-out of the list to make it unreachable, or list it first to start in it: >lua
+Direct `agentic` mode does not use the overlay, review, or diary. It gives
+cursor-agent ordinary write access to the real workspace and must be enabled
+explicitly: >lua
 
     require("yana").setup({
-      modes = { "agentic", "inline", "ask" },
-      sandbox = { inline = "vendor-default", agentic = "full" },
+      enable_agentic = true,
+      mode = "agentic",
     })
 <
-
-`sandbox` selects Yana's vendor-neutral level. Valid levels are `full`,
-`workspace`, `read-only`, and `vendor-default`; the last appends no vendor
-sandbox flag. Ask always uses `read-only`. Each backend translates the selected
-level into its own CLI spelling; a backend missing a level refuses at setup.
-Inline defaults to `vendor-default`: Yana's overlay is the write boundary, so
-no second vendor sandbox token is added. A system-wide vendor config may still
-narrow a declared `write_roots` entry; |yana-health| warns when this inheritance
-is active.
 
 Nothing the agent prints can enable direct mode.
 
@@ -550,8 +486,8 @@ insert-mode `<C-s>` untouched everywhere else) is reported as INFO instead.
 The default steer key (`<C-CR>`) is indistinguishable from plain `<CR>` on
 many terminals without the Kitty keyboard protocol or an equivalent, which
 health reports as INFO on a terminal it cannot confirm supports it — rebind
-it, e.g. `mappings = { steer = "<M-CR>" }`, if `<C-CR>` never steers for you.
-Yana ships no completion provider of its own, so `mappings.completion_menu`
+it, e.g. `keymaps = { steer = "<M-CR>" }`, if `<C-CR>` never steers for you.
+Yana ships no completion provider of its own, so `keymaps.completion_menu`
 (default `<C-Space>`) only shows yana-scoped slash-command/@mention
 completions when your own blink.cmp config special-cases
 `vim.b.yana_prompt`, which health also reports as INFO.

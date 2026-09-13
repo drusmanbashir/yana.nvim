@@ -24,94 +24,16 @@ else
 fi
 mkdir -p "$jail_tmpdir"
 scratch=$(mktemp -d "$jail_tmpdir/yana-confined.XXXXXX")
-
-# Every yanad this gate starts runs with --root under $scratch (XDG_STATE_HOME
-# is $scratch/turn/state). Empty roots are skipped: an empty root would match
-# every yanad on the host. Same process-table approach as fresh_install.sh.
-yanad_pids_under() {
-	local root pattern
-	for root in "$@"; do
-		[[ -n "$root" ]] || continue
-		pattern=$(printf '%s' "$root" | sed 's/[][\.*^$+?(){}|]/\\&/g')
-		pgrep -f -- "-m yanad --root $pattern/" || true
-	done
-}
-
-signal_yanad_under() {
-	local sig=$1 pid=$2 root cmdline
-	shift 2
-	cmdline=$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null) || return 0
-	for root in "$@"; do
-		[[ -n "$root" && "$cmdline" == *"-m yanad --root $root/"* ]] || continue
-		kill "-$sig" "$pid" 2>/dev/null || true
-		return 0
-	done
-}
-
-wait_yanads_gone() {
-	local seconds=$1 deadline
-	shift
-	deadline=$((SECONDS + seconds))
-	while [[ -n "$(yanad_pids_under "$@")" ]]; do
-		(( SECONDS < deadline )) || return 1
-		sleep 0.1
-	done
-}
-
-# yanad does not exit when its clients do, so never wait passively: TERM what
-# the process table shows under this gate's scratch, KILL what ignores TERM,
-# then rescan for a daemon that started meanwhile. Same shape as fresh_install.
-stop_yanads_under() {
-	local pass pid pids
-	for pass in 1 2 3; do
-		pids=$(yanad_pids_under "$@")
-		[[ -n "$pids" ]] || return 0
-		for pid in $pids; do
-			signal_yanad_under TERM "$pid" "$@"
-		done
-		wait_yanads_gone 5 "$@" && continue
-		for pid in $(yanad_pids_under "$@"); do
-			printf 'confined turn: yanad pid=%s ignored TERM for 5s; sending KILL\n' "$pid" >&2
-			signal_yanad_under KILL "$pid" "$@"
-		done
-		wait_yanads_gone 2 "$@" || {
-			printf 'confined turn: yanad survived KILL pids=[%s]\n' "$(yanad_pids_under "$@" | tr '\n' ' ')" >&2
-			return 1
-		}
-	done
-	pids=$(yanad_pids_under "$@" | tr '\n' ' ')
-	[[ -n "${pids// /}" ]] || return 0
-	printf 'confined turn: yanad still starting under harness roots after 3 stop passes pids=[%s]\n' "${pids% }" >&2
-	return 1
-}
-
-cleanup_confined_gate() {
-	local exit_rc=$? shutdown_rc=0 survivors
-	stop_yanads_under "$scratch" || shutdown_rc=$?
-	survivors=$(yanad_pids_under "$scratch" | tr '\n' ' ')
-	if (( shutdown_rc != 0 )) || [[ -n "${survivors// /}" ]]; then
-		printf 'CONFINED TURN CLEANUP FAIL: yanad remains alive after gate PASS survivors=[%s] scratch=%s\n' \
-			"${survivors% }" "$scratch" >&2
-		# Keep scratch for diagnostics when cleanup fails.
-		exit 1
-	fi
-	rm -rf "$scratch"
-	exit "$exit_rc"
-}
-trap cleanup_confined_gate EXIT
+trap 'rm -rf "$scratch"' EXIT
 
 run_smoke() {
-	# Yanad stores session layers under $XDG_STATE_HOME/yana/…. The smoke forces
-	# preview.state_root to $YANA_CONFINED_SCRATCH/state; point XDG at that same
-	# tree so layer paths land under the gate scratch the smoke inspects.
-	mkdir -p "$scratch/home" "$scratch/turn/state" "$scratch/config" "$scratch/data" "$scratch/cache"
 	env -i \
 		HOME="$scratch/home" \
 		PATH="$(dirname "$nvim"):/usr/bin:/bin:/usr/sbin:/sbin" \
 		YANA_CONFINED_SCRATCH="$scratch/turn" \
 		XDG_CONFIG_HOME="$scratch/config" \
 		XDG_DATA_HOME="$scratch/data" \
-		XDG_STATE_HOME="$scratch/turn/state" \
+		XDG_STATE_HOME="$scratch/state" \
 		XDG_CACHE_HOME="$scratch/cache" \
 		LC_ALL=C TZ=UTC \
 		"$@" \
@@ -120,7 +42,8 @@ run_smoke() {
 }
 
 # Mutation guard first: a harness that runs green while a development checkout
-# is injected proves nothing about the exported tree.
+# is injected proves nothing. Any non-empty YANA_REPO_DIR must be refused
+# before the plugin loads.
 if run_smoke YANA_REPO_DIR="${DEV_CHECKOUT:-$scratch}"; then
 	echo "CONFINED TURN GATE FAIL: contaminated environment was not refused" >&2
 	exit 1

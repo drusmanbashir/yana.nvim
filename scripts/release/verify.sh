@@ -20,12 +20,13 @@ note_fail() { echo "VERIFY FAIL: $*" >&2; fail=1; }
 [[ -f "$manifest" && -f "$patterns" ]] || die "release policy files missing"
 LC_ALL=C sort -cu "$manifest" || die "manifest must be sorted and unique"
 
-# Shared with tests/forbidden_bytes_gate.sh (row 62): the path-class classifier and the
-# forbidden-byte scan itself both live in scripts/release/lib/forbidden_bytes.sh so the
-# exported-tree check here and the working-tree gate can never disagree about what is
-# scanned or what is forbidden. Sourced from beside this script, not from "$tree", so
-# `verify.sh` keeps working when invoked to check a tree other than its own
-# (candidate.sh runs a clone's own copy; either way the copy running carries its own
+# Shared with tests/forbidden_bytes_gate.sh (row 62): the path-class
+# classifier and the forbidden-byte scan itself both live in
+# scripts/release/lib/forbidden_bytes.sh so the exported-tree check here and
+# the working-tree gate can never disagree about what is scanned or what is
+# forbidden. Sourced from beside this script, not from "$tree", so `verify.sh`
+# keeps working when invoked to check a tree other than its own (candidate.sh
+# runs a clone's own copy; either way the copy running carries its own lib).
 lib="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/forbidden_bytes.sh"
 [[ -f "$lib" ]] || die "shared forbidden-bytes lib missing: $lib"
 # shellcheck source=lib/forbidden_bytes.sh
@@ -77,24 +78,6 @@ while IFS= read -r link; do
 	note_fail "symlink forbidden: ${link#./}"
 done < <(cd "$tree" && find . -path './.git' -prune -o -type l -print)
 
-# Every local Markdown link in a shipped .md file must name a file inside the
-# exported tree: README sends users to docs/, so a manifest that drops a page
-# ships a dead link, and a ../ link points outside what the user installed.
-links_lib="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/doc_links.sh"
-[[ -f "$links_lib" ]] || die "shared doc-links lib missing: $links_lib"
-# shellcheck source=lib/doc_links.sh
-source "$links_lib"
-while IFS= read -r doc; do
-	while IFS= read -r target; do
-		resolved=$(doc_links_resolve "$doc" "$target")
-		if [[ "$resolved" == ".." || "$resolved" == ../* ]]; then
-			note_fail "local link leaves the exported tree in $doc: $target"
-		elif [[ ! -f "$tree/$resolved" ]]; then
-			note_fail "dead local link in $doc: $target"
-		fi
-	done < <(doc_links_targets "$tree/$doc")
-done < <(grep -E '\.md$' "$manifest")
-
 echo "VERIFY EXEMPT: scripts/release/forbidden-patterns.txt is the scanner registry"
 echo "VERIFY EXEMPT: NOTICE's one audited upstream repository URL line"
 while IFS= read -r path; do
@@ -131,9 +114,13 @@ if [[ -n "$tag" && "$tag" != "v$version" ]]; then
 	note_fail "tag $tag does not equal v$version"
 fi
 
-# LICENSE is the unmodified Apache 2.0 text; its appendix carries only the licensor's
-# own copyright (Yana / Usman Bashir), per the Apache boilerplate. Both checks below
-# therefore read NOTICE, not LICENSE.
+# LICENSE is the unmodified Apache 2.0 text; its appendix carries only the
+# licensor's own copyright (Yana / Usman Bashir), per the Apache boilerplate.
+# Attribution for upstream-derived material is not an Apache LICENSE concern
+# -- it belongs in NOTICE, which is the Apache-idiomatic home for it, and
+# which already reproduces the upstream MIT licence text in full (satisfying
+# MIT's own requirement that its notice be retained somewhere in the
+# distribution). Both checks below therefore read NOTICE, not LICENSE.
 grep -Fq "Copyright 2026 Usman Bashir" "$tree/LICENSE" \
 	|| note_fail "Yana copyright holder missing from LICENSE"
 grep -Fqx "Copyright (c) 2026 The Sigillite" "$tree/NOTICE" \

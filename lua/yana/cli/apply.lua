@@ -63,10 +63,34 @@ end
 --- installed 0664 — a mode change nobody proposed, reviewed or journaled, on
 --- the one operation that is destructive without touching a byte.
 ---
---- Three provenances, in order: 1. A DELIBERATE mode decision. The producer records the
---- after-mode on the operation's evidence when the mode itself changed (`new-mode` in
---- `bin/yana-changeset`), which is what makes `chmod+modify` one reviewed compound
---- operation.
+--- Three provenances, in order:
+---   1. A DELIBERATE mode decision. The producer records the after-mode on the
+---      operation's evidence when the mode itself changed (`new-mode` in
+---      `bin/yana-changeset`), which is what makes `chmod+modify` one
+---      reviewed compound operation. When the evidence carries it, it wins:
+---      pinning the old mode unconditionally would silently drop the chmod
+---      half of the compound, which `the filesystem operations contract`
+---      forbids as half-acceptance. NOT YET WIRED END TO END: the producer
+---      emits `new-mode`, but `cli/turn.lua`'s `evidence_from_op` drops it
+---      when it builds the evidence row, so no change set carries
+---      `after_mode` today. The consumer is here and correct; the carrier is
+---      one field in the producer away, and until it lands a chmod cannot
+---      reach disk through this door at all — which is honest, where reading
+---      the staged copy's umask was a mode change on every accept.
+---   2. A CREATE has no target to inherit from, so the staged copy remains the
+---      only provenance there.
+---   3. Otherwise the mode is the TARGET's, and the authority is the target on
+---      real disk, NOT `base_mode` from the prep-time evidence. `the fixed safety contract`
+---      requires object identity AND content at the last instant before the
+---      write, and `base_mode` is a prep-time observation of a value the
+---      applier is about to re-read anyway: `state_matches` in
+---      `safety/diary.lua` compares mode as well as type, target and content,
+---      so a human chmod between preparation and accept is a named STALE
+---      refusal, not something either mode source could overwrite. Returning
+---      nil hands the decision to the journaled applier, which stats the
+---      target immediately before installing the temp, so the read and the
+---      write share one instant and no second source can disagree with the
+---      staleness check that just ran.
 local function mode_for_apply(ev, change_path)
 	local declared = ev.after_mode
 	if type(declared) == "number" then
@@ -81,12 +105,17 @@ end
 
 --- What the accept is about to do to the mode, said out loud.
 ---
---- The inline door already discloses its mode change; this is that parity. It is
---- disclosure, NOT a veto: a `chmod+modify` is one decision and the mode travels with
---- the bytes, which is the contract `the filesystem operations contract` states and
---- this does not touch. The product cannot separate a deliberate chmod from a umask
---- artifact left by an agent that replaced the file rather than rewriting it, so it
---- reports what it observed instead of guessing which one it was.
+--- The CLI door used to print `applied tool.sh` whether or not the accept also
+--- re-moded the file, so an operator could watch 0755 become 0664 with nothing
+--- naming it. The inline door already discloses its mode change; this is that
+--- parity. It is disclosure, NOT a veto: a `chmod+modify` is one decision and
+--- the mode travels with the bytes, which is the contract
+--- `the filesystem operations contract` states and this does not touch.
+--- The product cannot separate a deliberate chmod from a umask artifact left
+--- by an agent that replaced the file rather than rewriting it, so it reports
+--- what it observed instead of guessing which one it was. Nothing is appended
+--- when no mode change is in the operation, so a content-only accept still
+--- prints exactly `applied <rel>`.
 local function mode_note(ev, target_mode)
 	if type(target_mode) ~= "number" or type(ev.base_mode) ~= "number" then
 		return ""
@@ -191,12 +220,16 @@ local function cmd_apply(args)
 	local base_map = read_base_hashes(changes_dir)
 	local evidence_map = read_base_evidence(changes_dir)
 	local rels = collect_relpaths(changes_dir)
-	-- `--diary` is operator-supplied, so a SECOND run against a directory that already
-	-- holds a journal is reachable — it is what re-running after a partial refusal looks
-	-- like. `diary.begin` on such a directory appends a second `begin` row and restarts
-	-- `op_seq` at 0, so the new session issues op ids the finished one already used.
-	-- `diary.open` is the entry for an existing journal: it reconstructs `op_seq` from the
-	-- rows so ids continue.
+	-- `--diary` is operator-supplied, so a SECOND run against a directory that
+	-- already holds a journal is reachable — it is what re-running after a
+	-- partial refusal looks like. `diary.begin` on such a directory appends a
+	-- second `begin` row and restarts `op_seq` at 0, so the new session issues
+	-- op ids the finished one already used. The symptom is not an error: the
+	-- reused id is already `done`, so `apply_pending` answers "no pending intent
+	-- for path" and the operation is NEITHER APPLIED NOR REFUSED BY NAME, while
+	-- `displaced/<seq>.bin` is keyed on that same seq and would be overwritten
+	-- by whichever writer got there second. `diary.open` is the entry for an
+	-- existing journal: it reconstructs `op_seq` from the rows so ids continue.
 	local session, serr
 	if vim.fn.filereadable(diary_dir .. "/journal.jsonl") == 1 then
 		session, serr = diary.open(diary_dir)

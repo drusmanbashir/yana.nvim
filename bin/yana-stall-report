@@ -1,27 +1,6 @@
 #!/usr/bin/env bash
 set -u
 
-usage() {
-	cat <<'EOF'
-Usage: yana-stall-report [ROOT]
-
-Scans ROOT (default: $YANA_STATE_ROOT, else $XDG_STATE_HOME/yana, else
-$HOME/.local/state/yana) for turn forensics summaries
-(*/forensics/summary.txt) and prints one TSV row per turn:
-turn, cause, duration_ms, last_event, cpu_pct_at_stop, erofs_count,
-sub_agent_dirs.
-
-  -h, --help   Print this help and exit.
-EOF
-}
-
-case "${1:-}" in
-	-h | --help)
-		usage
-		exit 0
-		;;
-esac
-
 root="${1:-${YANA_STATE_ROOT:-${XDG_STATE_HOME:-$HOME/.local/state}/yana}}"
 if [ ! -d "$root" ]; then
 	printf 'turn\tcause\tduration_ms\tlast_event\tcpu_pct_at_stop\terofs_count\tsub_agent_dirs\n'

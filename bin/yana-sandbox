@@ -198,16 +198,22 @@ refuse_entries_cap() {
 }
 
 # Filesystem identity, not spelling. `readlink -f` resolves symlinks; it does not
-# resolve bind mounts, so two disjoint pathnames can name one directory and one pathname
-# can name two directories over time. The approval verdict is therefore keyed on
-# (st_dev, st_ino, birth) — device and inode as a bind alias preserves them, plus inode
-# birth time so a recycled inode created later cannot inherit the previous directory's
-# verdict.
+# resolve bind mounts, so two disjoint pathnames can name one directory and one
+# pathname can name two directories over time. The approval verdict is therefore
+# keyed on (st_dev, st_ino, birth) — device and inode as a bind alias preserves
+# them, plus inode birth time so a recycled inode created later cannot inherit
+# the previous directory's verdict. The slug stays (st_dev, st_ino) only: it
+# names the state directory, it does not decide applicability.
 #
-# Birth is read with `stat %w`, NOT `%W`. `%W` is whole seconds, and ext4 hands a
-# delete/recreate the just-freed inode straight back, so a root replaced inside one
-# wall-clock second produced an identical (dev, ino, %W) triple and inherited the
-# previous root's approval. `%w` carries nanoseconds and separates them.
+# Birth is read with `stat %w`, NOT `%W`. `%W` is whole seconds, and ext4 hands
+# a delete/recreate the just-freed inode straight back, so a root replaced
+# inside one wall-clock second produced an identical (dev, ino, %W) triple and
+# inherited the previous root's approval. `%w` carries nanoseconds and separates
+# them. `%w` is a formatted local timestamp with spaces, colons and a zone
+# offset ("2026-08-19 04:24:24.952399512 +0100"), which neither the record's
+# key=value line format nor the malformed-verdict regex can carry, so it is
+# normalised through `date +%s%N` into epoch nanoseconds: pure digits, one
+# field, zone-independent, and comparable whole exactly as before.
 #
 # A missing, unparseable or zero birth time is a refusal, never a fallback to
 # the weaker pair.

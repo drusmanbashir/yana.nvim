@@ -14,11 +14,14 @@ import sys
 VERSION = "yana-changeset-v1"
 OPAQUE_XATTR = "user.overlay.opaque"
 
-# Control-plane floor — the Python mirror of lua/yana/safety/control_plane.lua. A
-# control-plane path belongs to another program's own state machine (git, hg, svn); it
-# is walked and COUNTED so nothing is silent, but is never emitted as a reviewable
-# content operation. the fixed safety contract control-plane invariant; the immutable
-# control-plane rules "Wall 4".
+# Control-plane floor — the Python mirror of lua/yana/safety/control_plane.lua.
+# A control-plane path belongs to another program's own state machine (git, hg,
+# svn); it is walked and COUNTED so nothing is silent, but is never emitted as a
+# reviewable content operation. the fixed safety contract control-plane invariant;
+# the immutable control-plane rules "Wall 4". The floor is immutable — config may
+# ADD segments, never remove one — so a lower-cased set is unioned with the
+# floor unconditionally. Kept deliberately identical to the Lua module across
+# this process boundary; both cite the spec as the single source of truth.
 CONTROL_PLANE_FLOOR = (".git", ".hg", ".svn")
 
 
@@ -311,8 +314,10 @@ def compare_path(upper_path: str, lower_path: str, st_upper: os.stat_result) -> 
         changed_bytes = upper_bytes != lower_bytes
         changed_mode = mode_bits(st_upper) != mode_bits(st_lower)
         if changed_bytes:
-            # Fingerprint AND state of the very object `changed_bytes` was decided on:
-            # one observation, emitted whole.
+            # Fingerprint AND state of the very object `changed_bytes` was
+            # decided on: one observation, emitted whole. When the mode also
+            # changed, carry the after-mode on the same record so a compound
+            # edit stays one decision (shortlist 3b).
             rec = [
                 "modify",
                 "file",
@@ -379,12 +384,14 @@ def walk_upper(workspace: str, upper: str) -> list[tuple[str, ...]]:
             upper_path = os.path.join(dirpath, name)
             rel = name if not rel_dir else f"{rel_dir}/{name}"
 
-            # Control-plane refusal at the producer. The path is still WALKED and
-            # RECORDED here — one `control-plane` record per path, a non-content kind —
-            # so the turn summary can count it ("wrote N control-plane files — discarded
-            # with the overlay") and nothing is silent. It is simply never emitted as a
-            # create/modify/delete, so it can never become a review offer or a
-            # reviewable typed operation.
+            # Control-plane refusal at the producer. The path is
+            # still WALKED and RECORDED here — one `control-plane` record per
+            # path, a non-content kind — so the turn summary can count it ("wrote
+            # N control-plane files — discarded with the overlay") and nothing is
+            # silent. It is simply never emitted as a create/modify/delete, so it
+            # can never become a review offer or a reviewable typed operation.
+            # os.walk still descends into the directory, so every internal file
+            # is counted, not just the top segment.
             if is_control_plane(rel, cp_segments) or (ws_bare and is_bare_entry(rel)):
                 records.append(("control-plane", rel))
                 continue
@@ -395,9 +402,14 @@ def walk_upper(workspace: str, upper: str) -> list[tuple[str, ...]]:
                 raise ChangesetError(f"cannot stat upper entry {upper_path}: {exc}") from exc
 
             if is_whiteout(st):
-                # A WHITEOUT DELETE CARRIES ITS BEFORE-EVIDENCE LIKE EVERY OTHER RECORD.
-                # The applier destroys the whole object on this record's word; it is the
-                # last record that may travel without saying what it saw.
+                # A WHITEOUT DELETE CARRIES ITS BEFORE-EVIDENCE LIKE EVERY OTHER
+                # RECORD. It used to carry the path and nothing else, so the one
+                # consumer that could act on it had to look at the real tree
+                # again to decide what it was deleting — a second observation,
+                # with a human save fitting between it and the classification
+                # this record already made. The applier destroys the whole object
+                # on this record's word; it is the last record that may travel
+                # without saying what it saw.
                 lower_path = os.path.join(workspace, rel)
                 st_lower = lstat_lower(lower_path)
                 detail = file_kind(st_lower) if st_lower is not None else "absent"
@@ -412,13 +424,33 @@ def walk_upper(workspace: str, upper: str) -> list[tuple[str, ...]]:
                     if op_fields[0] == "create" and ("opaque", rel) in records:
                         continue
                     if op_fields[0] == "mode" and dir_has_upper_children(upper_path):
-                        # A pre-existing directory that also holds copied-up descendants
-                        # is not itself a content change: its presence, and any mode it
-                        # carries, in the upper layer is fully explained by
-                        # materialising the descendants underneath it, which are ALREADY
-                        # their own separate records in this same walk. Refusing that as
-                        # an unrepresentable operation blocks review of the real edits
+                        # A pre-existing directory that also holds copied-up
+                        # descendants is not itself a content change: its
+                        # presence, and any mode it carries, in the upper
+                        # layer is fully explained by materialising the
+                        # descendants underneath it, which are ALREADY their
+                        # own separate records in this same walk. Whatever
+                        # process wrote those descendants (kernel copy-up on
+                        # a plain write, or a tool that copies a directory
+                        # tree by attribute-preserving means) may leave this
+                        # directory's own mode bits at whatever its own
+                        # materialisation path produced, independent of
+                        # anything the agent decided about permissions — a
+                        # measured case: a directory whose only upper content
+                        # is two edited files nested a level below it, walked
+                        # with a group-writable lower mode and a non-group-
+                        # writable upper mode with no `chmod` anywhere in the
+                        # turn. Refusing that as an unrepresentable operation
+                        # blocks review of the real edits beside it for a
+                        # delta nobody asked for and nothing can act on.
                         #
+                        # A directory with NO upper children is a different
+                        # case entirely: nothing else explains its presence in
+                        # upper, so a mode delta there is the operation, and
+                        # it is still emitted and refused by name exactly as
+                        # before — this is the mutation that must stay red:
+                        # an agent that chmods a directory and touches
+                        # nothing beneath it.
                         continue
                     records.append(tuple([op_fields[0], rel, *op_fields[1:]]))
                 continue
