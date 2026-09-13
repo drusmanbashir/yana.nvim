@@ -106,6 +106,7 @@ M.backend = {
 -- cache dir
 ----------------------------------------------------------------------
 
+-- Returns the pasted-image cache directory path (stdpath cache /yana/clip); does not create it
 function M.cache_dir()
   return vim.fn.stdpath("cache") .. "/yana/clip"
 end
@@ -134,7 +135,7 @@ end
 -- Keep only the newest `keep` pasted images (by mtime, not filename) in dir.
 function M.prune(dir, keep)
   dir = dir or M.cache_dir()
-  keep = keep or 20
+  keep = keep or require("yana.config").options.image_paste.keep
   local handle = uv.fs_scandir(dir)
   if not handle then
     return

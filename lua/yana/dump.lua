@@ -94,11 +94,10 @@ local function section_pools(out)
     local active = pool.active
     if active then
       out[#out + 1] = string.format(
-        "Active review: `%s` buffer %s · model source %s · hint line %s",
+        "Active review: `%s` buffer %s · model source %s",
         esc(active.rel),
         nn(active.bufnr),
-        esc(active.model_source),
-        nn(active.hint_line)
+        esc(active.model_source)
       )
       if active.review_error then
         out[#out + 1] = string.format("Review error: %s", esc(active.review_error))

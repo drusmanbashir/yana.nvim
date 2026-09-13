@@ -45,6 +45,7 @@ function M.one_line_text(msg, room)
   return msg
 end
 
+-- Flatten+trim msg to one line, log WARN/ERROR, then vim.notify it.
 function M.one_line(msg, level)
   msg = tostring(msg)
   -- Flatten FIRST. Width trimming alone does not deliver one line: a message
@@ -70,10 +71,8 @@ function M.one_line(msg, level)
     end
     msg = cut .. "…"
   end
-  -- Persist every WARN/ERROR at full text, whether or not the screen line
-  -- was truncated. Truncation used to be the only write trigger (`full ~= msg`),
-  -- so a wide terminal left yana.log unchanged for the same failure a
-  -- narrow one recorded. Lazy require: log.lua does not depend on this module.
+  -- Persist every WARN/ERROR at full text, whether or not the screen line was
+  -- truncated. Lazy require: log.lua does not depend on this module.
   if level and level >= vim.log.levels.WARN then
     pcall(function()
       require("yana.log").write(level >= vim.log.levels.ERROR and "ERROR" or "WARN", full)

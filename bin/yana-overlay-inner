@@ -2,20 +2,41 @@
 # yana-overlay-inner — mount helper run inside bwrap (not for direct use).
 set -eu
 
+# Resolve this file's own directory from BASH_SOURCE, never cwd, so the
+# sourced mount-phase library resolves at the same absolute path this helper
+# itself was exec'd at -- inside the jail that path is still the same file
+# (the outer --ro-bind / / keeps the whole host tree, including this bin/
+# directory, visible at its real path; see bin/lib/yana-overlay/mount.sh
+# and out/overlay-cutmap.md for the RISK note and the proof).
+readonly INNER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 readonly EXIT_USAGE=64
 readonly EXIT_REFUSE=65
 readonly EXIT_MOUNT=67
 readonly NEUTRAL_LOWER=/tmp/yana/lower
 readonly NEUTRAL_LAYER=/tmp/yana/layer
+readonly NEUTRAL_CURSOR=/tmp/yana/cursor
+readonly NEUTRAL_STATE=/tmp/yana/state
 readonly MOUNT_MARKER=.yana-overlay-mounted
 readonly MOUNT_MARKER_CONTENT=mounted
 
 if [[ ${1:-} == "--help" || ${1:-} == "-h" ]]; then
 	cat <<'EOF'
 Usage: yana-overlay-inner WORKSPACE COMMAND [ARGS...]
-       yana-overlay-inner --broad-root DIR [--cursor DIR]
+       yana-overlay-inner --broad-root DIR [--extra-root DIR]...
+                           [--cursor DIR] [--state-dir DIR]...
                            -- COMMAND [ARGS...]
-       yana-overlay-inner --roots N ROOT... -- COMMAND [ARGS...]
+       yana-overlay-inner --roots N ROOT... [--state-dir DIR]... -- COMMAND [ARGS...]
+
+--state-dir names one backend state directory (backends.<name>.state_dirs)
+to mount read-write at its real path AFTER the overlays, from the staging
+bind yana-overlay made for it at /tmp/yana/state/<i>, i counting the
+--state-dir arguments from 1 in the order they are given. Same reasoning,
+and same failure mode, as the --cursor exception.
+
+Every form runs the agent as the INVOKING USER, never as uid 0; see the
+"Private mount namespace" comment below for what that costs and how this
+helper pays it.
 
 Internal mount-namespace helper invoked only by yana-overlay. The first form
 is the single-root shape yana-overlay has always built when a turn declares
@@ -47,21 +68,47 @@ EOF
 	exit 0
 fi
 
+# ===================== Private mount namespace =====================
+#
+# yana-overlay's bwrap now runs this helper as the INVOKING USER
+# (`--uid $real_uid`), not as uid 0 -- so that the agent it finally execs is
+# the operator, and "super user" refusals from Electron-based vendor CLIs
+# (cursor-agent) cannot happen. That costs us the ability to mount into
+# bwrap's OWN mount namespace, and this re-exec is what buys it back.
+#
+# `ioctl(NS_GET_USERNS)` on /proc/self/ns/mnt confirms it: permitted at `--uid 0`, EPERM
+# at `--uid 1000`.
+#
+# unshare(CLONE_NEWNS) is checked against `current_user_ns()` instead, which
+# IS the namespace we hold CAP_SYS_ADMIN in, so it succeeds -- and the mount
+# namespace it creates is owned by THAT namespace, so every mount below is
+# permitted at a non-zero uid. The new namespace starts as a copy of bwrap's
+# mount table, so the `--ro-bind / /`, the private /tmp and the neutral bind
+# pairs are all still there, unchanged.
+#
+# NOT a nested bwrap / nested user namespace: a second user namespace cannot
+# be given a uid map here at all (writing /proc/PID/uid_map is EPERM under
+# kernel.apparmor_restrict_unprivileged_userns=1, which this host sets), and
+# would not help if it could -- the mount namespace would still belong to an
+# ancestor.
+#
+# `unshare --mount` execs the target directly (it forks only for --pid), so
+# this adds no process: bwrap's --die-with-parent and the launcher's pid
+# bookkeeping see exactly the process they saw before.
+if [[ -z "${YANA_OVERLAY_MOUNT_NS:-}" ]]; then
+	export YANA_OVERLAY_MOUNT_NS=1
+	exec unshare --mount -- "$0" "$@"
+fi
+
 BROAD_ROOT=""
 CURSOR_DIR=""
 ROOTS=()
 EXEC_ALLOW=()
-# volatile is scoped to the broad-root shape only. Measured while building
-# this gate: a killed-before-teardown volatile mount leaves
-# work/incompat/volatile/dirty behind, one directory level deeper than the
-# plain work/incompat a non-volatile mount leaves and, unlike it, non-empty
-# -- so a bare `rm -rf` of the abandoned layer (as tests/overlay_gate.sh's
-# own scratch-dir trap does, and as probe-4 deliberately never tears down
-# itself, "no leak on kill") fails with EACCES where it used to succeed. The
-# product's own teardown_work() already chmod -R's before deleting and
-# handles this fine; a bare `rm -rf` outside that path does not. Since the
-# legacy single-root and --roots shapes must stay byte-identical, volatile
-# applies only to the mount(s) the broad-root shape makes.
+STATE_DIRS=()
+# volatile is scoped to the broad-root shape only. The product's own teardown_work()
+# already chmod -R's before deleting and handles this fine; a bare `rm -rf` outside that
+# path does not. Since the legacy single-root and --roots shapes must stay
+# byte-identical, volatile applies only to the mount(s) the broad-root shape makes.
 VOLATILE_OPT=""
 
 if [[ ${1:-} == "--broad-root" ]]; then
@@ -69,11 +116,22 @@ if [[ ${1:-} == "--broad-root" ]]; then
 	BROAD_ROOT=${1:?--broad-root requires a directory}
 	VOLATILE_OPT=",volatile"
 	shift
+	ROOTS=("$BROAD_ROOT")
 	while [[ $# -gt 0 && "$1" != "--" ]]; do
 		case "$1" in
+			--extra-root)
+				[[ $# -ge 2 ]] || { echo "yana-overlay-inner: --extra-root requires a directory" >&2; exit "$EXIT_USAGE"; }
+				ROOTS+=("$2")
+				shift 2
+				;;
 			--cursor)
 				[[ $# -ge 2 ]] || { echo "yana-overlay-inner: --cursor requires a directory" >&2; exit "$EXIT_USAGE"; }
 				CURSOR_DIR=$2
+				shift 2
+				;;
+			--state-dir)
+				[[ $# -ge 2 ]] || { echo "yana-overlay-inner: --state-dir requires a path" >&2; exit "$EXIT_USAGE"; }
+				STATE_DIRS+=("$2")
 				shift 2
 				;;
 			--exec-allow)
@@ -89,7 +147,6 @@ if [[ ${1:-} == "--broad-root" ]]; then
 	done
 	[[ ${1:-} == "--" ]] || { echo "yana-overlay-inner: expected -- after broad-root options" >&2; exit "$EXIT_USAGE"; }
 	shift
-	ROOTS=("$BROAD_ROOT")
 elif [[ ${1:-} == "--roots" ]]; then
 	shift
 	count=${1:?--roots requires a count}
@@ -101,6 +158,11 @@ elif [[ ${1:-} == "--roots" ]]; then
 	done
 	while [[ $# -gt 0 && "$1" != "--" ]]; do
 		case "$1" in
+			--state-dir)
+				[[ $# -ge 2 ]] || { echo "yana-overlay-inner: --state-dir requires a path" >&2; exit "$EXIT_USAGE"; }
+				STATE_DIRS+=("$2")
+				shift 2
+				;;
 			--exec-allow)
 				[[ $# -ge 2 ]] || { echo "yana-overlay-inner: --exec-allow requires a path" >&2; exit "$EXIT_USAGE"; }
 				EXEC_ALLOW+=("$2")
@@ -121,12 +183,31 @@ else
 	# helper with directly.
 	ROOTS=("${1:?WORKSPACE required}")
 	shift
-	while [[ $# -gt 0 && "$1" == "--exec-allow" ]]; do
+	while [[ $# -gt 0 && "$1" != "--" ]]; do
 		case "$1" in
+			--state-dir)
+				[[ $# -ge 2 ]] || { echo "yana-overlay-inner: --state-dir requires a path" >&2; exit "$EXIT_USAGE"; }
+				STATE_DIRS+=("$2")
+				shift 2
+				;;
 			--exec-allow)
 				[[ $# -ge 2 ]] || { echo "yana-overlay-inner: --exec-allow requires a path" >&2; exit "$EXIT_USAGE"; }
 				EXEC_ALLOW+=("$2")
 				shift 2
+				;;
+			*)
+				# NOT an error, and NOT a fallthrough. This form is
+				# `WORKSPACE COMMAND [ARGS...]`, and yana-overlay emits the
+				# `--` separator only when it actually passed an option, so
+				# the first non-option token here is the COMMAND. The other
+				# two forms refuse an unknown token because their `--` is
+				# mandatory; this one must stop.
+				#
+				# Without this arm the loop shifts nothing and spins on the
+				# command forever -- every single-root launch, and every
+				# direct drive of this helper (tests/overlay_gate.sh), hangs
+				# with no output at all.
+				break
 				;;
 		esac
 	done
@@ -137,66 +218,18 @@ fi
 
 LAYERS=()
 
-# mount_overlays — one overlay per entry of ROOTS. The broad-root shape adds
-# -o volatile (packet mount table step 3: "the one broad-root mount; volatile
-# removes the per-copy-up fsync (22x)"), carried in VOLATILE_OPT so the
-# single-root and --roots forms -- which never set it -- mount exactly the
-# option string they always have.
-mount_overlays() {
-	local idx=0 root lower layer
-	for root in "${ROOTS[@]}"; do
-		idx=$(( idx + 1 ))
-		if (( idx == 1 )); then
-			lower=$NEUTRAL_LOWER
-			layer=$NEUTRAL_LAYER
-		else
-			lower="/tmp/yana/r$idx/lower"
-			layer="/tmp/yana/r$idx/layer"
-		fi
-		mount -t overlay yana-ovl \
-			-o "lowerdir=${lower},upperdir=${layer}/upper,workdir=${layer}/work${VOLATILE_OPT}" \
-			"$root" || exit "$EXIT_MOUNT"
-		LAYERS+=("$layer")
-	done
-}
+source "$INNER_DIR/lib/yana-overlay/mount.sh"
 
-# mount_cursor_exception — packet mount table step 5: the ~/.cursor writable
-# exception, mounted ON TOP of the overlay(s) mount_overlays just
-# established. A no-op for the single-root and --roots forms, which never
-# populate CURSOR_DIR -- those two call shapes still mount the exception as
-# an outer bwrap arg, unchanged, exactly as before this file changed.
-#
-# Secret masking (mount table steps 4) was RETIRED 2026-08-24 (ruling "Yana
-# confines writes, not reads", ship-issue tracker issue 2) -- this helper no
-# longer mounts anything over a compiled credential path.
-mount_cursor_exception() {
-	if [[ -n "$CURSOR_DIR" ]]; then
-		mount --bind "$CURSOR_DIR" "$CURSOR_DIR" || exit "$EXIT_MOUNT"
-		# ...AND MAKE IT WRITABLE. This bind's source is the path as this mount
-		# namespace already sees it -- underneath the outer `--ro-bind / /` --
-		# so a plain bind inherits MS_RDONLY and the exception is an exception
-		# in name only: the vendor's token refresh, and anything else writing
-		# there, dies EROFS. (The legacy per-root path never had this problem:
-		# there the exception is an OUTER bwrap `--bind`, which binds from the
-		# host namespace and is writable by construction.) The remount is the
-		# whole point of mounting it here rather than outside -- on top of the
-		# overlay, so it reaches the real host file instead of the turn's
-		# disposable upper.
-		mount -o bind,remount,rw "$CURSOR_DIR" || exit "$EXIT_MOUNT"
-	fi
-}
 
 mount_overlays
 mount_cursor_exception
+mount_state_dirs
 
-# Markers are written only after the FULL set has mounted -- the overlay(s),
-# and now the cursor exception too, when this invocation has one. yana-overlay
-# reads them to tell a pre-agent mount failure (release the claims; the agent
-# never ran) from an agent that happened to exit 67 (touch nothing). A
-# partially mounted set must therefore read as a failure, so no marker may
-# exist until it is complete. This MUST happen before the exec below, in
-# either branch: once this script execs, nothing after that point ever runs
-# again in this process.
+# Markers are written only after the FULL set has mounted -- the overlay(s), and now the
+# cursor exception too, when this invocation has one. yana-overlay reads them to tell a
+# pre-agent mount failure (release the claims; the agent never ran) from an agent that
+# happened to exit 67 (touch nothing). A partially mounted set must therefore read as a
+# failure, so no marker may exist until it is complete.
 for layer in "${LAYERS[@]}"; do
 	touch "${layer}/${MOUNT_MARKER}"
 	echo "$MOUNT_MARKER_CONTENT" >"${layer}/${MOUNT_MARKER}"
@@ -214,44 +247,17 @@ capsh_path=$(command -v capsh) || {
 }
 
 if (( ${#EXEC_ALLOW[@]} == 0 )); then
-	# No inline_exec_allowlist: unrestricted, byte-identical to before this
-	# change -- bash itself execs capsh directly, no python3, no Landlock,
-	# and (since YANA_INLINE_EXEC_ALLOW_PATH is only ever set alongside a
-	# non-empty allowlist) no PATH narrowing either.
 	if [[ -n "${YANA_INLINE_EXEC_ALLOW_PATH:-}" ]]; then
 		export PATH="$YANA_INLINE_EXEC_ALLOW_PATH"
 	fi
 	exec "$capsh_path" --drop=all --caps= -- -c "$(printf '%q ' "${cmd[@]}")"
 fi
 
-# python3 is resolved here, AFTER the branch above returns early for the
-# unrestricted case (so a machine that never sets inline_exec_allowlist is
-# never refused for lacking python3 -- lua/yana/dependencies.lua makes the
-# same call at the config layer), and BEFORE the PATH-narrowing courtesy
-# further below: python3 is not a tool the AGENT is choosing to run either,
-# so it does not belong to the allowlist's own semantics -- it is this
-# launcher's own Landlock-setup machinery. Resolving it against the
-# NARROWED PATH instead (measured while building this fix) made `exec
-# python3` fail with "python3: not found" for every allowlisted turn whose
-# list correctly omitted python3 (it is not a tool the agent should ever
-# invoke directly), refusing the turn before Landlock ever had a chance to
-# run at all.
 python3_path=$(command -v python3) || {
 	echo "yana-overlay-inner: python3 not found on PATH" >&2
 	exit "$EXIT_REFUSE"
 }
 
-# ldd, same reasoning as capsh/python3 above: it is this launcher's OWN
-# library-closure-resolution machinery (order B5), not a tool the agent
-# chose to run, so it must be resolved against the REAL, unnarrowed PATH,
-# before the courtesy narrowing below -- and resolved HERE, in bash,
-# rather than left for the python3 heredoc to look up itself, because by
-# the time that heredoc runs, PATH already IS the narrowed
-# YANA_INLINE_EXEC_ALLOW_PATH (bindir of allowlist symlinks only) and
-# `ldd` is never one of the symlinks placed there. Measured live building
-# this fix: without this, subprocess.run(["ldd", ...]) inside the heredoc
-# raised FileNotFoundError for every allowlisted turn, refusing every
-# closure resolution before Landlock ever ran.
 ldd_path=$(command -v ldd) || {
 	echo "yana-overlay-inner: ldd not found on PATH (required to resolve the exec allowlist's library closure)" >&2
 	exit "$EXIT_REFUSE"
@@ -261,50 +267,28 @@ if [[ -n "${YANA_INLINE_EXEC_ALLOW_PATH:-}" ]]; then
 	export PATH="$YANA_INLINE_EXEC_ALLOW_PATH"
 fi
 
-# THE PROCESS THAT CALLS landlock_restrict_self(2) MUST BE THE PROCESS THAT
-# EXECS THE CONFINED COMMAND. Landlock binds to the calling process (and is
-# inherited by every fork AND execve after it -- that survival across exec
-# is the whole mechanism a confinement boundary like this depends on): a
-# restriction applied by a forked child that then exits confines nothing in
-# whichever process forked it. The previous shape here was exactly that bug
-# -- `python3 - <<PY` called landlock_restrict_self on ITSELF inside a
-# child, the heredoc ended, that child exited, and the bash PARENT that
-# then ran `exec capsh` separately was never restricted. PATH narrowing
-# (kept below, as a courtesy -- "not found" reads better than "permission
-# denied" in the agent's stderr) was the only real block, and an ABSOLUTE
-# executable path bypasses PATH lookup entirely: measured as
-# tests/rb_inline_validation_gate.lua row 2b, mutation M1 below.
+# THE PROCESS THAT CALLS landlock_restrict_self(2) MUST BE THE PROCESS THAT EXECS THE
+# CONFINED COMMAND. The previous shape here was exactly that bug -- `python3 - <<PY`
+# called landlock_restrict_self on ITSELF inside a child, the heredoc ended, that child
+# exited, and the bash PARENT that then ran `exec capsh` separately was never
+# restricted.
 #
-# The fix: `exec python3` HERE, replacing this bash process (no fork). The
-# python3 that comes up in its place does the Landlock setup, calls
-# landlock_restrict_self on itself, and immediately os.execv()s into capsh
-# -- so the SAME, now-restricted process becomes capsh, becomes the shell
-# capsh execs, and becomes whatever that shell execs next. The confined
-# command reaches python3 through an environment variable, NUL-separated,
-# never re-quoted into a shell string: a `printf '%q'` round-trip through a
-# second shell layer is exactly the kind of extra parser this boundary
-# should not have to trust. PR_SET_NO_NEW_PRIVS still runs before
-# restrict_self, unchanged.
+# The fix: `exec python3` HERE, replacing this bash process (no fork). The python3 that
+# comes up in its place does the Landlock setup, calls landlock_restrict_self on itself,
+# and immediately os.execv()s into capsh -- so the SAME, now-restricted process becomes
+# capsh, becomes the shell capsh execs, and becomes whatever that shell execs next. The
+# confined command reaches python3 through an environment variable, NUL-separated, never
+# re-quoted into a shell string: a `printf '%q'` round-trip through a second shell layer
 #
-# WITHDRAWN (order B5, measured): LANDLOCK_ACCESS_FS_EXECUTE was believed to
-# gate execve(2) of the named file only. It does not -- it ALSO gates the
-# kernel's implicit load of a dynamically linked binary's ELF interpreter
-# and the mmap(2) of every shared object that interpreter maps for it. The
-# python3 block below therefore resolves and grants each allowlisted
-# entry's (and capsh's own) full library closure, not just the entry file
-# itself -- see resolve_closure() there. A script's INTERPRETER is still a
-# SEPARATE exec from the script: allowlisting a shell script without also
-# allowlisting /usr/bin/env (or the shebang's literal interpreter path, or
-# bash/sh for a `sh -c` invocation) refuses the interpreter, not the
-# script; the isolation module doc documents this.
+# It does not -- it ALSO gates the kernel's implicit load of a dynamically linked
+# binary's ELF interpreter and the mmap(2) of every shared object that interpreter maps
+# for it. The python3 block below therefore resolves and grants each allowlisted entry's
+# (and capsh's own) full library closure, not just the entry file itself -- see
+# resolve_closure() there. A script's INTERPRETER is still a SEPARATE exec from the
+# script: allowlisting a shell script without also allowlisting /usr/bin/env (or the
 export YANA_INLINE_EXEC_CAPSH="$capsh_path"
 export YANA_INLINE_EXEC_LDD="$ldd_path"
-# \x1e (ASCII Record Separator), NOT NUL: an environment variable is itself a
-# NUL-TERMINATED C string at the OS level, so a NUL byte here would not
-# reach python3 at all -- bash's own command substitution already discards
-# it before that ("ignored null byte in input"), and even without that, the
-# fork/exec environ transfer would truncate on the first one. \x1e cannot
-# appear in a filesystem path or an ordinary command-line argument, so it is
+# \x1e cannot appear in a filesystem path or an ordinary command-line argument, so it is
 # a safe field separator that survives both hops intact.
 export YANA_INLINE_EXEC_CMD="$(printf '%s\x1e' "${cmd[@]}")"
 exec "$python3_path" - "${EXEC_ALLOW[@]}" <<'PY'

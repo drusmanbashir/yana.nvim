@@ -6,6 +6,7 @@ launch-profile-design
 NEOCURSOR
 neocursor
 /home/ub
+/s/agent_rw
 spec_v2
 CORE\.md
 BUILD-SHORTLIST

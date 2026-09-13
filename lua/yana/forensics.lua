@@ -119,6 +119,7 @@ local function slurp_tree(dir, max_files)
   return table.concat(parts, "\n")
 end
 
+-- Classify a stalled turn's cause from CPU% and forensics text evidence.
 function M.classify(bundle)
   bundle = bundle or {}
   local dir = bundle.dir or bundle.path
@@ -165,6 +166,7 @@ function M.classify(bundle)
   return { code = "S6", cause = "vendor-hang", erofs_count = erofs, evidence = evidence }
 end
 
+-- Capture proc/vendor forensics to disk and classify why the turn stalled.
 function M.snapshot(opts)
   opts = opts or {}
   local private = opts.private_dir

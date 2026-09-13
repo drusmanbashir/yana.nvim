@@ -1,12 +1,11 @@
 -- Inline edit ("Ctrl-K"): a one-shot instruction float over a selection.
 --
--- This module owns the ENTRY only — a floating prompt, its keymaps, and an
--- instruction history. It deliberately knows nothing about turns, containment,
--- diffing or review: on submit it hands (selection, instruction) to
--- yana.ui and returns. Everything after that is the ordinary agent turn
--- path, so CORE's contract (agent writes the private layer, Yana reviews
--- inline, the journaled applier is the sole real-tree writer) applies with no
--- special case for inline edit. A bug in review is never a bug in this file.
+-- This module owns the ENTRY only — a floating prompt, its keymaps, and an instruction
+-- history. It deliberately knows nothing about turns, containment, diffing or review:
+-- on submit it hands (selection, instruction) to yana.ui and returns. Everything after
+-- that is the ordinary agent turn path, so CORE's contract (agent writes the private
+-- layer, Yana reviews inline, the journaled applier is the sole real-tree writer)
+-- applies with no special case for inline edit.
 --
 -- Why a float and not the panel prompt: the point of the feature is not having
 -- to leave the buffer you are reading. Routing through the panel would move the
@@ -27,7 +26,7 @@ local history = {}
 local active = nil
 
 local function opts()
-  return config.options.inline_edit or config.defaults.inline_edit
+  return config.options.inline_edit
 end
 
 local function warn(msg)
@@ -134,7 +133,7 @@ local function submit(state)
 end
 
 local function apply_keymaps(state)
-  local k = opts().keymaps or {}
+  local k = config.options.mappings
   local function map(modes, lhs, fn)
     if type(lhs) ~= "string" or lhs == "" then
       return
@@ -144,15 +143,12 @@ local function apply_keymaps(state)
   map({ "n", "i" }, k.submit, function()
     submit(state)
   end)
-  -- submit_normal is normal-mode only on purpose: in insert mode <CR> has to
-  -- keep inserting a newline, because a multi-line instruction is ordinary.
-  map("n", k.submit_normal, function()
-    submit(state)
-  end)
-  map({ "n", "i" }, k.cancel, function()
+  -- The float closes with close in normal mode and with stop in insert mode;
+  -- insert-mode <CR> keeps inserting a newline and <Esc> only leaves insert mode.
+  map("n", k.close, function()
     close_float(state)
   end)
-  map("n", k.cancel_normal, function()
+  map("i", k.stop, function()
     close_float(state)
   end)
   if opts().history > 0 then
@@ -257,9 +253,9 @@ function M.open(buf, l1, l2, instruction)
     -- The footer is the whole discoverability story for this float: it is a
     -- transient window with no help page and no menu to look the keys up in.
     footer = string.format(
-      " %s send · %s cancel ",
-      opts().keymaps.submit or "<C-s>",
-      opts().keymaps.cancel or "<Esc>"
+      " %s send · %s close ",
+      config.options.mappings.submit or "",
+      config.options.mappings.close or ""
     ),
     footer_pos = "right",
   })
@@ -304,12 +300,6 @@ function M.open_visual()
   end
   vim.cmd("normal! \27")
   M.open(0, l1, l2, nil)
-end
-
---- Open over the current line.
-function M.open_line()
-  local l = vim.fn.line(".")
-  M.open(0, l, l, nil)
 end
 
 M._test = M._test or {}

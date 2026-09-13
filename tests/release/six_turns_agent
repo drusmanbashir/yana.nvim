@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# six_turns_agent — deterministic fixture for tests/release/container_six_turns.lua.
+# Makes one real cwd edit per invocation (turn N appends a marker), then emits a
+# minimal NDJSON result stream. Under inline/ask the edit lands in the overlay
+# upper layer; under agentic it hits the real workspace.
+set -euo pipefail
+for arg in "$@"; do
+	if [[ "$arg" == "--list-models" ]]; then
+		printf 'Available models\n\nauto - Auto (current)\n'
+		exit 0
+	fi
+done
+target="${YANA_SIX_TURNS_TARGET:-notes.txt}"
+n="${YANA_SIX_TURNS_N:-1}"
+printf 'six-turn-%s\n' "$n" >>"$target"
+printf '%s\n' \
+	"{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"yana-six-turns\",\"model\":\"Auto\"}" \
+	"{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"six turn $n\"}]},\"session_id\":\"yana-six-turns\"}" \
+	"{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"six turn $n\",\"session_id\":\"yana-six-turns\",\"usage\":{\"inputTokens\":1,\"outputTokens\":1}}"

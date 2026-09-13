@@ -27,32 +27,18 @@ end
 
 --- WHAT THIS PATH WAS WHEN THE TURN STARTED, as a tag, not as bytes.
 ---
---- `read_bytes` above answers "" for a path that does not exist, and "" is also
---- what an existing empty file reads as. Storing only the bytes therefore threw
---- away the one distinction the revert needs: a whole-turn revert of a file the
---- agent CREATED restored "" and left a ZERO-BYTE FILE where the operator had
---- nothing, and reported success. `the review and apply contract` already rules
---- on it -- "Absence is restored as absence, never as an empty file" -- and the
---- same document says why a fingerprint cannot stand in for the tag: "absence
---- and an empty file share the empty fingerprint, so content alone cannot
---- license a write."
+--- `read_bytes` above answers "" for a path that does not exist, and "" is also what an
+--- existing empty file reads as. Storing only the bytes therefore threw away the one
+--- distinction the revert needs: a whole-turn revert of a file the agent CREATED
+--- restored "" and left a ZERO-BYTE FILE where the operator had nothing, and reported
+--- success.
 ---
 --- THE TAG IS A MEASUREMENT, NOT THE PRODUCER'S TYPING. `the change model contract`
---- does distinguish `create` from `modify`, but that typing is not what belongs
---- here. It is not reachable -- `shadow/apply.lua:begin_pass` projects
---- `change.path` out of the change set and drops `kind` and `base_state`, so
---- `begin_turn` receives a flat list of strings -- and threading it through
---- would be the wrong repair anyway. The producer's tag records what the SHADOW
---- saw when the review was built; the checkpoint must record what is on the
---- REAL TREE at capture time. review-apply already legislates that gap (the
---- applier refuses an `absent`-tagged accept onto a path a human has since
---- created, and `tests/apply_gate.sh` probe-37 holds it). A checkpoint that
---- trusted a `create` tag over a path now holding the human's bytes would have
---- the revert DELETE those bytes. One lstat, at the moment of capture.
+--- does distinguish `create` from `modify`, but that typing is not what belongs here.
+--- It is not reachable -- `shadow/apply.lua:begin_pass` projects `change.path` out of
+--- the change set and drops `kind` and `base_state`, so `begin_turn` receives a flat
+--- list of strings -- and threading it through would be the wrong repair anyway.
 ---
---- Mode rides on the same observation because it costs nothing extra and the
---- revert needs it: measured on the unfixed tree, a reverted DELETE of a 755
---- script came back at 664 -- the file returns, unrunnable.
 local function capture_state(path)
 	local st = uv.fs_lstat(path)
 	if st == nil then
@@ -124,17 +110,11 @@ end
 --- opts.paths — list of paths the turn may touch (abs or workspace-relative)
 ---
 --- IDEMPOTENT ON (session, turn_id), and guarded on the MANIFEST rather than on
---- anything the caller holds. `shadow/apply.lua` also keeps a `checkpoint_started`
---- boolean, but that boolean lives on the pass object and a retried or resumed
---- pass is a NEW pass object over the SAME diary directory and turn id — which
---- `the review and apply contract` makes reachable on purpose ("the halt does not
---- kill the pass: the next accept attempts the open again"). Reaching here a
---- second time, the target no longer holds pre-turn bytes: it holds what the
---- first pass already accepted. Capturing those as the turn's pre-turn state
---- makes the whole-turn revert restore the ACCEPTED state and report success —
---- the operator asks to undo the turn, is told it worked, and the turn is still
---- there. Silent data loss, so the guard is the one artefact that survives the
---- pass object being rebuilt: the manifest on disk.
+--- anything the caller holds. Capturing those as the turn's pre-turn state makes the
+--- whole-turn revert restore the ACCEPTED state and report success — the operator asks
+--- to undo the turn, is told it worked, and the turn is still there. Silent data loss,
+--- so the guard is the one artefact that survives the pass object being rebuilt: the
+--- manifest on disk.
 ---
 --- The re-entry is a NO-OP, not a merge. The existing capture is returned as it
 --- stands, so a retried pass that names MORE paths than the first does not
@@ -227,13 +207,12 @@ function M.revert_turn(opts)
 	end
 
 	for _, entry in ipairs(manifest.entries or {}) do
-		-- Validate the PERSISTED path before it drives a real-tree write (finding
-		-- 3): a forged checkpoint manifest naming `.git/config` must be refused,
-		-- independent of ingestion. The write is routed through the guarded
-		-- primitive with the workspace + persisted rel so `write_bytes` re-derives
-		-- and re-classifies the target itself (defense-in-depth). It stays FIRST:
-		-- a forged entry must be refused as a control-plane path, not as an
-		-- untagged one.
+		-- Validate the PERSISTED path before it drives a real-tree write: a
+		-- forged checkpoint manifest naming `.git/config` must be refused, independent of
+		-- ingestion. The write is routed through the guarded primitive with the workspace +
+		-- persisted rel so `write_bytes` re-derives and re-classifies the target itself
+		-- (defense-in-depth). It stays FIRST: a forged entry must be refused as a
+		-- control-plane path, not as an untagged one.
 		local rel = entry.rel
 		if type(rel) ~= "string" or rel == "" then
 			return false, "checkpoint entry has no rel: refusing to restore an unvalidated path"

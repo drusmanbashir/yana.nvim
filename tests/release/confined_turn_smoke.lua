@@ -98,7 +98,8 @@ check(not starts_with(preview.state_root(), root .. "/"), "turn state root is ou
 
 local session, err = preview.begin_turn({ workspace = workspace, stream = "release", turn_id = "1" })
 check(session ~= nil, "preview.begin_turn: " .. tostring(err))
-check(session and starts_with(session.layer_dir, scratch), "overlay layer directory lives under the gate scratch")
+-- Under yanad, begin_turn leaves layer_dir nil; the daemon mints the layer and
+-- jail.consume_answer binds it after the overlay exits (same as run_overlay_shell).
 
 local agent_argv = {
   "sh",
@@ -127,6 +128,10 @@ local job = vim.fn.jobstart(cmd, {
 check(job > 0, "overlay job started")
 local code = vim.fn.jobwait({ job })[1]
 check(code == 0, "confined fake agent exited 0 (got " .. tostring(code) .. "): " .. table.concat(out, " | "))
+
+local answer = jail.consume_answer(session)
+check(answer ~= nil, "yanad answer bound onto the session after overlay")
+check(session and starts_with(session.layer_dir, scratch), "overlay layer directory lives under the gate scratch")
 
 local report, rerr = preview.end_turn(session)
 check(report ~= nil, "preview.end_turn: " .. tostring(rerr))

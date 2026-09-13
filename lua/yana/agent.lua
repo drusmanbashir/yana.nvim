@@ -8,55 +8,34 @@ local notify = require("yana.notify")
 
 local M = {}
 local uv = vim.uv or vim.loop
-local ffi_ok, ffi = pcall(require, "ffi")
-if ffi_ok then
-  ffi.cdef("typedef long ssize_t; ssize_t pread(int fd, void *buf, unsigned long count, long offset);")
-end
 
--- Build the argv used to invoke the ACTIVE BACKEND for a single request.
--- req: { prompt, mode, model, session_id }
+-- req: { prompt, mode, model, session_id, images? }
 --
--- Layer 1 (which backend/binary/account) is decided by config.cmd(), which
--- resolves through the active `config.options.backend` entry
--- (config.resolve_cmd). Layer 2 (which flags that backend's argv carries) is
--- decided here. THE INVARIANTS BELOW ARE YANA'S, NOT THE ENTRY'S (operator
--- ruling, 2026-08-21: "an entry declares spellings, never policy") -- this
--- function places every flag at a fixed point, in a fixed order, and only
--- ever asks the active backend's DESCRIPTOR (config.backend_descriptor) for
--- the TOKEN that vendor uses to say it, never for whether or where. The
--- descriptor table in config.lua's `M.defaults.backends` is the declarative
--- "zoo" entry (avante.nvim's `providers` shape) an operator can extend
--- without touching this file -- see its doc comment for the exact list of
--- what an entry cannot influence and what enforces each. No field read below
--- ever translates the STREAM (claude nests tool_use inside
--- assistant.message.content[] where cursor emits top-level tool_call
--- events) -- that stays out of scope here; see cp/ingest-from-disk, which
--- removes the dependency on stream shape entirely by deriving the review
--- list from the overlay instead of the stream.
+-- Layer 1 (which backend/binary/account) is decided by config.cmd(), which resolves
+-- through the active `config.options.backend` entry (config.resolve_cmd). Layer 2
+-- (which flags that backend's argv carries) is decided here. The descriptor table in
+-- config.lua's `M.defaults.backends` is the declarative "zoo" entry (avante.nvim's
+-- `providers` shape) an operator can extend without touching this file -- see its doc
+-- comment for the exact list of what an entry cannot influence and what enforces each.
 --
 -- The shipped "cursor" descriptor's fields reproduce exactly what this
 -- function hard-coded before backends existed, so the default argv is
 -- byte-identical: an operator who sets nothing sees no change.
-local function build_cmd(req)
+local function build_cmd(req, resolved_command)
   local o = config.options
   local backend_name = o.backend or config.defaults.backend
   local bd = config.backend_descriptor(backend_name) or {}
-  local cmd = { config.cmd() }
+  local cmd = { resolved_command or config.cmd() }
+  local stream_channel = req.steer_enabled and bd.steer_channel == "stream-json"
 
-  -- Work order VENDORS: `subcommand` tokens (codex: {"exec"}) are placed
-  -- IMMEDIATELY after `cmd`, before every flag Yana adds below.
   if bd.subcommand then
     vim.list_extend(cmd, bd.subcommand)
   end
 
-  -- Work order VENDORS, resume-as-subcommand shape ONLY: when this turn is a
-  -- resume AND the active backend resumes via a subcommand rather than a
-  -- flag (bd.resume_subcommand, e.g. codex's `exec resume <id>`), those
-  -- tokens plus the POSITIONAL session id go directly after `subcommand`,
-  -- before every other flag -- never at the tail where bd.resume_flag's
-  -- `--resume <id>` pair goes (see the tail of this function). The two
-  -- shapes are mutually exclusive at setup (M.normalize_backends), so at
-  -- most one of them ever fires for a given turn.
+  -- Work order VENDORS, resume-as-subcommand shape ONLY: when this turn is a resume AND
+  -- the active backend resumes via a subcommand rather than a flag
+  -- (bd.resume_subcommand, e.g. The two shapes are mutually exclusive at setup
+  -- (M.normalize_backends), so at most one of them ever fires for a given turn.
   local has_session = req.session_id and req.session_id ~= ""
   local resumes_by_subcommand = has_session and bd.resume_subcommand ~= nil
   if resumes_by_subcommand then
@@ -64,12 +43,7 @@ local function build_cmd(req)
     table.insert(cmd, req.session_id)
   end
 
-  -- INVARIANT: every turn runs non-interactively. Yana places the flag;
-  -- bd.noninteractive_flag only supplies this vendor's spelling of it
-  -- (required, validated non-empty at setup -- config.lua's require_flag) --
-  -- UNLESS it is the literal `false`, meaning this vendor's `subcommand`
-  -- IS its non-interactive mode already (codex's `exec`), in which case
-  -- Yana places no separate token at all.
+  -- INVARIANT: every turn runs non-interactively.
   if bd.noninteractive_flag then
     table.insert(cmd, bd.noninteractive_flag)
   end
@@ -80,16 +54,16 @@ local function build_cmd(req)
   -- (M.normalize_backends) so an entry cannot silently swap the format
   -- Yana parses.
   vim.list_extend(cmd, bd.stream_json_args or {})
+  if stream_channel then
+    -- Hold stdin open for user/control frames.
+    vim.list_extend(cmd, { "--input-format", "stream-json" })
+  end
 
-  -- CURSOR-SPECIFIC SPELLING, deliberately NOT a schema field (operator
-  -- ruling, 2026-08-21): --trust/--approve-mcps are cursor's own words for
-  -- cursor's own ideas (a one-time workspace-trust prompt, MCP-server
-  -- consent) that most vendors have no concept of at all. Promoting them to
-  -- a generic per-backend field would force every future vendor entry to
-  -- declare nil for something that was never theirs. `o.trust`/
-  -- `o.approve_mcps` predate the backends feature and have only ever meant
-  -- "cursor-agent, don't prompt me for this"; if a future backend earns an
-  -- equivalent concept, it gets its own named capability then, on evidence.
+  -- Promoting them to a generic per-backend field would force every future vendor entry
+  -- to declare nil for something that was never theirs. `o.trust`/ `o.approve_mcps`
+  -- predate the backends feature and have only ever meant "cursor-agent, don't prompt
+  -- me for this"; if a future backend earns an equivalent concept, it gets its own
+  -- named capability then, on evidence.
   if backend_name == "cursor" then
     if o.trust then
       table.insert(cmd, "--trust")
@@ -99,25 +73,40 @@ local function build_cmd(req)
     end
   end
 
-  -- The vendor permission mode is a CONSEQUENCE of the dial, never an operator
-  -- option. `plan` is gone as a mode: it was a way of asking, and it is reached
-  -- by asking for a plan in `ask` (the mode contract).
+  -- Vendor sandbox levels: Yana selects one
+  -- level; the descriptor supplies this vendor's tokens. Ask is always the
+  -- read-only level. vendor-default is a deliberate empty list.
   local mode = req.mode or config.agent_permission_mode()
+  local sandbox_level
   if mode == "ask" or mode == "plan" then
-    -- bd.ask_args == nil is a real, documented gap (see the "claude" entry's
-    -- comment in config.lua): this backend has no non-interactive ask
-    -- equivalent, so nothing is appended rather than guessing a flag that
-    -- would hang a headless turn.
+    sandbox_level = "read-only"
+  else
+    local yana_mode = req.yana_mode or config.options.mode
+    if yana_mode == "review" then
+      yana_mode = "inline"
+    end
+    sandbox_level = config.options.sandbox[yana_mode]
+  end
+  local sandbox_tokens = bd.sandbox_args[sandbox_level]
+  if type(sandbox_tokens) ~= "table" then
+    error(
+      "yana: backend " .. tostring(backend_name) .. " has no sandbox_args for level " .. tostring(sandbox_level),
+      0
+    )
+  end
+  vim.list_extend(cmd, sandbox_tokens)
+
+  -- Non-sandbox permission/launch tokens remain separate. `plan` is gone as
+  -- a user mode; it survives here only as the historical ask alias.
+  if mode == "ask" or mode == "plan" then
+    -- ask_args contains only non-sandbox tokens and may be empty or absent.
     if bd.ask_args then
       vim.list_extend(cmd, bd.ask_args)
     end
   elseif config.agent_needs_permission_flag() then
-    -- config.agent_needs_permission_flag() is the single place this is
-    -- decided; see its comment for the adjudicated reasoning and the
-    -- revisit trigger. bd.allow_edits_args is REQUIRED and validated non-nil
-    -- at setup (may be `{}`) -- a turn that needs edit permission always
-    -- gets it, by construction: an entry cannot leave a mode able to write
-    -- silently unable to (operator ruling, 2026-08-21).
+    -- config.agent_needs_permission_flag() remains the policy switch.
+    -- bd.allow_edits_args contains only tokens not already represented by
+    -- the selected sandbox level and may therefore be empty.
     vim.list_extend(cmd, bd.allow_edits_args)
   end
 
@@ -132,406 +121,111 @@ local function build_cmd(req)
     vim.list_extend(cmd, { bd.select_model_flag, model })
   end
 
-  -- Resume keeps the same conversation/session for follow-up turns. Session
-  -- ids are VENDOR-SPECIFIC (row 58's sharp edge): ui.lua is responsible for
-  -- never handing this function a session_id that belongs to a different
-  -- backend than the one currently active (see M.resume's refusal and
-  -- pick_backend's session-drop in ui.lua) -- this function only adds the
-  -- flag when the active backend's descriptor has one. Skipped entirely when
-  -- `resumes_by_subcommand` already placed the session id earlier (right
-  -- after `subcommand`) -- the two resume shapes never both fire.
+  -- Only spellings the backend descriptor names are emitted; never invent suffixes
+  -- here.
+  local modes = req.model_modes or o.model_modes
+  if type(modes) == "table" and type(bd.mode_tokens) == "table" then
+    local keys = {}
+    for k in pairs(bd.mode_tokens) do
+      keys[#keys + 1] = k
+    end
+    table.sort(keys)
+    for _, key in ipairs(keys) do
+      local tok = bd.mode_tokens[key]
+      local val = modes[key]
+      if type(tok) == "table" and type(val) == "string" and val ~= "" and val ~= "-" then
+        if tok.kind == "config" and type(tok.key) == "string" and tok.key ~= "" then
+          vim.list_extend(cmd, { "-c", string.format('%s="%s"', tok.key, val) })
+        elseif tok.kind == "flag" and type(tok.flag) == "string" and tok.flag ~= "" then
+          vim.list_extend(cmd, { tok.flag, val })
+        end
+      end
+    end
+  end
+
+  -- Resume keeps the same conversation/session for follow-up turns. Session ids are
+  -- VENDOR-SPECIFIC (row 58's sharp edge): pick_backend drops the live session before
+  -- the active backend changes, so this function only receives ids minted by that
+  -- backend. It adds the flag only when the descriptor has one.
   if has_session and not resumes_by_subcommand and bd.resume_flag then
     vim.list_extend(cmd, { bd.resume_flag, req.session_id })
   end
 
-  -- Prompt is positional and passed as a single argv element (no shell), so
-  -- newlines and special characters are safe. Placed last by Yana itself,
-  -- always -- no capability list above can relocate or impersonate it.
-  table.insert(cmd, req.prompt)
+  -- Use the active vendor's native image flag when it has one. Backends
+  -- without this capability receive the expanded path in the prompt.
+  if bd.image_flag and type(req.images) == "table" then
+    for _, image in ipairs(req.images) do
+      if type(image) == "table" and type(image.path) == "string" and image.path ~= "" then
+        vim.list_extend(cmd, { bd.image_flag, image.path })
+      end
+    end
+  end
+
+  -- Prompt is positional unless §11.2's stream-json channel sends it as stdin.
+  if not stream_channel then
+    table.insert(cmd, req.prompt)
+  end
   return cmd
 end
 
-----------------------------------------------------------------------
--- Turn liveness: what the agent last DID
-----------------------------------------------------------------------
---
--- One decoder, two consumers. The panel's status line needs a short label for
--- the last stream event so "working" and "hung" stop looking the same, and the
--- turn's durable `meta.json` needs the same fact so a turn that never finished
--- still says where it stopped. Deriving it twice would let the two disagree
--- exactly when they matter, so it is derived once, here, in the module that
--- already owns stream-json decoding.
---
--- It exists because of a measured failure: on 2026-08-20 an inline turn's last
--- event was a vendor `taskToolCall` `started` (a nested subagent) and nothing
--- followed for 11 minutes. Subagent output is not forwarded into the parent
--- stream, so the only honest thing the parent can say is what it last saw and
--- how long ago.
-
---- The single `<name>ToolCall` member of a tool_call envelope, if there is one.
---- Vendor envelopes carry exactly one; anything else is not a tool call this
---- can describe, and nil is the honest answer.
-local function tool_member(obj)
-  local tc = obj.tool_call
-  if type(tc) ~= "table" then
-    return nil, nil
-  end
-  for k, v in pairs(tc) do
-    if type(k) == "string" and type(v) == "table" and k:match("ToolCall$") then
-      return k, v
-    end
-  end
-  return nil, nil
-end
-
---- Describe one decoded stream event for the liveness surfaces.
----
---- Returns a table { type, subtype, tool, call_id, description, nested, label,
---- timestamp_ms } or nil. nil means "this event carries no operator-meaningful
---- progress" (the echoed user prompt is the only such case today) and the
---- caller must KEEP its previous label rather than blanking it: an event with
---- nothing to say is not the same as the agent having said nothing.
-function M.describe_event(obj)
-  if type(obj) ~= "table" then
-    return nil
-  end
-  local t, st = obj.type, obj.subtype
-  if t == "tool_call" then
-    local name, call = tool_member(obj)
-    if not name then
-      return nil
-    end
-    local info = {
-      type = t,
-      subtype = st,
-      tool = name,
-      call_id = obj.call_id,
-      timestamp_ms = obj.timestamp_ms,
-    }
-    if name == "taskToolCall" then
-      -- A nested subagent. Its `description` is the only thing the parent
-      -- stream ever says about what the subagent is doing, so it IS the label.
-      local args = type(call.args) == "table" and call.args or {}
-      info.nested = true
-      info.description = type(args.description) == "string" and args.description or nil
-      local what = info.description or "nested task"
-      info.label = (st == "completed") and ("task done: " .. what) or ("task: " .. what)
-    else
-      local short = name:gsub("ToolCall$", "")
-      info.label = (st == "completed") and (short .. " done") or short
-    end
-    return info
-  elseif t == "thinking" then
-    return { type = t, subtype = st, label = "thinking", timestamp_ms = obj.timestamp_ms }
-  elseif t == "assistant" then
-    local only_thinking = true
-    local any = false
-    for _, item in ipairs((obj.message or {}).content or {}) do
-      any = true
-      if item.type ~= "thinking" then
-        only_thinking = false
-      end
-    end
-    return {
-      type = t,
-      subtype = st,
-      label = (any and only_thinking) and "thinking" or "answering",
-      timestamp_ms = obj.timestamp_ms,
-    }
-  elseif t == "result" then
-    return { type = t, subtype = st, label = "result", timestamp_ms = obj.timestamp_ms }
-  elseif t == "error" then
-    return { type = t, subtype = st, label = "error", timestamp_ms = obj.timestamp_ms }
-  elseif t == "system" then
-    return {
-      type = t,
-      subtype = st,
-      label = (st == "init") and "session start" or ("system " .. tostring(st)),
-      timestamp_ms = obj.timestamp_ms,
-    }
-  end
-  return nil
-end
+-- Turn liveness decoding moved to agent_liveness.lua: pure
+-- functions of a decoded stream event, no dependency on this module's state.
+M.describe_event = require("yana.agent_liveness").describe_event
 
 -- Why a turn ended, recorded BEFORE the signal is sent. The exit callback that
 -- writes the durable evidence runs once the process is already gone and has
 -- nothing left to ask, so a stop that did not say why at the time is a stop
 -- whose reason is lost. Keyed by job id and cleared at exit.
 local stop_reasons = {}
-local job_status = {}
-local sample_interval_ms = 2000
 M._test = M._test or {}
+M._test.build_cmd = build_cmd
 
 M.DEFAULT_STOP_REASON = "stopped by the operator (:YanaStop)"
 
-local function read_file(path)
-  local f = io.open(path, "r")
-  if not f then
-    return nil
+-- Write one stream-json stdin frame.
+function M.send_frame(job, obj)
+  if not job or job <= 0 then
+    return false
   end
-  local data = f:read("*a")
-  f:close()
-  return data
+  local ok, encoded = pcall(vim.json.encode, obj)
+  if not ok then
+    return false
+  end
+  local ok_send, sent = pcall(vim.fn.chansend, job, encoded .. "\n")
+  return ok_send and tonumber(sent) ~= nil and tonumber(sent) > 0
 end
 
-local function proc_children(pid)
-  local out = {}
-  local req = uv.fs_scandir("/proc/" .. tostring(pid) .. "/task")
-  if not req then
-    return out
+-- Close held stdin after idle result.
+function M.close_stdin(job)
+  if not job or job <= 0 then
+    return false
   end
-  while true do
-    local tid = uv.fs_scandir_next(req)
-    if not tid then
-      break
-    end
-    local data = read_file("/proc/" .. tostring(pid) .. "/task/" .. tid .. "/children") or ""
-    for child in data:gmatch("%d+") do
-      out[#out + 1] = tonumber(child)
-    end
-  end
-  return out
+  return pcall(vim.fn.chanclose, job, "stdin")
 end
 
-local function proc_tree(root)
-  local seen, out, queue = {}, {}, { tonumber(root) }
-  while #queue > 0 do
-    local pid = table.remove(queue, 1)
-    if pid and not seen[pid] and uv.fs_stat("/proc/" .. tostring(pid)) then
-      seen[pid] = true
-      out[#out + 1] = pid
-      for _, child in ipairs(proc_children(pid)) do
-        queue[#queue + 1] = child
-      end
-    end
-  end
-  return out
-end
+-- Per-turn CPU% sampling via /proc moved to agent_cpu_sampler.lua
+--. `job_status` is aliased to the SAME table the sampler module
+-- owns (not a copy), so the hot per-line event path below
+-- (`job_status[job_id].last_event_hr = ...`) is unchanged text and still
+-- mutates the one table the sampler's timer reads.
+local agent_cpu_sampler = require("yana.agent_cpu_sampler")
+local job_status = agent_cpu_sampler.job_status
+local start_cpu_sampler = agent_cpu_sampler.start
+local stop_cpu_sampler = agent_cpu_sampler.stop
+local stderr_tail = agent_cpu_sampler.stderr_tail
+M.status = agent_cpu_sampler.status
+M._test.set_sample_interval_ms = agent_cpu_sampler.set_sample_interval_ms
+M._test.force_status = agent_cpu_sampler.force_status
 
-local clk_tck = nil
-local function clock_ticks_per_second()
-  if clk_tck then
-    return clk_tck
-  end
-  local ok, out = pcall(vim.fn.system, { "getconf", "CLK_TCK" })
-  clk_tck = tonumber(ok and out or nil) or 100
-  return clk_tck
-end
-
-local function proc_ticks(pid)
-  local path = "/proc/" .. tostring(pid) .. "/stat"
-  local fd = uv.fs_open(path, "r", 0)
-  local stat = nil
-  if fd then
-    stat = uv.fs_read(fd, 4096, 0)
-    uv.fs_close(fd)
-  end
-  if not stat then
-    return 0
-  end
-  local rest = stat:match("^%d+ %b() (.+)$")
-  if not rest then
-    return 0
-  end
-  local i, utime, stime = 0, nil, nil
-  for v in rest:gmatch("%S+") do
-    i = i + 1
-    if i == 12 then
-      utime = tonumber(v) or 0
-    elseif i == 13 then
-      stime = tonumber(v) or 0
-      break
-    end
-  end
-  return (utime or 0) + (stime or 0)
-end
-
-local function tree_ticks(pid)
-  local total = 0
-  for _, p in ipairs(proc_tree(pid)) do
-    total = total + proc_ticks(p)
-  end
-  return total
-end
-
-local function ticks_for_pids(pids)
-  local total = 0
-  local live = {}
-  for _, p in ipairs(pids or {}) do
-    if uv.fs_stat("/proc/" .. tostring(p)) then
-      live[#live + 1] = p
-      total = total + proc_ticks(p)
-    end
-  end
-  return total, live
-end
-
-local function ticks_for_status(status)
-  local total = 0
-  local live = {}
-  status.stat_fds = status.stat_fds or {}
-  for _, p in ipairs(status.pids or {}) do
-    if uv.fs_stat("/proc/" .. tostring(p)) then
-      live[#live + 1] = p
-      local fd = status.stat_fds[p]
-      if not fd then
-        fd = uv.fs_open("/proc/" .. tostring(p) .. "/stat", "r", 0)
-        status.stat_fds[p] = fd
-      end
-      local stat = nil
-      if fd and ffi_ok then
-        local n = ffi.C.pread(fd, status.stat_buf, 4095, 0)
-        if n > 0 then
-          stat = ffi.string(status.stat_buf, n)
-        end
-      elseif fd then
-        stat = uv.fs_read(fd, 4096, 0)
-      end
-      if stat then
-        local rest = stat:match("^%d+ %b() (.+)$")
-        if rest then
-          local i, utime, stime = 0, nil, nil
-          for v in rest:gmatch("%S+") do
-            i = i + 1
-            if i == 12 then
-              utime = tonumber(v) or 0
-            elseif i == 13 then
-              stime = tonumber(v) or 0
-              break
-            end
-          end
-          total = total + (utime or 0) + (stime or 0)
-        end
-      end
-    elseif status.stat_fds[p] then
-      pcall(uv.fs_close, status.stat_fds[p])
-      status.stat_fds[p] = nil
-    end
-  end
-  return total, live
-end
-
-local function start_cpu_sampler(job, pid)
-  if not (job and job > 0 and pid and pid > 0) then
-    return
-  end
-  local pids = proc_tree(pid)
-  local fds = {}
-  for _, p in ipairs(pids) do
-    fds[p] = uv.fs_open("/proc/" .. tostring(p) .. "/stat", "r", 0)
-  end
-  local status = {
-    job = job,
-    pid = pid,
-    cpu_pct = 0,
-    last_activity_ms = nil,
-    sample_count = 0,
-    sample_cost_ms_total = 0,
-    sample_cpu_ms_total = 0,
-    last_event_hr = nil,
-    last_sample_hr = uv.hrtime(),
-    last_ticks = tree_ticks(pid),
-    hz = clock_ticks_per_second(),
-    pids = pids,
-    stat_fds = fds,
-    stat_buf = ffi_ok and ffi.new("char[4096]") or nil,
-  }
-  job_status[job] = status
-  local timer = uv.new_timer()
-  status.timer = timer
-  timer:start(sample_interval_ms, sample_interval_ms, vim.schedule_wrap(function()
-    log.guard("yana.agent cpu sampler", function()
-      if not job_status[job] then
-        return
-      end
-      local t0 = uv.hrtime()
-      if status.sample_count > 0 and status.sample_count % 30 == 0 then
-        status.pids = proc_tree(pid)
-      end
-      local now = uv.hrtime()
-      local ticks, live_pids = ticks_for_status(status)
-      status.pids = (#live_pids > 0) and live_pids or { pid }
-      local dt_ms = (now - status.last_sample_hr) / 1e6
-      local dt_ticks = ticks - status.last_ticks
-      if dt_ms > 0 and dt_ticks >= 0 then
-        status.cpu_pct = (dt_ticks / status.hz) / (dt_ms / 1000) * 100
-      end
-      status.last_sample_hr = now
-      status.last_ticks = ticks
-      status.sample_count = status.sample_count + 1
-      status.sample_cpu_ms_total = status.sample_cpu_ms_total + ((uv.hrtime() - t0) / 1e6)
-      status.sample_cost_ms_total = status.sample_cost_ms_total + ((uv.hrtime() - t0) / 1e6)
-    end)
-  end))
-end
-
-local function stop_cpu_sampler(job)
-  local status = job_status[job]
-  if status and status.timer then
-    status.timer:stop()
-    if not status.timer:is_closing() then
-      status.timer:close()
-    end
-    status.timer = nil
-  end
-  for _, fd in pairs(status and status.stat_fds or {}) do
-    pcall(uv.fs_close, fd)
-  end
-  if status then
-    status.stat_fds = nil
-  end
-end
-
-function M.status(job)
-  local status = job and job_status[job] or nil
-  if not status then
-    return nil
-  end
-  return {
-    job = status.job,
-    pid = status.pid,
-    cpu_pct = status.cpu_pct or 0,
-    sample_count = status.sample_count or 0,
-    sample_cost_ms_total = status.sample_cost_ms_total or 0,
-    sample_cpu_ms_total = status.sample_cpu_ms_total or 0,
-    sample_cost_ms_avg = (status.sample_count or 0) > 0
-      and ((status.sample_cost_ms_total or 0) / status.sample_count)
-      or 0,
-  }
-end
-
-function M._test.set_sample_interval_ms(ms)
-  sample_interval_ms = (type(ms) == "number" and ms > 0) and ms or 2000
-end
-
-function M._test.force_status(job, status)
-  job_status[job] = status
-end
-
--- run a request.
--- req fields:
---   prompt      (string)   final prompt text
---   mode        (string)   "ask" | "agent" | "plan"
---   model       (string?)  model id for this request (nil => config/auto)
---   session_id  (string?)  resume an existing session
---   cwd         (string?)  working directory for the agent
---   on_event    (fn(obj))  called per decoded JSON event (on main loop)
---   on_done     (fn(code, stderr)) called when the process exits (on main loop)
---   panel_id    (number?)  owning panel, for the turn ledger
---   turn_gen    (number?)  owning turn generation, for the turn ledger
---   spawn_reason(string?)  why this process exists ("submit", "redirect", …)
--- returns the job id (number) or nil on failure.
+-- run a request. yana_mode (string?) the yana dial value for THIS turn
+-- (config.panel_mode(p.mode) at submit time) -- the only field the jail session's own
+-- mode may be set from.
 function M.run(req)
   -- CONFINEMENT IS AN INVARIANT OF THE MODE, NOT A COURTESY OF THE CALLER.
   --
-  -- Adjudication 2026-08-17 (fresh reviewer, FAIL verdict) found that the
-  -- overlay boundary held "only when invoked": the wrap below is guarded by
-  -- `req.jail_session`, so a caller that supplies none falls straight through
-  -- to jobstart with the raw argv -- unconfined, and in a permission-flagged
-  -- mode that means unconfined WITH the flag. ui.lua does fail closed before
-  -- reaching here, so the shipping path was safe; but it was safe by caller
-  -- discipline, and that is the difference between a hole being currently
-  -- absent and being structurally impossible.
+  -- ui.lua does fail closed before reaching here, so the shipping path was safe; but it
+  -- was safe by caller discipline, and that is the difference between a hole being
+  -- currently absent and being structurally impossible.
   --
   -- `inline` AND `ask` promise the agent is confined (ruling R-3: confinement is
   -- a property of the harness, not of whether the turn expects to propose
@@ -562,6 +256,18 @@ function M.run(req)
     return nil
   end
 
+  -- Resolved executable safety: resolve once before
+  -- any agent spawn and refuse Cursor's desktop Electron launcher by static
+  -- identity. Running it to ask what it is would itself raise the window.
+  local resolution = config.resolve_cmd()
+  local desktop_refusal = dependencies.desktop_cursor_refusal(resolution.value, resolution.backend)
+  if desktop_refusal then
+    if req.on_done then
+      req.on_done(-1, desktop_refusal)
+    end
+    return nil
+  end
+
   local ready, dependency_error = dependencies.preflight(config.options.mode)
   if not ready then
     if req.on_done then
@@ -569,13 +275,12 @@ function M.run(req)
     end
     return nil
   end
-  local cmd = build_cmd(req)
-  -- The resolved agent binary, captured once here (cmd[1], exactly what
-  -- config.cmd() produced inside build_cmd) before `cmd` is potentially
-  -- reassigned to a jail-wrapped argv below (bwrap/sh, not cursor-agent).
-  -- Every ledger/error-message site past this point reports THIS, not a
-  -- fresh config.cmd() call, so provenance always names the binary that was
-  -- actually resolved for this spawn rather than whatever a second
+  local cmd = build_cmd(req, resolution.value)
+  -- The resolved agent binary, captured once here (cmd[1], exactly what config.cmd()
+  -- produced inside build_cmd) before `cmd` is potentially reassigned to a jail-wrapped
+  -- argv below (bwrap/sh, not cursor-agent). Every ledger/error-message site past this
+  -- point reports THIS, not a fresh config.cmd() call, so provenance always names the
+  -- binary that was actually resolved for this spawn rather than whatever a second
   -- resolution (env var mutated mid-flight, however unlikely) might answer.
   local resolved_cmd = cmd[1]
   -- Provenance, record 1 of 3: every jobstart is logged into the turn ledger
@@ -585,9 +290,13 @@ function M.run(req)
   local L = req.panel_id and ledger.ensure(req.panel_id, req.turn_gen) or nil
   local spawn = nil
   local job_env = nil
+  local jail = nil
   if config.overlay_mode() and req.jail_session then
-    local jail = require("yana.shadow.jail")
-    req.jail_session.mode = req.mode or config.options.mode
+    jail = require("yana.shadow.jail")
+    -- NEVER req.mode here: that is the VENDOR permission mode ("ask"/"agent" /"plan",
+    -- config.agent_permission_mode's vocabulary), and jail.wrap_cmd feeds this straight
+    -- into config.resolve_mode(session.mode) to decide inline_exec_allowlist_active.
+    req.jail_session.mode = req.yana_mode or config.options.mode
     local wrapped, jail_env = jail.wrap_cmd(cmd, req.jail_session)
     if not wrapped then
       if L then
@@ -625,6 +334,7 @@ function M.run(req)
   -- itself be a new fact, same "first write wins" rule `rec:note_model_actual`
   -- already follows.
   local model_mismatch_checked = false
+  local got_result = false
 
   -- Opt-in raw tee (config.debug_record, default off). nil when recording is
   -- off, so every call site below is a plain nil check and the default path
@@ -649,13 +359,9 @@ function M.run(req)
     }, rec)
   end
 
-  -- LAYER 1 NARRATION. Every vendor speaks its own event dialect; the panel
-  -- reads exactly one of them (cursor's). The normalizer translates the other
-  -- protocols into that shape so `on_event` never learns there was a second
-  -- vendor. It is per-turn state because claude reports a tool's ARGUMENTS and
-  -- its RESULT in two separate events, so the pairing has to be remembered
-  -- across lines. `cursor` returns each event unchanged, which is what keeps
-  -- the default path byte-identical to pre-backends Yana.
+  -- LAYER 1 NARRATION. Every vendor speaks its own event dialect; the panel reads
+  -- exactly one of them (cursor's). The normalizer translates the other protocols into
+  -- that shape so `on_event` never learns there was a second vendor.
   --
   -- This is narration only. The review list is still derived from the overlay
   -- walk at turn end -- the cardinal rule in the core spec -- so a vendor that
@@ -672,31 +378,28 @@ function M.run(req)
     end
       local ok, obj = pcall(vim.json.decode, line)
     if ok and type(obj) == "table" then
+      if obj.type == "result" then
+        got_result = true
+      end
       local described = M.describe_event(obj)
       if described then
         described.at = os.date("!%Y-%m-%dT%H:%M:%SZ")
         last_event = described
       end
-      -- The vendor's system/init event carries the model it ACTUALLY used,
-      -- which is a fact distinct from `req.model` (what Yana requested) and
-      -- can disagree with it silently — the only way to catch a model switch
-      -- that did not take. Recorded once, from the first system event that
-      -- names one, since a later disagreement would itself be a new fact.
-      -- This runs whether or not opt-in recording (`rec`) is on: the
-      -- disagreement is a UX fact the operator needs regardless of whether
-      -- they also asked for a raw stream tee (row 76).
+      -- The vendor's system/init event carries the model it ACTUALLY used, which is a
+      -- fact distinct from `req.model` (what Yana requested) and can disagree with it
+      -- silently — the only way to catch a model switch that did not take. Recorded
+      -- once, from the first system event that names one, since a later disagreement
+      -- would itself be a new fact. This runs whether or not opt-in recording (`rec`)
+      -- is on: the disagreement is a UX fact the operator needs regardless of whether
       if obj.type == "system" and type(obj.model) == "string" and obj.model ~= "" then
         if rec then
           rec:note_model_actual(obj.model)
         end
-        -- The winbar's CONFIRMED-model source (operator ruling, 2026-08-22):
-        -- the operator's pick is a request, never a display value
-        -- on its own -- this is the one place that request turns into a fact,
-        -- because it is the one place the vendor has actually spoken. Fired on
-        -- every system event that names a model (not gated by
-        -- model_mismatch_checked below, which only dedupes the mismatch
-        -- notification), so a later system event's model — a fact, same as the
-        -- first — still reaches the panel.
+        -- Fired on every system event that names a model (not gated by
+        -- model_mismatch_checked below, which only dedupes the mismatch notification),
+        -- so a later system event's model — a fact, same as the first — still reaches
+        -- the panel.
         if req.on_model_actual then
           req.on_model_actual(obj.model)
         end
@@ -727,6 +430,11 @@ function M.run(req)
         st.last_event_hr = uv.hrtime()
       end
       for _, ev in ipairs(vendor_stream.normalize(vstate, obj)) do
+        -- Track the normalized event, not only the raw cursor-shaped input, so the exit
+        -- warning and outcome metadata agree with the decode path.
+        if ev.type == "result" then
+          got_result = true
+        end
         log.guard("yana.agent on_event", req.on_event, ev)
       end
     elseif L then
@@ -800,11 +508,11 @@ function M.run(req)
             end
             emit(leftover)
           end
-          -- A stop recorded before the signal wins; otherwise the exit
-          -- code is the reason. Either way the record always says something:
-          -- "no reason" is the state that made the 2026-08-20 turn unreadable.
+          -- A stop recorded before the signal wins; otherwise the exit code is the
+          -- reason.
           local key = jid or job_id
           local stop_reason = key and stop_reasons[key] or nil
+          local stopped_by_yana = stop_reason ~= nil
           if key then
             stop_reasons[key] = nil
             stop_cpu_sampler(key)
@@ -839,15 +547,34 @@ function M.run(req)
             ms = elapsed_ms,
             mode = req.mode or config.options.mode,
           })
+          if not got_result and not stopped_by_yana then
+            local tail = stderr_tail(stderr_acc, 10)
+            local cause = tail ~= ""
+              and ("process stderr: " .. tail)
+              or string.format(
+                "process %s exited with code %s without stderr",
+                tostring(resolved_cmd), tostring(code)
+              )
+            log.write("WARN", string.format(
+              "agent produced no result (exit_code=%s elapsed_ms=%s argv0=%s cause=%s)",
+              tostring(code),
+              tostring(elapsed_ms),
+              tostring(resolved_cmd),
+              cause
+            ))
+            notify.one_line(
+              string.format("yana: agent produced no result in %d ms — %s", elapsed_ms, cause),
+              vim.log.levels.WARN
+            )
+          end
           if job_env and job_env.YANA_INLINE_EXEC_ALLOWLIST_ACTIVE == "1" then
             local stderr_text = table.concat(stderr_acc, "\n")
-            -- AUTHORITATIVE FIRST: bin/yana-overlay-inner's own exec attempt,
-            -- when it is the one that fails, prints a structured line naming
-            -- the exact argv0 and the real errno the exec(2) call itself saw
-            -- (`yana-exec-refused argv0=<path> errno=<NAME>`) -- see its
-            -- refuse_exec(). That is sourced from the syscall, not inferred,
-            -- so it is trusted outright and the free-text scan below never
-            -- runs when it is present.
+            -- AUTHORITATIVE FIRST: bin/yana-overlay-inner's own exec attempt, when it
+            -- is the one that fails, prints a structured line naming the exact argv0
+            -- and the real errno the exec(2) call itself saw (`yana-exec-refused
+            -- argv0=<path> errno=<NAME>`) -- see its refuse_exec(). That is sourced
+            -- from the syscall, not inferred, so it is trusted outright and the
+            -- free-text scan below never runs when it is present.
             local structured_argv0, structured_errno =
               stderr_text:match("yana%-exec%-refused argv0=(%S+) errno=(%S+)")
             if structured_argv0 then
@@ -858,14 +585,12 @@ function M.run(req)
                 mode = req.mode or config.options.mode,
               })
             else
-              -- FALLBACK ONLY: a refusal that happens deeper than this
-              -- process's own final exec (e.g. inside the agent's own
-              -- shelled-out children) never reaches the structured line
-              -- above, so this free-text scan over the agent's raw stderr
-              -- is the only signal left. It is a heuristic -- English
-              -- shell error text, not a syscall errno -- and is labelled
-              -- as such so a caller never mistakes it for the authoritative
-              -- source.
+              -- FALLBACK ONLY: a refusal that happens deeper than this process's own
+              -- final exec (e.g. inside the agent's own shelled-out children) never
+              -- reaches the structured line above, so this free-text scan over the
+              -- agent's raw stderr is the only signal left. It is a heuristic --
+              -- English shell error text, not a syscall errno -- and is labelled as
+              -- such so a caller never mistakes it for the authoritative source.
               local denied = stderr_text:match("([%w%._%-%+/]+): Permission denied")
                 or stderr_text:match("([%w%._%-%+/]+): Operation not permitted")
                 or stderr_text:match("([%w%._%-%+/]+): not found")
@@ -881,6 +606,15 @@ function M.run(req)
               end
             end
           end
+          if req.jail_session then
+            -- A vendor may finish the model turn with exit 0 after one child
+            -- write received EROFS. Classify only raw process stderr here;
+            -- jail_refusal supplies the EROFS and filesystem-attribution gates.
+            local stderr_text = table.concat(stderr_acc, "\n")
+            if stderr_text ~= "" then
+              pcall(jail.record_vendor_job_refusal, req.jail_session, resolved_cmd, stderr_text, code)
+            end
+          end
           -- Gen-independent: fires for EVERY real job death, stale or not, so a
           -- redirect can wait for a CONFIRMED exit rather than assuming one
           -- from jobstop() (which only sends SIGTERM). Not called on the
@@ -889,13 +623,19 @@ function M.run(req)
             req.on_exit_confirmed(code)
           end
           if req.on_done then
-            req.on_done(code, table.concat(stderr_acc, "\n"))
+            req.on_done(code, table.concat(stderr_acc, "\n"), {
+              argv0 = resolved_cmd,
+              elapsed_ms = elapsed_ms,
+              got_result = got_result,
+            })
           end
         end)
       end)
     end,
   }
-  if spawn_bd.close_stdin then
+  if req.steer_enabled and spawn_bd.steer_channel == "stream-json" then
+    jobstart_opts.stdin = "pipe"
+  elseif spawn_bd.close_stdin then
     jobstart_opts.stdin = "null"
   end
   local ok_start, job = pcall(vim.fn.jobstart, cmd, jobstart_opts)
@@ -956,15 +696,8 @@ function M.stop(job, reason, extra)
   end
 end
 
--- OS pid for a job, for signal escalation beyond jobstop()'s SIGTERM.
--- Returns the pid (number) or nil (job invalid / already gone).
-function M.pid(job)
-  local ok, pid = pcall(vim.fn.jobpid, job)
-  if ok and type(pid) == "number" and pid > 0 then
-    return pid
-  end
-  return nil
-end
+-- OS pid for a job (M.pid) moved to agent_cpu_sampler.lua.
+M.pid = agent_cpu_sampler.pid
 
 -- Escalate to SIGKILL when SIGTERM (jobstop) was ignored. pid may already be
 -- gone (process died between the caller's check and this call) — pcall
@@ -982,214 +715,13 @@ function M.kill(job)
   return true
 end
 
--- `list_models_format == "lines"` (default; cursor's shape) parser. Requires
--- literal English: `ID - label`, with optional literal `(current)` /
--- `(default)` markers. cursor-agent inherits Neovim's (i.e. the operator's
--- shell's) locale, and under a non-English LANG/LC_ALL it may emit localized
--- labels or a different separator, silently emptying the model list or
--- losing current/default status (PORT-12, portability review). There is no
--- documented machine-readable --list-models format to switch to, so the fix
--- is scoped to exactly this call: M.list_models forces the classic "C"
--- locale on the spawned process only (jobstart's `env` MERGES onto the
--- inherited environment rather than replacing it, so PATH/HOME etc. are
--- untouched) rather than requiring the operator's whole session to run
--- un-localized.
-local function parse_lines_models(out)
-  local models = {}
-  local seen = {}
-  for _, line in ipairs(out) do
-    local id, label = line:match("^(%S+)%s+%-%s+(.+)$")
-    if id and not seen[id] then
-      seen[id] = true
-      local current = label:match("%(current%)") ~= nil
-      local default = label:match("%(default%)") ~= nil
-      label = label:gsub("%s*%(current%)%s*$", ""):gsub("%s*%(default%)%s*$", "")
-      table.insert(models, { id = id, label = label, current = current, default = default })
-    end
-  end
-  return models
-end
-
--- `list_models_format == "json_models"` parser (codex's `debug models`
--- shape, work order VENDORS): `{"models":[{slug,display_name,visibility,...}]}`.
--- Keeps only `visibility == "list"` entries (`"hide"` entries -- e.g. codex's
--- `gpt-reserve`, `codex-auto-review` -- are filtered out, never offered to
--- the operator) and maps `slug` -> id, `display_name` -> label. Deliberately
--- NEVER reads `model_messages` or any other field: that object carries a
--- large prompt-template payload that must not enter the picker, a log, or a
--- fixture (see tests/fixtures/codex-models.json, trimmed to exactly these
--- three fields for the same reason). A malformed/undecodable payload yields
--- an empty list rather than throwing -- on_exit's log.guard would already
--- catch a throw, but an empty list is the more honest signal here (nothing
--- USABLE was found), not "something crashed".
-local function parse_json_models(out)
-  local ok, decoded = pcall(vim.json.decode, table.concat(out, "\n"))
-  if not ok or type(decoded) ~= "table" or type(decoded.models) ~= "table" then
-    return {}
-  end
-  local models = {}
-  for _, m in ipairs(decoded.models) do
-    if type(m) == "table" and m.visibility == "list" and type(m.slug) == "string" and m.slug ~= "" then
-      local label = m.display_name
-      if type(label) ~= "string" or label == "" then
-        label = m.slug
-      end
-      table.insert(models, { id = m.slug, label = label })
-    end
-  end
-  return models
-end
-
--- Per-backend model catalogue cache (session-scoped). Keyed by backend name
--- so a vendor switch never shows another vendor's list (row 58). Filled at
--- setup via M.prefetch_model_lists and on first pick; successes stick for
--- the Neovim process so \am / :YanaModel do not re-spawn the CLI.
---
--- Entry shapes:
---   { status = "ready", models, code, reason }
---   { status = "pending", waiters = { cb, ... } }
--- Failed spawns are NOT cached (retry on next pick). Unsupported (-2) and
--- static `bd.models` catalogues ARE cached.
-local model_list_cache = {}
-
-local function cache_notify_waiters(entry, models, code, reason)
-  local waiters = entry.waiters or {}
-  entry.waiters = nil
-  for _, w in ipairs(waiters) do
-    w(models, code, reason)
-  end
-end
-
---- Snapshot if this backend's list is already warm. Returns
---- models, code, reason or nil when missing/pending.
-function M.cached_model_list(backend)
-  local entry = model_list_cache[backend]
-  if entry and entry.status == "ready" then
-    return entry.models, entry.code, entry.reason
-  end
-  return nil
-end
-
---- Clear one backend (or every backend when nil). Tests / force-refresh.
-function M.clear_model_list_cache(backend)
-  if backend then
-    model_list_cache[backend] = nil
-  else
-    model_list_cache = {}
-  end
-end
-
--- List available models via a backend's `list_models_args`.
--- cb(models, code, reason) where models = { { id, label, current, default }, ... }.
---
--- opts.backend  — which vendor (default: active). Prefetch and the vendor
---                 cascade pass the name explicitly.
--- opts.force    — bypass cache and re-spawn.
---
--- code -2 means "this backend's descriptor declares list_models =
--- false" -- reason names the backend. Requirement 4 (row 58): a backend that
--- cannot list models must degrade HONESTLY (say so in the picker) rather
--- than silently showing the PREVIOUS backend's list under the new backend's
--- name, which would recreate the exact vendor-confusion this feature exists
--- to remove. Checked before spawning anything, so an unsupported backend
--- never even attempts to list models against a binary that would not
--- understand it.
---
--- Work order VENDORS: the argv built below is DELIBERATELY `{cmd} ++
--- list_models_args` and nothing else -- it never prepends `bd.subcommand`.
--- codex's `debug models` is NOT a subcommand of `exec`; it REPLACES
--- `subcommand` entirely, so `codex debug models` is correct and
--- `codex exec debug models` (what prepending subcommand would produce) is
--- not a command codex understands at all.
-function M.list_models(cb, opts)
-  opts = opts or {}
-  local backend = opts.backend or config.options.backend
-  local bd = config.backend_descriptor(backend) or {}
-
-  if not opts.force then
-    local cached = model_list_cache[backend]
-    if cached and cached.status == "ready" then
-      cb(cached.models, cached.code, cached.reason)
-      return
-    end
-    if cached and cached.status == "pending" then
-      cached.waiters[#cached.waiters + 1] = cb
-      return
-    end
-  end
-
-  if not bd.list_models_args then
-    -- Static catalogue (e.g. claude): treat as a ready cache entry so the
-    -- picker and prefetch share one path. Empty/absent still degrades -2.
-    if bd.models and #bd.models > 0 then
-      local models = {}
-      for _, m in ipairs(bd.models) do
-        models[#models + 1] = { id = m.id, label = m.label }
-      end
-      model_list_cache[backend] = { status = "ready", models = models, code = 0, reason = nil }
-      cb(models, 0, nil)
-      return
-    end
-    local reason = backend .. " does not support listing models"
-    model_list_cache[backend] = { status = "ready", models = {}, code = -2, reason = reason }
-    cb({}, -2, reason)
-    return
-  end
-
-  local pending = { status = "pending", waiters = { cb } }
-  model_list_cache[backend] = pending
-
-  local out = {}
-  -- MUST resolve THIS backend's binary, not the active dial — prefetch runs
-  -- for every vendor while the operator may still be on another one.
-  local argv = { config.cmd(backend) }
-  vim.list_extend(argv, bd.list_models_args)
-  local job = vim.fn.jobstart(argv, {
-    env = { LC_ALL = "C" },
-    stdout_buffered = true,
-    on_stdout = function(_, data)
-      if data then
-        vim.list_extend(out, data)
-      end
-    end,
-    on_exit = function(_, code)
-      vim.schedule(function()
-        log.guard("yana.agent list_models on_exit", function()
-          local models
-          if bd.list_models_format == "json_models" then
-            models = parse_json_models(out)
-          else
-            models = parse_lines_models(out)
-          end
-          local entry = model_list_cache[backend]
-          if code == 0 and #models > 0 then
-            model_list_cache[backend] = { status = "ready", models = models, code = 0, reason = nil }
-          else
-            -- Leave uncached on failure so the next pick retries.
-            if entry and entry.status == "pending" then
-              model_list_cache[backend] = nil
-            end
-          end
-          cache_notify_waiters(entry or pending, models, code, nil)
-        end)
-      end)
-    end,
-  })
-
-  if job <= 0 then
-    model_list_cache[backend] = nil
-    cache_notify_waiters(pending, {}, -1, nil)
-  end
-end
-
---- Warm every configured backend's model list in the background at setup.
---- Static catalogues fill synchronously; CLI listings spawn and fill the
---- cache without blocking setup() return.
-function M.prefetch_model_lists()
-  local backends = config.options.backends or {}
-  for name, _ in pairs(backends) do
-    M.list_models(function() end, { backend = name })
-  end
-end
+-- Per-backend model catalogue (--list-models spawn/parse/cache) moved to
+-- agent_models.lua: self-contained, nothing else in this file
+-- read or wrote its cache.
+local agent_models = require("yana.agent_models")
+M.cached_model_list = agent_models.cached_model_list
+M.clear_model_list_cache = agent_models.clear_model_list_cache
+M.list_models = agent_models.list_models
+M.model_list_refreshing = agent_models.model_list_refreshing
 
 return M

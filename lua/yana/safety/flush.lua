@@ -1,14 +1,7 @@
 -- Durable flushes, taken OFF the operator's event loop.
 --
--- WHY THIS FILE EXISTS. Every fsync Yana performs is kept; not one is
--- batched, deferred, deleted or reordered here. What moves is WHERE the caller
--- waits for it. `uv.fs_fsync(fd)` runs the flush on the calling thread, which
--- in Neovim is the main loop: for as long as the disk takes, the editor is
--- stopped — no keystroke serviced, no repaint, no timer. On the operator's
--- filesystem one fsync costs 50-294 ms (S7's own control), the accept path
--- performs 13 of them for a single path, and perf row `S7d2` measured the
--- resulting freeze at 1819.6 ms for one path and `S7e2` at 8495.4 ms in
--- aggregate for five.
+-- WHY THIS FILE EXISTS. Every fsync Yana performs is kept; not one is batched,
+-- deferred, deleted or reordered here. What moves is WHERE the caller waits for it.
 --
 -- `uv.fs_fsync(fd, callback)` runs the same flush on the libuv threadpool and
 -- calls back on the loop thread. Awaiting it with `vim.wait(..., fast_only)`
@@ -16,14 +9,9 @@
 -- at exactly the same moment they did before, in exactly the same order,
 -- because the caller still does not proceed until the callback has arrived.
 --
--- Operator ruling, 2026-08-19 (`the review and apply contract`, "Durability
--- posture"): a durability guarantee stronger than Neovim's own is never worth
--- 300 ms or more of the operator's time. This satisfies it by option 1 —
--- moving the work off the loop — rather than by withdrawing a flush.
+-- This satisfies it by option 1 — moving the work off the loop — rather than by
+-- withdrawing a flush.
 --
--- WHAT MAY RUN DURING THE WAIT, measured on this Neovim (v0.12.4) rather than
--- assumed, because a wait that admits a second accept would be a worse defect
--- than the freeze it removes:
 --
 --   delivered   libuv fs callbacks (this file's own), and raw `uv` timer
 --               callbacks, both in FAST context
@@ -60,15 +48,10 @@ M.timeout_ms = 600000
 M._test = {
 	--- Take the on-loop path, for a caller that wants the old timing.
 	force_sync = false,
-	--- Injected failures.
-	---   `fail_fsync`       — refuse before any request is made.
-	---   `fail_async_fsync` — the message the libuv callback reports, which is
-	---                        the ONLY way to fail a flush that is already off
-	---                        the loop, and so the only honest way to prove the
-	---                        failure path of this seam.
-	---   `fail_async_nth`   — restrict `fail_async_fsync` to the Nth off-loop
-	---                        flush, so a row can place the failure at a chosen
-	---                        point of the accept.
+	--- Injected failures. `fail_fsync` — refuse before any request is made.
+	--- `fail_async_fsync` — the message the libuv callback reports, which is the ONLY way
+	--- to fail a flush that is already off the loop, and so the only honest way to prove
+	--- the failure path of this seam.
 	fault = {},
 	--- Counters, so a row can prove which path a flush actually took.
 	stats = { async = 0, sync = 0 },
