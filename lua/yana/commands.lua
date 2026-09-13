@@ -25,7 +25,6 @@ local builtin_descriptors = {
 	{ name = "model", description = "Pick a model", details = "Layer 2: select the model used within the active backend" },
 	{ name = "backend", description = "Pick a backend", details = "Layer 1: select which binary/account/bill (cursor/claude/…); resets the model" },
 	{ name = "mode", description = "Cycle agent/ask mode", details = "Only before this chat's first turn; a chat's mode is locked once it has run a turn" },
-	{ name = "resume", description = "Resume a session", details = "Pick a previous session to resume" },
 	{ name = "resend", description = "Resend last prompt", details = "here (default) | new = new chat | agent = new chat in agent mode" },
 	{ name = "queue", description = "Manage queued prompts", details = "View, edit, delete or send a queued prompt" },
 	{ name = "stop", description = "Stop the current turn", details = "Cancel the in-flight agent turn" },
@@ -84,10 +83,6 @@ local builtin_callbacks = {
 			cb()
 		end
 	end,
-	resume = function(_panel, _args, cb)
-		require("yana.ui").pick_session()
-		cb(nil)
-	end,
 	queue = function(_panel, _args, cb)
 		require("yana.ui").pick_queue()
 		cb(nil)
@@ -105,13 +100,9 @@ local builtin_callbacks = {
 ----------------------------------------------------------------------
 -- disk-backed custom commands (.cursor/commands/*.md)
 ----------------------------------------------------------------------
--- Scan order, first hit wins on name collision (project overrides global):
---   1. <git-root-or-cwd>/.cursor/commands/*.md
---   2. ~/.cursor/commands/*.md
--- Descriptor name = file basename. Callback = rewrite whose text is the file
--- body. `---`-fenced frontmatter is parsed for `description`; a malformed or
--- unterminated fence degrades to "whole file is the body" — never errors,
--- never drops the command from the menu.
+-- Scan order, first hit wins on name collision (project overrides global): 1.
+-- <git-root-or-cwd>/.cursor/commands/*.md 2. ~/.cursor/commands/*.md Descriptor name =
+-- file basename.
 
 local function project_root()
 	local cwd = vim.fn.getcwd()
@@ -204,28 +195,15 @@ local function scan_dir(dir, out, seen)
 end
 
 ----------------------------------------------------------------------
--- skills (~/.cursor/skills, ~/.cursor/skills-cursor, ~/.claude/skills,
--- .codex/skills, + project-local .cursor/skills)
 ----------------------------------------------------------------------
--- Layout differs from disk commands: each skill is a DIRECTORY containing a
--- SKILL.md whose YAML frontmatter carries `name:` and `description:`.
--- Scan order, first hit wins on name collision (mirrors the commands scan):
---   1. <git-root-or-cwd>/.cursor/skills/*/SKILL.md
---   2. config.options.skill_dirs, in list order (default: ~/.cursor/skills,
---      ~/.cursor/skills-cursor, ~/.claude/skills, .codex/skills)
--- Precedence with commands: commands are scanned into `seen` FIRST in
--- M.get_commands below, so a command and a skill sharing a name always
--- resolves to the command — skills never shadow a command.
+-- Layout differs from disk commands: each skill is a DIRECTORY containing a SKILL.md
+-- whose YAML frontmatter carries `name:` and `description:`. Scan order, first hit wins
+-- on name collision (mirrors the commands scan): 1.
+-- <git-root-or-cwd>/.cursor/skills/*/SKILL.md 2.
 --
--- EXPANSION SEMANTICS: selecting a skill injects the SKILL.md BODY (the
--- text after the closing `---` fence) as the submitted prompt, exactly like
--- a disk command's "rewrite" kind. Rationale: yana drives `cursor-agent
--- --print` headless, so whatever client-side skill-resolution mechanism the
--- interactive Cursor CLI has (if any) is not reachable from a headless
--- --print process — `cursor-agent --help` lists no skill-related flag, and
--- there is no evidence in this binary or repo of headless /skillname
--- resolution. Body-injection is the only semantics guaranteed to work
--- headless.
+-- EXPANSION SEMANTICS: selecting a skill injects the SKILL.md BODY (the text after the
+-- closing `---` fence) as the submitted prompt, exactly like a disk command's "rewrite"
+-- kind. Body-injection is the only semantics guaranteed to work headless.
 
 -- Returns name (or nil), description (or nil), body (string). Never throws
 -- — a broken/missing frontmatter degrades to "no name/description, whole
@@ -318,14 +296,12 @@ local function scan_skill_dir(dir, out, seen)
 	end
 end
 
--- Full-tree skill scan result, throttled: directory globbing (readdir per
--- root, stat per SKILL.md) is cheap per-root but these roots hold 100+
--- entries combined, and get_commands() runs on every completion keystroke
--- (the `/` source re-derives the list each time, same as the disk-command
--- scan above). Re-glob at most once per SKILL_SCAN_TTL_MS; individual file
--- reads/parses are additionally mtime-cached above so a rescan inside the
--- TTL window is still cheap once it does fire. Edits are picked up within
--- one TTL window without restarting nvim.
+-- Full-tree skill scan result, throttled: directory globbing (readdir per root, stat
+-- per SKILL.md) is cheap per-root but these roots hold 100+ entries combined, and
+-- get_commands() runs on every completion keystroke (the `/` source re-derives the list
+-- each time, same as the disk-command scan above). Re-glob at most once per
+-- SKILL_SCAN_TTL_MS; individual file reads/parses are additionally mtime-cached above
+-- so a rescan inside the TTL window is still cheap once it does fire. Edits are picked
 local SKILL_SCAN_TTL_MS = 2000
 local skill_scan_cache = { at = -math.huge, list = {} }
 
@@ -356,6 +332,7 @@ end
 -- public
 ----------------------------------------------------------------------
 
+-- Build the /command menu: builtins, disk commands, then skills, deduped.
 function M.get_commands(panel)
 	local list = {}
 	local seen = {}
@@ -406,6 +383,7 @@ function M.get_commands(panel)
 	return list
 end
 
+-- Look up one command by name in the full menu M.get_commands returns.
 function M.find(panel, name)
 	local list = M.get_commands(panel)
 	for _, c in ipairs(list) do

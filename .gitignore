@@ -1,6 +1,7 @@
 nvim.log
 .nvimlog
 tests/scratch/
+scratch/
 
 # macOS Finder
 .DS_Store
@@ -13,3 +14,9 @@ __pycache__/
 # Agent scratch worktrees and side checkouts
 .claude/
 xcheck/
+.agent/INDEX.tsv
+.agent/INDEX.tsv.tmp
+.agent/INDEX.lock
+spec/council/runs/
+spec/council/LATEST
+transcript.log

@@ -62,8 +62,6 @@ function M:get_completions(ctx, callback)
 		end
 		return out
 	end)
-	-- get_completions never throws into blink: on failure, empty list -- but
-	-- the failure itself was previously swallowed with no trace anywhere.
 	if not ok then
 		require("yana.log").write("WARN", "blink_yana.commands: get_completions failed: " .. tostring(items))
 	end

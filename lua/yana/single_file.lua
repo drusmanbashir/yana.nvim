@@ -2,7 +2,7 @@ local M = {}
 
 local diff = require("yana.diff")
 local hash = require("yana.safety.hash")
-local claim_identity = require("yana.claim_identity")
+local workspace_identity = require("yana.workspace_identity")
 local uv = vim.uv or vim.loop
 
 local SECRET_DIRS = {
@@ -125,14 +125,17 @@ local function secret_roots()
 	return roots
 end
 
+-- Return absolute paths of secret dirs/files under every known $HOME.
 function M.secret_roots()
 	return secret_roots()
 end
 
+-- Stash flags for the next M.decide call to consume.
 function M.set_next_flags(flags)
 	next_flags = flags
 end
 
+-- Return and clear the flags stashed by M.set_next_flags.
 function M.consume_next_flags()
 	local flags = next_flags or {}
 	next_flags = nil
@@ -143,11 +146,13 @@ local function forced_workspace(flags)
 	return flags and flags.workspace and flags.workspace ~= ""
 end
 
+-- Return the real on-disk path mapped for a scratch-buffer path.
 function M.real_path(map, path)
 	local p = real(path) or diff.abs_path(path)
 	return map and (map[p] or map[diff.abs_path(path)]) or nil
 end
 
+-- Return the scratch-buffer path mapped to a given real path.
 function M.scratch_path(map, path)
 	local p = real(path) or diff.abs_path(path)
 	if type(map) ~= "table" then
@@ -161,11 +166,13 @@ function M.scratch_path(map, path)
 	return nil
 end
 
+-- Return the records directory path for a decision's real path.
 function M.records_workspace(decision, state_root)
 	local base = state_root .. "/single-file/" .. hash.hash_bytes(decision.real_path):sub(1, 16)
 	return base .. "/records"
 end
 
+-- Classify a saved path into a single-file-mode trigger, or refuse/skip it.
 function M.decide(opts)
 	opts = opts or {}
 	local cfg = require("yana.config").options.single_file or {}
@@ -198,15 +205,10 @@ function M.decide(opts)
 		return { trigger = "home", real_path = rp, candidate_dir = candidate }
 	end
 	local home = real(vim.env.HOME or "") or ""
-	local git = claim_identity.git_root(rp, home)
+	local git = workspace_identity.git_root(rp, home)
 	if git and real(git) ~= home then
 		return nil
 	end
-	-- Ruling 94: auto-trigger only in $HOME-like folders. A folder OUTSIDE
-	-- $HOME with no .git (a test scratch tree, /srv/x, a mounted volume) is
-	-- ordinary folder mode -- the 2026-08-23 batch gate on d640591 turned
-	-- every hermetic test workspace into single-file mode when this check
-	-- was missing (proxy decision 94b).
 	local cand = real(candidate) or candidate or ""
 	local below_home = home ~= "" and (cand == home or cand:sub(1, #home + 1) == home .. "/")
 	if not below_home then
@@ -221,6 +223,7 @@ function M.decide(opts)
 	return nil
 end
 
+-- Create the scratch workspace, copy the file in, and write meta.json.
 function M.materialise(decision, state_root)
 	local slug = hash.hash_bytes(decision.real_path):sub(1, 16)
 	local base = state_root .. "/single-file/" .. slug
@@ -291,6 +294,7 @@ local function each_meta(state)
 	end
 end
 
+-- Return the records dir for a real path or workspace, scanning meta.json.
 function M.records_for_real(workspace, rel)
 	local path = workspace
 	if type(rel) == "string" and rel ~= "" then
@@ -361,6 +365,7 @@ function M.buffer_abs_path(workspace, rel)
 	return diff.abs_path(rw:gsub("/+$", "") .. "/" .. rel)
 end
 
+-- Delete a turn's single-file scratch workspace directory.
 function M.cleanup(turn)
 	local sfm = turn and turn.single_file
 	if sfm and sfm.base then

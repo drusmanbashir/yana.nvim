@@ -1,7 +1,6 @@
 -- yana: the turn lifecycle — durable turn ids, classified bundle
 -- publication, the actionability predicate every durable action waits on,
--- turn-bound callbacks, and a resume path that inspects a retained claim
--- before any cleanup runs.
+-- and turn-bound callbacks.
 --
 -- Why this module exists (the fixed safety contract, "Async principle"):
 --
@@ -9,14 +8,11 @@
 --   bundle published → review becomes ACTIONABLE → generation-bound accept →
 --   applier re-read → write.
 --
--- The panel must never block, but DISPLAY and ACTION are different things. A
--- review may open early and provisionally from the stream's declared edits,
--- because opening changes nothing durable. Every action that changes durable
--- state waits for the complete, classified, published bundle: an accept that
--- runs before its evidence exists is not a latency win, it is a write with no
--- authority behind it. A hostile agent that mislabels `.git/config` as an
--- ordinary edit is stopped here, because actionability is a property of the
--- CLASSIFICATION and not of what the stream said.
+-- The panel must never block, but DISPLAY and ACTION are different things. A review may
+-- open early and provisionally from the stream's declared edits, because opening
+-- changes nothing durable. Every action that changes durable state waits for the
+-- complete, classified, published bundle: an accept that runs before its evidence
+-- exists is not a latency win, it is a write with no authority behind it.
 --
 -- Three things are kept apart on purpose:
 --   * `begin_turn` — the turn exists, has a durable id, and is NOT actionable.
@@ -25,9 +21,8 @@
 --   * `action_allowed` — the single predicate every durable action asks.
 --
 -- This module owns no files of its own. Durable turn records are written by
--- `yana.record`, which is the module that already owns durable turn-scoped
--- writes; claim release goes through `yana.shadow.jail`, which is the only
--- actor allowed to release a claim.
+-- `yana.record`; live yanad status is the only recovery view of
+-- claims/reviews.
 
 local log = require("yana.log")
 local record = require("yana.record")
@@ -148,10 +143,12 @@ function M.capture_tracked_evidence(workspace)
   return { status = "repo", paths = set, submodules = submodules }
 end
 
+-- Return only the pre-turn tracked paths, discarding evidence detail.
 function M.capture_tracked(workspace)
   return M.capture_tracked_evidence(workspace).paths
 end
 
+-- Mark rel as declared this turn by setting pass.declared[rel] = true.
 function M.note_declared(pass, rel)
   if pass and rel and rel ~= "" then
     pass.declared[rel] = true
@@ -162,6 +159,7 @@ function M.tracked_preturn(pass, rel)
   return pass ~= nil and rel ~= nil and pass.tracked_preturn[rel] == true
 end
 
+-- Return true if rel was tracked pre-turn but never declared this turn.
 function M.is_undeclared_tracked(pass, rel)
   if not pass or not rel or rel == "" then
     return false
@@ -205,7 +203,7 @@ end
 --- Begin a turn. The pass exists, carries its tuple, and is explicitly NOT
 --- actionable: nothing has been classified yet.
 ---
---- opts: { panel_id, generation, stream, turn_id, workspace, claim_dir,
+--- opts: { panel_id, generation, stream, turn_id, workspace,
 ---         state_dir, declared }
 function M.begin_turn(opts)
   opts = opts or {}
@@ -219,8 +217,8 @@ function M.begin_turn(opts)
     turn_id = turn_id,
     generation = generation,
     workspace = opts.workspace,
-    claim_dir = opts.claim_dir,
     state_dir = opts.state_dir,
+    session_id = opts.session_id,
     -- What the stream DECLARED. A provisional review may render from this; no
     -- action may be decided from it.
     declared = opts.declared or {},
@@ -246,6 +244,17 @@ end
 --- The live pass for a panel, or nil.
 function M.current(panel_id)
   return M._passes[panel_id]
+end
+
+--- Forget one finished in-memory pass. Disk cannot extend its lifetime.
+function M.finish_turn(pass)
+  if not pass then
+    return false, "no turn pass"
+  end
+  if M._passes[pass.panel] == pass then
+    M._passes[pass.panel] = nil
+  end
+  return true
 end
 
 --- Canonical bytes of a classified entry list. Sorted, so two walks that
@@ -412,15 +421,12 @@ end
 --- callback "should" belong to is exactly how a callback from turn N binds its
 --- change to turn N+1 (arch BLOCKER-2).
 ---
---- The owner's tuple is READ FROM THE CAPTURED PASS at delivery rather than
---- copied at bind time, because callbacks are legitimately built while a review
---- is still provisional, when the bundle digest does not exist yet. A pass table
---- is created once per turn and `publish_bundle` refuses to republish a
---- different bundle under it, so the captured pass's tuple is immutable in every
---- field that matters by the time any delivery can happen. A stale callback
---- holds turn N's pass table while the panel holds turn N+1's, so all five
---- fields are compared across two different passes and a mismatch on any single
---- one is a refusal.
+--- The owner's tuple is READ FROM THE CAPTURED PASS at delivery rather than copied at
+--- bind time, because callbacks are legitimately built while a review is still
+--- provisional, when the bundle digest does not exist yet. A pass table is created once
+--- per turn and `publish_bundle` refuses to republish a different bundle under it, so
+--- the captured pass's tuple is immutable in every field that matters by the time any
+--- delivery can happen. A stale callback holds turn N's pass table while the panel
 function M.bind_callback(pass, name, fn)
   local owner_pass = pass
   return function(...)
@@ -444,8 +450,7 @@ end
 --- to look and does not have to guess which panel it lost.
 ---
 --- Same resolver as claims and layers (`shadow/preview.state_root`): YANA_STATE_ROOT,
---- then XDG_STATE_HOME/yana, then the default. Never a second answer to "where
---- is state" (audit F6, 2026-08-25).
+--- then XDG_STATE_HOME/yana, then the default.
 function M.state_dir()
   local preview = require("yana.shadow.preview")
   return preview.state_root() .. "/turns"
@@ -458,6 +463,7 @@ function M.persist(pass, state)
     return false, "no turn pass"
   end
   local dir = pass.state_dir or M.state_dir()
+  local usage = pass.usage or {}
   return record.write_turn_record(dir, {
     turn_id = pass.turn_id,
     panel = pass.panel,
@@ -465,7 +471,11 @@ function M.persist(pass, state)
     generation = pass.generation,
     bundle_digest = pass.bundle and pass.bundle.bundle_digest or nil,
     workspace = pass.workspace,
-    claim_dir = pass.claim_dir,
+    input_tokens = usage.input_tokens,
+    output_tokens = usage.output_tokens,
+    cache_read_tokens = usage.cache_read_tokens,
+    cache_write_tokens = usage.cache_write_tokens,
+    session_id = pass.session_id or usage.session_id,
     state = state or "open",
     -- The review is owed while the turn is open. `false` is written only by the
     -- paths that KNOW the review resolved; a crash never gets to write it, which
@@ -485,112 +495,6 @@ function M.close_turn(pass, _reason)
     M._passes[pass.panel] = nil
   end
   return ok, err
-end
-
---- Inspect one retained turn's claim. READ ONLY, and deliberately so: this runs
---- before any cleanup and its whole job is to report what is still owed.
----
---- `the claims and concurrency contract`: "Never guess dead." A claim directory
---- that exists and carries a review-open marker is an open review, whatever
---- happened to the process that created it. Unknown is reported as unknown and
---- is never rounded down to "safe to clean".
-function M.inspect_claim(rec)
-  local claim_dir = rec and rec.claim_dir
-  local out = {
-    turn_id = rec and rec.turn_id,
-    claim_dir = claim_dir,
-    -- The record's own opinion, written before the crash.
-    record_open = rec ~= nil and rec.open == true,
-  }
-  if claim_dir == nil or claim_dir == "" then
-    out.claim_held = false
-    out.review_open = false
-    out.open = out.record_open
-    return out
-  end
-  local ok, jail = pcall(require, "yana.shadow.jail")
-  if not ok then
-    out.claim_held = nil
-    out.review_open = nil
-    out.open = true -- unreadable is not released
-    out.unknown = "could not load the claim module"
-    return out
-  end
-  out.claim_held = jail.claim_held(claim_dir)
-  out.review_open = jail.review_open(claim_dir)
-  out.open = out.record_open or out.review_open or out.claim_held
-  return out
-end
-
---- The production resume path.
----
---- THE ORDERING IS THE CLAIM. Every retained turn is INSPECTED first, and
---- cleanup only ever runs against what the inspection reported as released.
---- Cleanup that ran first would be a crash recovery that destroys the evidence
---- of the review it was recovering (arch BLOCKER-3), so the two steps are
---- recorded in the order they ran and the order is returned to the caller
---- rather than asserted in a comment.
----
---- opts: { state_dir?, release? }  `release` defaults to the real claim
---- release; it is a parameter so a caller can resume in report-only mode.
-function M.resume_turn(opts)
-  opts = opts or {}
-  local dir = opts.state_dir or M.state_dir()
-  local order = {}
-  local result = {
-    order = order,
-    retained = {},
-    inspected = {},
-    cleaned = {},
-    kept = {},
-  }
-
-  -- STEP 1, always first: read every retained turn and inspect its claim.
-  order[#order + 1] = "inspect-claim"
-  local records = record.read_turn_records(dir)
-  for _, rec in ipairs(records) do
-    -- A record this path already cleaned is not a retained turn; skipping it
-    -- keeps resume idempotent across restarts.
-    if rec.state ~= "cleaned" then
-      result.retained[#result.retained + 1] = rec
-      result.inspected[#result.inspected + 1] = M.inspect_claim(rec)
-    end
-  end
-
-  -- STEP 2, never before step 1: clean up only what the inspection released.
-  order[#order + 1] = "cleanup"
-  for i, rec in ipairs(result.retained) do
-    local claim = result.inspected[i]
-    if claim.open then
-      -- A still-open review keeps its claim and its record. The operator
-      -- inspects and force-releases; nothing here guesses the turn dead.
-      result.kept[#result.kept + 1] = rec.turn_id
-    else
-      local release = opts.release
-      if release == nil then
-        local ok, jail = pcall(require, "yana.shadow.jail")
-        -- Closed reviews are cleaned after inspect proved them non-open.
-        -- force-release is correct here: the turn record carries no nonce, and
-        -- a bare release_claim would decline a claim that still has one (F1).
-        release = ok
-            and function(claim_dir)
-              return jail.force_release_claim(claim_dir, "resume: review closed")
-            end
-          or nil
-      end
-      if release and rec.claim_dir and rec.claim_dir ~= "" then
-        pcall(release, rec.claim_dir)
-      end
-      record.write_turn_record(dir, vim.tbl_extend("force", rec, {
-        state = "cleaned",
-        open = false,
-        at = os.date("!%Y-%m-%dT%H:%M:%SZ"),
-      }))
-      result.cleaned[#result.cleaned + 1] = rec.turn_id
-    end
-  end
-
-  return result
 end
 
 return M

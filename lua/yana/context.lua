@@ -14,6 +14,7 @@ local function relpath(name)
   return rel ~= "" and rel or name
 end
 
+-- Find the first non-excluded normal-buffer window; return its context.
 function M.current_origin(exclude)
   exclude = exclude or {}
   for _, win in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
@@ -75,6 +76,7 @@ function M.selection_from_range(buf, l1, l2)
   }
 end
 
+-- Format selection.lines as "L<n>|text" strings for the prompt.
 function M.numbered_lines(selection)
   if not selection or not selection.lines then
     return {}
@@ -100,6 +102,7 @@ end
 
 local BOUNDARY_TOKEN = "{{YANA_WRITABLE_BOUNDARY}}"
 
+-- Pick the writable root dir from opts, selection buf, origin, or cwd.
 function M.writable_boundary_root(origin, selection, opts)
   opts = opts or {}
   if type(opts.writable_root) == "string" and opts.writable_root ~= "" then
@@ -124,6 +127,7 @@ function M.writable_boundary_root(origin, selection, opts)
   return diff.abs_path(opts.cwd or vim.fn.getcwd())
 end
 
+-- Build the "you can write under root" boundary sentence.
 function M.writable_boundary_text(root)
   return "You can write under "
     .. tostring(root)
@@ -179,6 +183,7 @@ local function diagnostics_block(origin)
   return table.concat(lines, "\n")
 end
 
+-- Assemble the full prompt (instructions, context, question); return it.
 function M.build(question, origin, selection, opts)
   opts = opts or {}
   local o = config.options

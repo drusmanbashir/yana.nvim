@@ -15,13 +15,12 @@
 --   passes when the intended range is itself short by a row, which is exactly
 --   the shape of the reference defect (N new lines, N−1 highlighted).
 --
--- The model arrives from the caller and this module never builds one. What it
--- does guarantee is that it never INVENTS one: a block the caller could not
--- join to a model hunk is recorded as `model_unavailable`, carrying the
--- caller's `model_join` reason and `model_source`, and is never scored against
--- the block's own numbers. The independence of the model is the caller's
--- contract (see inline_diff.payload_model); the refusal to substitute for it
--- is this module's.
+-- The model arrives from the caller and this module never builds one. What it does
+-- guarantee is that it never INVENTS one: a block the caller could not join to a model
+-- hunk is recorded as `model_unavailable`, carrying the caller's `model_join` reason
+-- and `model_source`, and is never scored against the block's own numbers. The
+-- independence of the model is the caller's contract (see inline_diff.payload_model);
+-- the refusal to substitute for it is this module's.
 --
 -- Row coverage is computed the way the compositor resolves it, not the way the
 -- call site meant it: an extmark spanning (start_row,0) → (end_row,end_col)
@@ -44,7 +43,14 @@ M.KIND = {
   lost_winhl = "lost_window_mapping",
   model_extent = "model_extent",
   model_unavailable = "model_unavailable",
+  unowned_paint = "unowned_paint",
 }
+
+-- The extmark highlight group that MEANS "this row is agent-authored". Named
+-- here only as the fallback for a caller that did not pass its `ext_hl` table;
+-- the real name always arrives from review_context.ext_hl.incoming through
+-- `collect`, so this module still invents nothing.
+M.INCOMING_HL = "YanaDiffIncoming"
 
 -- How far an extmark may sit from the row its block claims before it is drift
 -- rather than ordinary gravity. Extmarks are position authority in this engine,
@@ -73,6 +79,40 @@ function M.covered_rows(mark)
     rows = rows + 1
   end
   return rows
+end
+
+--- The 1-based buffer rows an incoming-paint mark covers, resolved the way the
+--- compositor resolves it (see `covered_rows`): start_row..end_row-1 in full,
+--- end_row only when end_col > 0. `line_count`, when known, clamps the last row
+--- so a mark reaching past the end of the buffer cannot invent rows.
+function M.painted_rows(mark, line_count)
+  local out = {}
+  if type(mark) ~= "table" then
+    return out
+  end
+  local sr = mark.row or 0
+  local er = mark.end_row
+  local ec = mark.end_col or 0
+  local last
+  if er == nil then
+    if ec > (mark.col or 0) then
+      last = sr
+    else
+      return out
+    end
+  else
+    if er < sr then
+      return out
+    end
+    last = (ec > 0) and er or (er - 1)
+  end
+  if line_count then
+    last = math.min(last, line_count - 1)
+  end
+  for r = sr, last do
+    out[#out + 1] = r + 1
+  end
+  return out
 end
 
 local function attrs_empty(attrs)
@@ -176,17 +216,11 @@ function M.evaluate(input)
       model_new = block.model_span_new_count
     end
     -- EXTENT IS SUMMED OVER EVERY SPAN, not read off the first one.
-    -- `incoming_extmark_id` is documented at inline_diff's set_incoming_paint
-    -- as staying the FIRST of `incoming_extmark_ids` -- navigation wants the
-    -- hunk's head. Measuring extent from that single mark scores a hunk the
-    -- human has typed inside at the width of its first span, so a CORRECTLY
-    -- painted 3-row hunk split 1+2 reported `expected 3, applied 1` and red
-    -- `model_extent`. Twenty-eight such lines sit in the operator's real
-    -- session log (`expected 2 applied 1`, `expected 3 applied 2`,
-    -- `expected 8 applied 1`), and every one of them was the check, not the
-    -- paint. The ownership half of this same fact is already handled twelve
-    -- lines above, where every id in the list is `claimed` so the extra spans
-    -- do not read as orphans; only the extent half was left reading one mark.
+    -- `incoming_extmark_id` is documented at inline_diff's set_incoming_paint as
+    -- staying the FIRST of `incoming_extmark_ids` -- navigation wants the hunk's head.
+    -- Measuring extent from that single mark scores a hunk the human has typed inside
+    -- at the width of its first span, so a CORRECTLY painted 3-row hunk split 1+2
+    -- reported `expected 3, applied 1` and red `model_extent`.
     local applied = 0
     local counted_any = false
     for _, id in ipairs(block.incoming_extmark_ids or {}) do
@@ -363,6 +397,74 @@ function M.evaluate(input)
     end
   end
 
+  -- 7. UNOWNED PAINT (rung-1, bug-4 shape): a buffer row wearing the incoming
+  -- highlight that NO pending hunk OWNS. Ownership is the ledger's per-row
+  -- anchor table (`block.owned_rows`, lua/yana/hunk_extent_anchor.lua:38), not
+  -- the block's start/end band: after a paced split + undo the band still
+  -- covers the row while every hunk has stopped owning it, and every other
+  -- check on this state passes. The two sides joined here are the SAME product
+  -- tables the painter and the ledger already keep; nothing is recomputed and
+  -- no model is invented.
+  --
+  -- Silent when ownership is UNKNOWN (no block carries anchors at all): a
+  -- caller whose blocks predate the anchor tier would otherwise see every
+  -- painted row reported, which is a fact about the caller, not the render.
+  local owned, ownership_known = {}, false
+  for _, block in ipairs(blocks) do
+    if block.owned_rows ~= nil then
+      ownership_known = true
+      for _, owner in ipairs(block.owned_rows) do
+        if owner.row then
+          owned[owner.row] = true
+        end
+      end
+    end
+  end
+  result.ownership_known = ownership_known
+  if ownership_known then
+    local incoming_hl = input.incoming_hl or M.INCOMING_HL
+    local painted, painted_by = {}, {}
+    for _, m in ipairs(marks) do
+      if m.hl_group == incoming_hl then
+        for _, row in ipairs(M.painted_rows(m, input.line_count)) do
+          painted[row] = true
+          painted_by[row] = painted_by[row] or m.id
+        end
+      end
+    end
+    local painted_list, unowned = {}, {}
+    for row in pairs(painted) do
+      painted_list[#painted_list + 1] = row
+    end
+    table.sort(painted_list)
+    for _, row in ipairs(painted_list) do
+      if not owned[row] then
+        unowned[#unowned + 1] = row
+      end
+    end
+    local owned_list = {}
+    for row in pairs(owned) do
+      owned_list[#owned_list + 1] = row
+    end
+    table.sort(owned_list)
+    result.counts.painted_rows = #painted_list
+    result.counts.owned_rows = #owned_list
+    result.painted_rows = painted_list
+    result.owned_rows = owned_list
+    -- Rows are reported ASCENDING and one violation per row: the signature is
+    -- part of the record's identity, so the same desync must always spell the
+    -- same string.
+    for _, row in ipairs(unowned) do
+      violate(M.KIND.unowned_paint, {
+        row = row,
+        rel = input.rel,
+        extmark_id = painted_by[row],
+        hl_group = incoming_hl,
+        detail = "row painted " .. incoming_hl .. " but no pending hunk owns it",
+      })
+    end
+  end
+
   result.counts.violations = #result.violations
   result.signature = M.signature(result)
   return result
@@ -377,7 +479,7 @@ function M.signature(result)
   for _, v in ipairs(result.violations or {}) do
     parts[#parts + 1] = table.concat({
       v.kind,
-      tostring(v.hunk or v.group or v.win or v.extmark_id or "-"),
+      tostring(v.hunk or v.group or v.win or v.row or v.extmark_id or "-"),
       tostring(v.expected or "-"),
       tostring(v.got or "-"),
     }, ":")
@@ -412,6 +514,20 @@ function M.summarize(result)
     if v.kind == M.KIND.model_extent then
       worst = string.format(" hunk %s expected %s highlighted row(s), applied %s", tostring(v.hunk), tostring(v.expected), tostring(v.got))
       break
+    end
+  end
+  if not worst then
+    -- The unowned-paint rows are NAMED in the one line the operator sees: the
+    -- defect is "which row is green with nobody behind it", and a bare kind
+    -- name sends them to :YanaDump to find out which.
+    local rows = {}
+    for _, v in ipairs(result.violations) do
+      if v.kind == M.KIND.unowned_paint and v.row then
+        rows[#rows + 1] = tostring(v.row)
+      end
+    end
+    if #rows > 0 then
+      worst = string.format(" painted row(s) %s carry %s with no owning hunk", table.concat(rows, ","), M.INCOMING_HL)
     end
   end
   return string.format(
@@ -499,22 +615,26 @@ function M.collect(desc)
       model_span_last = block.model_span_last,
       model_span_new_count = block.model_span_new_count,
       incoming_extmark_id = block.incoming_extmark_id,
-      -- Every incoming-paint extmark id for this block, not just the first.
-      -- `evaluate`'s MODEL EXTENT check sums `covered_rows` over this whole
-      -- list (and claims every id in it so an interior human row's gap does
-      -- not read the SECOND span as `leaked_decoration`) -- a hunk split by
-      -- an interior human row paints as several extmarks
-      -- (inline_diff.set_incoming_paint), and without this field `evaluate`
-      -- never sees past the first one. Omitting it here is exactly what let
-      -- a correctly-painted split hunk still log
-      -- "model_extent,leaked_decoration ... expected N ... applied 1" at
-      -- `buffer_watch` (PACKET-render-check-inhunk-false-alarm-20260826):
-      -- the CHANGELOG's fix landed in `evaluate` alone and never reached the
-      -- production data path, which goes through `collect` first.
+      -- Every incoming-paint extmark id for this block, not just the first. Omitting it
+      -- here is exactly what let a correctly-painted split hunk still log
+      -- "model_extent,leaked_decoration ... expected N ...
       incoming_extmark_ids = block.incoming_extmark_ids,
       delete_extmark_id = block.delete_extmark_id,
+      -- The ledger's own per-row ownership anchors, copied (row only) so the
+      -- observer cannot write through them. This is the ledger side of the
+      -- unowned-paint join; the extmarks below are the other side.
+      owned_rows = block.owned_rows and (function()
+        local rows = {}
+        for _, owner in ipairs(block.owned_rows) do
+          rows[#rows + 1] = { row = owner.row }
+        end
+        return rows
+      end)() or nil,
     }
   end
+
+  -- Which highlight group MEANS agent-authored, from the caller's own table.
+  input.incoming_hl = (desc.ext_hl or {}).incoming or M.INCOMING_HL
 
   input.marks = mark_list(bufnr, desc.ns)
   if desc.hint_ns then
@@ -574,4 +694,4 @@ function M.run(desc)
   return M.evaluate(M.collect(desc))
 end
 
-return M
+return require("yana.render_check_extent").install(M)

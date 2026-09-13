@@ -1,3 +1,4 @@
+local hunks_lib = dofile((debug.getinfo(1, "S").source:sub(2)):match("^(.*)/tests/") .. "/tests/headless/lib/hunks.lua")
 -- turn_smoke.lua — the fresh-install smoke that actually spawns a turn.
 --
 -- tests/release/smoke.lua (the pre-existing fresh-install check) calls
@@ -81,6 +82,7 @@ require("yana.shadow.preview")._test.force_state_root = scratch .. "/state"
 require("yana").setup({
   mode = "inline",
   cmd = agent_fixture,
+  write_roots = { workspace },
   sessions = { dir = scratch .. "/sessions-data", chats_dir = scratch .. "/chats" },
 })
 
@@ -98,19 +100,44 @@ end
 ui.focus_prompt(p)
 vim.api.nvim_buf_set_lines(p.prompt_buf, 0, -1, false, { "edit notes.txt" })
 ui.focus_prompt(p)
+check(inline.active_state({ workspace = workspace }) == nil, "review state is clear before submit")
+check(p.got_result == false, "panel has no prior result before submit")
+if inline.active_state({ workspace = workspace }) ~= nil or p.got_result ~= false then
+  die("turn smoke precondition failed")
+end
+local before_gen = p.turn_gen
 ui.submit()
 
-local turned = vim.wait(30000, function()
-  return p.busy ~= true
+local launched_gen = nil
+local advanced = vim.wait(5000, function()
+  if p.turn_gen > before_gen then
+    launched_gen = p.turn_gen
+    return true
+  end
+  return false
 end, 25)
-check(turned, "turn finished (agent.run/vendor_stream did not hang or crash the process)")
+check(advanced and launched_gen ~= nil, "turn generation advanced after submit")
+if not launched_gen then
+  die("turn generation did not advance after submit")
+end
+local turned = vim.wait(30000, function()
+  return p.turn_gen == launched_gen
+    and (p.job_spawn_gen == nil or p.job_spawn_gen == launched_gen)
+    and p.got_result == true
+end, 25)
+check(turned, "submitted turn produced a result")
 
 local state = nil
-local got_hunk = vim.wait(10000, function()
+local got_hunk = vim.wait(30000, function()
   state = inline.active_state({ workspace = workspace })
   return state ~= nil
+    and state.change ~= nil
+    and state.change.turn_gen == launched_gen
+    and state.hunk_ledger ~= nil
+    and hunks_lib.hunks(state) ~= nil
+    and hunks_lib.pending_count(state) > 0
 end, 25)
-check(got_hunk and state ~= nil and state.diff_blocks and #state.diff_blocks > 0,
+check(got_hunk and state ~= nil and hunks_lib.hunks(state) and hunks_lib.pending_count(state) > 0,
   "a hunk appeared after the turn (overlay walk + inline_diff review, proves vendor_stream loaded)")
 
 if not state then
@@ -118,24 +145,54 @@ if not state then
 end
 
 local win = vim.fn.bufwinid(state.bufnr)
+local review_bufnr = state.bufnr
 check(win ~= -1, "the hunk's buffer is displayed in a window")
 if win == -1 then
   die("hunk buffer not visible; cannot drive accept/undo")
 end
 
 vim.api.nvim_set_current_win(win)
-vim.api.nvim_win_set_cursor(win, { state.hint_line or 1, 0 })
+local first_hunk = state.hunk_ledger:pending()[1]
+local live_start, live_end
+local ready = vim.wait(30000, function()
+  live_start, live_end = inline.live_block_range(review_bufnr, first_hunk)
+  return vim.api.nvim_get_current_buf() == review_bufnr
+    and vim.fn.maparg("ca", "n", false, true).buffer == 1
+    and type(live_start) == "number"
+    and type(live_end) == "number"
+    and live_start <= live_end
+end, 25)
+check(ready, "review buffer and live accept range are ready")
+if not ready then
+  die("review accept range did not become ready")
+end
+vim.api.nvim_win_set_cursor(win, { live_start, 0 })
+local cursor_row = vim.api.nvim_win_get_cursor(win)[1]
+check(cursor_row >= live_start and cursor_row <= live_end, "cursor is inside the live accept range")
 vim.cmd("redraw")
 
 -- Accept the (only) hunk -- "ca", the exact key the product's own
 -- notification names ("yana: review notes.txt — ca accept · cr reject").
 -- Closing the review is what installs the retrace-aware u/<C-r> for this
 -- buffer (lua/yana/inline_diff.lua's "POST-REVIEW RETRACE" block).
-vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("ca", true, false, true), "x", false)
-local closed = vim.wait(5000, function()
-  return inline.active_state({ workspace = workspace }) == nil
+local accept_sent = false
+vim.schedule(function()
+  vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("ca", true, false, true), "x", false)
+  accept_sent = true
+end)
+local closed = vim.wait(15000, function()
+  return accept_sent
+    and inline.active_state({ workspace = workspace }) == nil
+    and hunks_lib.pending_count(state) == 0
 end, 25)
 check(closed, "review closed after accepting the hunk")
+
+local expected = "alpha\nbeta\ngamma\n"
+-- The review buffer already shows the hunk before accept (the closed check
+-- above is what proves accept ran); this proves undo has bytes to restore,
+-- so the buffer check after undo cannot pass on an unchanged buffer.
+local accepted_bytes = table.concat(vim.api.nvim_buf_get_lines(review_bufnr, 0, -1, false), "\n") .. "\n"
+check(accepted_bytes ~= expected, "review buffer holds the turn's change before undo")
 
 vim.cmd("messages clear")
 local undo_ok, undo_err = pcall(function()
@@ -150,17 +207,14 @@ local looks_like_error = msgs:find("E%d%d%d", 1) ~= nil
   or msgs:find("attempt to", 1, true) ~= nil
 check(not looks_like_error, "no Lua/Vim error appears in :messages after undo (got: " .. msgs .. ")")
 
--- The stronger, behavioural half of this check (measured 2026-08-21: a tree
--- with lua/yana/timeline/retrace.lua removed passes the "no error" check
--- above with EXIT 0 -- the pcall swallows it exactly as designed -- and
--- undo silently degrades to Neovim's own "N changes; before #N ..." status
--- line instead of retrace's notify.one_line("yana: undid " .. ..., see
--- lua/yana/timeline/retrace.lua:608). Retrace present is the only way this
--- specific text appears, so its absence here means retrace's post-review
--- key was never reinstalled -- the module is missing, unreachable, or
--- broken, and the earlier "no Lua error" check alone would have missed it.
-check(msgs:find("yana: undid ", 1, true) ~= nil,
-  "undo went through yana's retrace-aware handler, not Neovim's native fallback (msgs: " .. msgs .. ")")
+local buffer_bytes = table.concat(vim.api.nvim_buf_get_lines(review_bufnr, 0, -1, false), "\n") .. "\n"
+check(buffer_bytes == expected, "undo restored review buffer bytes exactly")
+-- Accept does not write notes.txt in this flow (a no-undo mutation left the
+-- disk bytes original), so this proves the file is intact, not that undo ran.
+local fh = assert(io.open(target, "rb"))
+local file_bytes = fh:read("*a")
+fh:close()
+check(file_bytes == expected, "notes.txt on disk holds the original bytes after accept and undo")
 
 if #failures > 0 then
   print(string.format("FAILED %d check(s)", #failures))

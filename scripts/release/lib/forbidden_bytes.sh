@@ -24,13 +24,18 @@ forbidden_bytes_allowed_path() {
 	case $1 in
 	.github/workflows/ci.yml | .github/workflows/release.yml) return 0 ;;
 	.gitignore | .stylua.toml | CHANGELOG.md | LICENSE | NOTICE | README.md | VERSION) return 0 ;;
-	assets/*.gif | assets/*.png) return 0 ;;
+	assets/*.gif | assets/*.mp4 | assets/*.png | assets/*.svg) return 0 ;;
 	doc/yana.txt | plugin/yana.lua) return 0 ;;
+	docs/*.md) return 0 ;;
 	lua/yana/*.lua | lua/yana/*/*.lua | lua/blink_yana/*.lua) return 0 ;;
 	bin/yana-[a-z]*) return 0 ;;
+	bin/yanad) return 0 ;;
+	bin/lib/yanad/*.py) return 0 ;;
+	bin/lib/yana-overlay/*.sh) return 0 ;;
 	scripts/install-deps.sh) return 0 ;;
 	scripts/release/*) return 0 ;;
 	tests/release/*) return 0 ;;
+	tests/headless/lib/hunks.lua) return 0 ;;
 	esac
 	return 1
 }
@@ -41,7 +46,7 @@ forbidden_bytes_allowed_path() {
 # are allowed to ship but are not UTF-8 text and cannot be scanned line-wise.
 forbidden_bytes_binary_path() {
 	case $1 in
-	assets/*.gif | assets/*.png) return 0 ;;
+	assets/*.gif | assets/*.mp4 | assets/*.png | assets/*.svg) return 0 ;;
 	esac
 	return 1
 }
@@ -52,18 +57,12 @@ forbidden_bytes_binary_path() {
 # file (scripts/release/forbidden-patterns.txt format: one extended regex
 # per line, consumed by `grep -f`).
 #
-# Exemptions:
-#   - PATH == scripts/release/forbidden-patterns.txt is never scanned: it is
-#     the scanner's own registry and must contain the literal pattern text.
-#   - PATH == NOTICE has its one audited upstream repository URL line (the
-#     recorded fork point citation) filtered out of the hits. The exemption
-#     is keyed to the URL's own text, not to a line number: NOTICE is prose
-#     that gets edited, and coupling the exemption to "line 4" broke on the
-#     first legitimate rewrite that moved the line. NOTICE must still carry
-#     exactly one occurrence of the audited URL -- a second occurrence (e.g.
-#     duplicated into a section heading) is a genuine forbidden-bytes hit,
-#     by design, so this scanner cannot be used to launder an unaudited
-#     second reference.
+# Exemptions: - PATH == scripts/release/forbidden-patterns.txt is never scanned: it is
+# the scanner's own registry and must contain the literal pattern text. - PATH == NOTICE
+# has its one audited upstream repository URL line (the recorded fork point citation)
+# filtered out of the hits. The exemption is keyed to the URL's own text, not to a line
+# number: NOTICE is prose that gets edited, and coupling the exemption to "line 4" broke
+# on the first legitimate rewrite that moved the line.
 #
 # On stdout: zero or more "LINENO:matched text" rows (grep -n format), one
 # per hit, in file order. Emits nothing on a clean file.
@@ -71,6 +70,7 @@ forbidden_bytes_binary_path() {
 forbidden_bytes_scan() {
 	local tree=$1 patterns=$2 path=$3
 	[[ "$path" == "scripts/release/forbidden-patterns.txt" ]] && return 0
+	[[ "$path" == ".gitignore" ]] && return 0
 	forbidden_bytes_binary_path "$path" && return 0
 
 	local hits

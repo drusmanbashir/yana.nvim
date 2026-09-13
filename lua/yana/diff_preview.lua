@@ -153,7 +153,7 @@ local function snippet(highlights)
     "diff_highlights = {",
     "  incoming = " .. spec_text(highlights.incoming) .. ",",
     "  deleted = " .. spec_text(highlights.deleted) .. ",",
-    "  hint = " .. spec_text(highlights.hint or { link = "Comment" }) .. ",",
+    "  hint = " .. spec_text(highlights.hint) .. ",",
     "},",
   }, "\n")
 end
@@ -179,7 +179,7 @@ local function show_panel(preset)
     "",
     "incoming " .. spec_text(h.incoming),
     "deleted  " .. spec_text(h.deleted),
-    "hint     " .. spec_text(h.hint or { link = "Comment" }),
+    "hint     " .. spec_text(h.hint),
     "",
     "]t next · [t prev · yt yank · 1-9/]t jump · q close",
     "",
@@ -229,8 +229,29 @@ end
 
 local function cleanup_preview()
   close_float()
-  if preview.state then
-    inline.close_active(preview.state.opts or {})
+  local state = preview.state
+  if state then
+    -- Theme preview binds NO Turn (observe_open guarded on opts.preview).
+    -- Plain scrub only: detach any listener group, clear paint, drop the
+    -- synthetic pool/active state. No End-turn dialog, no settle.
+    if state.listener_group then
+      pcall(require("yana.turn_listeners").detach, state.listener_group)
+    end
+    if type(inline.cleanup) == "function" then
+      pcall(inline.cleanup, state)
+    else
+      local bufnr = state.bufnr
+      if bufnr and vim.api.nvim_buf_is_valid(bufnr) then
+        pcall(vim.api.nvim_buf_clear_namespace, bufnr, vim.api.nvim_create_namespace("YanaInlineDiff"), 0, -1)
+        pcall(vim.api.nvim_buf_clear_namespace, bufnr, vim.api.nvim_create_namespace("YanaInlineDiffAuthority"), 0, -1)
+      end
+    end
+    local ok_st, st = pcall(function()
+      return inline._test.pool_for(preview_opts())
+    end)
+    if ok_st and type(st) == "table" and st.active == state then
+      st.active = nil
+    end
   end
   if preview.saved then
     config.options.diff_highlights = preview.saved
@@ -285,6 +306,7 @@ local function setup_keys(bufnr)
   end
 end
 
+-- Open (or restart) the diff-theme preview review with a sample diff.
 function M.open()
   if inline.active_state(preview_opts()) and not preview.state then
     notify_one_line("yana: close active inline review first", vim.log.levels.WARN)
@@ -294,7 +316,7 @@ function M.open()
     cleanup_preview()
   end
 
-  preview.saved = vim.deepcopy(config.options.diff_highlights or {})
+  preview.saved = vim.deepcopy(config.options.diff_highlights)
   local change = {
     id = -9001,
     status = "pending",
@@ -346,6 +368,7 @@ function M.open()
   end
 end
 
+-- Return the list of built-in diff highlight theme presets.
 function M.presets()
   return PRESETS
 end

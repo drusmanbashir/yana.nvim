@@ -30,6 +30,7 @@ M._fs = {
 
 local _review_seq = 0
 
+-- Return p relative to cwd; falls back to p, or "?" if empty.
 function M.relpath(p)
   if not p or p == "" then
     return "?"
@@ -38,6 +39,7 @@ function M.relpath(p)
   return rel ~= "" and rel or p
 end
 
+-- Resolve path to an absolute, symlink-resolved, normalized form.
 function M.abs_path(path)
   if not path or path == "" then
     return path
@@ -74,6 +76,7 @@ function M.abs_path_literal(path)
   return vim.fs.normalize(norm)
 end
 
+-- Find the *ToolCall key/value pair inside obj.tool_call, or nil.
 function M.parse_tool(obj)
   local tc = obj.tool_call
   if type(tc) ~= "table" then
@@ -87,10 +90,12 @@ function M.parse_tool(obj)
   return nil
 end
 
+-- Strip a trailing "ToolCall" suffix from name; default "tool".
 function M.short_name(name)
   return (name or "tool"):gsub("ToolCall$", "")
 end
 
+-- Build a unified diff string between before and after text.
 function M.synthesize_diff(before, after, path)
   local old = before or ""
   local new = after or ""
@@ -105,6 +110,7 @@ function M.synthesize_diff(before, after, path)
   return string.format("--- a/%s\n+++ b/%s\n%s", rel, rel, body)
 end
 
+-- Count added/removed lines in a unified diff string.
 function M.count_stats(diffstr)
   local added, removed = 0, 0
   for _, l in ipairs(vim.split(diffstr or "", "\n", { plain = true })) do
@@ -117,14 +123,9 @@ function M.count_stats(diffstr)
   return added, removed
 end
 
--- Deletions are NOT inferred from a missing `after`. cursor-agent emits them
--- as their own tool (deleteToolCall, handled explicitly in
--- change_from_payload); the only way an EDIT payload arrives with
--- before ~= nil, after == nil is a truncated/malformed result — and calling
--- that a deletion made the panel say "the agent deleted your file" for what
--- is a payload problem, then refuse the review with a stale-disk message.
--- Malformed modifies stay "modify" and are caught by the after == nil branch
--- in open_review_buffer, which now says what actually happened.
+-- Deletions are NOT inferred from a missing `after`. Malformed modifies stay "modify"
+-- and are caught by the after == nil branch in open_review_buffer, which now says what
+-- actually happened.
 function M.classify_kind(before, after)
   if before == nil and after ~= nil then
     return "create"
@@ -132,6 +133,7 @@ function M.classify_kind(before, after)
   return "modify"
 end
 
+-- Build a change record (create/modify/delete) from a tool payload.
 function M.change_from_payload(name, payload)
   local res = payload and payload.result
   local success = res and res.success
@@ -139,14 +141,11 @@ function M.change_from_payload(name, payload)
     return nil
   end
   -- Real deletions arrive as a DIFFERENT tool with a different payload shape:
-  --   deleteToolCall.result.success = { path, deletedFile, fileSize, prevContent }
-  -- No diffString, no afterFullFileContent — so the gate below dropped every
-  -- one of them silently: no review, no panel row, the file just gone. The
-  -- whole deletion resolve path (S4) was unreachable in real use because of
-  -- it. Keyed off the tool name and `deletedFile`, never off a bare
-  -- `prevContent`: parse_tool accepts ANY key matching ToolCall$, so a
-  -- present-or-future tool that happens to carry prevContent would be
-  -- classified as a deletion whose accept path unlinks the file.
+  -- deleteToolCall.result.success = { path, deletedFile, fileSize, prevContent } No
+  -- diffString, no afterFullFileContent — so the gate below dropped every one of them
+  -- silently: no review, no panel row, the file just gone. The whole deletion resolve
+  -- path (S4) was unreachable in real use because of it. Keyed off the tool name and
+  -- `deletedFile`, never off a bare `prevContent`: parse_tool accepts ANY key matching
   if name == "deleteToolCall" or success.deletedFile ~= nil then
     local dpath = M.abs_path(success.path or success.deletedFile or (payload.args and payload.args.path))
     local prev = success.prevContent
@@ -215,6 +214,7 @@ local function one_line(s, max)
   return s
 end
 
+-- Build a one-line panel summary describing a tool call's args.
 function M.tool_summary(name, payload)
   local short = M.short_name(name)
   local args = (payload and payload.args) or {}
@@ -233,6 +233,7 @@ function M.tool_summary(name, payload)
   return short
 end
 
+-- Split diffstr into lines, dropping the --- / +++ headers.
 function M.diff_hunks(diffstr)
   local out = {}
   for _, l in ipairs(vim.split(diffstr or "", "\n", { plain = true })) do
@@ -243,6 +244,7 @@ function M.diff_hunks(diffstr)
   return out
 end
 
+-- Map change.status/review_error to its panel status icon.
 function M.status_icon(change)
   if change.status == "accepted" then
     return "✓"
@@ -263,6 +265,7 @@ function M.status_icon(change)
   return "⏳"
 end
 
+-- Map change.status to its panel status label text.
 function M.status_label(change)
   if change.status == "accepted" then
     return "accepted"
@@ -289,6 +292,7 @@ function M.kind_verb(change)
   return "edited"
 end
 
+-- Return only the entries in changes with status "pending".
 function M.pending(changes)
   local out = {}
   for _, c in ipairs(changes or {}) do
@@ -300,13 +304,8 @@ function M.pending(changes)
 end
 
 -- Atomic write: temp in target dir (O_EXCL), fchmod to preserve mode past umask,
--- short-write loop, fsync, close-checked rename.
--- CHANGED BEHAVIOUR vs the old truncating io.open writer, which preserved the
--- inode: rename installs a NEW inode. Consequences, all deliberate:
---   * hardlinks to the old inode stop tracking this file (measured);
---   * ownership follows the writing process, so a cross-owner write is REFUSED
---     rather than silently re-owned;
---   * inode-keyed watchers see a replacement.
+-- short-write loop, fsync, close-checked rename. CHANGED BEHAVIOUR vs the old
+-- truncating io.open writer, which preserved the inode: rename installs a NEW inode.
 -- Directory fsync is out of scope (needs a dir fd; no-op/error on Windows).
 function M.write_file(path, content, opts)
   opts = opts or {}
@@ -463,9 +462,9 @@ function M.write_file(path, content, opts)
   return true
 end
 
--- Stage 1 seam: safety/diary.lua accepts through this path only (IR-09 preserved).
 M.diary_atomic_write = M.write_file
 
+-- Unlink path; missing file counts as success, non-file is an error.
 function M.delete_file(path)
   if not path or path == "" then
     return false, "no path"
@@ -484,13 +483,11 @@ function M.delete_file(path)
   return true
 end
 
--- Save a buffer through Vim itself rather than raw io.write, for callers that
--- already hold the resolved content in a live buffer. `!` bypasses the W12
--- "changed since reading it" prompt — intentional, because the review buffer
--- is *supposed* to differ from disk mid-review. Resolve-time protection against
--- external disk edits is inline_diff's CAS (`change.disk_at_open`), not W12.
--- `noautocmd` stops the write from re-triggering autosave/format-on-save and
--- from tripping the BufWriteCmd guard registered on review buffers.
+-- Save a buffer through Vim itself rather than raw io.write, for callers that already
+-- hold the resolved content in a live buffer. `!` bypasses the W12 "changed since
+-- reading it" prompt — intentional, because the review buffer is *supposed* to differ
+-- from disk mid-review. Resolve-time protection against external disk edits is
+-- inline_diff's CAS (`change.disk_at_open`), not W12.
 function M.save_buffer(bufnr)
   local ok, err = pcall(vim.api.nvim_buf_call, bufnr, function()
     vim.cmd("noautocmd write!")
@@ -506,6 +503,7 @@ local function snapshot_lines(text)
   return lines
 end
 
+-- Read path as text via vim.fn.readfile, joined with "\n".
 function M.read_file_text(path)
   if not path or path == "" then
     return nil, "no path"
@@ -540,6 +538,7 @@ function M.read_file_bytes(path)
   return data
 end
 
+-- Check path's current disk bytes still equal snapshot_bytes.
 function M.disk_bytes_unchanged(path, snapshot_bytes)
   if snapshot_bytes == nil then
     return true
@@ -554,6 +553,7 @@ function M.disk_bytes_unchanged(path, snapshot_bytes)
   return true
 end
 
+-- Join bufnr's lines with "\n" (no fileformat/BOM handling).
 function M.buffer_text_normalized(bufnr)
   return table.concat(vim.api.nvim_buf_get_lines(bufnr, 0, -1, false), "\n")
 end
@@ -587,6 +587,7 @@ function M.buffer_bytes_snapshot(bufnr)
   return body
 end
 
+-- Compare buf_text and snapshot line-by-line, ignoring trailing blank.
 function M.text_equal_snapshot(buf_text, snapshot)
   local a = snapshot_lines(buf_text)
   local b = snapshot_lines(snapshot or "")
@@ -601,6 +602,7 @@ function M.text_equal_snapshot(buf_text, snapshot)
   return true
 end
 
+-- Reload path's buffer from disk; opts.force overrides unsaved edits.
 function M.reload_file(path, opts)
   opts = opts or {}
   if not path or path == "" then
@@ -610,6 +612,13 @@ function M.reload_file(path, opts)
   if bufnr <= 0 or not vim.api.nvim_buf_is_loaded(bufnr) then
     return true
   end
+  -- A reload frees the buffer, and with it whatever was highlighting it. When a
+  -- review's BufReadCmd swallows the read that follows, `BufReadPost` -- and so
+  -- the FileType/Syntax pass that repaints -- never runs. Capture here, while
+  -- the buffer is still whole: measured on nvim 0.12.4, by `BufUnload` the
+  -- treesitter highlighter is already destroyed and nothing survives that can
+  -- tell it was ever on. review_reread_highlight.lua carries the reasoning.
+  pcall(require("yana.review_reread_highlight").capture, bufnr)
   local ok, err = pcall(vim.api.nvim_buf_call, bufnr, function()
     vim.cmd("checktime")
     if opts.force then
@@ -626,6 +635,7 @@ function M.reload_file(path, opts)
   return true
 end
 
+-- Open a side-by-side diff tab comparing change.before vs after.
 function M.show(change)
   if not change then
     return

@@ -7,22 +7,18 @@
 -- invariant, not by configuration"); the immutable control-plane rules "Wall 4 —
 -- applier fail-safe (control-plane refusal)".
 --
--- The classification is LEXICAL and workspace-relative and runs BEFORE any
--- symlink resolution: a `.git` symlink must not lose its name to resolution.
--- This module is the sole home of the rule; ops.lua (producer consumer),
--- diary.lua (applier choke point `resolve_target`) and cli/apply.lua all call
--- here rather than re-deriving it. The producer `bin/yana-changeset` keeps
--- an intentionally identical Python mirror of the same immutable floor, because
--- the two live on opposite sides of a process boundary; both cite this spec as
--- the single source of truth.
+-- The classification is LEXICAL and workspace-relative and runs BEFORE any symlink
+-- resolution: a `.git` symlink must not lose its name to resolution. This module is the
+-- sole home of the rule; ops.lua (producer consumer), diary.lua (applier choke point
+-- `resolve_target`) and cli/apply.lua all call here rather than re-deriving it. The
+-- producer `bin/yana-changeset` keeps an intentionally identical Python mirror of the
+-- same immutable floor, because the two live on opposite sides of a process boundary;
 local M = {}
 
--- Immutable floor, compiled into the product. Config may ADD segments and may
--- NEVER remove one (the immutable control-plane rules "Standing rule — config
--- within immutable floors": Control plane | `.git/`, `.hg/`, `.svn/` always
--- refused | **add** segments only). A config typo that drops `.git` is exactly
--- the incident that started this work, so removal is structurally impossible:
--- the floor is unioned in unconditionally, last, below.
+-- Immutable floor, compiled into the product. Config may ADD segments and may NEVER
+-- remove one (the immutable control-plane rules "Standing rule — config within
+-- immutable floors": Control plane | `.git/`, `.hg/`, `.svn/` always refused | **add**
+-- segments only).
 M.FLOOR = { ".git", ".hg", ".svn" }
 
 --- Build the effective segment set: operator-added segments (if any) plus the
@@ -88,13 +84,11 @@ function M.is_control_plane(rel, opts)
 	return M.match(rel, opts) ~= nil
 end
 
--- Top-level entries of a BARE repository. A bare repo has no `.git/` segment to
--- catch, so its `HEAD`/`objects/`/`refs/`/`config` sit at the workspace root.
--- These are refused ONLY when the caller has PROVEN the workspace root is bare
--- (git `core.bare = true` plus the HEAD/objects/refs triad); an ordinary project
--- with a stray top-level `HEAD` is never refused. The safety rule is to refuse
--- bare-repository roots — but only after PROVING the root is bare … refusing on
--- names alone manufactures false refusals."
+-- Top-level entries of a BARE repository. A bare repo has no `.git/` segment to catch,
+-- so its `HEAD`/`objects/`/`refs/`/`config` sit at the workspace root. These are
+-- refused ONLY when the caller has PROVEN the workspace root is bare (git `core.bare =
+-- true` plus the HEAD/objects/refs triad); an ordinary project with a stray top-level
+-- `HEAD` is never refused.
 M.BARE_NAMES = {
 	["head"] = true,
 	["config"] = true,

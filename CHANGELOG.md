@@ -3,6 +3,39 @@
 All notable changes to Yana are documented here. Versions follow Semantic
 Versioning.
 
+## 0.1.0-alpha.6 - 2026-09-12
+
+### Fixed
+
+- **`:YanaEdit` no longer silently promotes `config.options.mode` to unconfined
+  `agentic`.** The first inline edit of a fresh, `mode = "inline"` session used
+  to call `ui.lua`'s `set_mode(p, "agent")`; `config.resolve_mode()` treated
+  the string `"agent"` as an alias for `"agentic"`, so a panel that was never
+  asked to change mode silently flipped the whole session's confinement dial
+  before the agent was even spawned — no hunk review, no sandbox, panel header
+  reading `## Cursor · agentic`. `resolve_mode()`'s `"agent"` alias is removed
+  (it errors loudly now — nothing legitimate used it); `:YanaEdit` asks a new
+  `ui.panel_write_capable()` whether its panel can produce an edit at all and
+  never assigns a mode itself, so only the documented mode-switch command
+  (`:YanaMode` / `<M-t>`) may change `config.options.mode`. A mode = `"ask"`
+  (read-only) session now refuses `:YanaEdit` with a named reason instead of
+  silently promoting itself.
+- **A sibling defect in the same "agent" ambiguity, in `agent.lua`**:
+  `jail_session.mode` was fed the vendor's own CLI permission-mode string
+  (`config.agent_permission_mode()`'s `"ask"`/`"agent"`/`"plan"` vocabulary)
+  instead of yana's own mode dial, so `inline_exec_allowlist_active`
+  (`shadow/jail.lua`) was always computed `false` for a genuine `inline` turn
+  when `inline_exec_allowlist` was configured — masked for as long as the
+  `"agent"` alias above existed. `agent.run()` now takes an explicit
+  `req.yana_mode` field for this purpose; `req.mode` keeps its original,
+  vendor-facing meaning.
+- **`:checkhealth` now warns when the resolved agent binary is the raw,
+  unwrapped `cursor-agent`** (its own probe output carrying `"not in the list
+  of known options"` — Electron/Chromium rejecting yana's flags, exit 0, zero
+  usable stream-json events). The new `exec:cursor-agent-wrapper` row names
+  the resolved `cmd` and recommends a wrapper script in the
+  `~/scripts/bin/cursor-cli` shape.
+
 ## 0.1.0-alpha.5 - 2026-08-26
 
 ### Added
@@ -323,3 +356,16 @@ Versioning.
 
 - Direct workspace-writing mode is disabled unless explicitly enabled.
 - Confined turns fail closed when their host enforcement cannot be established.
+
+## Unreleased
+
+### Added
+
+- **Backend `state_dirs` configuration**: Each backend can declare directories that need to be writable at startup (e.g., cursor `~/.cursor`, `~/.config/cursor`; codex `~/.codex`; claude `~/.claude`, `~/.claude.json`). The overlay bind-mounts exactly those paths read-write; everything else under `$HOME` remains read-only. Paths outside `$HOME` or under protected directories (`~/.ssh`, `~/.gnupg`, `~/.aws`) are refused at setup with an error.
+
+### Fixed
+
+- **The agent runs as the invoking user; root is never exposed to it**: the sandbox launched with `bwrap --unshare-user --uid 0 --gid 0`, so every turn's agent ran as root. Electron-based CLIs refuse outright ("You are trying to start Cursor as a super user which isn't recommended..."), and everything a turn wrote came back root-owned. The launcher now passes the invoking `--uid`/`--gid`, so the namespace maps exactly one uid and uid 0 does not exist inside the sandbox to be reached. Because bwrap reaches a non-zero sandbox uid through an intermediate user namespace — leaving its mount namespace owned by an ancestor, where CAP_SYS_ADMIN does not satisfy `may_mount()` — `yana-overlay-inner` now re-execs itself under `unshare --mount` and mounts into a mount namespace of its own. `unshare` (util-linux) joins `bwrap` and `capsh` as a required executable. Capabilities are still dropped in full before the agent starts.
+
+- **Vendor CLI state directory failures**: fixed "Read-only file system (os error 30)" when vendor CLIs (codex, claude, cursor) wrote their state directories at startup, which happens before the prompt is read and so refused the whole turn. The launcher binds each declared `state_dirs` entry read-write. They are staged inside bwrap's private `/tmp` and mounted onto their real paths after the overlay — so the write reaches the REAL host directory instead of the turn's disposable upper layer, where a refreshed credential would be discarded at release and the next turn would re-authenticate forever. The `~/.cursor` exception was corrected the same way, and for the same reason.
+
