@@ -51,7 +51,7 @@ yanad_client_call() {
 yanad_turn_args() {
 	local mounted_root=$WORKSPACE
 	[[ -n "$BROAD_ROOT" ]] && mounted_root=$BROAD_ROOT
-	python3 - "$SESSION_ID" "$TURN_ID" "$MODE" "$mounted_root" "$TURN_CGROUP" \
+	python3 - "$SESSION_ID" "$TURN_ID" "$MODE" "$mounted_root" "$TURN_CGROUP" "${PLAN_JSON-}" \
 		${TOUCHED_FILES[@]+"${TOUCHED_FILES[@]}"} -- \
 		${EXTRA_ROOTS[@]+"${EXTRA_ROOTS[@]}"} <<'PY'
 import json
@@ -60,8 +60,8 @@ import sys
 args = sys.argv[1:]
 sep = args.index("--")
 head, roots = args[:sep], args[sep + 1 :]
-session_id, turn_id, mode, mounted_root, cgroup, *files = head
-print(json.dumps({
+session_id, turn_id, mode, mounted_root, cgroup, plan_json, *files = head
+payload = {
     "session_id": session_id,
     "turn_id": turn_id,
     "mode": mode,
@@ -69,7 +69,12 @@ print(json.dumps({
     "roots": roots,
     "cgroup": cgroup,
     "files": files,
-}, separators=(",", ":")))
+}
+# Absent until the turn lifecycle (stage S5) builds one; an empty argument is
+# the absence, never a plan the daemon would have to guess at.
+if plan_json:
+    payload["plan"] = json.loads(plan_json)
+print(json.dumps(payload, separators=(",", ":")))
 PY
 }
 
@@ -82,7 +87,7 @@ import json
 import os
 import sys
 
-from yanad.slug import workspace_slug
+from yanad.claims import path_key
 
 answer_path, encoded, session_id, *declared_roots = sys.argv[1:]
 frame = json.loads(encoded)
@@ -96,7 +101,7 @@ layers = launch["layers"]
 workspace = layers["workspace"]
 values = [os.path.join(workspace, "upper"), os.path.join(workspace, "work")]
 for root in declared_roots:
-    layer = layers["roots"][workspace_slug(root)]
+    layer = layers["roots"][path_key(root)]
     values.extend((os.path.join(layer, "upper"), os.path.join(layer, "work")))
 sys.stdout.buffer.write(b"\0".join(os.fsencode(value) for value in values) + b"\0")
 PY

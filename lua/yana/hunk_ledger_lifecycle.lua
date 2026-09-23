@@ -26,6 +26,20 @@ function M.install(Ledger, helpers)
 	local signal_dirty = helpers.signal_dirty
 	local REBUILD_REASONS = helpers.rebuild_reasons
 
+	-- Publish a prepared native batch through the membership owner. Existing
+	-- block tables keep their identity for older actions and saved frames.
+	-- Paint is signalled only after History and Register also commit.
+	function Ledger:publish_prepared_members(members, fields)
+		assert_open(self, "publish_prepared_members")
+		for block, value in pairs(fields) do
+			for key in pairs(block) do block[key] = nil end
+			for key, item in pairs(value) do block[key] = item end
+		end
+		self.hunks = members
+		self.last_batch = nil
+		self.anchor_collisions = nil
+	end
+
 	-- `U` must not replay decisions or reconstruct from live fragments.
 	function Ledger:load_snapshot(blocks)
 		assert_open(self, "load_snapshot")
@@ -194,7 +208,7 @@ function M.install(Ledger, helpers)
 	    -- A split child is a NEW hunk, not the parent under another name, so it
 	    -- is stamped rather than made to inherit: two children that happen to
 	    -- propose the same bytes must still be two different hunks.
-	    hunk_identity.stamp(child)
+	    if self.identity_stage then self.identity_stage:stamp(child) else hunk_identity.stamp(child) end
 	    child.model_index = nil
 	    -- THE GENEALOGY, RECORDED WHERE IT IS KNOWN. A child leaves this function
 	    -- with no model index and a content key that is a SUBSET of the parent's, so
@@ -242,13 +256,13 @@ function M.install(Ledger, helpers)
 	  end
 	  self.last_batch = nil
 	  signal_dirty(self)
-	  log.lifecycle_info("hunk_ledger.membership", {
+	  if not self._timeline_stage then log.lifecycle_info("hunk_ledger.membership", {
 	    mutator = "split",
 	    pending_before = pending_before,
 	    pending_after = self:count(),
 	    parent_model_index = parent_model_index,
 	    children = #children,
-	  })
+	  }) end
 	end
 
 	-- Merges several pending hunks (already in ascending buffer order) into one.
@@ -279,7 +293,7 @@ function M.install(Ledger, helpers)
 	  end
 	  merged.model_index = nil
 	  -- Same as a split child: the merged block is a new hunk with its own name.
-	  hunk_identity.stamp(merged)
+	  if self.identity_stage then self.identity_stage:stamp(merged) else hunk_identity.stamp(merged) end
 	  merged.initial_new_count = merged.initial_new_count or #(merged.new_lines or {})
 	  -- Same reason as split's children (above): the merged block is a fresh
 	  -- table too, and would otherwise log model_index = nil unexplained.
@@ -304,13 +318,13 @@ function M.install(Ledger, helpers)
 	  self:seed_row_owners(merged)
 	  self.last_batch = nil
 	  signal_dirty(self)
-	  log.lifecycle_info("hunk_ledger.membership", {
+	  if not self._timeline_stage then log.lifecycle_info("hunk_ledger.membership", {
 	    mutator = "merge",
 	    pending_before = pending_before,
 	    pending_after = self:count(),
 	    member_model_indices = member_model_indices,
 	    members = #members,
-	  })
+	  }) end
 	  -- Hand the caller the inverse of what we just consumed. `merge` blanks the
 	  -- merged block's model_index (:206) and stamps model_join = "lost_at_merge"
 	  -- (:210), and takes the members off the list entirely, so nothing downstream

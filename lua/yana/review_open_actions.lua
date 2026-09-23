@@ -129,7 +129,14 @@ function Factory.new(deps)
     end
     return function(...)
       local moved = door(...)
-      require("yana.turn_bind").refresh_review_liveness(pool_for(opts or {}))
+      -- A cross-file undo opened another review without focusing it; focus it
+      -- now that neovim's undo has run there. No block: focus only, no cursor.
+      local active = pool_for(opts or {}).active
+      if active and active ~= state and active._focus_after_history_move then
+        active._focus_after_history_move = nil
+        land_on(active.change.path, active.bufnr, nil)
+      end
+      require("yana.turn.turn_bind").refresh_review_liveness(pool_for(opts or {}))
       return moved
     end
   end

@@ -135,7 +135,7 @@ class Daemon(LifecycleMixin):
         self.client_writers.add(writer)
         try:
             # Persistent connection: clients send hello then commands on ONE
-            # socket (bin/lib/yanad/client.py exchange(); lua/yana/yanad.lua).
+            # socket (bin/lib/yanad/client.py exchange(); lua/yana/runtime/yanad.lua).
             # Closing after the first frame → BrokenPipe on
             # the second write and yanad.client exits 66. One-shot CLIs still
             # work — they send one frame and close their end.
@@ -399,6 +399,7 @@ class Daemon(LifecycleMixin):
             args["kind"],
             args["owner"],
             self.owner_identity,
+            self.version,
         )
         self.watch_owner(sid, None, args["owner"], "editor")
         return protocol.ok(frame["id"], {"session_id": sid})
@@ -454,14 +455,14 @@ class Daemon(LifecycleMixin):
         if mode == "ask":
             launch = self.make_turn_dir(sid, args, owner, mode)
             return protocol.ok(frame["id"], {"launch": launch})
-        slugs = claims.claim_slugs(args["mounted_root"], args.get("touched") or args.get("files") or [])
+        keys = claims.claim_keys(args.get("touched") or args.get("files") or [])
         launch = self.make_turn_dir(sid, args, owner, mode)
-        for slug in slugs:
-            store.write_claim_row(self.root, slug, sid, args["turn_id"], "running")
+        for key in keys:
+            store.write_claim_row(self.root, key, sid, args["turn_id"], "running")
             self.log.write(
                 "DEBUG",
-                "claim event action=acquire slug=%s session=%s turn=%s"
-                % (slug, sid, args["turn_id"]),
+                "claim event action=acquire key=%s session=%s turn=%s"
+                % (key, sid, args["turn_id"]),
             )
         self.watch_owner(sid, args["turn_id"], owner, "launcher")
         return protocol.ok(frame["id"], {"launch": launch})
@@ -470,7 +471,7 @@ class Daemon(LifecycleMixin):
         try:
             return store.turn_dir(
                 self.root, sid, args["turn_id"], args["cgroup"], owner,
-                args["mounted_root"], args.get("roots", []), mode,
+                args["mounted_root"], args.get("roots", []), mode, args.get("plan"),
             )
         except Exception as exc:
             self.log.write(
@@ -546,7 +547,7 @@ class Daemon(LifecycleMixin):
         state, reason = liveness.seal_cgroup(store.read_json(meta_path).get("cgroup", ""))
         next_state = "settling" if state == "sealed" else state
         for row in held:
-            store.write_claim_row(self.root, row["slug"], sid, tid, next_state)
+            store.write_claim_row(self.root, row["key"], sid, tid, next_state)
         store.set_turn_state(
             self.root, sid, tid, next_state, reason, log=self.log,
             clear_workdirs=self.defer_workdir_cleanup,
@@ -569,7 +570,7 @@ class Daemon(LifecycleMixin):
         if turn.get("state") not in {"running", "settling"}:
             return protocol.refuse(frame["id"], "not_holder")
         files = args["files"]
-        incoming_slugs = claims.claim_slugs(turn["mounted_root"], files)
+        incoming_keys = claims.claim_keys(files)
         for holder in store.iter_arbitration_holders(self.root):
             if holder["session_id"] == sid:
                 continue
@@ -580,8 +581,8 @@ class Daemon(LifecycleMixin):
             self.root, sid, tid, files, args.get("tabs", []), args.get("bundle", []),
         )
         store.clear_claim_rows(self.root, sid)
-        for slug in incoming_slugs:
-            store.write_claim_row(self.root, slug, sid, tid, "reviewing")
+        for key in incoming_keys:
+            store.write_claim_row(self.root, key, sid, tid, "reviewing")
         store.set_turn_state(
             self.root, sid, tid, "reviewing", log=self.log,
             clear_workdirs=self.defer_workdir_cleanup,

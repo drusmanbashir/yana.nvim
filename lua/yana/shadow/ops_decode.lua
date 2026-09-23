@@ -5,7 +5,7 @@ local M = {}
 local EXPECTED_PRODUCER = "yana-changeset-v1"
 
 local control_plane = require("yana.safety.control_plane")
-local workspace_identity = require("yana.workspace_identity")
+local repo_root = require("yana.paths.repo_root")
 
 local function changeset_bin()
 	local src = debug.getinfo(1, "S").source:sub(2)
@@ -94,7 +94,9 @@ end
 --- markers are real typed operations that the producer reports and the review
 --- surface has no representation for. They are NOT dropped silently — the
 --- manifest route could not even see them — they are carried into the report
---- and named, so the gap is visible rather than invented away.
+--- and named, so the gap is visible rather than invented away. The one exception is a
+--- same-bytes `mode` record on a regular file (below): it is offered as a `modify`
+--- whose before and after bytes are identical.
 local CONTENT_KINDS = {
 	create = true,
 	modify = true,
@@ -106,10 +108,38 @@ local CONTENT_KINDS = {
 --- The producer tags every record with the kind of the object the operation acts on:
 --- the upper entry for a create or a modify, the lower object for a delete. A `create
 --- dir`, a `create symlink` and a whiteout over a directory are content-kind records
---- with no whole-file content, so they belong in the report beside mode changes, not in
---- the review.
+--- with no whole-file content, so they belong in the report beside directory and
+--- symlink mode changes, not in the review.
 local function reviewable(op)
+	if op.kind == "mode" then
+		return type(op.base_evidence) == "table" and op.base_evidence.state == "file"
+	end
 	return CONTENT_KINDS[op.kind] and op.detail == "file"
+end
+
+--- Before-evidence for a same-bytes `mode` record on a REGULAR FILE, or nil.
+---
+--- The producer emits only `mode <rel> <new octal>` for it. It is carried here the way a
+--- `chmod+modify` record is (`state=file mode=<before> new-mode=<after>` plus a
+--- fingerprint), so the one change build, evidence check and after-mode route serve it
+--- unchanged. The fingerprint is taken from the upper bytes, which the producer already
+--- judged equal to the lower bytes. The before mode comes from the lower file's lstat.
+--- A directory or symlink mode record gets none, and stays unreviewable.
+local function file_mode_evidence(workspace, upper, rel, new_mode)
+	local uv = vim.uv or vim.loop
+	if not upper or type(new_mode) ~= "string" or not tonumber(new_mode, 8) then
+		return nil
+	end
+	local ust, lst = uv.fs_lstat(upper .. "/" .. rel), uv.fs_lstat(workspace .. "/" .. rel)
+	if not (ust and lst and ust.type == "file" and lst.type == "file") then
+		return nil
+	end
+	local bytes = require("yana.diff").read_file_bytes(upper .. "/" .. rel)
+	if bytes == nil then
+		return nil
+	end
+	return require("yana.safety.hash").hash_bytes(bytes),
+		{ state = "file", mode = string.format("%o", lst.mode % 4096), ["new-mode"] = new_mode }
 end
 
 --- How many non-control-plane typed operations landed on each path, within
@@ -196,12 +226,18 @@ function M.typed_ops(workspace, upper)
 					evidence[key] = value
 				end
 			end
+			local extra = rec[4]
+			if kind == "mode" then
+				local fp, mode_ev = file_mode_evidence(workspace, upper, rel, rec[3])
+				evidence = mode_ev
+				extra = fp or extra
+			end
 			ops[#ops + 1] = {
 				kind = kind,
 				rel = rel,
 				path = workspace .. "/" .. rel,
 				detail = rec[3],
-				extra = rec[4],
+				extra = extra,
 				base_evidence = evidence,
 				base_hash_captured_ts = base_hash_captured_ts,
 			}
@@ -287,7 +323,7 @@ end
 --- WHICH REPOSITORY A TOUCHED PATH BELONGS TO.
 ---
 --- `.git` is a directory in an ordinary clone and a file in a worktree or submodule;
---- `workspace_identity.git_root` is the single implementation both this and claim
+--- `repo_root.git_root` is the single implementation both this and claim
 --- identity ask, so a hunk can never be grouped under one repository and claimed under
 --- another.
 ---
@@ -305,7 +341,7 @@ local function repo_root_for(abs, base, workspace)
 	if vim.fn.isdirectory(abs) ~= 1 then
 		dir = vim.fn.fnamemodify(abs, ":h")
 	end
-	local git = workspace_identity.git_root(dir, base)
+	local git = repo_root.git_root(dir, base)
 	if git then
 		return git
 	end

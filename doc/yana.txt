@@ -1,4 +1,4 @@
-*yana.txt*                         Yana                         version 0.1.0-alpha.8
+*yana.txt*                         Yana                         version 0.1.0-alpha.14
 
 ==============================================================================
 CONTENTS                                                        *yana-contents*
@@ -11,7 +11,7 @@ CONTENTS                                                        *yana-contents*
 6. Machine-specific configuration ................ |yana-machine-config|
 7. Security ................................................ |yana-security|
    Where a turn may run ................................. |yana-workspace|
-   Single-file mode ..................................... |yana-single-file|
+   Retired single-file mode ............................ |yana-single-file|
 8. Health .................................................... |yana-health|
 9. Events .................................................... |yana-events|
 
@@ -236,7 +236,7 @@ The default mode is `inline`, the first entry of `modes`. Important options: >lu
       artifact_dir_prefixes = {},
       -- Directories outside the opened workspace a turn may write.
       write_roots = {},
-      mappings = { toggle = false, ask = false, inline_edit = false },
+      mappings = { toggle = "<C-a>", ask = false, inline_edit = false },
     })
 <
 
@@ -247,6 +247,10 @@ Review keys (accept/reject a hunk, a file, or the whole turn) live in the flat
 old `diff_keymaps` names (`ours`, `theirs`, `all_theirs`, `all_changes`,
 `next`, `prev`) and the deprecated `both` alias still translate onto these;
 `both` warns once per session.
+
+`<C-a>` is the global sidebar toggle from any normal-mode buffer, including a
+panel buffer. `:YanaAccept` remains the separate command for accepting pending
+changes.
 
 The panel displays configuration mode `ask` as "Ask", `inline` as "Inline", and
 `agentic` as "Agent". Its conversation winbar leads with Yana and the mode;
@@ -356,86 +360,15 @@ symlinks: `/` is 0, `/home` is 1 (refused), `/home/you` is your home (refused
 by the home rule, via `$HOME` and via your passwd entry), `/home/you/notes` is
 3 (allowed). The rule exists because a top-level folder is never a project:
 accepting it would put every sibling under the agent's write scope. Start
-Yana inside the project or folder you mean to change. When the file you mean
-to edit would otherwise be refused or is loose, huge, or explicitly pinned,
-Yana may run in |yana-single-file| instead.
+Yana inside the project or folder you mean to change. `:Yana --workspace DIR`
+binds the next turn to a named directory; `:Yana --file` is retired and
+refuses by name.
 
                                                         *yana-single-file*
-SINGLE-FILE MODE. When a turn would otherwise use a refused or oversized
-workspace, Yana runs the agent against a scratch copy of exactly ONE file.
-The review paints in your real buffer; the agent's confined writes land only
-in the scratch workspace; your `:w` writes the real file. Reads stay the
-jail's read-only view of the host. A file inside a git project below `$HOME`
-is never single-file, whatever its folder size.
-
-WHEN IT TRIGGERS. Checks run in this order; the first match wins:
-
-1. `single_file.enabled = false` — single-file mode is off; ordinary workspace
-   rules apply.
-2. `:Yana --workspace DIR` on this turn — widens the workspace; single-file
-   mode is not entered.
-3. The file is behind the secrets wall — turn refused (see REFUSALS below).
-4. The file is not saved to disk yet — turn refused.
-5. `:Yana --file` — forced for this turn only.
-6. The file's folder would be refused as a workspace (`/`, `$HOME`, passwd
-   home, or depth < 2 below `/` after resolving symlinks) — trigger `home`.
-7. The file has no `.git` ancestor below `$HOME` — trigger `loose`.
-8. The file's folder has more than `single_file.max_entries` entries (default
-   2000; non-recursive `readdir`) — trigger `huge`.
-9. Otherwise — ordinary folder mode (not single-file).
-
-WHAT THE AGENT MAY TOUCH. Exactly one file: a byte-equal copy in the scratch
-workspace. Multi-file edits, create, delete, and chmod are refused by name.
-Declared `write_roots` are unavailable in single-file mode.
-
-SCRATCH COPY. Yana creates under the state root (`$XDG_STATE_HOME/nvim` by
-default, overridable with `YANA_STATE_ROOT`):
-
-    <state_root>/single-file/<sha16>/ws/<basename>
-    <state_root>/single-file/<sha16>/records/     " scratch turn records
-    <state_root>/single-file/<sha16>/meta.json    " real_path, real_workspace
-
-`<sha16>` is the first 16 hex digits of a hash of the file's real path. The
-`ws/` tree is wiped and recopied at each single-file turn; it is removed when
-the turn ends or the review closes. Yana never writes a `.yana` directory
-under `$HOME` for these turns.
-
-BANNER. While a single-file turn is open, the prompt winbar shows:
-
-    Single-file mode · agent edits only <basename> · multi-file/create/delete refused · :Yana --workspace DIR to widen
-
-REFUSALS (verbatim; `<basename>` and `<rel>` are filled in by Yana):
-
-                                                              *yana-sfm-refusals*
-`single-file mode: <basename> is behind the secrets wall`
-    Open a file outside the masked secrets paths.
-
-`single-file mode: save <basename> first`
-    `:write` the file to disk, then start the turn.
-
-`single-file mode: could not read <basename>`
-    Fix permissions or disk errors and retry.
-
-`single-file mode: declared write roots are not available`
-    Remove `write_roots` or use `:Yana --workspace DIR` to widen.
-
-`single-file mode: only <basename> may change (refused <rel>)`
-    The agent proposed another file or a non-modify change; the allowed file's
-    hunk may still be offered.
-
-`single-file mode: the buffer is closed — reopen <basename> and decide again`
-    `:edit` the file, then accept or reject again.
-
-`single-file mode: buffer differs from the composed review — decide again`
-    Reconcile the real buffer with what you want, then decide again.
-
-ACCEPT, REJECT, UNDO. Accept (`ca`) lands the hunk in the real buffer and
-marks it `modified`; the real disk file is unchanged until your `:w`. Reject
-(`cr`) restores the pre-turn lines in the real buffer. Once the review closes
-it stays closed: `u` in the real buffer is plain Neovim undo — bytes may move,
-no review reopens. The review lives in the real buffer, not the scratch copy.
-
-DISABLE OR FORCE. >lua
+RETIRED SINGLE-FILE MODE. Yana no longer runs a turn through a scratch copy of
+one file. Home-dotfile and loose-file turns stay on their real paths and use
+the ordinary review/accept path. Legacy setup keys are accepted only for
+compatibility:
 
     require("yana").setup({
       single_file = {
@@ -444,9 +377,9 @@ DISABLE OR FORCE. >lua
       },
     })
 <
-`:Yana --file` forces single-file mode on the next panel turn only.
-`:Yana --workspace DIR` widens the workspace for one turn and skips
-single-file mode.
+The table above emits one warning and is ignored. `:Yana --file` refuses with
+"Yana --file is retired; open the file normally or use --workspace DIR".
+`:Yana --workspace DIR` still binds one turn to `DIR`.
 
                                                         *yana-write-roots*
 `write_roots` declares directories OUTSIDE the opened workspace that a turn may

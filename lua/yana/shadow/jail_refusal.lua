@@ -17,7 +17,7 @@
 local M = {}
 
 local diff = require("yana.diff")
-local workspace_identity = require("yana.workspace_identity")
+local path_key = require("yana.paths.path_key")
 
 --- Why the write died, in the product's voice.
 M.OUT_OF_WORKSPACE_REASON = "the path is outside the claimed workspace, which yana confines by design"
@@ -182,6 +182,82 @@ local function under_any(paths, roots)
 		end
 	end
 	return false
+end
+
+--- F-EROFS-REFUSAL. WHY this write landed outside every layer, in one class.
+---
+--- `CONFINEMENT.md` "Outside capture" fixes four. They are tested here
+--- most-specific first because a path can satisfy several at once: a protected
+--- path is also, trivially, unseeded.
+---
+--- READ FROM THE PLAN AND MOUNTINFO, NEVER FROM CONFIGURATION -- which is the
+--- point of having a class at all. The refusal this replaces answered "declare
+--- it in write_roots", i.e. it told the operator to widen the boundary in
+--- response to hitting it. A class states what the kernel and the plan make
+--- true, and three of the four name no remedy, because none exists.
+---
+--- Returns `class, remedy`; `remedy` is nil when there is none.
+M.OUTSIDE_CAPTURE_CLASSES = { "protected", "mount-kind", "host-mount", "unseeded" }
+
+function M.outside_capture_class(path, plan, mounts)
+	if type(path) ~= "string" or path == "" then
+		return nil
+	end
+	plan = plan or {}
+	mounts = mounts or {}
+
+	-- `protected`: yana's own state, or a layer's upper or work directory --
+	-- the change set this turn is reviewed out of. Handing an agent its own
+	-- evidence is the thing confinement exists to prevent, so: no remedy.
+	for _, root in ipairs(plan.protected or {}) do
+		if under(path, root) then
+			return "protected", nil
+		end
+	end
+	for _, layer in ipairs(plan.layers or {}) do
+		if under(path, layer.upper) or under(path, layer.work) then
+			return "protected", nil
+		end
+	end
+
+	-- The mount the path sits on: longest matching mountpoint wins.
+	local mount
+	for _, entry in ipairs(mounts) do
+		if under(path, entry.mountpoint) and (not mount or #entry.mountpoint > #mount.mountpoint) then
+			mount = entry
+		end
+	end
+
+	-- `mount-kind`: read-only, pseudo, tmpfs, overlay, squashfs or FUSE. No
+	-- layer can be built on one, so no remedy.
+	if mount then
+		local blocked = { proc = true, sysfs = true, devtmpfs = true, devpts = true, tmpfs = true, overlay = true, squashfs = true, fuse = true, fuseblk = true }
+		local writable = false
+		for _, option in ipairs(vim.split(mount.options or "", ",", { trimempty = true })) do
+			if option == "rw" then
+				writable = true
+			end
+		end
+		if blocked[mount.fstype] or not writable then
+			return "mount-kind", nil
+		end
+	end
+
+	-- `host-mount`: something is mounted strictly below the path's own
+	-- directory, so no layer can contain the path -- an unprivileged mount
+	-- namespace cannot clone a tree carrying locked child mounts. Kernel
+	-- limit, no remedy.
+	local parent = vim.fn.fnamemodify(path, ":h")
+	for _, entry in ipairs(mounts) do
+		if entry.mountpoint ~= parent and under(entry.mountpoint, parent) then
+			return "host-mount", nil
+		end
+	end
+
+	-- `unseeded`: an ordinary writable directory the turn's seeds never
+	-- reached. The only class with a remedy, and it is an editor action rather
+	-- than a configuration line.
+	return "unseeded", "open a file there and resend"
 end
 
 local function root_list(...)
@@ -384,8 +460,8 @@ function M.consume_answer(session)
 		local root_layers = layers.roots or {}
 		if session.roots then
 			for i = 2, #session.roots do
-				local slug = workspace_identity.workspace_slug(session.roots[i].workspace)
-				local layer = root_layers[slug]
+				local key = path_key.of(session.roots[i].workspace)
+				local layer = root_layers[key]
 				if type(layer) == "string" then
 					session.roots[i].layer_dir = layer
 					session.roots[i].upper_dir = layer .. "/upper"
@@ -419,7 +495,7 @@ function M.run_overlay_shell(session, cmd)
 	local answer = M.consume_answer(session)
 	if answer and answer.refuse then
 		pcall(function()
-			require("yana.yanad").render_refusal(result.stderr or output, answer)
+			require("yana.runtime.yanad").render_refusal(result.stderr or output, answer)
 		end)
 	end
 	-- Never let bookkeeping about a refusal change the outcome of the command

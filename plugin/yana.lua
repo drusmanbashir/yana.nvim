@@ -20,7 +20,7 @@ local log = require("yana.log")
 local raw_cmd = vim.api.nvim_create_user_command
 local function cmd(name, callback, opts)
   raw_cmd(name, function(args)
-    require("yana.recovery_entry").schedule(vim.fn.getcwd())
+    require("yana.runtime.recovery_entry").schedule(vim.fn.getcwd())
     return callback(args)
   end, opts)
 end
@@ -32,7 +32,7 @@ local function parse_yana_args(raw)
   while i <= #args do
     local a = args[i]
     if a == "--file" then
-      flags.file = true
+      error("Yana --file is retired; open the file normally or use --workspace DIR", 0)
     elseif a == "--workspace" then
       i = i + 1
       if not args[i] or args[i] == "" then
@@ -49,7 +49,7 @@ end
 
 cmd("Yana", function(opts)
   log.guard("Yana", function()
-    require("yana.single_file").set_next_flags(parse_yana_args(opts.args))
+    vim.g.yana_next_launch_flags = parse_yana_args(opts.args)
     yana().toggle()
   end)
 end, { nargs = "*", desc = "Toggle the yana agent panel" })
@@ -158,13 +158,13 @@ end, { desc = "View agent file changes as a diff (read-only)" })
 
 cmd("YanaRefusals", function()
   log.guard("YanaRefusals", function()
-    require("yana.ui").show_refusals()
+    require("yana.panel.ui").show_refusals()
   end)
 end, { desc = "List system-refused operations for the current Yana panel" })
 
 cmd("YanaIgnore", function(opts)
   log.guard("YanaIgnore", function()
-    local ignore = require("yana.ignore")
+    local ignore = require("yana.paths.ignore")
     local pattern = vim.trim(opts.args or "")
     if pattern == "" then
       local patterns = ignore.patterns()
@@ -265,7 +265,7 @@ end, { nargs = "*", range = true, desc = "Inline edit the current line/selection
 -- Spec: modules/external-roots.md §CAPTURE SET — one command, both behaviours.
 cmd("YanaRoots", function(opts)
   log.guard("YanaRoots", function()
-    require("yana.ui_roots").command(opts)
+    require("yana.panel.ui_roots").command(opts)
   end)
 end, {
   nargs = "?",

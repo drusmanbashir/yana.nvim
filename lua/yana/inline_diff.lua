@@ -1,4 +1,4 @@
--- yana: in-buffer per-hunk diff review (Avante replace_in_file parity).
+-- yana: in-buffer per-hunk diff review.
 -- Restores the pre-edit snapshot on disk, previews agent edits as extmarked hunks,
 -- and writes the resolved buffer only after the user accepts.
 local diff = require("yana.diff")

@@ -163,7 +163,7 @@ class LifecycleMixin:
                 "turns": [{"turn_id": t["turn_id"], "state": t["state"]} for t in turns],
             })
         claim_rows = [
-            {key: row[key] for key in ["slug", "session_id", "turn_id", "state", "since"]}
+            {key: row[key] for key in ["key", "session_id", "turn_id", "state", "since"]}
             for row in store.iter_claims(self.root)
         ]
         return {"sessions": sessions, "claims": claim_rows, "pruned": pruned}
@@ -171,7 +171,7 @@ class LifecycleMixin:
     def replay_startup(self):
         # first.
         migrate.migrate_legacy(self.root)
-        startup_reap.reap(self.root, self.owner_identity, self.log)
+        startup_reap.reap(self.root, self.owner_identity, self.log, self.version)
         store.replay(self.root)
         for sess in store.iter_sessions(self.root, log=self.log):
             for turn in store.iter_turns(self.root, sess["session_id"]):
@@ -252,9 +252,9 @@ class LifecycleMixin:
             for row in store.iter_claims(self.root):
                 if row["session_id"] == sid and row["turn_id"] == tid:
                     if state == "dead_unsealed":
-                        store.write_claim_row(self.root, row["slug"], sid, tid, state)
+                        store.write_claim_row(self.root, row["key"], sid, tid, state)
                     else:
-                        (self.root / "claims" / row["slug"] / "row.json").unlink(missing_ok=True)
+                        (self.root / "claims" / row["key"] / "row.json").unlink(missing_ok=True)
         self.maybe_exit()
 
     def clear_releasable_claims(self, sid):
@@ -265,10 +265,10 @@ class LifecycleMixin:
             try:
                 meta = store.read_json(meta_path)
             except OSError:
-                (self.root / "claims" / row["slug"] / "row.json").unlink(missing_ok=True)
+                (self.root / "claims" / row["key"] / "row.json").unlink(missing_ok=True)
                 continue
             if meta["state"] != "dead_unsealed":
-                (self.root / "claims" / row["slug"] / "row.json").unlink(missing_ok=True)
+                (self.root / "claims" / row["key"] / "row.json").unlink(missing_ok=True)
 
     async def exit0(self):
         if self.exiting:

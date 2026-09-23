@@ -123,7 +123,7 @@ def set_turn_state(root, session_id, turn_id, state, reason=None, log=None, clea
         (clear_workdirs or clear_turn_workdirs)(str(turn_dir), log)
 
 
-def write_claim_row(root, claim_slug, session_id, turn_id, state):
+def write_claim_row(root, claim_key, session_id, turn_id, state):
     session = load_session(root, session_id)
     row = {
         "session_id": session_id,
@@ -133,7 +133,7 @@ def write_claim_row(root, claim_slug, session_id, turn_id, state):
     }
     if session.get("daemon_owner") is not None:
         row["daemon_owner"] = session["daemon_owner"]
-    base.write_claim_row(root, claim_slug, row)
+    base.write_claim_row(root, claim_key, row)
 
 
 def iter_sessions(root, log=None):
@@ -174,15 +174,15 @@ def iter_claims(root):
     rows = []
     for path in sorted(claims.glob("*/row.json")):
         row = read_json(path)
-        row["slug"] = path.parent.name
+        row["key"] = path.parent.name
         rows.append(row)
     return rows
 
 
 def iter_open_review_holders(root):
-    """Synthetic holders from claims/<slug>/reviews/<session_id> pointers.
+    """Synthetic holders from claims/<key>/reviews/<session_id> pointers.
 
-    One row.json per workspace slug: a later disjoint launch overwrites the
+    One row.json per claimed path: a later disjoint launch overwrites the
     active claim row. Open-review pointers stay, so arbitration must still
     see every reviewing session (U5 F1 / U2 disjoint co-holders).
     """
@@ -208,7 +208,7 @@ def iter_open_review_holders(root):
             continue
         seen.add(session_id)
         rows.append({
-            "slug": pointer.parent.parent.name,
+            "key": pointer.parent.parent.name,
             "session_id": session_id,
             "turn_id": turn_id,
             "state": "reviewing",
@@ -230,14 +230,14 @@ def iter_arbitration_holders(root):
 def clear_claim_rows(root, session_id):
     for row in iter_claims(root):
         if row["session_id"] == session_id:
-            base.clear_claim_row(root, row["slug"])
+            base.clear_claim_row(root, row["key"])
 
 
 def clear_claim_rows_for_turn(root, session_id, turn_id):
     """Remove launch-index rows owned by one turn."""
     for row in iter_claims(root):
         if row["session_id"] == session_id and row["turn_id"] == turn_id:
-            base.clear_claim_row(root, row["slug"])
+            base.clear_claim_row(root, row["key"])
 
 
 def remove_turn(root, session_id, turn_id, log=None):

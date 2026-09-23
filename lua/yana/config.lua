@@ -1,17 +1,18 @@
 -- yana: configuration defaults and merge logic.
 local M = {}
 
-M.defaults = require("yana.config_defaults")
+M.defaults = require("yana.configuration.config_defaults")
 
 M.options = vim.deepcopy(M.defaults)
 M._setup_done = false
+M._single_file_notice_emitted = false
 
 function M.home_dir()
   return vim.fn.expand("~")
 end
 
 
-local _backends = require("yana.config_backends").new({
+local _backends = require("yana.configuration.config_backends").new({
   defaults = M.defaults,
   home_dir = M.home_dir,
   get_options = function()
@@ -23,32 +24,7 @@ M.normalize_backend = _backends.normalize_backend
 M.backend_descriptor = _backends.backend_descriptor
 
 
-local _resolve = require("yana.config_resolve").new({
-  defaults = M.defaults,
-  get_options = function()
-    return M.options
-  end,
-  backend_descriptor = function(name)
-    return M.backend_descriptor(name)
-  end,
-})
-M.mode_hl_groups = _resolve.mode_hl_groups
-M.model_hl_group = _resolve.model_hl_group
-M.normalize_mode = _resolve.normalize_mode
-M.resolve_mode = _resolve.resolve_mode
-M.overlay_mode = _resolve.overlay_mode
-M.review_mode_active = _resolve.review_mode_active
-M.agent_permission_mode = _resolve.agent_permission_mode
-M.agent_needs_permission_flag = _resolve.agent_needs_permission_flag
-M.normalize_cmd_env = _resolve.normalize_cmd_env
-M.resolve_cmd = _resolve.resolve_cmd
-M.cmd = _resolve.cmd
-M.normalize_modes = _resolve.normalize_modes
-M.mode_enabled = _resolve.mode_enabled
-
-
-
-local _normalize = require("yana.config_normalize").new({
+local _normalize = require("yana.configuration.config_normalize").new({
   defaults = M.defaults,
 })
 M.normalize_selection_scope = _normalize.normalize_selection_scope
@@ -66,8 +42,34 @@ M.normalize_capture_root = _normalize.normalize_capture_root
 M.normalize_capture_root_candidates = _normalize.normalize_capture_root_candidates
 M.normalize_artifact_dir_prefixes = _normalize.normalize_artifact_dir_prefixes
 M.normalize_inline_exec_allowlist = _normalize.normalize_inline_exec_allowlist
+M.normalize_open_capture = _normalize.normalize_open_capture
 
-local _mappings = require("yana.config_mappings")
+local _resolve = require("yana.configuration.config_resolve").new({
+  defaults = M.defaults,
+  get_options = function()
+    return M.options
+  end,
+  backend_descriptor = function(name)
+    return M.backend_descriptor(name)
+  end,
+  normalize_open_capture_mode = _normalize.normalize_open_capture_mode,
+})
+M.mode_hl_groups = _resolve.mode_hl_groups
+M.model_hl_group = _resolve.model_hl_group
+M.normalize_mode = _resolve.normalize_mode
+M.resolve_mode = _resolve.resolve_mode
+M.overlay_mode = _resolve.overlay_mode
+M.review_mode_active = _resolve.review_mode_active
+M.agent_permission_mode = _resolve.agent_permission_mode
+M.agent_needs_permission_flag = _resolve.agent_needs_permission_flag
+M.normalize_cmd_env = _resolve.normalize_cmd_env
+M.resolve_cmd = _resolve.resolve_cmd
+M.cmd = _resolve.cmd
+M.normalize_modes = _resolve.normalize_modes
+M.mode_enabled = _resolve.mode_enabled
+M.resolve_open_capture_mode = _resolve.resolve_open_capture_mode
+
+local _mappings = require("yana.configuration.config_mappings")
 
 -- Runtime facts derived from the resolved options, written only here: the
 -- current mode starts at the first listed mode, enable_agentic reports whether
@@ -113,7 +115,7 @@ function M.normalize_profile(value)
 end
 
 function M.normalize_multi_panel_layout(value)
-  local policy = require("yana.ui_panel_layout_policy")
+  local policy = require("yana.panel.ui_panel_layout_policy")
   if value == nil then
     return M.defaults.ui.multi_panel_layout
   end
@@ -172,6 +174,13 @@ function M.setup(opts)
   -- A private copy: nothing below writes into the caller's table, so a second
   -- setup() with the same table resolves to the same options.
   opts = vim.deepcopy(opts or {})
+  if opts.single_file ~= nil and not M._single_file_notice_emitted then
+    M._single_file_notice_emitted = true
+    vim.notify(
+      "yana: single_file config is deprecated and ignored",
+      vim.log.levels.WARN
+    )
+  end
   local next_options = vim.tbl_deep_extend("force", vim.deepcopy(M.defaults), opts)
   -- Replace (do not deep-merge) each highlight role so a custom bg/fg does not
   -- keep a leftover defaults.link (e.g. DiffAdd) that would win at apply time.
@@ -207,6 +216,7 @@ function M.setup(opts)
   next_options.workspace_roots = M.normalize_workspace_roots(next_options.workspace_roots)
   next_options.capture_root = M.normalize_capture_root(next_options.capture_root)
   next_options.capture_root_candidates = M.normalize_capture_root_candidates(next_options.capture_root_candidates)
+  next_options.open_capture = M.normalize_open_capture(next_options.open_capture)
   next_options.inline_exec_allowlist = M.normalize_inline_exec_allowlist(next_options.inline_exec_allowlist)
   next_options.cmd_env = M.normalize_cmd_env(next_options.cmd_env)
   next_options.sandbox = M.normalize_sandbox(next_options.sandbox)
@@ -226,7 +236,7 @@ function M.setup(opts)
   -- The ignore matcher compiles `review.ignore` once and caches it. A setup()
   -- that changed the list must not be answered by the previous compile.
   pcall(function()
-    require("yana.ignore").reset()
+    require("yana.paths.ignore").reset()
   end)
   require("yana.log").set_level(next_options.log_level)
   return M.options

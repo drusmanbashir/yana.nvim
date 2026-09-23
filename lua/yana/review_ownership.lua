@@ -82,7 +82,7 @@ local function resolve_disk_unchanged(change)
     -- path, and yana's own proposal-time touch is exactly that appearance -- unamended,
     -- this guard would rule every created-file review stale the moment the touch and
     -- the open raced, in either order.
-    local creation_touch = require("yana.creation_touch")
+    local creation_touch = require("yana.paths.creation_touch")
     local ours, why = creation_touch.disk_is_ours(change.path)
     if ours then
       return true

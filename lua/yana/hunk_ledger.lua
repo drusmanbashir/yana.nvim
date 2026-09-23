@@ -134,8 +134,15 @@ function Ledger:members()
 	return out
 end
 
+function Ledger:stamp_frozen()
+	self.frozen_for_end = true
+end
+
 function Ledger:decide(block, action, line_delta)
 	assert_open(self, "decide")
+	if self.frozen_for_end then
+		return false, "turn is frozen for End"
+	end
 	assert_action(action)
 	local idx = index_of(self.hunks, block)
 	if not idx then
@@ -239,6 +246,9 @@ end
 -- pending set, which no forward action is allowed to do.
 function Ledger:restore_verdict(block, verdict)
 	assert_open(self, "restore_verdict")
+	if self.frozen_for_end then
+		return false, "turn is frozen for End"
+	end
 	if not index_of(self.hunks, block) then
 		error("hunk_ledger: restore_verdict on a hunk this ledger does not own", 2)
 	end
@@ -357,6 +367,9 @@ end
 -- hunk (verdict still pending after the door's attempt) stays detectable (A5).
 function Ledger:decide_all(action)
 	assert_open(self, "decide_all")
+	if self.frozen_for_end then
+		return false, "turn is frozen for End"
+	end
 	if action ~= "accept" then
 		error("hunk_ledger: decide_all only accepts; bulk reject is a door loop (A5)", 2)
 	end
@@ -393,6 +406,9 @@ end
 -- (A1 — the once-per-review latch was defeated by undo, amendment log).
 function Ledger:undo_decision(block)
 	assert_open(self, "undo_decision")
+	if self.frozen_for_end then
+		return false, "turn is frozen for End"
+	end
 	local idx = index_of(self.hunks, block)
 	if not idx then
 		error("hunk_ledger: undo_decision on a hunk this ledger does not own", 2)
@@ -407,6 +423,9 @@ end
 
 function Ledger:redo_decision(block, action)
 	assert_open(self, "redo_decision")
+	if self.frozen_for_end then
+		return false, "turn is frozen for End"
+	end
 	assert_action(action)
 	local idx = index_of(self.hunks, block)
 	if not idx then

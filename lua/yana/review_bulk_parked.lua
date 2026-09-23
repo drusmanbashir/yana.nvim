@@ -1,5 +1,6 @@
 -- Parked-change composition and ledger construction for bulk accept.
 local hunk_ledger = require("yana.hunk_ledger")
+local hunk_identity = require("yana.hunk_identity")
 
 local M = {}
 
@@ -43,9 +44,29 @@ function M.new(deps)
   local function parked_ledger(change_i)
     local parked = change_i and change_i._parked_review
     local blocks = {}
-    for i, block in ipairs((parked and parked.blocks) or {}) do
-      blocks[i] = hunk_ledger.scrub_paint(vim.deepcopy(block))
+    local function add(block)
+      if type(block) ~= "table" then
+        return
+      end
+      for _, existing in ipairs(blocks) do
+        if hunk_identity.same(existing, block) then
+          return
+        end
+      end
+      blocks[#blocks + 1] = hunk_ledger.scrub_paint(vim.deepcopy(block))
     end
+    for _, block in ipairs((parked and parked.blocks) or {}) do
+      add(block)
+    end
+    -- `parked.blocks` is the pending set. Decisions sealed before parking are
+    -- still members of the retained ledger and remain acceptance evidence.
+    for _, decision in ipairs((parked and parked.sealed_decisions) or {}) do
+      add(decision.block)
+    end
+    table.sort(blocks, function(a, b)
+      return (a.new_start_line or a.start_line or math.huge)
+        < (b.new_start_line or b.start_line or math.huge)
+    end)
     return hunk_ledger.open(blocks)
   end
 

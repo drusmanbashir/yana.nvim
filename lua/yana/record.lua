@@ -338,7 +338,7 @@ end
 -- They live under `stdpath("state")`, never in the workspace and never in
 -- `yana.log`, so a clean turn still leaves both untouched.
 --
--- `yana.turn_lifecycle` owns their meaning; this module owns the bytes,
+-- `yana.turn.turn_lifecycle` owns their meaning; this module owns the bytes,
 -- because it is where durable turn-scoped writes already live.
 
 local function record_path(dir, turn_id)

@@ -1,6 +1,5 @@
 -- yana: slash-command registry (engine-agnostic, no UI/completion
--- knowledge). Mirrors avante's shape (avante/slashcommands.lua): a
--- declarative descriptor table `{ name, description, details }` beside a
+-- knowledge). A declarative descriptor table `{ name, description, details }` beside a
 -- SEPARATE `callbacks` table keyed by name, zipped by M.get_commands.
 --
 -- Callback contract: fun(panel, args, cb) — exactly two legal outcomes:
@@ -58,19 +57,19 @@ local builtin_callbacks = {
 		cb(nil)
 	end,
 	new = function(_panel, _args, cb)
-		require("yana.ui").new_chat()
+		require("yana.panel.ui").new_chat()
 		cb(nil)
 	end,
 	model = function(_panel, _args, cb)
-		require("yana.ui").pick_model()
+		require("yana.panel.ui").pick_model()
 		cb(nil)
 	end,
 	backend = function(_panel, _args, cb)
-		require("yana.ui").pick_backend()
+		require("yana.panel.ui").pick_backend()
 		cb(nil)
 	end,
 	mode = function(_panel, _args, cb)
-		require("yana.ui").toggle_mode()
+		require("yana.panel.ui").toggle_mode()
 		cb(nil)
 	end,
 	resend = function(_panel, args, cb)
@@ -78,21 +77,21 @@ local builtin_callbacks = {
 		if where ~= "here" and where ~= "new" and where ~= "agent" then
 			where = "here"
 		end
-		require("yana.ui").resend({ where = where })
+		require("yana.panel.ui").resend({ where = where })
 		if cb then
 			cb()
 		end
 	end,
 	queue = function(_panel, _args, cb)
-		require("yana.ui").pick_queue()
+		require("yana.panel.ui").pick_queue()
 		cb(nil)
 	end,
 	stop = function(_panel, _args, cb)
-		require("yana.ui").stop()
+		require("yana.panel.ui").stop()
 		cb(nil)
 	end,
 	review = function(_panel, _args, cb)
-		require("yana.ui").review_changes()
+		require("yana.panel.ui").review_changes()
 		cb(nil)
 	end,
 }

@@ -235,7 +235,7 @@ local function cleanup_preview()
     -- Plain scrub only: detach any listener group, clear paint, drop the
     -- synthetic pool/active state. No End-turn dialog, no settle.
     if state.listener_group then
-      pcall(require("yana.turn_listeners").detach, state.listener_group)
+      pcall(require("yana.turn.turn_listeners").detach, state.listener_group)
     end
     if type(inline.cleanup) == "function" then
       pcall(inline.cleanup, state)

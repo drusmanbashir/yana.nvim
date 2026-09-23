@@ -10,7 +10,14 @@ set -euo pipefail
 
 root=$(git -C "$(dirname "$0")/../.." rev-parse --show-toplevel)
 commit=${1:-HEAD}
-tmp=${TMPDIR:-/tmp}
+dev_checks=0
+if [[ ${2:-} == --dev ]]; then
+	dev_checks=1
+elif (( $# > 1 )); then
+	echo "Usage: $0 [COMMIT] [--dev]" >&2
+	exit 64
+fi
+tmp=${YANA_HEADLESS_TMPDIR:-${TMPDIR:-/tmp}}
 work=$(mktemp -d "$tmp/yana-release-gate.XXXXXX")
 trap 'rm -rf "$work"' EXIT
 
@@ -35,6 +42,14 @@ cmp "$work/a/yana.nvim-"*.tar.gz "$work/b/yana.nvim-"*.tar.gz
 "$work/export/tests/release/fresh_install.sh" "$work/export" "$(command -v nvim)"
 "$work/export/tests/release/yana_ui_dependency_gate.sh" "$work/export" "$(command -v nvim)"
 DEV_CHECKOUT="$root" "$work/export/tests/release/confined_turn_gate.sh" "$work/export" "$(command -v nvim)"
+if (( dev_checks )); then
+	# These checks use development-only fixtures and the public remote.
+	"$root/tests/release/candidate_check_gate.sh"
+	"$root/tests/release/candidate_history_exceptions_gate.sh"
+	"$root/tests/release/yana_release_preflight_gate.sh"
+	"$(command -v nvim)" --clean --headless -u NONE -i NONE --cmd "set rtp^=$root" -l "$root/tests/release/install_remedy_smoke.lua"
+	"$(command -v nvim)" --clean --headless -u NONE -i NONE --cmd "set rtp^=$root" -l "$root/tests/release/health_yana_ui_smoke.lua"
+fi
 
 if [[ $skip_container == 1 ]]; then
 	echo "RELEASE GATE: skipping container_smoke (YANA_RELEASE_SKIP_CONTAINER_SMOKE=1 — local bounded run only)" >&2

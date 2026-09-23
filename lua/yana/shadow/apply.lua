@@ -6,8 +6,6 @@ local diary = require("yana.safety.diary")
 local checkpoint = require("yana.safety.checkpoint")
 local preview = require("yana.shadow.preview")
 local diff = require("yana.diff")
-local log = require("yana.log")
-local hash = require("yana.safety.hash")
 
 M._test = {
 	inject = {},
@@ -103,9 +101,6 @@ local apply_accept = require("yana.shadow.apply_accept")
 apply_accept._test = M._test
 
 M.reconcile_applied_buffer = apply_accept.reconcile_applied_buffer
-M.single_file_accept_refusal = apply_accept.single_file_accept_refusal
-M.accept_transfer = apply_accept.accept_transfer
-M.accept_apply = apply_accept.accept_apply
 M.accept_composed = apply_accept.accept_composed
 
 --- The panel-local journal a standalone accept or scope revert writes through.
@@ -150,47 +145,30 @@ end
 --- Journaled accept when no apply-mode shadow_pass exists (preview-mode inline
 --- review). Checkpoint is omitted: preview turns discard the overlay without a
 --- pass, but a real-tree accept during review still routes through the diary.
+--- The standalone route consumes the SAME explicit `{action, bytes, mode,
+--- purpose, preserve_review}` record as the pass route, takes the same
+--- preflight, and reaches disk through the same `apply_accept.commit`. It has
+--- no transfer-only shortcut and it never reads `change.kind` or
+--- `change.after_mode` to decide what to do.
 function M.accept_standalone(panel, change, composed, opts)
 	if not panel then
 		return false, "no panel"
 	end
-	opts = opts or {}
-	local staged_bufnr = opts.staged_bufnr
-	if change and change.single_file then
-		local refusal = M.single_file_accept_refusal(change, staged_bufnr)
-		if refusal then
-			return false, refusal
-		end
-		return M.accept_transfer(panel, change, composed, staged_bufnr)
+	local plan, perr = apply_accept.write_plan(change, composed, opts)
+	if not plan then
+		return false, perr
 	end
-	if apply_accept.valid_loaded_buffer(staged_bufnr) then
-		local live = diff.buffer_bytes_snapshot(staged_bufnr)
-		-- A created file is an ordinary file.
-		if live == composed and change and change.kind ~= "delete" and not apply_accept.mode_delta(change) then
-			return M.accept_transfer(panel, change, composed, staged_bufnr)
-		end
-		if live ~= composed then
-			log.write(
-				log.levels.WARN,
-				"yana: staged buffer mismatch for " .. tostring(change and change.path or "?") .. " -- written at accept"
-			)
-		elseif apply_accept.mode_delta(change) then
-			log.write(log.levels.WARN, "yana: mode change — written at accept (trash gate pending)")
-		end
-	end
-	if change.base_hash == nil then
-		return false,
-			"refusing to accept "
-				.. tostring(change.path)
-				.. ": the change set carries no before-fingerprint for it, so drift cannot be judged"
-	end
-
 	-- The same accept-step pairing as `accept_composed`, on the preview-mode
 	-- route that has no apply pass. Pass the panel: file_claim_refusal(nil)
 	-- drops yanad_session_id and fails closed with "yanad session_id missing".
-	local standalone_claim_refusal = M.file_claim_refusal(panel, change)
-	if standalone_claim_refusal then
-		return false, standalone_claim_refusal
+	local ok, err = apply_accept.accept_preflight(panel, change)
+	if not ok then
+		return false, err
+	end
+	if plan.action == "none" then
+		-- Nothing is owed, so no journal is opened: a pass that writes nothing
+		-- must not leave a diary directory behind.
+		return apply_accept.commit(nil, change, plan, opts and opts.own_splice)
 	end
 	-- A change from a declared write root journals at THAT root: the diary's
 	-- own "path escapes workspace" refusal is a boundary worth keeping, so the
@@ -200,51 +178,7 @@ function M.accept_standalone(panel, change, composed, opts)
 	if not session then
 		return false, serr
 	end
-	local is_delete = change.kind == "delete"
-	local predicted_op_id = string.format("%s:%d", session.stream, (session.op_seq or 0) + 1)
-	local ok, err = diary.intent({
-		session = session,
-		path = change.path,
-		target = is_delete and "" or (composed or ""),
-		op_kind = is_delete and "delete" or "replace",
-		base_hash = change.base_hash,
-		-- WHEN that fingerprint was captured, same reason as accept_apply above.
-		base_hash_captured_ts = change.base_hash_captured_ts,
-		base_state = change.base_state,
-		base_mode = change.base_mode,
-		base_link_target = change.base_link_target,
-		target_mode = change.after_mode,
-		record_only = true,
-	})
-	if not ok then
-		return false, err
-	end
-	local detail
-	ok, err, detail = diary.apply_pending({
-		session = session,
-		path = change.path,
-	})
-	if not ok then
-		if type(detail) == "table" then
-			change.shadow_refusal = detail
-		end
-		return false, err
-	end
-	local uv = vim.uv or vim.loop
-	local applied = {
-		path = change.path,
-		kind = is_delete and "delete" or "replace",
-		stat = (not is_delete) and uv.fs_stat(change.path) or nil,
-		diary_dir = session.diary_dir,
-		op_id = predicted_op_id,
-		base_hash = change.base_hash,
-		target_hash = hash.hash_bytes(is_delete and "" or (composed or "")),
-	}
-	local rok, rerr = M.reconcile_applied_buffer(applied)
-	if not rok then
-		applied.reconcile_error = rerr
-	end
-	return true, nil, applied
+	return apply_accept.commit(session, change, plan, opts and opts.own_splice)
 end
 
 --- Scope-revert an out-of-zone edit through the journaled applier.

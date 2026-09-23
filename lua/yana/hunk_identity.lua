@@ -21,6 +21,32 @@ local M = {}
 
 local next_lineage = 0
 
+-- A flush can prepare several native endpoints before publishing any of them.
+-- These names are private until commit; a rejected preparation burns no global
+-- identity and cannot leave later group genealogy pointing at an unnamed child.
+function M.stage_ids()
+  local base = next_lineage
+  local staged = { base = base, last = base }
+  function staged:stamp(block)
+    if type(block) == "table" and block.lineage_id == nil then
+      self.last = self.last + 1
+      block.lineage_id = "lin-" .. self.last
+    end
+    return block
+  end
+  function staged:commit()
+    if next_lineage ~= self.base then
+      return false, "hunk identity advanced during history preparation"
+    end
+    next_lineage = self.last
+    return true
+  end
+  function staged:rollback()
+    if next_lineage == self.last then next_lineage = self.base end
+  end
+  return staged
+end
+
 --- Mint a lineage id if this hunk has none. Called where a hunk BEGINS
 --- existing; never called to refresh one, because an id that can be reassigned
 --- is not an identity.

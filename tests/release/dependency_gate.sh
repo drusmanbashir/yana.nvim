@@ -10,11 +10,11 @@ trap 'rm -rf "$scratch"' EXIT
 mapfile -t required < <(
 	"$nvim" --clean --headless -u NONE -i NONE \
 		--cmd "set rtp^=$tree" \
-		-c "lua io.write(table.concat(require('yana.dependencies').required_executables('inline'), '\\n') .. '\\n')" \
+		-c "lua io.write(table.concat(require('yana.runtime.dependencies').required_executables('inline'), '\\n') .. '\\n')" \
 		-c qa
 )
 
-# bwrap_userns_row() (lua/yana/dependencies.lua) probes the kernel by
+# bwrap_userns_row() (lua/yana/runtime/dependencies.lua) probes the kernel by
 # actually launching bwrap with a trivial no-op payload, `true`, INSIDE the
 # sandbox it builds -- that probe's own PATH is inherited from whatever
 # spawned nvim, i.e. the narrowed PATH this harness builds below. `true` is

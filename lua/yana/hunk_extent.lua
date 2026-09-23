@@ -235,8 +235,7 @@ end
 --- `lines` is read from the live buffer for that span's OWN bounds in the same step
 --- that computes them, exactly as the absorb branch pairs `set_new_lines` with
 --- `set_span` (review_watch.lua:318-319). A caller therefore cannot write a bound from
---- here without the matching content being in its hand -- the defect cordoned at
---- tests/RED-LEDGER.tsv:18 is the one this pairing exists to prevent.
+--- here without the matching content being in its hand.
 ---
 --- A caller that needs trust must test it. Content then comes from `block.new_lines`
 --- rather than from the buffer, because a stored bound is not a claim about live rows.

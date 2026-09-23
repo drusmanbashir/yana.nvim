@@ -9,6 +9,7 @@ set -euo pipefail
 
 mode=${1:-positive}
 export_tree=/opt/yana-export
+. "$export_tree/tests/lib/sigsafe.sh"
 ui_root=/opt/yana-ui
 scratch_base=/var/yana/scratch
 rm -rf "$scratch_base"/*
@@ -61,7 +62,7 @@ signal_yanad_under() {
 	cmdline=$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null) || return 0
 	for root in "$@"; do
 		[[ -n $root && $cmdline == *"-m yanad --root $root/"* ]] || continue
-		kill "-$sig" "$pid" 2>/dev/null || true
+		sigsafe_signal "$sig" "$pid" || true
 		return 0
 	done
 }
@@ -82,12 +83,12 @@ stop_yanads_under() {
 		pids=$(yanad_pids_under "$@")
 		[[ -n $pids ]] || return 0
 		for pid in $pids; do
-			signal_yanad_under TERM "$pid" "$@"
+			signal_yanad_under 15 "$pid" "$@"
 		done
 		wait_yanads_gone 5 "$@" && continue
 		for pid in $(yanad_pids_under "$@"); do
 			printf 'container smoke: yanad pid=%s ignored TERM; sending KILL\n' "$pid" >&2
-			signal_yanad_under KILL "$pid" "$@"
+			signal_yanad_under 9 "$pid" "$@"
 		done
 		wait_yanads_gone 2 "$@" || return 1
 	done

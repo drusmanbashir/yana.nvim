@@ -21,6 +21,7 @@ function M.new(env)
   local try_split = hunk_split.try_split
   local try_merge = hunk_split.try_merge
   local merge_gap_pair = hunk_split.merge_gap_pair
+  local rejoin_owned_siblings = hunk_split.rejoin_owned_siblings
   local splice = require("yana.hunk_anchor_splice")
   local anchor_bounds = require("yana.hunk_ledger_settle").anchor_bounds
 
@@ -321,8 +322,7 @@ function M.new(env)
             -- A human does not materialise a finished line; they open a blank one and
             -- type into it. An in-place change to a row this hunk does not own as an
             -- AGENT row is that same human line, still under adjudication, so it faces
-            -- the parent test too. It is legal only as the ancestor test's OWN
-            -- no-parser fallback (`interior_line_is_yana_owned`'s tail), never as a
+            -- the parent test too. It is never a
             -- shortcut that skips the ancestor test here: doing so let a fresh
             local interior_owned = interior and interior_line_is_yana_owned(change.first + 1)
             local trailing_owned = trailing_insert
@@ -413,6 +413,7 @@ function M.new(env)
     bufnr = bufnr,
     try_split = try_split,
     try_merge = try_merge,
+    rejoin_owned_siblings = rejoin_owned_siblings,
   }).repartition
   local absorb_on_insert_leave = insert_leave_factory.new({
     deps = deps,

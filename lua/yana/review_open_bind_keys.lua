@@ -22,6 +22,7 @@ function M.bind(deps)
   end
   local function traced(point, key, fn)
     return function(...)
+      require("yana.review_undo_trace").capture(point .. "_before", state, { key = key })
       local result = fn(...)
       require("yana.review_undo_trace").capture(point, state, { key = key })
       return result

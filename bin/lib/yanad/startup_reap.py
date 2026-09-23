@@ -1,4 +1,4 @@
-"""One-shot startup reap for session trees owned by dead yanad processes.
+"""One-shot startup reap for sessions whose editor owner is dead.
 
 The candidate tuple is frozen before any ownership decision.  Nothing created
 after `_candidates()` returns can enter this daemon lifetime's reap.
@@ -109,21 +109,26 @@ def _read_owner(session_path):
     try:
         row = json.loads(session_json.read_text(encoding="utf-8"))
     except FileNotFoundError:
-        return None, "zombie_session_missing", session_json
+        return None, "zombie_session_missing", session_json, None
     except (OSError, TypeError, ValueError):
-        return None, "zombie_session_unreadable", session_json
-    if not isinstance(row, dict) or "daemon_owner" not in row:
-        return None, "zombie_owner_missing", session_json
-    owner = row.get("daemon_owner")
+        return None, "zombie_session_unreadable", session_json, None
+    if not isinstance(row, dict) or "owner" not in row:
+        return None, "zombie_owner_missing", session_json, None
+    # Session lifetime belongs to the editor, not the daemon that happened to
+    # write this row. A daemon restart must therefore not make a live editor's
+    # session look like a dead artefact.
+    owner = row.get("owner")
+    if owner is None:
+        return None, "zombie_owner_missing", session_json, row.get("version")
     try:
         pid = int(owner["pid"])
         start = int(owner["start_ticks"])
         boot = str(owner["boot_id"])
         if pid <= 0 or start < 0 or not boot:
-            raise ValueError("invalid daemon owner")
+            raise ValueError("invalid editor owner")
     except (KeyError, TypeError, ValueError):
-        return None, "zombie_owner_unreadable", session_json
-    return {"pid": pid, "boot_id": boot, "start_ticks": start}, None, session_json
+        return None, "zombie_owner_unreadable", session_json, row.get("version")
+    return {"pid": pid, "boot_id": boot, "start_ticks": start}, None, session_json, row.get("version")
 
 
 def _same_owner(left, right):
@@ -260,7 +265,7 @@ def _reap_staging(staging_candidates, current_owner, log, outcomes):
             _log_keep(log, "zombie_candidate_changed", path)
             outcomes.append((str(path), "keep", "zombie_candidate_changed"))
             continue
-        owner, code, _owner_path = _read_owner(path)
+        owner, code, _owner_path, _version = _read_owner(path)
         if code == "zombie_session_missing":
             reason = "zombie_staging_incomplete"
         elif code is not None:
@@ -291,8 +296,8 @@ def _reap_staging(staging_candidates, current_owner, log, outcomes):
         outcomes.append((str(path), "delete", reason))
 
 
-def reap(root, current_owner, log):
-    """Delete the frozen set of session trees whose daemon owner is dead."""
+def reap(root, current_owner, log, version=None):
+    """Delete dead-editor sessions and records from older release epochs."""
     (session_candidates, claim_candidates, journal_candidates,
      staging_candidates) = _candidates(root, log)
     outcomes = []
@@ -301,10 +306,32 @@ def reap(root, current_owner, log):
             _log_keep(log, "zombie_candidate_changed", session_path)
             outcomes.append((str(session_path), "keep", "zombie_candidate_changed"))
             continue
-        owner, code, owner_path = _read_owner(session_path)
+        owner, code, owner_path, session_version = _read_owner(session_path)
         if code is not None:
             _log_keep(log, code, owner_path)
             outcomes.append((str(session_path), "keep", code))
+            continue
+        if version is not None and session_version != version:
+            try:
+                base_store._force_rmtree(session_path, log=log)
+                if os.path.lexists(session_path):
+                    raise OSError("session tree remains after epoch removal")
+            except Exception as exc:
+                code = "zombie_epoch_delete_failed"
+                log.write(
+                    "ERROR",
+                    "zombie_reap outcome=keep code=%s path=%s error=%s"
+                    % (code, session_path, type(exc).__name__),
+                )
+                outcomes.append((str(session_path), "keep", code))
+                continue
+            _remove_claim_candidates(claim_candidates, session_path.name, log)
+            log.write(
+                "INFO",
+                "zombie_reap outcome=delete code=zombie_version_epoch path=%s"
+                % session_path,
+            )
+            outcomes.append((str(session_path), "delete", "zombie_version_epoch"))
             continue
         if _same_owner(owner, current_owner):
             code = "zombie_owner_current"

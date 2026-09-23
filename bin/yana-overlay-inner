@@ -2,12 +2,9 @@
 # yana-overlay-inner — mount helper run inside bwrap (not for direct use).
 set -eu
 
-# Resolve this file's own directory from BASH_SOURCE, never cwd, so the
-# sourced mount-phase library resolves at the same absolute path this helper
-# itself was exec'd at -- inside the jail that path is still the same file
-# (the outer --ro-bind / / keeps the whole host tree, including this bin/
-# directory, visible at its real path; see bin/lib/yana-overlay/mount.sh
-# and out/overlay-cutmap.md for the RISK note and the proof).
+# Own directory from BASH_SOURCE, never cwd: the outer `--ro-bind / /` keeps
+# this bin/ directory visible at its real path inside the jail, so the sourced
+# mount-phase library resolves to the same file this helper was exec'd at.
 readonly INNER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 readonly EXIT_USAGE=64
@@ -70,31 +67,13 @@ fi
 
 # ===================== Private mount namespace =====================
 #
-# yana-overlay's bwrap now runs this helper as the INVOKING USER
-# (`--uid $real_uid`), not as uid 0 -- so that the agent it finally execs is
-# the operator, and "super user" refusals from Electron-based vendor CLIs
-# (cursor-agent) cannot happen. That costs us the ability to mount into
-# bwrap's OWN mount namespace, and this re-exec is what buys it back.
-#
-# `ioctl(NS_GET_USERNS)` on /proc/self/ns/mnt confirms it: permitted at `--uid 0`, EPERM
-# at `--uid 1000`.
-#
-# unshare(CLONE_NEWNS) is checked against `current_user_ns()` instead, which
-# IS the namespace we hold CAP_SYS_ADMIN in, so it succeeds -- and the mount
-# namespace it creates is owned by THAT namespace, so every mount below is
-# permitted at a non-zero uid. The new namespace starts as a copy of bwrap's
-# mount table, so the `--ro-bind / /`, the private /tmp and the neutral bind
-# pairs are all still there, unchanged.
-#
-# NOT a nested bwrap / nested user namespace: a second user namespace cannot
-# be given a uid map here at all (writing /proc/PID/uid_map is EPERM under
-# kernel.apparmor_restrict_unprivileged_userns=1, which this host sets), and
-# would not help if it could -- the mount namespace would still belong to an
-# ancestor.
-#
-# `unshare --mount` execs the target directly (it forks only for --pid), so
-# this adds no process: bwrap's --die-with-parent and the launcher's pid
-# bookkeeping see exactly the process they saw before.
+# bwrap runs this helper as the INVOKING USER (`--uid $real_uid`), never uid 0,
+# so the agent it finally execs is the operator -- but at a non-zero uid the
+# mount namespace bwrap made is owned by an ancestor user namespace and every
+# mount into it is EPERM. This re-exec makes a namespace owned by the user
+# namespace we do hold CAP_SYS_ADMIN in, copied from bwrap's mount table, so
+# `--ro-bind / /`, the private /tmp and the neutral bind pairs all survive.
+# `unshare` execs the target directly, so this adds no process.
 if [[ -z "${YANA_OVERLAY_MOUNT_NS:-}" ]]; then
 	export YANA_OVERLAY_MOUNT_NS=1
 	exec unshare --mount -- "$0" "$@"
@@ -105,13 +84,50 @@ CURSOR_DIR=""
 ROOTS=()
 EXEC_ALLOW=()
 STATE_DIRS=()
-# volatile is scoped to the broad-root shape only. The product's own teardown_work()
-# already chmod -R's before deleting and handles this fine; a bare `rm -rf` outside that
-# path does not. Since the legacy single-root and --roots shapes must stay
-# byte-identical, volatile applies only to the mount(s) the broad-root shape makes.
+CAPTURE_PLAN=""
+OPEN_CAPTURE_BACKEND=""
+# volatile applies to the broad-root shape only: teardown_work() chmod -R's before
+# deleting and copes with it, a bare `rm -rf` does not, and the single-root and
+# --roots shapes must stay byte-identical.
 VOLATILE_OPT=""
 
-if [[ ${1:-} == "--broad-root" ]]; then
+source "$INNER_DIR/lib/yana-overlay/capture_plan.sh"
+
+if [[ ${1:-} == "--capture-plan" ]]; then
+	shift
+	CAPTURE_PLAN=${1:?--capture-plan requires a file}
+	shift
+	[[ ${1:-} == "--backend" ]] || { echo "yana-overlay-inner: --capture-plan requires --backend" >&2; exit "$EXIT_USAGE"; }
+	shift
+	OPEN_CAPTURE_BACKEND=${1:?--backend requires a value}
+	shift
+	ROOTS=("$(capture_plan_field "$CAPTURE_PLAN" project_cwd)")
+	while [[ $# -gt 0 && "$1" != "--" ]]; do
+		case "$1" in
+			--cursor)
+				[[ $# -ge 2 ]] || { echo "yana-overlay-inner: --cursor requires a directory" >&2; exit "$EXIT_USAGE"; }
+				CURSOR_DIR=$2
+				shift 2
+				;;
+			--state-dir)
+				[[ $# -ge 2 ]] || { echo "yana-overlay-inner: --state-dir requires a path" >&2; exit "$EXIT_USAGE"; }
+				STATE_DIRS+=("$2")
+				shift 2
+				;;
+			--exec-allow)
+				[[ $# -ge 2 ]] || { echo "yana-overlay-inner: --exec-allow requires a path" >&2; exit "$EXIT_USAGE"; }
+				EXEC_ALLOW+=("$2")
+				shift 2
+				;;
+			*)
+				echo "yana-overlay-inner: unknown capture-plan option '$1'" >&2
+				exit "$EXIT_USAGE"
+				;;
+		esac
+	done
+	[[ ${1:-} == "--" ]] || { echo "yana-overlay-inner: expected -- after capture-plan options" >&2; exit "$EXIT_USAGE"; }
+	shift
+elif [[ ${1:-} == "--broad-root" ]]; then
 	shift
 	BROAD_ROOT=${1:?--broad-root requires a directory}
 	VOLATILE_OPT=",volatile"
@@ -177,10 +193,8 @@ elif [[ ${1:-} == "--roots" ]]; then
 	[[ ${1:-} == "--" ]] || { echo "yana-overlay-inner: expected -- after the root list" >&2; exit "$EXIT_USAGE"; }
 	shift
 else
-	# The single-root form, unchanged: WORKSPACE then the command. Kept because
-	# it is the shape yana-overlay builds whenever a turn declares no broad
-	# root and no extra root, and the shape tests/overlay_gate.sh drives this
-	# helper with directly.
+	# The single-root form: WORKSPACE then the command. It is the shape
+	# yana-overlay builds when a turn declares no broad root and no extra root.
 	ROOTS=("${1:?WORKSPACE required}")
 	shift
 	while [[ $# -gt 0 && "$1" != "--" ]]; do
@@ -196,17 +210,9 @@ else
 				shift 2
 				;;
 			*)
-				# NOT an error, and NOT a fallthrough. This form is
-				# `WORKSPACE COMMAND [ARGS...]`, and yana-overlay emits the
-				# `--` separator only when it actually passed an option, so
-				# the first non-option token here is the COMMAND. The other
-				# two forms refuse an unknown token because their `--` is
-				# mandatory; this one must stop.
-				#
-				# Without this arm the loop shifts nothing and spins on the
-				# command forever -- every single-root launch, and every
-				# direct drive of this helper (tests/overlay_gate.sh), hangs
-				# with no output at all.
+				# NOT an error and NOT a fallthrough: this form's `--` is
+				# optional, so the first non-option token is the COMMAND, and
+				# without this arm the loop spins on it forever.
 				break
 				;;
 		esac
@@ -219,17 +225,44 @@ fi
 LAYERS=()
 
 source "$INNER_DIR/lib/yana-overlay/mount.sh"
+source "$INNER_DIR/lib/yana-overlay/fuse.sh"
 
+inner_run_agent_without_caps() {
+	local capsh_path cap_now
+	local -a cmd=( "$@" )
+	capsh_path=$(command -v capsh) || {
+		echo "yana-overlay-inner: capsh not found on PATH" >&2
+		exit "$EXIT_REFUSE"
+	}
+	if (( ${#EXEC_ALLOW[@]} != 0 )); then
+		echo "yana-overlay-inner: fuse-compat exec allowlist is not available" >&2
+		exit "$EXIT_REFUSE"
+	fi
+	if [[ -n "${YANA_INLINE_EXEC_ALLOW_PATH:-}" ]]; then
+		export PATH="$YANA_INLINE_EXEC_ALLOW_PATH"
+	fi
+	exec "$capsh_path" --drop=all --caps= -- -c '
+cap_now=$(awk "/^CapEff:/ {print \$2}" /proc/self/status)
+if [ "$cap_now" != 0000000000000000 ]; then
+	echo open_capture_capabilities >&2
+	exit 65
+fi
+exec "$@"
+' capsh "${cmd[@]}"
+}
+
+if [[ -n "$CAPTURE_PLAN" && "$OPEN_CAPTURE_BACKEND" == fuse-compat ]]; then
+	fuse_run inner_run_agent_without_caps "$@"
+	exit $?
+fi
 
 mount_overlays
 mount_cursor_exception
 mount_state_dirs
 
-# Markers are written only after the FULL set has mounted -- the overlay(s), and now the
-# cursor exception too, when this invocation has one. yana-overlay reads them to tell a
-# pre-agent mount failure (release the claims; the agent never ran) from an agent that
-# happened to exit 67 (touch nothing). A partially mounted set must therefore read as a
-# failure, so no marker may exist until it is complete.
+# Markers are written only after the FULL set has mounted: yana-overlay reads
+# them to tell a pre-agent mount failure from an agent that itself exited 67, so
+# a partially mounted set must leave no marker at all.
 for layer in "${LAYERS[@]}"; do
 	touch "${layer}/${MOUNT_MARKER}"
 	echo "$MOUNT_MARKER_CONTENT" >"${layer}/${MOUNT_MARKER}"
@@ -237,20 +270,15 @@ done
 
 cmd=( "$@" )
 
-# Resolve capsh BEFORE the PATH-narrowing courtesy below, using the real
-# (unnarrowed) PATH: it is not a tool the AGENT is choosing to run, so it
-# does not belong to the allowlist's own semantics -- it is this launcher's
-# own capability-drop machinery, needed in BOTH branches below.
+# Resolve capsh against the real, unnarrowed PATH, BEFORE the narrowing below:
+# it is this launcher's own capability-drop machinery, not a tool the agent chose.
 capsh_path=$(command -v capsh) || {
 	echo "yana-overlay-inner: capsh not found on PATH" >&2
 	exit "$EXIT_REFUSE"
 }
 
 if (( ${#EXEC_ALLOW[@]} == 0 )); then
-	if [[ -n "${YANA_INLINE_EXEC_ALLOW_PATH:-}" ]]; then
-		export PATH="$YANA_INLINE_EXEC_ALLOW_PATH"
-	fi
-	exec "$capsh_path" --drop=all --caps= -- -c "$(printf '%q ' "${cmd[@]}")"
+	inner_run_agent_without_caps "${cmd[@]}"
 fi
 
 python3_path=$(command -v python3) || {
@@ -267,25 +295,12 @@ if [[ -n "${YANA_INLINE_EXEC_ALLOW_PATH:-}" ]]; then
 	export PATH="$YANA_INLINE_EXEC_ALLOW_PATH"
 fi
 
-# THE PROCESS THAT CALLS landlock_restrict_self(2) MUST BE THE PROCESS THAT EXECS THE
-# CONFINED COMMAND. The previous shape here was exactly that bug -- `python3 - <<PY`
-# called landlock_restrict_self on ITSELF inside a child, the heredoc ended, that child
-# exited, and the bash PARENT that then ran `exec capsh` separately was never
-# restricted.
-#
-# The fix: `exec python3` HERE, replacing this bash process (no fork). The python3 that
-# comes up in its place does the Landlock setup, calls landlock_restrict_self on itself,
-# and immediately os.execv()s into capsh -- so the SAME, now-restricted process becomes
-# capsh, becomes the shell capsh execs, and becomes whatever that shell execs next. The
-# confined command reaches python3 through an environment variable, NUL-separated, never
-# re-quoted into a shell string: a `printf '%q'` round-trip through a second shell layer
-#
-# It does not -- it ALSO gates the kernel's implicit load of a dynamically linked
-# binary's ELF interpreter and the mmap(2) of every shared object that interpreter maps
-# for it. The python3 block below therefore resolves and grants each allowlisted entry's
-# (and capsh's own) full library closure, not just the entry file itself -- see
-# resolve_closure() there. A script's INTERPRETER is still a SEPARATE exec from the
-# script: allowlisting a shell script without also allowlisting /usr/bin/env (or the
+# THE PROCESS THAT CALLS landlock_restrict_self(2) MUST BE THE PROCESS THAT EXECS
+# THE CONFINED COMMAND, so `exec python3` HERE replaces this bash process rather
+# than forking: that python3 sets up Landlock, restricts itself and execv()s into
+# capsh, carrying the restriction through to the confined command. The command
+# reaches it through a NUL-separated environment variable, never re-quoted into a
+# shell string.
 export YANA_INLINE_EXEC_CAPSH="$capsh_path"
 export YANA_INLINE_EXEC_LDD="$ldd_path"
 # \x1e cannot appear in a filesystem path or an ordinary command-line argument, so it is
@@ -327,33 +342,22 @@ def die(msg):
     sys.exit(65)
 
 def refuse_exec(argv0, exc):
-    # THE STRUCTURED REFUSAL LINE (order B4 Part A.3): the caller's stderr
-    # heuristic in lua/yana/agent.lua parses this line FIRST -- an exact
-    # argv0 and the real errno from the exec attempt itself -- and only
-    # falls back to free-text pattern matching (labelled
-    # source=stderr-heuristic) when this line is absent, e.g. a refusal
-    # that happens deeper than this process's own final exec.
+    # THE STRUCTURED REFUSAL LINE: lua/yana/agent/agent.lua parses it FIRST for
+    # an exact argv0 and the real errno, and only falls back to free-text stderr
+    # matching when it is absent.
     name = errno.errorcode.get(exc.errno, str(exc.errno))
     print("yana-exec-refused argv0=%s errno=%s" % (argv0, name), file=sys.stderr)
 
-# Resolved by bash against the REAL, unnarrowed PATH before the
-# YANA_INLINE_EXEC_ALLOW_PATH courtesy narrowing (see the shell comment
-# above this heredoc) -- by the time THIS process runs, PATH is already
-# narrowed to the allowlist's own bindir, which never contains an `ldd`
-# symlink, so a bare "ldd" lookup here would fail every time.
+# Resolved by bash against the real, unnarrowed PATH: by the time this process
+# runs PATH is the allowlist's own bindir, which holds no `ldd`.
 LDD_PATH = os.environ.get("YANA_INLINE_EXEC_LDD", "")
 if not LDD_PATH:
     die("ldd path not provided (YANA_INLINE_EXEC_LDD unset)")
 
 def die_closure(entry, detail):
-    # FAIL CLOSED, NEVER A SILENT HANG (order B5): a listed executable whose
-    # library closure this process cannot resolve is refused by name, the
-    # same way a real denied exec is -- including the SAME structured line
-    # refuse_exec() prints on an actual EACCES, so lua/yana/agent.lua's
-    # exec.refused parser (which looks for this line FIRST, before its
-    # free-text stderr fallback) fires here too. errno=ENOENT is synthetic
-    # (no syscall produced it -- this runs before any exec is attempted) but
-    # names the right failure class: a missing shared object.
+    # FAIL CLOSED, NEVER A SILENT HANG: an unresolvable closure is refused by
+    # name through the SAME structured line a real denied exec prints. The
+    # errno=ENOENT is synthetic but names the right class, a missing .so.
     print(
         "yana-overlay-inner: cannot resolve library closure for %s: %s" % (entry, detail),
         file=sys.stderr,
@@ -362,20 +366,11 @@ def die_closure(entry, detail):
     sys.exit(65)
 
 def resolve_closure(entry):
-    # Returns the SET of extra absolute paths -- the ELF interpreter plus
-    # every shared object `entry` maps PROT_EXEC -- that ALSO need a
-    # Landlock EXECUTE rule for `entry`'s own execve(2) to succeed.
-    # LANDLOCK_ACCESS_FS_EXECUTE gates more than execve(2) of the named
-    # file: it also gates the kernel's implicit load of the ELF interpreter
-    # and the mmap(2) of every .so the interpreter maps for it (order B5,
-    # measured with a standalone ctypes probe against this exact
-    # kernel/ABI: granting EXECUTE on the file alone still denies its own
-    # exec with EACCES; granting the file plus ld.so plus libc lets it
-    # run). `ldd` is used rather than hand-parsing PT_INTERP/DT_NEEDED via
-    # readelf/objdump because it performs the SAME dynamic-linker
-    # kernel's own loader uses at exec time -- parsing the ELF headers
-    # ourselves could name a different (or missing) file than the one the
-    # loader would actually open.
+    # The extra absolute paths -- ELF interpreter plus every shared object `entry`
+    # maps PROT_EXEC -- that ALSO need an EXECUTE rule before `entry`'s own
+    # execve(2) can succeed: EXECUTE on the file alone still fails EACCES here.
+    # `ldd` rather than parsing PT_INTERP/DT_NEEDED, so the names come from the
+    # same dynamic linker the kernel's loader uses at exec time.
     try:
         proc = subprocess.run(
             [LDD_PATH, entry],
@@ -388,12 +383,9 @@ def resolve_closure(entry):
     output = proc.stdout or ""
     low = output.lower()
     if "not a dynamic executable" in low or "statically linked" in low:
-        # A statically linked binary (or a non-ELF script -- ldd reports the
-        # same "not a dynamic executable" for those) needs nothing extra:
-        # there is no interpreter and no .so to resolve. A script's own
-        # INTERPRETER is a separate exec target the operator must list
-        # itself (documented in the isolation module notes); this function
-        # only closes the library graph of an ELF binary.
+        # A statically linked binary, or a non-ELF script, needs nothing extra:
+        # no interpreter and no .so to resolve. A script's own INTERPRETER is a
+        # separate exec target the operator must list itself.
         return set()
     extra = set()
     missing = []
@@ -423,13 +415,9 @@ def resolve_closure(entry):
         )
     return extra
 
-# THIS PROCESS is the one Landlock will restrict, and the one that then
-# execs the confined command -- see the shell comment above this heredoc.
-# capsh/the command are read here, BEFORE Landlock setup, only because
-# capsh_path is needed below to resolve ITS OWN library closure (capsh is
-# launcher machinery, not a tool the agent chose to run, exactly like
-# python3 above -- see that comment -- so its own exec must always be
-# grantable even when the operator's allowlist never mentions it).
+# Read BEFORE Landlock setup because capsh_path is needed below to resolve its
+# OWN library closure: capsh is launcher machinery, not a tool the agent chose,
+# so its exec must stay grantable even when the allowlist never names it.
 capsh_path = os.environ.get("YANA_INLINE_EXEC_CAPSH", "")
 if not capsh_path:
     die("capsh path not provided (YANA_INLINE_EXEC_CAPSH unset)")
@@ -445,38 +433,12 @@ if abi < 1:
     e = ctypes.get_errno()
     die("Landlock unavailable for inline_exec_allowlist (errno=%s)" % (e or errno.ENOSYS))
 
-# WITHDRAWN (order B5, measured): an earlier version of this file believed
-# a file-scoped EXECUTE rule needed LANDLOCK_ACCESS_FS_READ_FILE granted
-# alongside it, or the rule was "silently ineffective". That measurement
-# conflated two different things: EVERY probe that showed EXECUTE-alone
-# failing was ALSO missing the target's library closure (the ELF
-# interpreter + its .so's -- see resolve_closure() above), and a bare
-# EXECUTE+READ_FILE rule on the file alone, still with no closure, fails
-# EXACTLY the same way (reproduced directly: kernel 7.0.0-28-generic,
-# Landlock ABI 8). Once the closure is granted, EXECUTE ALONE is
-# sufficient -- READ_FILE was never the fix.
-#
-# Worse, READ_FILE must NOT be included here at all: LANDLOCK_ACCESS_FS_*
-# bits named in a ruleset's handled_access_fs become DENY-BY-DEFAULT for
-# every filesystem operation needing that right, process-wide, not just for
-# the allowlisted paths. Handling READ_FILE turned every plain file open()
-# anywhere the confined process later touches into a Landlock-gated
-# operation -- including python3's own stdlib imports (each `.py`/`.so`
-# under its install prefix is a READ_FILE, not an EXECUTE, and none of them
-# are in any exec closure) -- and broke every allowlisted script or
-# interpreter that reads its own data files at runtime. Reproduced directly
-# building this fix: allowlisting python3 with EXECUTE+READ_FILE handled
-# made python3 exec successfully and then die
-# `PermissionError: [Errno 13] ... encodings/__init__.py` on its very first
-# stdlib import; dropping READ_FILE from handled_access_fs entirely (kept
-# EXECUTE only) fixed it with no other change.
-#
-# So HANDLED_ACCESS_FS carries EXECUTE only. This ruleset governs nothing
-# about what the confined process may READ -- that boundary is the
-# separate one bwrap's own mount table already enforces (`--ro-bind / /`
-# plus the writable exception at the workspace) -- it governs only which
-# FILES the confined process may execve(2)/mmap(2)-with-PROT_EXEC, which is
-# the allowlist's entire purpose.
+# EXECUTE ONLY: LANDLOCK_ACCESS_FS_READ_FILE must NOT be added here. Every bit
+# named in handled_access_fs is deny-by-default process-wide, not just for the
+# allowlisted paths, so handling READ_FILE gates every plain open() the confined
+# process makes -- including python3's own stdlib imports -- and kills any
+# allowlisted program that reads its data files. With the closure granted,
+# EXECUTE alone suffices; what may be READ is bwrap's mount table's boundary.
 HANDLED_ACCESS_FS = LANDLOCK_ACCESS_FS_EXECUTE
 
 ruleset_attr = RulesetAttr(HANDLED_ACCESS_FS)
@@ -489,17 +451,10 @@ ruleset_fd = syscall(
 if ruleset_fd < 0:
     die("Landlock ruleset creation failed (errno=%s)" % ctypes.get_errno())
 
-# ALLOW_TARGETS is every FILE this process's Landlock ruleset must grant
-# EXECUTE to: each operator-listed entry (sys.argv[1:], i.e. EXEC_ALLOW)
-# and capsh -- PLUS, for every one of those that is a
-# dynamically linked ELF, its own library closure (resolve_closure above).
-# Granting an entry without its closure is exactly the state order B5
-# reproduced: the entry's own execve(2) is permitted but the kernel denies
-# the implicit load of its ELF interpreter, so the exec never completes.
-# This is a set of FILES, never a directory: a directory-scoped rule over
-# /lib or /usr/lib would grant execute to every file beneath it (including
-# an unlisted /usr/bin/python3 sharing libc with an allowlisted bash) and
-# destroy the exactness this allowlist promises.
+# Every FILE this ruleset grants EXECUTE to: each listed entry plus capsh, and
+# for every dynamically linked one its closure. FILES, never a directory -- a
+# rule over /lib would grant execute to everything beneath it, including an
+# unlisted binary sharing libc with an allowlisted one.
 listed = list(sys.argv[1:]) + [capsh_path]
 allow_targets = set(listed)
 for entry in listed:
@@ -530,16 +485,9 @@ if syscall(SYS_landlock_restrict_self, ruleset_fd, 0) != 0:
     die("Landlock restrict_self failed (errno=%s)" % ctypes.get_errno())
 os.close(ruleset_fd)
 
-# THIS PROCESS is now the one Landlock restricted -- capsh_path and
-# cmd_argv were already read above (needed there to resolve capsh's own
-# library closure). It is the one that execs the confined command -- see
-# the shell comment above this heredoc.
-#
-# capsh's `--` hands its remaining arguments to /bin/bash (or --shell=).
-# `-c 'exec "$@"' capsh <cmd...>` is the standard argv-safe idiom for
-# passing an argv list through a `sh -c` boundary without building a
-# quoted string: "$@" inside the inline script becomes cmd_argv, verbatim,
-# with no re-parsing of any argument's own bytes.
+# capsh's `--` hands its remaining arguments to a shell; `-c 'exec "$@"' capsh
+# <cmd...>` is the argv-safe idiom for crossing that boundary, so cmd_argv
+# arrives verbatim with no argument's own bytes re-parsed.
 argv = [capsh_path, "--drop=all", "--caps=", "--", "-c", 'exec "$@"', "capsh"] + cmd_argv
 try:
     os.execv(capsh_path, argv)

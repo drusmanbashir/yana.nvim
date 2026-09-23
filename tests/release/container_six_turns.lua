@@ -83,7 +83,7 @@ end
 require("yana").setup(setup_opts)
 vim.fn.chdir(workspace)
 
-local ui = require("yana.ui")
+local ui = require("yana.panel.ui")
 local inline = require("yana.inline_diff")
 
 -- Headless abort confirmations (same shape as tests/headless/lib/r_abort_adversarial_common.lua).
@@ -126,7 +126,7 @@ local function read_target()
 end
 
 -- Clear review + shadow claim so the next submit is not queued behind
--- "review still open" (lua/yana/ui_submit.lua).
+-- "review still open" (lua/yana/panel/ui_submit.lua).
 local function clear_confined_turn()
   if mode == "agentic" then
     return true

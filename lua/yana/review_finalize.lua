@@ -45,10 +45,14 @@ function M.new(deps)
     if state.hunk_ledger:count() > 0 then
       return false
     end
-    local tb = require("yana.turn_bind")
+    local tb = require("yana.turn.turn_bind")
     local pool = pool_for_state(state)
     if pool and tb.get(pool) then
-      tb.on_decision(pool, state)
+      -- The controls already name themselves -- `accept_turn`, `accept_file`,
+      -- `accept_hunk`, `reject_hunk`, `reject_all`, `accept_turn_retry`. That
+      -- name was dropped here, so every End result said `last_hunk` whatever
+      -- the operator actually pressed. Forward it; do not invent one.
+      tb.on_decision(pool, state, trigger)
       return "stay"
     end
     return "stay"
@@ -85,7 +89,7 @@ function M.new(deps)
     -- `reject_block_at` door leaves its own close to this same edge); own the
     -- close here only when there is no Turn to hand off to.
     local pool = pool_for_state(state)
-    local turn_owns_close = pool ~= nil and require("yana.turn_bind").get(pool) ~= nil
+    local turn_owns_close = pool ~= nil and require("yana.turn.turn_bind").get(pool) ~= nil
     local recorded = finish_session(state, false, restoring, true, turn_owns_close)
     facade._poll_leave_edge(state, trigger)
     return recorded

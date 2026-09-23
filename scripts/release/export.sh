@@ -16,6 +16,14 @@ trap 'rm -f "$manifest"' EXIT
 git -C "$root" cat-file -e "$commit^{commit}"
 git -C "$root" show "$commit:scripts/release/manifest.txt" >"$manifest" \
 	|| { echo "export: manifest missing from commit $commit" >&2; exit 1; }
+# Older public commits have only manifest.txt. New commits also carry paths.conf;
+# run their own generator so a later checkout cannot reinterpret their policy.
+if git -C "$root" cat-file -e "$commit:scripts/release/paths.conf" 2>/dev/null; then
+	policy_check=$(mktemp)
+	trap 'rm -f "$manifest" "$policy_check"' EXIT
+	git -C "$root" show "$commit:scripts/release/manifest_policy.py" >"$policy_check"
+	python3 "$policy_check" --root "$root" --check "$commit"
+fi
 [[ ! -e "$out" ]] || { echo "export: output already exists: $out" >&2; exit 1; }
 mkdir -p "$out"
 
@@ -35,5 +43,11 @@ done <"$manifest"
 
 git -C "$root" archive --format=tar "$commit" -- "${paths[@]}" | tar -xf - -C "$out"
 "$out/scripts/release/verify.sh" "$out"
+if [[ -x "$out/tests/release/manifest_coverage_gate.sh" ]]; then
+	"$out/tests/release/manifest_coverage_gate.sh" "$out"
+elif git -C "$root" cat-file -e "$commit:scripts/release/paths.conf" 2>/dev/null; then
+	echo "export: new policy requires manifest_coverage_gate.sh" >&2
+	exit 1
+fi
 printf 'EXPORT PASS commit=%s files=%d output=%s\n' \
 	"$(git -C "$root" rev-parse "$commit^{commit}")" "${#paths[@]}" "$out"

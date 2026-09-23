@@ -13,6 +13,19 @@
 
 local M = {}
 
+-- Disabled observers read no editor state. Diagnostic failure cannot change
+-- the result of the operation supplying these synchronous observations.
+local buffer_observer
+function M.observe_buffers(observer)
+  buffer_observer = observer
+end
+
+function M.buffer_event(point, facts)
+  if not buffer_observer then return end
+  local ok, err = pcall(buffer_observer, point, facts or {})
+  if not ok then pcall(M.write, "WARN", "buffer snapshot capture_failed: " .. tostring(err)) end
+end
+
 local flush = require("yana.safety.flush")
 local uv = vim.uv or vim.loop
 
@@ -331,13 +344,19 @@ end
 local LIFECYCLE_TYPE_KEY = "kind"
 local LIFECYCLE_TYPE_COLLISION_KEY = "row_kind"
 
+local event_seq = 0
+local log_session = tostring(uv.os_getpid()) .. ":" .. tostring(uv.hrtime())
+
 local function lifecycle_line(kind, fields)
+  event_seq = event_seq + 1
   -- Additive millisecond epoch alongside the existing second-resolution
   -- `at`, which stays byte-identical. vim.uv falls back to vim.loop on
   -- older builds (module-level `uv` above already resolves this).
   local s, us = uv.gettimeofday()
   local payload = {
     kind = tostring(kind or "unknown"),
+    log_session = log_session,
+    log_seq = event_seq,
     at = os.date("!%Y-%m-%dT%H:%M:%SZ"),
     at_ms = s * 1000 + math.floor((us or 0) / 1000),
   }
@@ -434,8 +453,12 @@ function M.lifecycle_later(kind, fields)
   if not line then
     return append_record("WARN", "yana.lifecycle encode failed: " .. tostring(err), false)
   end
+  if force ~= true and current_level > vim.log.levels.DEBUG then return true end
+  -- Freeze the outer timestamp too; deferred writes retain capture order via event_seq.
+  local frozen = record_line("DEBUG", line)
   vim.schedule(function()
-    append_record("DEBUG", line, force == true)
+    run_before_append()
+    write_durable(frozen)
   end)
   return true
 end

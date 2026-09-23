@@ -85,8 +85,31 @@ local reactivate_parked_state = require("yana.review_park_snapshot").reactivate_
 M._reactivate_parked_state = reactivate_parked_state
 
 local function open_or_abandon(change, opts)
-  if reactivate_parked_state(change, opts) then
+  -- Three answers, not two. `true` resumed the parked review in place; `false,
+  -- nil` declined to (not resumable this way -- rebuild it below); `false, err`
+  -- STARTED the resume and could not finish it.
+  --
+  -- The third is why this is not a plain boolean. The rebuild below is the one
+  -- route that consumes `change._parked_review`, and a replacement that has
+  -- already failed to bind once is exactly the case the recovery snapshot exists
+  -- for (design: keep `_parked_review` until a replacement has bound
+  -- successfully). Falling through would spend the snapshot on a second attempt
+  -- with no more chance than the first and leave nothing to retry from. So a
+  -- failed resume refuses here, with the review still parked and still
+  -- recoverable, and the caller's own recovery decides what to put on screen.
+  local resumed, resume_err = reactivate_parked_state(change, opts)
+  if resumed then
     return true, nil
+  end
+  if resume_err ~= nil then
+    local err_text = tostring(resume_err)
+    if change and change.review_error == nil then
+      change.review_error = err_text
+    end
+    -- Same reason the throw branch below announces: the panel is already
+    -- painting a claim line for a review that is not going to appear.
+    announce_state()
+    return false, err_text
   end
   local pcall_ok, a, b = pcall(M.open, change, opts)
   if not pcall_ok then
@@ -278,37 +301,13 @@ local function count_total_hunks_for_change(change)
 end
 
 local function undecided_hunks_for_change(change, st)
-  if not change then
+  if not (change and change.path) then
     return 0
   end
-  local active = st and st.active
-  if active and active.change == change then
-    -- Two live shapes, told apart by the ledger's own pending LIST (not the painted
-    -- subset `count_live_pending_blocks` counts): * truly empty (`#pending_blocks ==
-    -- 0`) -- every hunk decided. Trusting the stale status here is exactly what made
-    -- `pending_paths` (review_tabs.lua:361-379) report a phantom hunk and "keeping tab
-    -- open" fire (review_tabs.lua:499) on a review that had already fully settled. *
-    -- blocks remain but none are PAINTED yet (`live == 0` with `#pending_blocks > 0`)
-    local pending_blocks = active.hunk_ledger and active.hunk_ledger:pending() or {}
-    if #pending_blocks == 0 then
-      return 0
-    end
-    local live = count_live_pending_blocks(active)
-    if live > 0 then
-      return live
-    end
-  end
-  local status = tostring(change.status or "")
-  if status == "accepted" or status == "rejected" or status == "superseded" or status == "kept_unreviewed" then
-    return 0
-  end
-  if type(change._parked_review) == "table" then
-    return #(change._parked_review.blocks or {})
-  end
-  if status == "pending" or status == "system_refused" then
-    return count_total_hunks_for_change(change)
-  end
-  return 0
+  local turn = require("yana.turn.turn_bind").get(st)
+  local file = turn and turn:file(diff.abs_path(change.path)) or nil
+  local ledger = file and file.ledger
+  return ledger and #ledger:pending() or 0
 end
 
 local review_tabs = require("yana.review_tabs").new({
@@ -357,8 +356,29 @@ function M.turn_undecided_hunks(turn)
   return pending
 end
 
+-- Navigation "undecided" (I5): the Turn File's own pending count -- ledger
+-- pending hunks plus a textless operation still pending -- plus one for a
+-- permission proposal still unresolved under `ask`. Close and tab authority
+-- (`undecided_hunks_for_change`) stays text-only; this is what `]x`/`[x` walk.
 local function pending_hunk_count_for(change, st)
-  return undecided_hunks_for_change(change, st)
+  if not (change and change.path) then
+    return 0
+  end
+  local turn = require("yana.turn.turn_bind").get(st)
+  local file = turn and turn:file(diff.abs_path(change.path)) or nil
+  if not file then
+    return 0
+  end
+  local n = file:pending_count()
+  local policy = require("yana.review_permissions").permission_policy(file, turn)
+  -- Unresolved = no record for THIS proposal (I3 content key): a record left
+  -- by an earlier, since-revised proposal does not resolve the new one.
+  local settle = require("yana.turn.turn_settle")
+  if policy == "ask" and settle.mode_proposal_key(file) ~= nil
+    and settle.current_mode_verdict(file) == nil then
+    n = n + 1
+  end
+  return n
 end
 
 local function remember_batch_item(st, item)

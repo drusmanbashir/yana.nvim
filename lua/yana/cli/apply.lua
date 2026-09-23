@@ -12,7 +12,7 @@ end
 
 local diff = require("yana.diff")
 local diary = require("yana.safety.diary")
-local manifest = require("yana.manifest")
+local manifest = require("yana.paths.manifest")
 local control_plane = require("yana.safety.control_plane")
 local shadow_ops = require("yana.shadow.ops")
 local uv = vim.uv or vim.loop

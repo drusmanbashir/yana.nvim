@@ -22,9 +22,7 @@
 -- EVERY callback logged (`XREC_KEYS_RECORD_ALL=1`, xrec dbg-onkey-b2 take,
 -- 2026-09-09):
 --
---   17 keys sent -> 18 callbacks. The 3x fan-out
---   `tests/headless/xrec/selftest/counter_init.lua:5-12` measured (10 keys ->
---   30 callbacks, on the counter editor) DOES NOT HAPPEN HERE.
+--   17 keys sent -> 18 callbacks.
 --
 --   WHAT DOES HAPPEN IS MAPPINGS. The review mapping `ca` arrived as ONE
 --   callback with typed="ca", followed by TWO callbacks with typed="" carrying

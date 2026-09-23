@@ -17,6 +17,7 @@ end
 
 local Factory = {}
 local review_open_bind_factory = require("yana.review_open_bind")
+local review_permissions = require("yana.review_permissions")
 
 
 function Factory.new(deps)
@@ -40,6 +41,9 @@ function Factory.new(deps)
     -- so nothing downstream mistakes this for a healthy pending review.
     if change then
       change.review_error = "invalid change: missing path"
+      log.buffer_event("review_staged", { change = change, outcome = "invalid_change",
+        reason = "invalid change: missing path",
+        engine = { not_reached = "the change carries no path, so no review was attempted" } })
     end
     -- A malformed payload must cost one change, not the session.
     announce_state()
@@ -54,6 +58,9 @@ function Factory.new(deps)
     if change.status ~= "pending" then
       announce_state()
       schedule_queue_advance({ opts = opts })
+      log.buffer_event("review_staged", { change = change, outcome = "not_pending",
+        reason = "change is no longer pending",
+        engine = { not_reached = "the change left the pending state before review" } })
       return false, "change is no longer pending"
     end
     change.reason_class = bin_class
@@ -80,6 +87,8 @@ function Factory.new(deps)
       end)
     end
     notify_one_line("yana: refused " .. detail, vim.log.levels.WARN)
+    log.buffer_event("review_staged", { change = change, outcome = "system_refused", reason = detail,
+      engine = { not_reached = "refused before review: " .. bin_class } })
     announce_state()
     schedule_queue_advance({ opts = opts })
     return false, detail
@@ -112,11 +121,29 @@ function Factory.new(deps)
     -- disk with nothing to revert to; now a missing `before` is simply a
     -- create, reviewed against an empty base, and nothing is on disk to keep.
     --
-    -- Genuine refusal: the change stays "pending" but nothing was opened.
-    -- Record why so a later accept/reject on this row can retry instead of
-    -- giving hunk advice for a review that never existed.
+    -- Retryable refusals stay pending. A dirty pre-existing buffer is
+    -- different: Yana must preserve the operator's bytes and retire this
+    -- proposal, because no review was attached that could ever be answered.
     if change.review_error == nil then
       change.review_error = open_err
+    end
+    if refusal and refusal.reason == "dirty_buffer" then
+      local withdrew, withdraw_err = require("yana.turn.turn_bind").withdraw_unopened(
+        diff.abs_path(change.path)
+      )
+      if withdrew then
+        change.status = "system_refused"
+        notify_owner(opts.on_system_refused, change, "on_system_refused")
+        if opts.on_close then
+          vim.schedule(function()
+            notify_owner(function()
+              opts.on_close(nil, false)
+            end, change, "on_close")
+          end)
+        end
+      else
+        change.review_error = tostring(withdraw_err or open_err)
+      end
     end
     -- BURST GUARD (DEFECT C): a refused target keeps getting retried -- `]x`/`[x` parks
     -- the current file and reopens the target on EVERY press, and a target whose
@@ -130,7 +157,7 @@ function Factory.new(deps)
       change._open_refusal_announced = open_err_text
       M._announce_open_failure(change, "could not open review buffer: " .. open_err_text, vim.log.levels.WARN)
     end
-    if repeated_open_refusal then
+    if repeated_open_refusal and change.status == "pending" then
       -- Same refusal class, unchanged conditions: do not spin the queue.
       announce_state()
       return false, open_err
@@ -155,8 +182,9 @@ function Factory.new(deps)
   -- inside the one hunk and add a blank line to the composed file. Drop it from the
   -- target here and drop the buffer's forced blank line after staging; match_eol
   -- restores the real final newline at accept.
-  if change._retrace_model == nil and type(change.before) == "string" and type(change.after) == "string" then
-    change._retrace_model = { before = change.before, after = change.after }
+  local review_before = change.review_before ~= nil and change.review_before or change.before
+  if change._retrace_model == nil and type(review_before) == "string" and type(change.after) == "string" then
+    change._retrace_model = { before = review_before, after = change.after }
   end
   local target = model_target(change)
   -- Model FIRST, blocks second, join last: the model must not be able to
@@ -175,7 +203,7 @@ function Factory.new(deps)
   -- nothing to do with it.
   local parked_already_staged = change._parked_already_staged
   change._parked_already_staged = nil
-  local blocks = stamp_model_index(M.build_diff_blocks(change.before or "", target), model)
+  local blocks = stamp_model_index(M.build_diff_blocks(review_before or "", target), model)
   if parked then
     local parked_blocks = {}
     for i, block in ipairs(parked.blocks or {}) do
@@ -188,6 +216,12 @@ function Factory.new(deps)
     model = vim.deepcopy(parked.model_hunks or model)
     model_source = parked.model_source or model_source
   end
+  -- The study reads the operands this path actually used, never a recomputed
+  -- approximation. `blocks` is the live table, so a later capture of the same
+  -- facts sees the extmark ids painting adds to it.
+  local engine_facts = { review_before = review_before, target = target, model = model,
+    model_source = model_source, blocks = blocks, parked = parked ~= nil }
+
   -- Zero hunks means `before` equals `after`: disk already holds the accepted
   -- content, so there is nothing to write and nothing to review, and settling
   -- the change here is correct.
@@ -201,7 +235,16 @@ function Factory.new(deps)
   -- So a create falls through to the normal review below. It stages an empty
   -- buffer with no hunks; the file-level keys (accept-all / reject-file) still
   -- work, and the file is created only by finish_session at accept.
-  if #blocks == 0 and change.before ~= nil then
+  --
+  -- I4: settling here is only for a change with nothing else to decide. A
+  -- delete/create operation or a mode proposal binds like any review, with an
+  -- EMPTY ledger (the bind opens one over zero blocks), so the file doors and
+  -- the permission question stay reachable.
+  local carries_decision = change.kind == "delete"
+    or change.kind == "create"
+    or review_permissions.proposes_mode(change)
+  if #blocks == 0 and change.before ~= nil and not carries_decision then
+    log.buffer_event("review_staged", { change = change, bufnr = bufnr, outcome = "no_hunks", engine = engine_facts })
     vim.bo[bufnr].modified = false
     change.status = "accepted"
     notify_owner(opts.on_accept, change, "on_accept")
@@ -216,6 +259,7 @@ function Factory.new(deps)
   end
 
   local pre_stage_lines = vim.deepcopy(vim.api.nvim_buf_get_lines(bufnr, 0, -1, false))
+  log.buffer_event("proposal_stage_begin", { change = change, bufnr = bufnr, engine = engine_facts })
   local stage_ok, stage_err = pcall(function()
     -- `render` alone still paints correctly: `blocks`' positions were computed against
     -- `target`, which IS the buffer's current content in this path.
@@ -243,6 +287,8 @@ function Factory.new(deps)
     pcall(vim.api.nvim_buf_set_lines, bufnr, 0, -1, false, pre_stage_lines)
     vim.bo[bufnr].modified = false
     change.review_error = tostring(stage_err)
+    log.buffer_event("review_staged", { change = change, bufnr = bufnr, outcome = "stage_failed",
+      reason = tostring(stage_err), engine = engine_facts })
     do
       local L = change_ledger(change, opts)
       ledger.record_decision(L, {
@@ -278,6 +324,7 @@ function Factory.new(deps)
       pcall(vim.api.nvim_buf_set_lines, bufnr, 0, -1, false, pre_stage_lines)
       vim.bo[bufnr].modified = false
       change.review_error = "parked review restore mismatch"
+      log.buffer_event("review_staged", { change = change, bufnr = bufnr, outcome = "restore_mismatch", engine = engine_facts })
       ledger.record_decision(change_ledger(change, opts), {
         action = "review_refused",
         actor = "system",
@@ -291,7 +338,10 @@ function Factory.new(deps)
       schedule_queue_advance({ opts = opts or {} })
       return false, "parked review restore mismatch"
     end
-    change._parked_review = nil
+    -- `change._parked_review` is NOT cleared here. It is the recovery snapshot,
+    -- and a rebuild that fails below -- an unwatchable buffer, a keymap that
+    -- throws half-way through the bind -- must still be recoverable from it
+    -- (R7, design :87). It is dropped only once the replacement has bound.
   end
 
   -- Seal the staging into its own undo block and bookmark where it landed. THE REVIEW'S
@@ -346,7 +396,7 @@ function Factory.new(deps)
   ledger.mark(change_ledger(change, opts), "review_profile_hunks_ready")
 
 
-  return review_open_bind_factory.new(child_deps({
+  local bound, bound_state = review_open_bind_factory.new(child_deps({
     change = change,
     bufnr = bufnr,
     opts = opts,
@@ -360,6 +410,16 @@ function Factory.new(deps)
     retrace_floor = retrace_floor,
     initial_landing_block = initial_landing_block,
   }))
+  -- THE REPLACEMENT HAS BOUND. Only now does the recovery snapshot go: until
+  -- this line a failed rebuild can still be recovered from it, which is the
+  -- whole of R7's "keep `_parked_review` until a replacement has bound
+  -- successfully".
+  if bound and parked then
+    change._parked_review = nil
+  end
+  log.buffer_event("review_staged", { change = change, bufnr = bufnr,
+    outcome = bound and "opened" or "bind_failed", engine = engine_facts })
+  return bound, bound_state
 
   end
   setfenv(open, env)

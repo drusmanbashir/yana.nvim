@@ -5,7 +5,7 @@ local M = {}
 local diff = require("yana.diff")
 local hash = require("yana.safety.hash")
 local jail = require("yana.shadow.jail")
-local manifest = require("yana.manifest")
+local manifest = require("yana.paths.manifest")
 local uv = vim.uv or vim.loop
 
 function M.new(deps)
@@ -190,7 +190,7 @@ local function recover_one_layer(session, root)
 	local base = table.concat({
 		deps.state_root(),
 		"recovered",
-		deps.workspace.workspace_slug(root.workspace),
+		deps.workspace.path_key(root.workspace),
 		session.stream,
 	}, "/")
 	vim.fn.mkdir(base, "p")
@@ -253,7 +253,7 @@ function I.arm_review_open(session, on_marked)
 	end
 	if session.mode == "ask" then
 		-- Ask turns take no claim; tell the daemon there is no review.
-		require("yana.yanad").review_none({
+		require("yana.runtime.yanad").review_none({
 			session_id = session.yanad_session_id,
 			turn_id = tostring(session.turn_id),
 		}, tostring(session.turn_id) .. ":review.none", function()
@@ -266,7 +266,7 @@ function I.arm_review_open(session, on_marked)
 	local files = session.review_files or {}
 	if type(files) ~= "table" or #files == 0 then
 		-- Walk found nothing: review.none releases the claim.
-		require("yana.yanad").review_none({
+		require("yana.runtime.yanad").review_none({
 			session_id = session.yanad_session_id,
 			turn_id = tostring(session.turn_id),
 		}, tostring(session.turn_id) .. ":review.none", function(ok)
@@ -287,7 +287,7 @@ function I.arm_review_open(session, on_marked)
 		end
 	end
 	session.review_open_requested = true
-	require("yana.yanad").review_open({
+	require("yana.runtime.yanad").review_open({
 		session_id = session.yanad_session_id,
 		turn_id = tostring(session.turn_id),
 		files = abs,
@@ -354,7 +354,7 @@ function I.release(session, on_released)
 		session.released = true
 		if session.turn_pass then
 			local log = require("yana.log")
-			local lifecycle = require("yana.turn_lifecycle")
+			local lifecycle = require("yana.turn.turn_lifecycle")
 			if session.claim_open_logged then
 				log.lifecycle_later("claim.release", {
 					turn_id = session.turn_pass.turn_id,
@@ -376,8 +376,8 @@ function I.release(session, on_released)
 		return true
 	end
 	local sender = session.review_open_requested
-		and require("yana.yanad").review_close
-		or require("yana.yanad").review_none
+		and require("yana.runtime.yanad").review_close
+		or require("yana.runtime.yanad").review_none
 	local args
 	if session.review_open_requested then
 		args = {

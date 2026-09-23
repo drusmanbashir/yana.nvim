@@ -62,7 +62,7 @@ function M.build_diff_blocks(before, after)
   local new_lines = split_lines(new_str)
   -- ctxlen is how many UNCHANGED lines must separate two changes before vim.diff calls
   -- them SEPARATE hunks, so it decides hunk boundaries and must never come from a
-  -- display option. `vim.o.scrolloff` was passed here (inherited from avante); at
+  -- display option. `vim.o.scrolloff` was passed here; at
   -- scrolloff >= 5 two changes a few lines apart arrived as ONE hunk spanning both,
   -- swallowing the untouched lines between them, so the operator could not decide them
   -- separately. 0 also matches settlement (turn_settle.lua:46) and every other vim.diff

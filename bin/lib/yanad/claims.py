@@ -1,12 +1,33 @@
+import hashlib
+import os
 from pathlib import Path
 
 from . import daemon_store as store
 from . import liveness
-from .slug import resolve_workspace, workspace_slug
 
 
-def claim_slugs(mounted_root, touched):
-    return {workspace_slug(resolve_workspace(item)) for item in touched}
+# F-CLAIM-KEYS. State identity is (session, turn) plus the ACTUAL path, never a
+# derived workspace or repository name.
+#
+# What this replaces: a key built by walking up from each touched file to the
+# nearest `.git` and hashing that directory's (dev, ino). Three things were
+# wrong with it. It made identity depend on Git, so one tree keyed differently
+# before and after `git init`. It walked the filesystem per item on a path that
+# must not walk. And -- measurably -- it COLLIDED: two declared roots inside one
+# repository resolved to the same ancestor and therefore to one key, so
+# `store.turn_dir` handed them a single shared layer directory instead of one
+# each. That is a cross-root bleed the multiroot gate's own premise forbids.
+#
+# The key is now the real path itself, hashed only to make a safe directory
+# name. Distinct paths are distinct keys; no ancestor is consulted; no Git.
+def path_key(path):
+    """Stable directory-safe key for one absolute path. No Git, no ancestor walk."""
+    real = os.path.realpath(os.fspath(path))
+    return hashlib.sha256(real.encode("utf-8")).hexdigest()[:16]
+
+
+def claim_keys(touched):
+    return {path_key(item) for item in touched}
 
 
 def review_files(root, session_id):

@@ -160,7 +160,7 @@ end
 -- It never replays decision stacks and never asks the journaled applier to touch disk.
 local function load_turn_start(state)
   local st = pool_for(state and state.opts or {})
-  local turn_bind = require("yana.turn_bind")
+  local turn_bind = require("yana.turn.turn_bind")
   local turn = turn_bind.get(st)
   local overlay = turn_bind.overlay(st)
   local path = state and state.change and diff.abs_path(state.change.path)
@@ -174,7 +174,7 @@ local function undo_rest_of_turn(state)
   local restored, refused = {}, {}
   local ordered, st = turn_changes(state)
   local opts = state.opts or {}
-  local turn_bind = require("yana.turn_bind")
+  local turn_bind = require("yana.turn.turn_bind")
   local turn = turn_bind.get(st)
   local overlay = turn_bind.overlay(st)
   for _, c in ipairs(ordered) do

@@ -7,7 +7,7 @@ vim.fn.writefile({ "#!/bin/sh", "exit 0" }, agent)
 vim.uv.fs_chmod(agent, 493)
 
 require("yana.config").setup({ cmd = agent, mode = "inline" })
-local dependencies = require("yana.dependencies")
+local dependencies = require("yana.runtime.dependencies")
 local before
 for _, row in ipairs(dependencies.check("inline")) do
   if row.id == "exec:cursor-agent" then before = row end
@@ -16,7 +16,7 @@ assert(before and before.level == "ok", "fixture agent did not resolve")
 assert(vim.uv.fs_rename(agent, agent .. ".moved"), "could not move fixture agent")
 
 local done_code, done_message
-local job = require("yana.agent").run({
+local job = require("yana.agent.agent").run({
   prompt = "must not start",
   jail_session = {},
   on_done = function(code, message)

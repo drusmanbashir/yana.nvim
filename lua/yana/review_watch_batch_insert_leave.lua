@@ -72,7 +72,12 @@ function M.new(env)
       if not dirty_rows[row] or claimed[row] or ledger_owner_other(block, row) then
         return false
       end
-      if state.hunk_ledger:row_is_owned(block, row) or is_owned(row) then
+      -- Growth asks outside this block's anchor bounds; only the classifier
+      -- can settle that new row, not an anchor already inside those bounds.
+      if is_owned(row) then
+        -- The grow walk is part of the same top-down pass, so a row it takes is
+        -- settled for the rows under it.
+        state.pass_settled_rows[row] = true
         return true
       end
       local neighbor = neighbor_beyond(block, row, growing_down)
@@ -94,40 +99,77 @@ function M.new(env)
       return { row = row, owned = is_owned(row, true) and true or false, source = line }
     end
 
-    local absorbed_any = false
-    for index, block in ipairs(pending) do
-      local lo, hi = anchor_bounds(block)
-      if lo == nil then
-        lo, hi = block.new_start_line, block.new_end_line or block.new_start_line
+    local function run_pass()
+      local absorbed_any = false
+      for index, block in ipairs(pending) do
+        local lo, hi = anchor_bounds(block)
+        if lo == nil then
+          lo, hi = block.new_start_line, block.new_end_line or block.new_start_line
+        end
+        if type(lo) == "number" and type(hi) == "number" then
+          local grew = true
+          while grew do
+            grew = false
+            if may_grow_to(block, hi + 1, true) then
+              hi, grew = hi + 1, true
+              claimed[hi] = true
+            end
+            if may_grow_to(block, lo - 1, false) then
+              lo, grew = lo - 1, true
+              claimed[lo] = true
+            end
+          end
+          -- TOP-DOWN, each answer settling before the next row asks: a header
+          -- typed in the same insert session as its body is judged first, so the
+          -- body inherits from a container whose owner is already known.
+          local decisions, rows = {}, {}
+          for row in pairs(dirty_rows) do
+            if type(row) == "number" and row >= lo and row <= hi and not ledger_owner_other(block, row) then
+              rows[#rows + 1] = row
+            end
+          end
+          table.sort(rows)
+          for _, row in ipairs(rows) do
+            local decision = judge(block, row)
+            if decision.owned then
+              state.pass_settled_rows[row] = true
+            end
+            decisions[#decisions + 1] = decision
+          end
+          if complete(block, index, decisions, {}, undo_seq, before_seq) then
+            absorbed_any = true
+          end
+        end
       end
-      if type(lo) == "number" and type(hi) == "number" then
-        local grew = true
-        while grew do
-          grew = false
-          if may_grow_to(block, hi + 1, true) then
-            hi, grew = hi + 1, true
-            claimed[hi] = true
-          end
-          if may_grow_to(block, lo - 1, false) then
-            lo, grew = lo - 1, true
-            claimed[lo] = true
-          end
-        end
-        local decisions = {}
-        for row in pairs(dirty_rows) do
-          if type(row) == "number" and row >= lo and row <= hi and not ledger_owner_other(block, row) then
-            decisions[#decisions + 1] = judge(block, row)
-          end
-        end
-        if complete(block, index, decisions, {}, undo_seq, before_seq) then
-          absorbed_any = true
-        end
-      end
+      return absorbed_any
+    end
+
+    -- Rows this pass has judged the hunk's, read back by the ownership
+    -- classifier: a pass fact, dropped with the pass.
+    --
+    -- SCOPE AND LIFETIME. The table is authority for exactly the span of
+    -- `run_pass` and nothing wider. `run_pass` is its only writer, and it is
+    -- dropped on the way out whether the pass returns or RAISES -- and it can
+    -- raise by design, from the classifier's loud no-parser failure or from
+    -- `complete` meeting a ledger the paint/notify callback closed. A leaked
+    -- table would keep answering for every later reader
+    -- (review_watch_batch_partition, review_watch_batch, review_hunk_split) with
+    -- rows `complete` never recorded.
+    --
+    -- The original error is re-raised UNCHANGED (level 0 adds no position and
+    -- the value is passed through as it came): cleaning up is not catching, and
+    -- a swallowed raise would be exactly the fallback ownership verdict the
+    -- 2026-09-18 ruling retired.
+    state.pass_settled_rows = {}
+    local pass_ok, pass_result = pcall(run_pass)
+    state.pass_settled_rows = nil
+    if not pass_ok then
+      error(pass_result, 0)
     end
     -- try_split runs AFTER paint recreates authority (see
     -- on_insert_leave_ownership): a completed edit deletes the mark, and
     -- try_split refuses non-live provenance.
-    return absorbed_any
+    return pass_result
   end
 
   return { absorb_on_insert_leave = absorb_on_insert_leave }

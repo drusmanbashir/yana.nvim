@@ -207,7 +207,7 @@ function Factory.new(deps)
       if top == nil then
         local pool = turn_pool()
         if pool then
-          pcall(require("yana.turn_bind").on_undo_exhausted, pool)
+          pcall(require("yana.turn.turn_bind").on_undo_exhausted, pool)
         end
         return nil
       end

@@ -3,6 +3,14 @@ local hunk_ledger = require("yana.hunk_ledger")
 
 local Factory = {}
 
+local function retired_single_file_reload_refusal(change)
+  if not (change and change.single_file) then
+    return nil
+  end
+  local name = vim.fn.fnamemodify(change.single_file.real_path or change.path or "file", ":t")
+  return "retired single-file review cannot be reloaded for " .. name .. "; close it and rerun Yana on the real file"
+end
+
 function Factory.new(deps)
   local env = setmetatable({}, {
     __index = function(_, key)
@@ -190,6 +198,10 @@ function Factory.new(deps)
     buffer = bufnr,
     group = state.augroup,
     callback = function()
+      local ready, reason = require("yana.review_watch").finalize(bufnr, state)
+      if not ready then
+        error("review reload refused: pending edit could not finish: " .. tostring(reason), 0)
+      end
       -- FIRST ACT: 'syntax', `b:current_syntax` and 'filetype' are still whole
       -- at handler entry (they survive `buf_freeall`); the treesitter
       -- highlighter is not. Merge what is still visible into the maintained
@@ -310,7 +322,7 @@ function Factory.new(deps)
               -- today.
               return
             end
-            local sfm_refusal = require("yana.shadow.apply").single_file_accept_refusal(state.change, bufnr)
+            local sfm_refusal = retired_single_file_reload_refusal(state.change)
             if sfm_refusal then
               state.reload_restore_error = nil
               M._record_shadow_accept_refusal(state, sfm_refusal)
@@ -337,6 +349,15 @@ function Factory.new(deps)
   -- F-OWN-TRIGGER: authoritative ownership settle on InsertLeave. Absorbs
   -- owned insert-touched rows into the parent; splits only at human boundaries.
   -- Torn down with state.augroup — does not touch attach/generation lifecycle.
+  vim.api.nvim_create_autocmd({ "InsertEnter" }, {
+    buffer = bufnr,
+    group = state.augroup,
+    callback = function()
+      local enter = state.on_insert_enter_ownership
+      if type(enter) == "function" then enter() end
+    end,
+  })
+
   vim.api.nvim_create_autocmd({ "InsertLeave" }, {
     buffer = bufnr,
     group = state.augroup,

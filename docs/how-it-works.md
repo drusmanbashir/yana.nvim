@@ -13,23 +13,16 @@ until you accept; accepted bytes are written through an applier that refuses
 if the file drifted underneath.
 
 **Confinement.** The agent runs inside a sandbox (bubblewrap) where the whole
-host is read-only and one overlay layer captures every write under your code
-tree — the opened repo, sibling repos, new directories — so cross-repo work is
-reviewed rather than refused. Secret stores (`~/.ssh`, `~/.gnupg`, `~/.aws`,
-credential files) are masked inside the sandbox. Writes Yana itself refuses
-(control-plane paths like `.git/`, binary artifacts, anything outside the
-capture root) are named in the panel and in `:YanaRefusals`, never dropped
-silently.
+host is read-only and one overlay layer captures every write inside your
+workspace. Secret stores (`~/.ssh`, `~/.gnupg`, `~/.aws`, credential files)
+are masked inside the sandbox. Writes Yana itself refuses (control-plane
+paths like `.git/`, binary artifacts, anything outside the workspace) are
+named in the panel and in `:YanaRefusals`, never dropped silently.
 
-**Multiple repositories.** By default a turn may write exactly the directory
-you opened; `write_roots` declares other directories a turn may also write,
-each with its own private capture, lock, change set, and review before
-anything reaches the real file. The common case needs no list at all: one overlay mounts over a capture root (usually `~/code`) that
-contains the repository you opened, and anything beneath it — a sibling repo
-you never mentioned, a directory that didn't exist when the turn started — is
-captured too, with hunks grouped by each file's own nearest `.git` root.
-Anything outside the capture root stays read-only, and a refusal always names
-the `write_roots` line that would allow it.
+**Workspace scope.** A turn may write inside the workspace you opened — the
+nearest `.git` root above the file, or the folder itself when there is no
+`.git` above it. Anything outside that boundary stays read-only, and a
+refusal always names the exact boundary that would allow it.
 
 **Modes.** One dial, three results: `ask` (reads and answers, no edits),
 `inline` (edits become hunks), `agentic` (direct, unconfined). `modes` picks
@@ -56,9 +49,8 @@ reads from memory instead of re-spawning the vendor CLI. A
 session id is vendor-specific too: resuming a session recorded under a
 different backend is refused by name, naming both backends.
 
-Backends are declared in `config.backends` — a named table of vendor entries
-(avante.nvim's `providers` shape, applied to a CLI agent instead of an HTTP
-provider). Three ship today (`cursor`, `claude`, `codex`); `codex`'s entry shows the fields a vendor whose
+Backends are declared in `config.backends` — a named table of vendor entries.
+Three ship today (`cursor`, `claude`, `codex`); `codex`'s entry shows the fields a vendor whose
 CLI shape genuinely differs needs (non-interactive mode as a subcommand
 rather than a flag, a positional resume id, its own JSON stream token):
 
@@ -124,8 +116,9 @@ state root.
 project, but never your whole home, `/`, or a top-level folder such as
 `/home` or `/tmp` (fewer than two path components below `/`). Those are
 refused by name with the remedy "pick a project subdirectory" — start Yana
-inside `~/code/myproject`, `~/notes`, and so on. For a file in `$HOME`, a loose
-folder, or a huge directory, see `:help yana-single-file`.
+inside `~/code/myproject`, `~/notes`, and so on. `:Yana --workspace DIR` binds
+one turn to a named directory; the old `:Yana --file` shortcut now refuses by
+name.
 
 **Recovery.** One claim per workspace keeps two editors from clobbering each
 other; a second turn on a busy repo is refused by name. If Neovim dies with a

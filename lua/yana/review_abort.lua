@@ -56,8 +56,11 @@ function Factory.new(deps)
     -- changes nothing. The v1 undo-every-buffer-by-hand body (the whole-review confirm
     -- dialog plus the per-file rewind it drove) is gone: every review now binds a Turn,
     -- so this door always defers to `turn_bind.abort`.
-    local tb = require("yana.turn_bind")
-    return tb.abort(st)
+    local tb = require("yana.turn.turn_bind")
+    -- The owning review travels with the Abort so its End result names both
+    -- what was pressed and which review it belonged to. `turn_bind.abort`
+    -- already took the owner; this was the caller that never supplied it.
+    return tb.abort(st, state.opts and state.opts.review_owner or nil)
   end
 
   -- Opens the next queued change in opts' pool, if any is pending.

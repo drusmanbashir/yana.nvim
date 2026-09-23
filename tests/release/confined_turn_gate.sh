@@ -4,6 +4,7 @@ set -euo pipefail
 [[ $# == 2 ]] || { echo "Usage: $0 EXPORTED_TREE NVIM" >&2; exit 64; }
 tree=$(realpath "$1")
 nvim=$(realpath "$2")
+. "$tree/tests/lib/sigsafe.sh"
 
 # This scratch becomes the overlay's WORKSPACE and LAYER_ROOT
 # (bin/yana-overlay --workspace/--upper/--work). run_overlay applies
@@ -43,7 +44,7 @@ signal_yanad_under() {
 	cmdline=$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null) || return 0
 	for root in "$@"; do
 		[[ -n "$root" && "$cmdline" == *"-m yanad --root $root/"* ]] || continue
-		kill "-$sig" "$pid" 2>/dev/null || true
+		sigsafe_signal "$sig" "$pid" || true
 		return 0
 	done
 }
@@ -67,12 +68,12 @@ stop_yanads_under() {
 		pids=$(yanad_pids_under "$@")
 		[[ -n "$pids" ]] || return 0
 		for pid in $pids; do
-			signal_yanad_under TERM "$pid" "$@"
+			signal_yanad_under 15 "$pid" "$@"
 		done
 		wait_yanads_gone 5 "$@" && continue
 		for pid in $(yanad_pids_under "$@"); do
 			printf 'confined turn: yanad pid=%s ignored TERM for 5s; sending KILL\n' "$pid" >&2
-			signal_yanad_under KILL "$pid" "$@"
+			signal_yanad_under 9 "$pid" "$@"
 		done
 		wait_yanads_gone 2 "$@" || {
 			printf 'confined turn: yanad survived KILL pids=[%s]\n' "$(yanad_pids_under "$@" | tr '\n' ' ')" >&2

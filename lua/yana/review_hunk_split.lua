@@ -5,6 +5,8 @@
 -- watcher's REFUSAL branch) still lives there.
 local extent = require("yana.hunk_extent")
 local splice = require("yana.hunk_anchor_splice")
+local ownership = require("yana.review_watch_ownership")
+local anchor_bounds = require("yana.hunk_ledger_settle").anchor_bounds
 
 local M = {}
 
@@ -58,101 +60,6 @@ function M.unshift_row(change, row)
   return row
 end
 
--- Self-contained (no per-buffer closure state, unlike review_watch's own copy of this
--- climb) because `merge_gap_pair` is reached for whichever buffer owns the pending
--- hunks, not one bound at attach time.
-local function live_tree_root(bufnr)
-  local filetype = vim.bo[bufnr].filetype
-  if filetype == "" then
-    local ok, matched = pcall(vim.filetype.match, { filename = vim.api.nvim_buf_get_name(bufnr) })
-    if ok and matched then
-      filetype = matched
-    end
-  end
-  local lang = filetype ~= "" and (vim.treesitter.language.get_lang(filetype) or filetype) or nil
-  local ok, parser = pcall(vim.treesitter.get_parser, bufnr, lang)
-  if not ok or not parser then
-    -- Mirrors review_watch.lua's OWN copy of this fallback: a fresh headless
-    -- nvim has no parser registered yet even though the .so is on disk, so
-    -- `get_parser` fails until `vim.treesitter.language.add` runs once.
-    -- Without this, `same_syntax_scope` below silently degrades to its
-    -- permissive "no parser answer" branch and the boundary veto never
-    -- fires at all (r_merge_refused_across_syntax_boundary[cross]).
-    local uname = vim.loop.os_uname()
-    local suffix = "/treesitter/" .. uname.sysname .. "-" .. uname.machine .. "/parser/" .. tostring(lang) .. ".so"
-    local paths = {}
-    if lang then
-      paths[#paths + 1] = vim.fn.stdpath("state") .. suffix
-      if vim.env.USER and vim.env.USER ~= "" then
-        paths[#paths + 1] = "/home/" .. vim.env.USER .. "/.local/state/nvim" .. suffix
-      end
-    end
-    for _, path in ipairs(paths) do
-      if vim.fn.filereadable(path) == 1 then
-        pcall(vim.treesitter.language.add, lang, { path = path })
-        ok, parser = pcall(vim.treesitter.get_parser, bufnr, lang)
-        if ok and parser then
-          break
-        end
-      end
-    end
-    if not ok or not parser then
-      return nil
-    end
-  end
-  local parsed, trees = pcall(parser.parse, parser)
-  if not parsed or not trees or not trees[1] then
-    return nil
-  end
-  return trees[1]:root()
-end
-
--- The smallest named node at a row's first non-blank column.
-local function smallest_node_for_line(bufnr, root, line_1)
-  local line = (vim.api.nvim_buf_get_lines(bufnr, line_1 - 1, line_1, false) or {})[1]
-  if line == nil then
-    return nil
-  end
-  local row = line_1 - 1
-  local first_col = (line:find("%S") or 1) - 1
-  return root:named_descendant_for_range(row, first_col, row, first_col + 1)
-end
-
--- The nearest enclosing `class_definition`, or nil when the row is not
--- inside a class body at all (module scope, or nested only in plain
--- functions).
-local function nearest_class(node)
-  while node do
-    if node:type() == "class_definition" then
-      return node
-    end
-    node = node:parent()
-  end
-  return nil
-end
-
--- Two rows are in the SAME scope for merge purposes when they are not on opposite sides
--- of a CLASS boundary. No parser, or neither row inside a class, never blocks a merge
--- that base-adjacency already allows -- the veto only fires when BOTH rows resolve to a
--- class and those classes differ.
-local function same_syntax_scope(bufnr, line_a, line_b)
-  local root = live_tree_root(bufnr)
-  if not root then
-    return true
-  end
-  local node_a = smallest_node_for_line(bufnr, root, line_a)
-  local node_b = smallest_node_for_line(bufnr, root, line_b)
-  if node_a == nil or node_b == nil then
-    return true
-  end
-  local class_a = nearest_class(node_a)
-  local class_b = nearest_class(node_b)
-  if class_a == nil and class_b == nil then
-    return true
-  end
-  return class_a == class_b
-end
-
 -- THE MODEL MIRROR IS PART OF A SPLIT'S RECORD, so it is part of its inverse: a
 -- mutation of `state.model_hunks` that no snapshot covers is one no `u` can take
 -- back. These two functions are the one place that reads and writes that array
@@ -187,6 +94,45 @@ function M.restore_model_snapshot(model, snap)
     model[i] = snap[i]
   end
   return true
+end
+
+-- THE CHILDREN A SPLIT WOULD MAKE, and nothing else. A pure calculation over the
+-- parent and the spans `hunk_extent`'s resolve tier already allocated: it reads no
+-- state, touches no ledger and decides nothing about whether the split happens --
+-- every refusal stays above it in `try_split`, and `hunk_extent_geometry.allocate`
+-- remains the one owner of the base-range allocation this only copies out.
+--
+-- The ARRAY SEMANTICS are part of the answer and are kept exactly: each child
+-- holds the span's own `old_lines` and `lines` tables BY REFERENCE, as the loop
+-- inside `try_split` always did, so a caller that compared identity still sees
+-- what it saw.
+local function build_split_children(block, spans)
+  local pure_insert_parent = #(block.old_lines or {}) == 0
+  local children = {}
+  for _, span in ipairs(spans) do
+    -- The child is born with both or with neither.
+    local child = {
+      old_lines = span.old_lines,
+      new_lines = span.lines,
+      new_start_line = span.first,
+      new_end_line = span.last,
+    }
+    if pure_insert_parent then
+      -- A pure-insert parent has no base range to cut, so every child keeps
+      -- the parent's own (empty) old span, byte-for-byte the behaviour this
+      -- branch has always had.
+      child.start_line = block.start_line
+      child.end_line = block.end_line
+    else
+      -- DELETED-BELOW in base coordinates, computed by `hunk_extent
+      -- .allocate`: the topmost child carries the whole deletion, every
+      -- lower child is an empty base range parked just after it.
+      child.start_line = span.old_start_line
+      child.end_line = span.old_end_line
+    end
+    children[#children + 1] = child
+  end
+  return children
 end
 
 function M.new(deps)
@@ -247,56 +193,12 @@ function M.new(deps)
     if #spans < 2 then
       return false
     end
-    -- F-OWN-GAP. Runs separated ONLY by blank/whitespace rows are ONE logical
-    -- pending hunk (the blanks are human, so classify=false broke the run under
-    -- F-OWN-DEF -- not a foreign block owning the gap). Keep the parent whole; it
-    -- paints as separate member spans via Ledger:paint_membership. A gap holding
-    -- ANY non-blank human row is a genuine boundary and STILL splits.
-    local all_gaps_blank = true
-    for k = 1, #spans - 1 do
-      local gap_from = spans[k].last
-      local gap_to = spans[k + 1].first
-      if type(gap_from) == "number" and type(gap_to) == "number" then
-        for row = gap_from + 1, gap_to - 1 do
-          local line = (vim.api.nvim_buf_get_lines(bufnr, row - 1, row, false) or {})[1] or ""
-          if not line:match("^%s*$") then
-            all_gaps_blank = false
-            break
-          end
-        end
-      end
-      if not all_gaps_blank then
-        break
-      end
-    end
-    if all_gaps_blank then
-      return false
-    end
-    local pure_insert_parent = #(block.old_lines or {}) == 0
-    local children = {}
-    for _, span in ipairs(spans) do
-      -- The child is born with both or with neither.
-      local child = {
-        old_lines = span.old_lines,
-        new_lines = span.lines,
-        new_start_line = span.first,
-        new_end_line = span.last,
-      }
-      if pure_insert_parent then
-        -- A pure-insert parent has no base range to cut, so every child keeps
-        -- the parent's own (empty) old span, byte-for-byte the behaviour this
-        -- branch has always had.
-        child.start_line = block.start_line
-        child.end_line = block.end_line
-      else
-        -- DELETED-BELOW in base coordinates, computed by `hunk_extent
-        -- .allocate`: the topmost child carries the whole deletion, every
-        -- lower child is an empty base range parked just after it.
-        child.start_line = span.old_start_line
-        child.end_line = span.old_end_line
-      end
-      children[#children + 1] = child
-    end
+    -- NO CONTENT EXCEPTION. One committed hunk is ONE contiguous interval with one
+    -- stable id and one verdict, so
+    -- what the rows between two runs contain decides nothing here: ownership is
+    -- the classifier's answer and it has already been given by the time the spans
+    -- arrive.
+    local children = build_split_children(block, spans)
     -- The old seam could drop an agent row because it allocated content by re-diff and
     -- the re-diff's cut points were not the ownership runs. The children above ARE the
     -- runs, so the cover is a tautology -- stated, not tested for.
@@ -323,6 +225,21 @@ function M.new(deps)
       retrace_before = review_change._retrace_absorbed[retrace_key]
     end
     state.hunk_ledger:split(block, children)
+    if state._timeline_stage then
+      state._timeline_split_parents[block.lineage_id] = {
+        parent = block, children = children, before = before_tag,
+        decisions = #state.decisions,
+      }
+      for _, child in ipairs(children) do
+        assert(type(state._timeline_mark_new) == "function",
+          "watch timeline: staged child has no native mark owner")
+        state._timeline_mark_new(child)
+        -- The prepared child has no real extmark yet. This sentinel preserves
+        -- the tracked-range branch while the injected reader supplies its
+        -- private native range; it is removed before publication.
+        child.authority_extmark_id = -1
+      end
+    end
     invalidate_retrace_cache(state, retrace_key)
     local after_tags = {}
     for i, child in ipairs(children) do
@@ -407,13 +324,20 @@ function M.new(deps)
       local a_start, a_end = deps.live_block_range(bufnr, a)
       local b_start, b_end = deps.live_block_range(bufnr, b)
       if a_start and b_start then
+        local _, a_owned_end = anchor_bounds(a)
+        local b_owned_start = anchor_bounds(b)
+        -- Neovim's mark can collapse onto the deleted row even when a human
+        -- gap survives. The settled owner rows are the actual membership
+        -- boundary: only adjacent owners have been joined by the deletion.
+        local owner_gap_survives = a_owned_end and b_owned_start
+          and b_owned_start > a_owned_end + 1
         -- COORDINATES. `change.first`/`last_orig` are on_lines' PRE-edit rows;
         -- `a_end`/`b_start` come from extmarks and are POST-edit, already shifted by
         -- this very deletion. Compare in the post-edit frame: the deletion collapses to
         -- row `change.first + 1`, which must sit after a's last row and no later than
         -- b's first row.
         local collapsed = change.first + 1
-        if collapsed > a_end and collapsed <= b_start then
+        if not owner_gap_survives and collapsed > a_end and collapsed <= b_start then
           -- SHARPENER. Extmarks alone cannot tell these two apart: deleting the gap
           -- ABOVE b and deleting b's OWN first row both collapse to row `b_start`,
           -- because b's authority mark slides up onto the deleted row either way. Read
@@ -435,7 +359,7 @@ function M.new(deps)
             -- even after the base line between them is deleted, and must stay two hunks
             -- (r_merge_refused_across_syntax_boundary[cross]); two hunks inside the
             -- same function body do share it and still merge ([control]).
-            if same_syntax_scope(bufnr, a_end, b_start) then
+            if ownership.same_class_scope(bufnr, a_end, b_start, state) then
               return a, b, a_start, b_end
             end
           end
@@ -517,10 +441,69 @@ function M.new(deps)
     return records
   end
 
+  -- Within one still-unpublished Insert pass, a gap that never survives the
+  -- completed pass may close. Reuse only the exact parent and children born
+  -- in this private pass; a merge of already-committed siblings stays fresh.
+  local function rejoin_owned_siblings(state)
+    if not state._timeline_stage then return {} end
+    local pending = state.hunk_ledger:pending()
+    local records = {}
+    for i = 1, #pending - 1 do
+      local a, b = pending[i], pending[i + 1]
+      local id = a.split_parent_lineage_id
+      local split = id and state._timeline_split_parents[id]
+      if split and id == b.split_parent_lineage_id
+        and split.children[1] == a and split.children[2] == b
+        and #state.decisions == split.decisions
+        and a.verdict == "pending" and b.verdict == "pending" then
+        local a_first = anchor_bounds(a)
+        local _, b_last = anchor_bounds(b)
+        if a_first and b_last and b_last >= a_first then
+          local lines = vim.api.nvim_buf_get_lines(state.bufnr, a_first - 1, b_last, false)
+          local owners, complete = {}, true
+          for row = a_first, b_last do
+            local source = lines[row - a_first + 1]
+            local anchored = false
+            for _, child in ipairs({ a, b }) do
+              for _, owner in ipairs(child.owned_rows or {}) do
+                if owner.row == row and not owner.provisional and owner.source == source then
+                  anchored = true
+                end
+              end
+            end
+            if not anchored and not state._row_is_yana_owned(row, true) then
+              complete = false
+              break
+            end
+            owners[#owners + 1] = { row = row, source = source, provisional = false }
+          end
+          if complete then
+            local merged = split.parent
+            merged.new_lines = lines
+            merged.new_start_line, merged.new_end_line = a_first, b_last
+            merged.owned_rows = owners
+            local record = state.hunk_ledger:merge({ a, b }, merged)
+            merged.model_index = split.before.model_index
+            merged.model_join = split.before.model_join
+            state._timeline_mark_new(merged)
+            merged.authority_extmark_id = -1
+            state._timeline_split_parents[id] = nil
+            records[#records + 1] = { record = record, members = record.members,
+              before = record.before, merged = merged,
+              after = { model_index = merged.model_index, model_join = merged.model_join } }
+            break
+          end
+        end
+      end
+    end
+    return records
+  end
+
   return {
     try_split = try_split,
     try_merge = try_merge,
     merge_gap_pair = merge_gap_pair,
+    rejoin_owned_siblings = rejoin_owned_siblings,
   }
 end
 

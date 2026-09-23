@@ -22,8 +22,12 @@
 # apart from each other.
 forbidden_bytes_allowed_path() {
 	case $1 in
+	# Buffer snapshots and the operator's toggle are development-only. Keep
+	# these out even if someone later adds them to the export manifest.
+	lua/yana/debug_buffer_states.lua | lua/yana/debug_buffer_states_bundle.lua \
+		| nvim/lua/user/yana.lua) return 1 ;;
 	.github/workflows/ci.yml | .github/workflows/release.yml) return 0 ;;
-	.gitignore | .stylua.toml | CHANGELOG.md | LICENSE | NOTICE | README.md | VERSION) return 0 ;;
+	.gitignore | .stylua.toml | CHANGELOG.md | LICENSE | NOTICE | README.md | VERSION | prompt.txt) return 0 ;;
 	assets/*.gif | assets/*.mp4 | assets/*.png | assets/*.svg) return 0 ;;
 	doc/yana.txt | plugin/yana.lua) return 0 ;;
 	docs/*.md) return 0 ;;
@@ -36,6 +40,7 @@ forbidden_bytes_allowed_path() {
 	scripts/release/*) return 0 ;;
 	tests/release/*) return 0 ;;
 	tests/headless/lib/hunks.lua) return 0 ;;
+	tests/lib/sigsafe.sh) return 0 ;;
 	esac
 	return 1
 }

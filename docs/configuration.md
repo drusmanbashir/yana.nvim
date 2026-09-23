@@ -124,7 +124,7 @@ opts = {
   modes = { "inline", "agentic", "ask" },
   sandbox = { inline = "vendor-default", agentic = "full" },
   inline_exec_allowlist = nil,
-  single_file = { enabled = true, max_entries = 2000 },
+  single_file = { enabled = false, max_entries = 0 }, -- legacy; ignored with one warning
 }
 ```
 
@@ -147,13 +147,8 @@ opts = {
   basenames/paths; when set, it narrows which executables `inline` mode may
   launch. `nil` keeps historical (unrestricted) behavior. `ask` and
   `agentic` never receive this rule.
-- **`single_file`** — behavior when you open a loose file or a huge
-  directory instead of a git project:
-  - `enabled` (default `true`) — whether single-file mode is offered at
-    all.
-  - `max_entries` (default `2000`) — above this many directory entries,
-    Yana falls back to single-file mode instead of trying to capture the
-    whole tree.
+- **`single_file`** — legacy compatibility only. Yana accepts the key so old
+  setup tables do not break, emits one warning, and ignores its values.
 
 **Confinement note:** the sandbox and `write_roots` (below) protect your
 files from being *written*. They do not stop the agent process from
@@ -205,6 +200,7 @@ opts = {
   review = {
     tabs = true,
     ignore = {},
+    permissions = "ask",
   },
 }
 ```
@@ -221,6 +217,13 @@ opts = {
   `.git/`, `.hg/`, or `.svn/`, which are refused regardless. It's merged
   with a per-machine list at `<state_root>/ignore`, which `:YanaIgnore
   <pattern>` appends to.
+- **`review.permissions`** (default `"ask"`) — who authorises a file
+  permission (mode) change the agent proposes. `"ask"` asks once per exact
+  proposal, the first time you actually visit that file's review; a tab
+  opened in the background asks nothing. `"allow"` applies proposed modes
+  without asking; `"deny"` keeps the original mode without asking. Any other
+  value is refused at setup. An approval accepts no text: the mode is written
+  only when the file is saved or the turn ends.
 
 ## UI and highlights
 
@@ -297,13 +300,13 @@ opts = {
     submit = "<C-s>", stop = "<C-c>",
     -- Panel
     model = "<C-g>", new_chat = "<C-n>", toggle_mode = "<M-t>", resend = "<M-r>",
-    review = "<C-y>", accept = "<C-a>", reject = "<C-x>", focus_prompt = "i",
+    review = "<C-y>", reject = "<C-x>", focus_prompt = "i",
     close = "q", next_panel = "<M-.>", prev_panel = "<M-,>", completion_menu = "<C-Space>",
     -- Advanced
     new_panel = "<M-n>", queue = "<M-q>", steer = "<C-CR>",
     history_prev = "<C-p>", history_next = "<C-n>",
-    -- Global, off by default
-    toggle = false, ask = false, inline_edit = false,
+    -- Global: <C-a> toggles the sidebar from any normal-mode buffer
+    toggle = "<C-a>", ask = false, inline_edit = false,
   },
 }
 ```
@@ -326,7 +329,10 @@ opts = {
   and `steer` in the prompt only). `history_prev` / `history_next` bind in the
   inline-edit float only.
 - **Global keys** (`toggle`, `ask`, `inline_edit`) bind from any buffer when
-  `setup()` runs, and are off by default. `inline_edit` binds visual mode only.
+  `setup()` runs. `toggle` defaults to `<C-a>` in normal mode, including panel
+  buffers; `ask` and `inline_edit` are off by default. `inline_edit` binds
+  visual mode only. The panel-only `accept` mapping no longer exists;
+  `:YanaAccept` remains the separate pending-change command.
 - `false` or `""` disables any key except a review key (see above). `nil` in your opts does
   not override a default (the deep merge ignores nil), so use `false`.
 
@@ -500,8 +506,8 @@ opts = {
   write_roots = {}, -- directories a turn may write besides the opened workspace; roots saved with :YanaRoots are merged in
   workspace_roots = {}, -- when a file has no .git root above it, the listed directory containing it becomes the workspace
   single_file = {
-    enabled = true, -- false never switches to single-file mode (for a loose file or a huge directory)
-    max_entries = 2000, -- a directory with more entries than this opens in single-file mode; number >= 0
+    enabled = false, -- legacy compatibility only; ignored with one warning
+    max_entries = 0, -- legacy compatibility only; ignored with one warning
   },
 
   review = {
@@ -549,7 +555,7 @@ opts = {
     steer = "<C-CR>", -- interrupt and resend the prompt as a new turn; many terminals cannot tell <C-CR> from <CR>
     history_prev = "<C-p>", -- previous instruction (inline-edit float, normal and insert)
     history_next = "<C-n>", -- next instruction (inline-edit float, normal and insert)
-    toggle = false, -- global, normal mode: open or close the panel, e.g. "<leader>cc"
+    toggle = "<C-a>", -- global, normal mode: open or close the panel; override, e.g. "<leader>cc"
     ask = false, -- global: open the panel (normal) or ask about the selection (visual), e.g. "<leader>ca"
     inline_edit = false, -- global, visual mode: inline-edit the selection, e.g. "<C-k>"
   },

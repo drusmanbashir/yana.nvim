@@ -1,7 +1,7 @@
 """The one reader of this tree's VERSION stamp.
 
 Absence is a value, not a fault. The plugin's client has always read a missing
-VERSION as the empty string (`lua/yana/yanad.lua`), so a daemon that raised on
+VERSION as the empty string (`lua/yana/runtime/yanad.lua`), so a daemon that raised on
 the same file disagreed with its own client about what the tree's version is.
 The disagreement was fatal in both directions: the constructor's uncaught
 OSError meant no socket was ever bound, so every `ensure` retry failed and the

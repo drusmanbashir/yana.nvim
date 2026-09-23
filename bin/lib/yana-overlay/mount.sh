@@ -77,3 +77,88 @@ mount_state_dirs() {
 		mount -o bind,remount,rw "$dir" || exit "$EXIT_MOUNT"
 	done
 }
+
+mount_reconstruct_capture_plan() {
+	local plan=$1 alias source
+	RECONSTRUCTED_CAPTURE_MOUNTS=()
+	while IFS=$'\t' read -r alias source; do
+		[[ -n "$alias" && -n "$source" ]] || continue
+		mount --bind "$alias" "$source" || return 1
+		mount -o bind,remount,rw "$source" || return 1
+		RECONSTRUCTED_CAPTURE_MOUNTS+=("$source")
+	done < <(python3 - "$plan" <<'PY'
+import json
+import sys
+with open(sys.argv[1], encoding="utf-8") as stream:
+    data = json.load(stream)
+project = data.get("project_cwd", "")
+rows = []
+for row in data.get("aliases", []):
+    alias = row.get("alias_prefix", "")
+    source = row.get("source_prefix", "")
+    if alias and source and alias == project:
+        rows.append((alias.count("/"), alias, source))
+for _, alias, source in sorted(rows, reverse=True):
+    print(f"{alias}\t{source}")
+PY
+	)
+}
+
+
+mount_decode_alias_proposals() {
+	local plan=$1 layer=$2
+	python3 - "$plan" "$layer" <<'PY'
+import json
+import os
+import shutil
+import sys
+plan, layer = sys.argv[1:]
+upper = os.path.join(layer, "upper")
+if not os.path.isdir(upper):
+    raise SystemExit(0)
+with open(plan, encoding="utf-8") as stream:
+    data = json.load(stream)
+project = data.get("project_cwd", "")
+for row in data.get("aliases", []):
+    alias = row.get("alias_prefix")
+    source = row.get("source_prefix")
+    decoded_file = row.get("reconstructed_private_abs", "")
+    if not alias or not source or alias != project or not decoded_file:
+        continue
+    host_upper = ""
+    targets = data.get("targets", [])
+    if targets and isinstance(targets[0], dict):
+        host_upper = targets[0].get("private_proposal_abs", "")
+    if host_upper and decoded_file == host_upper or (host_upper and decoded_file.startswith(host_upper.rstrip(os.sep) + os.sep)):
+        rel_decoded = os.path.relpath(decoded_file, host_upper)
+        decoded_file = os.path.join(upper, rel_decoded)
+    decoded_root = os.path.dirname(decoded_file)
+    os.makedirs(decoded_root, exist_ok=True)
+    for name in sorted(os.listdir(upper)):
+        if name == ".yana-decoded":
+            continue
+        src = os.path.join(upper, name)
+        dst = os.path.join(decoded_root, name)
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        if os.path.exists(dst):
+            if os.path.isdir(dst) and not os.path.islink(dst):
+                shutil.rmtree(dst)
+            else:
+                os.unlink(dst)
+        os.replace(src, dst)
+PY
+}
+
+mount_teardown_reconstructed() {
+	local idx path count
+	count=0
+	if declare -p RECONSTRUCTED_CAPTURE_MOUNTS >/dev/null 2>&1; then
+		count=${#RECONSTRUCTED_CAPTURE_MOUNTS[@]}
+	fi
+	for (( idx=count-1; idx>=0; idx-- )); do
+		path=${RECONSTRUCTED_CAPTURE_MOUNTS[$idx]}
+		[[ -n "$path" ]] || continue
+		umount "$path" >/dev/null 2>&1 || true
+	done
+	RECONSTRUCTED_CAPTURE_MOUNTS=()
+}

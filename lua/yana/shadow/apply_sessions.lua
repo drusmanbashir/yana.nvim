@@ -395,8 +395,7 @@ end
 --- HEALTHY daemon cost 387ms per accept. The claim is a QUESTION FOR A DOOR,
 --- not for the applier: every door pre-requests it asynchronously and enters
 --- this synchronous applier from the request's own callback
---- (`review_lifecycle.finish_session`, `review_bulk_claims`,
---- `review_undo_turn_step`).
+--- (`review_lifecycle.finish_session`, `turn_settle`).
 ---
 --- So an ungranted attempt is refused by name, immediately. Never a silent
 --- allow, and never a wait.
@@ -445,7 +444,19 @@ local function ensure_session(pass)
 		pass.diary_begin_halted = err
 		return nil, err
 	end
-	local session, berr = diary.begin(pass.diary_begin)
+	local diary_begin = pass.diary_begin
+	local turn = pass.shadow_turn
+	if turn and turn.home_buffer_capture then
+		if type(turn.turn_dir) ~= "string" or turn.turn_dir == "" then
+			local err = "buffer-only turn carries no pinned private turn directory"
+			pass.diary_begin_halted = err
+			return nil, err
+		end
+		diary_begin = vim.tbl_extend("force", {}, diary_begin, {
+			diary_dir = turn.turn_dir .. "/home-buffer-diary",
+		})
+	end
+	local session, berr = diary.begin(diary_begin)
 	if not session then
 		pass.diary_begin_halted = berr or "opening the durable journal failed"
 		return nil, pass.diary_begin_halted

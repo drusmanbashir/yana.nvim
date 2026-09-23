@@ -39,7 +39,7 @@ stable: `ask` appears as **Ask**, `inline` as **Inline**, and `agentic` as
 | `<M-r>` | Resend the last prompt |
 | `<C-g>` | Pick the agent CLI, then its model |
 | `<C-y>` | Open review for a pending change |
-| `<C-a>` / `<C-x>` | Accept / reject a pending change |
+| `<C-x>` | Reject a pending change |
 | `<C-c>` | Stop the in-flight response (prompt and conversation window) |
 | `<M-s>` | Pick a session |
 | `<M-n>` | Open an additional panel |
@@ -49,13 +49,13 @@ stable: `ask` appears as **Ask**, `inline` as **Inline**, and `agentic` as
 | `i` | Focus the prompt |
 | `q` | Close the panel |
 
-### Global — set these yourself; unset by default
+### Global — `<C-a>` toggles the sidebar by default
 
 | Setting (`mappings`) | Example | Action |
 |---|---|---|
-| `toggle` | `<leader>cc` | Open/close the panel from any buffer |
-| `ask` | `<leader>ca` | Ask about the current line/selection (normal + visual) |
-| `inline_edit` | `<C-k>` | Inline edit the visual selection |
+| `toggle` | `<C-a>` | Open/close the panel from any normal-mode buffer, including the panel |
+| `ask` | `<leader>ca` | Ask about the current line/selection (normal + visual; unset by default) |
+| `inline_edit` | `<C-k>` | Inline edit the visual selection (unset by default) |
 
 ## Commands
 

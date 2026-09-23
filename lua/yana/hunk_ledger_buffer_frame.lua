@@ -62,7 +62,8 @@ end
 local function frame_of(block, deep)
 	local fields = {}
 	for key, value in pairs(block) do
-		if not EXTMARK_HANDLES[key] then
+		if not EXTMARK_HANDLES[key]
+			and (type(key) ~= "string" or key:sub(1, 10) ~= "_timeline_") then
 			if deep and key == "owned_rows" then
 				-- The one field whose entries are tables. `copy_value` copies the
 				-- array and would leave the frame sharing every owner with the live

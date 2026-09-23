@@ -1,13 +1,9 @@
--- The reconcile-and-accept core of the shadow accept pass, split out of
--- shadow/apply.lua. Reachable under apply.lua's original names via its
--- facade; standalone/scope-revert accept calls into this module the same
--- way it always called these functions on the parent table.
+-- Reconcile-and-accept core of the shadow accept pass; apply.lua's facade
+-- re-exports it.
 local M = {}
 
--- Overwritten by the facade with the SAME table `apply.lua` exposes as
--- `M._test`, so a fault the parent's callers inject is the one
--- `reconcile_applied_buffer` here actually reads. This default only serves
--- apply_accept.lua required in isolation, e.g. by a unit test of its own.
+-- The facade overwrites this with apply.lua's own `M._test`, so an injected
+-- fault reaches the reads below.
 M._test = { inject = {}, fault = {} }
 
 local diary = require("yana.safety.diary")
@@ -16,11 +12,8 @@ local log = require("yana.log")
 local hash = require("yana.safety.hash")
 local apply_sessions = require("yana.shadow.apply_sessions")
 
---- Did this path move between the applier's own write and the buffer reconcile? Size,
---- mode, inode, and mtime and ctime at nanosecond resolution: movement in ANY of them
---- is movement. This is a two-stat comparison over ONE path the applier has just
---- written — not a workspace pass — and it exists only so the reconcile refuses to
---- touch a buffer whose file something else has changed since.
+--- Did this one path move between the applier's write and the buffer reconcile?
+--- Size, mode, inode, mtime, ctime at nanosecond resolution.
 local function stat_unmoved(a, b)
 	if not a or not b then
 		return false
@@ -37,38 +30,16 @@ local function stat_unmoved(a, b)
 end
 
 --- Bring the review buffer for a just-applied path back in step with the file
---- the applier wrote.
+--- the applier wrote, so a stale mtime cannot raise the BLOCKING W12/W13
+--- changed-on-disk dialog on the next `checktime`. Called per file; disk ->
+--- buffer only, so the diary stays the sole real-tree writer.
 ---
---- Without this, accepting a file in shadow-apply mode stalls the rest of the turn. The
---- applier renames new bytes over the real path; a review buffer the human refined is
---- left `modified`, against the mtime Vim recorded before the rename. The next bare
---- `checktime` — and `diff.reload_file` runs one every time a review opens — then finds
---- that buffer changed on disk AND changed in Vim, and raises the BLOCKING W12 dialog
---- (W13 for an agent-created file).
----
---- Two things this is deliberately not:
----
---- * Not a second door into the real tree. Bytes travel disk -> buffer only. No write,
---- no save, no create; the diary stays the sole real-tree writer.
----
---- Called from `accept_composed` itself rather than returned to the caller to
---- perform. That was the first shape, and the Oracle adapter found the flaw in
---- it within one run: a harness that dropped the extra return value turned the
---- whole fix into a silent no-op. Nothing a caller can forget to propagate can
---- leave the applier having written underneath a buffer that still describes
---- the pre-write file.
----
---- Per-file, not once when the pass completes. The applier acts per file and
---- the next review opens immediately after, so a reconcile owed until pass end
---- is owed across exactly the review opens that deadlock. And review-apply
---- states that multi-file acceptance is resumable, not atomic: a pass can be
---- refused or abandoned half way and never complete, so an end-of-pass
---- reconcile is a debt that may never be paid on the runs that need it most.
-function M.reconcile_applied_buffer(applied)
+--- `own_splice(bufnr, fn)` comes from the accept caller and carries EVERY
+--- buffer replacement below; absent, they splice plain.
+function M.reconcile_applied_buffer(applied, own_splice)
 	if not applied or applied.kind ~= "replace" then
-		-- An accepted deletion leaves no file to reconcile against. Neovim
-		-- reports a vanished file as the non-blocking E211 message, never a
-		-- dialog, so nothing is owed here.
+		-- Nothing to reconcile against, and a vanished file is the
+		-- non-blocking E211 message, never a dialog.
 		return true
 	end
 	local bufnr = vim.fn.bufnr(applied.path, false)
@@ -86,32 +57,44 @@ function M.reconcile_applied_buffer(applied)
 
 	local tick_pinned = vim.api.nvim_buf_get_changedtick(bufnr)
 
-	-- THE UNSAVED-EDITS GUARD. What actually distinguishes a genuine independent edit is
-	-- disagreeing with BOTH fingerprints this turn knows about:
+	-- THE UNSAVED-EDITS GUARD. A modified buffer matching `applied.base_hash`
+	-- (the pre-turn file), `applied.target_hash` (the turn's own result) or
+	-- `applied.staged_hash` (the exact proposal this review had painted, pinned
+	-- by the caller before its claim) loses nothing by replacement. Matching
+	-- NONE of them is an independent human edit: refuse, leaving disk accepted
+	-- and their bytes untouched. A caller carrying no fingerprint at all
+	-- reconciles unconditionally.
 	--
-	--   * `applied.base_hash` (== `change.base_hash`, the drift guard in
-	--     accept_composed already refuses to accept without it) -- the
-	--     buffer is exactly the pre-turn file, untouched.
-	--   * `applied.target_hash` -- the buffer already IS the turn's own
-	--     result, whether because inline review put it there or because a
-	--     caller passed a buffer already carrying it.
-	--
-	-- Matching either means replacing it with the applier's bytes discards nothing (the
-	-- second case does not even change anything visible). Matching NEITHER means the human
-	-- changed this buffer independently of this turn, and `nvim_buf_set_lines` below would
-	-- silently overwrite their work the instant it ran. Refuse instead: disk already
-	-- carries the accepted change (the diary is the sole real-tree writer and already
-	-- wrote it), but the buffer -- and the human's bytes in it -- are left exactly as they
-	--
-	-- Neither fingerprint present at all (not "both absent because they happen to be nil",
-	-- but a CALLER that never carries this turn's context, e.g. `timeline/walk_impl.lua`'s
-	-- post-revert reconcile) is a caller that has not opted into this guard, not a caller
-	-- with something to hide -- it gets the pre-guard behaviour, unconditional reconcile,
-	-- unchanged. Row 70 owns the ACCEPT path (`accept_composed`, `accept_standalone`),
-	-- which always supplies `base_hash`; a walk step reconciling the buffer to a disk
-	if
+	-- `staged_hash` is why a turn-exit reconcile is possible at all. At End the
+	-- review buffer is SUPPOSED to differ from both disk fingerprints -- it
+	-- still shows the proposal -- so without it every End with a visible hunk
+	-- was refused as a human edit that never happened. It is a third exact
+	-- value, not a relaxation: the buffer is re-read here, AFTER the claim, and
+	-- an edit made since the pin does not match it.
+	-- A PINNED TURN BUFFER IS JUDGED BY ITS PIN, AND ONLY BY ITS PIN. When the
+	-- caller supplied `staged_tick` this is a turn-exit reconcile of one exact
+	-- buffer, so the edit counter must still be that one. Matching bytes are
+	-- not enough (changed during the claim wait and put back) and the generic
+	-- base-hash allowance must not rescue it either: a deliberate return to the
+	-- pre-turn text during the wait is a new action, not permission to
+	-- overwrite. Refuse, and leave the buffer and its tick exactly as they are.
+	if applied.staged_tick ~= nil and not (M._test.fault and M._test.fault.skip_unsaved_guard) then
+		local live_tick = vim.api.nvim_buf_get_changedtick(bufnr)
+		if live_tick ~= applied.staged_tick then
+			return false,
+				"the buffer has unsaved edits of its own; disk was updated with the accepted change "
+					.. "but the buffer was left untouched so your edits are not lost -- save or discard them, "
+					.. "then reload to see the accepted change"
+		end
+		local snap = diff.buffer_bytes_snapshot(bufnr)
+		if snap == nil or hash.hash_bytes(snap) ~= applied.staged_hash then
+			return false,
+				"the review buffer no longer matches the proposal this turn pinned; "
+					.. "the buffer was left untouched"
+		end
+	elseif
 		vim.bo[bufnr].modified
-		and (applied.base_hash or applied.target_hash)
+		and (applied.base_hash or applied.target_hash or applied.staged_hash)
 		and not (M._test.fault and M._test.fault.skip_unsaved_guard)
 	then
 		local snap, snap_err = diff.buffer_bytes_snapshot(bufnr)
@@ -122,7 +105,11 @@ function M.reconcile_applied_buffer(applied)
 					.. "; the buffer was left untouched"
 		end
 		local snap_hash = hash.hash_bytes(snap)
-		if snap_hash ~= applied.base_hash and snap_hash ~= applied.target_hash then
+		if
+			snap_hash ~= applied.base_hash
+			and snap_hash ~= applied.target_hash
+			and snap_hash ~= applied.staged_hash
+		then
 			return false,
 				"the buffer has unsaved edits of its own; disk was updated with the accepted change but the buffer was left untouched so your edits are not lost -- save or discard them, then reload to see the accepted change"
 		end
@@ -138,9 +125,7 @@ function M.reconcile_applied_buffer(applied)
 		end
 	end
 
-	-- Buffer-native reconcile: one undo-atomic edit that installs the applier's
-	-- verified bytes, without `edit!` reload churn. Disk was already written by
-	-- the journaled rename; this is presentation only.
+	-- One undo-atomic edit installing bytes disk already holds.
 	local disk, derr = diff.read_file_bytes(applied.path)
 	if disk == nil then
 		return false, tostring(derr or "the applied file could not be read for buffer reconcile")
@@ -159,29 +144,37 @@ function M.reconcile_applied_buffer(applied)
 		return false, "the review buffer changed during reconcile; the buffer was left unreconciled"
 	end
 
-	-- Disk can move while the buffer is being replaced, which is why nothing is
-	-- decided from the bytes read above. The mutation happens first; the
-	-- observation that licenses clearing `modified` happens after it.
+	-- Disk can move while the buffer is replaced: mutate first, observe after.
 	if M._test.inject and M._test.inject.disk_write_after_second_stat then
 		diff.write_file(applied.path, M._test.inject.disk_write_after_second_stat)
 	end
 
 	local wants_eol = disk:match("\n$") ~= nil
+	local verified_lines = vim.split(disk, "\n", { plain = true })
+	if disk:sub(-1, -1) == "\n" and #verified_lines > 0 and verified_lines[#verified_lines] == "" then
+		table.remove(verified_lines)
+	elseif disk == "" then
+		verified_lines = {}
+	end
+	-- THE ONE WAY THE VERIFIED BYTES ENTER THE BUFFER: yana's own splice, not a
+	-- human edit; both replacements below owe the review the same door.
+	local function own_replacement()
+		local replace = function()
+			vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, verified_lines)
+		end
+		if type(own_splice) == "function" then
+			own_splice(bufnr, replace)
+		else
+			replace()
+		end
+	end
 	local ok, err = pcall(vim.api.nvim_buf_call, bufnr, function()
-		-- `:undojoin` acts on the CURRENT buffer, which is why the fault
-		-- injection lives inside this `nvim_buf_call` rather than beside it:
-		-- outside, "current" could be whatever buffer the editor happened to
-		-- be on, not `bufnr`, and the join would land on the wrong undo tree.
+		-- `:undojoin` acts on the CURRENT buffer, so this injection must sit
+		-- inside the `nvim_buf_call` or it joins the wrong undo tree.
 		if M._test.fault and M._test.fault.force_undojoin then
 			vim.cmd("keepjumps silent! undojoin")
 		end
-		local lines = vim.split(disk, "\n", { plain = true })
-		if disk:sub(-1, -1) == "\n" and #lines > 0 and lines[#lines] == "" then
-			table.remove(lines)
-		elseif disk == "" then
-			lines = {}
-		end
-		vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, lines)
+		own_replacement()
 		vim.bo[bufnr].fixendofline = wants_eol
 		vim.bo[bufnr].endofline = wants_eol
 	end)
@@ -198,19 +191,9 @@ function M.reconcile_applied_buffer(applied)
 		return false, tostring(err)
 	end
 
-	-- THE AGREEMENT IS PROVEN AFTER THE MUTATION, AGAINST CURRENT DISK.
-	--
-	-- review-apply: "afterwards buffer and disk agree". The earlier stat and read
-	-- are what the buffer was built FROM; they say nothing about the file now.
-	-- Comparing the new buffer against those cached bytes proved only that
-	-- `nvim_buf_set_lines` did what it was told, so anything that landed on disk
-	-- during the replacement left buffer and disk different while the buffer was
-	-- marked clean — the one thing clearing `modified` is a promise against.
-	--
-	-- So: re-stat for identity, re-read for bytes, compare the buffer to THAT,
-	-- and only then clear the flag. A refusal leaves the buffer modified, which
-	-- keeps the human's changed-on-disk prompt armed and their text unsaved but
-	-- intact.
+	-- THE AGREEMENT IS PROVEN AFTER THE MUTATION, AGAINST CURRENT DISK: the
+	-- earlier stat and read say what the buffer was built FROM, not what the
+	-- file is now. A refusal leaves the buffer modified, prompt armed.
 	local skip_final = M._test.fault and M._test.fault.reconcile_skip_final_verify
 	local buf_text = table.concat(vim.api.nvim_buf_get_lines(bufnr, 0, -1, false), "\n")
 	if wants_eol then
@@ -233,23 +216,29 @@ function M.reconcile_applied_buffer(applied)
 	end
 
 	vim.bo[bufnr].modified = false
-	-- The buffer is now backed by a real file from the START -- the touch happens at
-	-- proposal time -- so the stamp is never that, and a created file takes the same
-	-- silent `checktime` restamp every existing file takes, just below. Re-stamp the
-	-- buffer's view of the file mtime without reloading or raising changed-on-disk
-	-- prompts. `edit!` did this implicitly; here the bytes already match disk and only the
-	-- timestamp cache is stale.
-	--
-	-- KNOWN RESIDUAL (documented, not fixed here -- see SYNC-70 in tests/tests.md):
-	-- 'autoread' defaults ON in Neovim, so this unmodified buffer takes `:checktime`'s
-	-- SILENT-RELOAD branch regardless of whether the FileChangedShell autocmd fired -- it
-	-- re-reads the file and replaces the buffer wholesale. Bytes come out identical (we
-	-- just wrote them ourselves), but the replace registers as a second, redundant undo
-	-- state on top of the one this function just made. Fixing this belongs beside that
+	-- Re-stamp the buffer's view of the file mtime: bytes already match disk,
+	-- only the stamp is stale. EVERY event is ignored across it -- 'autoread'
+	-- sends `:checktime` down its silent-reload branch, which would otherwise
+	-- run yana's own review autocmds.
 	local ei = vim.o.eventignore
-	vim.o.eventignore = "FileChangedShell,FileChangedShellPost"
+	vim.o.eventignore = "all"
 	pcall(vim.cmd, "silent! checktime " .. bufnr)
 	vim.o.eventignore = ei
+
+	-- THE RESTAMP IS NOT ALLOWED TO MOVE THE BYTES: a buffer disagreeing with
+	-- disk while flagged clean is what clearing `modified` promises against.
+	-- Prove it again, repair by re-splicing, refuse if that fails.
+	local restamped = table.concat(vim.api.nvim_buf_get_lines(bufnr, 0, -1, false), "\n")
+	if wants_eol then
+		restamped = restamped .. "\n"
+	end
+	if restamped ~= buf_text then
+		local repaired = pcall(own_replacement)
+		if not repaired then
+			return false, "the buffer was reloaded away from the file during the mtime restamp"
+		end
+		vim.bo[bufnr].modified = false
+	end
 
 	if vim.bo[bufnr].modified then
 		return false, "the review buffer is still flagged modified after reload"
@@ -257,64 +246,54 @@ function M.reconcile_applied_buffer(applied)
 	return true
 end
 
-local function mode_perm(mode)
-	return mode and (mode % 4096) or nil
+--- THE EXPLICIT WRITE DESCRIPTION both accept routes consume:
+--- `{action, bytes, mode, purpose, preserve_review}`. `turn.turn_projection`
+--- is the ONE calculation of final bytes, existence and mode; this only
+--- NORMALISES it, never reading `change.kind` or `change.after_mode`.
+--- `opts.projection`'s `mode` is the ONLY thing that can authorise a
+--- permission change; a bare `composed` keeps the original mode.
+function M.write_plan(change, composed, opts)
+	if type(change) ~= "table" then
+		return nil, "an accept needs a change record"
+	end
+	local supplied = opts and opts.projection
+	if type(supplied) == "table" then
+		local action = supplied.action
+		if action ~= "replace" and action ~= "delete" and action ~= "none" then
+			return nil, "projection action must be replace, delete or none, got " .. tostring(action)
+		end
+		local bytes = ""
+		if action == "replace" then
+			bytes = supplied.bytes
+			if type(bytes) ~= "string" then
+				return nil, "projection action replace carries no bytes for " .. tostring(change.path)
+			end
+		end
+		return {
+			action = action,
+			bytes = bytes,
+			mode = supplied.mode,
+			purpose = supplied.purpose,
+			preserve_review = supplied.preserve_review == true,
+		}
+	end
+	return {
+		action = composed == nil and "delete" or "replace",
+		bytes = composed or "",
+		mode = change.base_mode,
+		purpose = nil,
+		preserve_review = false,
+	}
 end
 
-function M.valid_loaded_buffer(bufnr)
-	return type(bufnr) == "number" and vim.api.nvim_buf_is_valid(bufnr) and vim.api.nvim_buf_is_loaded(bufnr)
-end
-
-function M.mode_delta(change)
-	if not change or not change.base_mode or not change.after_mode then
-		return false
-	end
-	return mode_perm(change.base_mode) ~= mode_perm(change.after_mode)
-end
-
--- Refuse a single-file accept when its buffer is closed, stale, or retyped.
-function M.single_file_accept_refusal(change, staged_bufnr)
-	if not (change and change.single_file) then
-		return nil
-	end
-	local name = vim.fn.fnamemodify(change.single_file.real_path or change.path or "file", ":t")
-	if not M.valid_loaded_buffer(staged_bufnr) then
-		return "single-file mode: the buffer is closed — reopen " .. name .. " and decide again"
-	end
-	-- Compared against change.after (the AGENT'S proposed full file), not the
-	-- caller's just-taken snapshot of this same buffer.
-	local live = diff.buffer_bytes_snapshot(staged_bufnr)
-	if live ~= change.after then
-		return "single-file mode: buffer differs from the composed review — decide again"
-	end
-	if change.kind == "delete" or change.before == nil or M.mode_delta(change) then
-		return "single-file mode: only " .. name .. " may change (refused " .. tostring(change.rel or name) .. ")"
-	end
-	return nil
-end
-
-local function transfer_preflight(pass, change)
-	-- Any structured refusal detail is from a PREVIOUS attempt on this change;
-	-- clearing it here means a refusal is only ever labelled by evidence this
-	-- attempt actually gathered.
+local function accept_preflight(pass, change)
+	-- Detail from a PREVIOUS attempt: a refusal is labelled only by evidence
+	-- this attempt gathered.
 	change.shadow_refusal = nil
-	-- THE DRIFT EVIDENCE, per touched path. CORE: "A human-changed target is
-	-- refused by name; both versions are retained. The human's change is
-	-- detected per touched path, by content fingerprint, read immediately
-	-- before the write."
-	--
-	-- `change.base_hash` is the fingerprint of the before-bytes the review was
-	-- built on, captured by the change-set producer from the LOWER layer. The
-	-- diary re-reads the real file and compares against it one step before the
-	-- rename, which is the "immediately before the write" half. No turn-start
-	-- whole-workspace record is consulted, because none is taken.
-	--
-	-- Absent evidence refuses. The previous route defaulted a missing entry to
-	-- the empty hash, which was correct for an agent-created file under a
-	-- whole-tree manifest — every existing file was in it, so absence MEANT
-	-- non-existence. Under a per-path producer absence means the producer did
-	-- not run, and defaulting to the empty hash would authorise overwriting a
-	-- file whose contents were never examined.
+	-- THE DRIFT EVIDENCE, per touched path (CORE): a human-changed target is
+	-- refused by name, detected by content fingerprint read immediately before
+	-- the write. `change.base_hash` is that fingerprint. Absent evidence
+	-- refuses: an empty-hash default would overwrite a file nobody examined.
 	if change.base_hash == nil then
 		return false,
 			"refusing to accept "
@@ -322,11 +301,8 @@ local function transfer_preflight(pass, change)
 				.. ": the change set carries no before-fingerprint for it, so drift cannot be judged"
 	end
 
-	-- THE FILE CLAIM, paired with the drift guard above at the SAME accept step:
-	-- the fingerprint answers "is the file the one this review was prepared
-	-- against", and this answers "is anybody else already reviewing it".
-	-- Removing this one line is the mutation
-	-- tests/suite/p108_second_editor_clobber.lua drives.
+	-- THE FILE CLAIM, at the SAME accept step as the drift guard: is anybody
+	-- else already reviewing this file?
 	local claim_refusal = apply_sessions.file_claim_refusal(pass, change)
 	if claim_refusal then
 		return false, claim_refusal
@@ -334,77 +310,51 @@ local function transfer_preflight(pass, change)
 	return true
 end
 
--- Check drift/claim, then describe a transfer of a buffer's existing bytes.
-function M.accept_transfer(pass, change, composed, bufnr)
-	local ok, err = transfer_preflight(pass, change)
-	if not ok then
-		return false, err
-	end
-	return true, nil, {
-		kind = "transfer",
-		path = change.path,
-		bufnr = bufnr,
-		composed_hash = hash.hash_bytes(composed or ""),
-	}
-end
+M.accept_preflight = accept_preflight
 
---- Accept composed file content (post-hunk review) through the diary.
-function M.accept_apply(pass, change, composed)
-	local ok, err = transfer_preflight(pass, change)
-	if not ok then
-		return false, err
+--- THE ONE GUARDED DIARY WRITE: both accept routes reach disk through exactly
+--- this body -- intent row with the drift CAS, displaced copy, post-rename
+--- verification, receipt. `plan.preserve_review` withholds the BUFFER
+--- RECONCILE only, never a disk identity or content check. `own_splice` is an
+--- argument only: never onto `plan` or `applied`.
+---
+--- Returns `true, nil, applied` or `false, reason`. `applied.reconcile_error`
+--- marks the committed-but-unreadable case: it IS on disk, so keep the
+--- `{diary_dir, op_id}` receipt, never blindly repeat it.
+function M.commit(session, change, plan, own_splice, staged_proof)
+	if plan.action == "none" then
+		-- No shortcut around a write: the projection owner compared the
+		-- target against verified disk evidence.
+		return true, nil, { path = change.path, kind = "none", written = false }
 	end
-	-- THE ACTION WAITING FOR ITS DURABLE STATE. The journal is opened here, on
-	-- the accept, rather than when the review opened. It is opened BEFORE the
-	-- checkpoint, because the checkpoint writes inside the diary directory the
-	-- `begin` row names; a failure here returns without touching anything, so
-	-- the change stays offered and the accept stays retryable.
-	local root = apply_sessions.change_root(pass, change)
-	local session, serr = apply_sessions.session_for_root(pass, root)
-	if not session then
-		return false, serr
-	end
-	local ok, err = apply_sessions.ensure_checkpoint(pass, root)
-	if not ok then
-		return false, err
-	end
-	-- A deletion is a typed operation, not a write of empty content.
-	local is_delete = change.kind == "delete"
-	-- The op id this intent will take, predicted exactly as diary.next_op_id mints it
-	-- (safety/diary.lua: `stream:op_seq+1`). Carried out on `applied` so the timeline can
-	-- record a durable row the walk can later revert by (diary_dir, op_id).
+	local is_delete = plan.action == "delete"
+	-- Predicted as diary.next_op_id mints it, so the timeline can revert by
+	-- (diary_dir, op_id).
 	local predicted_op_id = string.format("%s:%d", session.stream, (session.op_seq or 0) + 1)
 	local ok, err = diary.intent({
 		session = session,
 		path = change.path,
-		target = is_delete and "" or (composed or ""),
+		target = plan.bytes,
 		op_kind = is_delete and "delete" or "replace",
 		base_hash = change.base_hash,
-		-- WHEN that fingerprint was captured (shadow/ops.lua's producer read),
-		-- carried through so a stale-file refusal can tell a human edit from a
-		-- stale capture rather than punting on the distinction.
+		-- WHEN it was captured, so a stale-file refusal tells a human edit
+		-- from a stale capture.
 		base_hash_captured_ts = change.base_hash_captured_ts,
-		-- The producer's before-state TAG travels with the fingerprint. Absence
-		-- and an empty file are different states, and only the tag separates
-		-- them at accept time.
+		-- Absence and an empty file are different states; only this tag
+		-- separates them at accept time.
 		base_state = change.base_state,
 		base_mode = change.base_mode,
 		base_link_target = change.base_link_target,
-		target_mode = change.after_mode,
+		-- THE MODE VERDICT, AND NOTHING ELSE: `change.after_mode` is the
+		-- agent's PROPOSAL and is never read here.
+		target_mode = plan.mode,
 		record_only = true,
 	})
 	if not ok then
 		return false, err
 	end
-	-- The structured mismatch, carried out of the diary. The recording site for
-	-- a refusal lives in the review engine, which never sees the diary's
-	-- evidence; without this it recorded the generic `shadow_accept_failed`
-	-- with no fingerprint pair, so the DEFAULT (shadow) drift refusal said less
-	-- than the legacy in-place one. Attached to the change because the change is
-	-- the one object both layers already hold.
-	--
-	-- Cleared first: a change can be retried, and a stale detail from an earlier
-	-- attempt would label the next refusal with fingerprints nobody compared.
+	-- The structured mismatch, carried out of the diary onto the change: the
+	-- review engine never sees the diary's own evidence.
 	local detail
 	ok, err, detail = diary.apply_pending({
 		session = session,
@@ -416,29 +366,39 @@ function M.accept_apply(pass, change, composed)
 		end
 		return false, err
 	end
-	-- The stat is read HERE, immediately after the diary's own post-rename
-	-- verification, so the reconcile below can prove nothing else has touched
-	-- the path since — and refuse if anything has.
+	-- Read immediately after the diary's post-rename verification, so the
+	-- reconcile can prove nothing else touched the path.
 	local uv = vim.uv or vim.loop
 	local applied = {
 		path = change.path,
 		kind = is_delete and "delete" or "replace",
 		stat = (not is_delete) and uv.fs_stat(change.path) or nil,
-		-- Durable identity for the timeline. op_id alone is not unique across
-		-- diaries (every new diary restarts the sequence at zero), so the
-		-- directory travels with it.
+		-- op_id alone is not unique across diaries, so the directory travels
+		-- with it.
 		diary_dir = session.diary_dir,
 		op_id = predicted_op_id,
-		-- The two fingerprints the unsaved-edits guard in
-		-- reconcile_applied_buffer checks a modified buffer against before
-		-- overwriting anything: what the review was built FROM, and what
-		-- this call is installing (inline review composes that INTO the
-		-- buffer itself, so a modified buffer already carrying it is the
-		-- normal case, not a divergent edit).
+		-- What the unsaved-edits guard checks a modified buffer against:
+		-- what the review was built FROM, and what this call installs.
 		base_hash = change.base_hash,
-		target_hash = hash.hash_bytes(is_delete and "" or (composed or "")),
+		target_hash = hash.hash_bytes(plan.bytes),
+		-- The exact bytes the review had staged when the caller pinned them,
+		-- just before the claim. Present only for a turn-exit settlement.
+		staged_hash = type(staged_proof) == "table" and staged_proof.hash or nil,
+		-- The pin's edit counter. Bytes alone cannot prove the buffer was
+		-- untouched: an operator can change it during the claim wait and put it
+		-- back, and the hash would agree while the undo history, marks and
+		-- extmarks have all moved underneath the review.
+		staged_tick = type(staged_proof) == "table" and staged_proof.tick or nil,
+		written = true,
+		purpose = plan.purpose,
 	}
-	local rok, rerr = M.reconcile_applied_buffer(applied)
+	if plan.preserve_review then
+		-- Buffer and file are SUPPOSED to differ here, so reconciling would
+		-- overwrite the live review. The diary's own checks already ran.
+		applied.preserved_review = true
+		return true, nil, applied
+	end
+	local rok, rerr = M.reconcile_applied_buffer(applied, own_splice)
 	if not rok then
 		applied.reconcile_error = rerr
 		log.write(
@@ -453,32 +413,35 @@ function M.accept_apply(pass, change, composed)
 	return true, nil, applied
 end
 
--- Accept a change: reuse a matching buffer via transfer, else full apply.
+--- Accept a change on an apply pass: preflight, open this root's journal and
+--- checkpoint, then take the one guarded diary write. No transfer-only
+--- shortcut: a staged buffer holding the bytes is not an accept.
 function M.accept_composed(pass, change, composed, opts)
-	opts = opts or {}
-	local staged_bufnr = opts.staged_bufnr
-	if change and change.single_file then
-		local refusal = M.single_file_accept_refusal(change, staged_bufnr)
-		if refusal then
-			return false, refusal
-		end
-		return M.accept_transfer(pass, change, composed, staged_bufnr)
+	local plan, perr = M.write_plan(change, composed, opts)
+	if not plan then
+		return false, perr
 	end
-	if M.valid_loaded_buffer(staged_bufnr) then
-		local live = diff.buffer_bytes_snapshot(staged_bufnr)
-		if live == composed and change and change.kind ~= "delete" and not M.mode_delta(change) then
-			return M.accept_transfer(pass, change, composed, staged_bufnr)
-		end
-		if live ~= composed then
-			log.write(
-				log.levels.WARN,
-				"yana: staged buffer mismatch for " .. tostring(change and change.path or "?") .. " -- written at accept"
-			)
-		elseif M.mode_delta(change) then
-			log.write(log.levels.WARN, "yana: mode change — written at accept (trash gate pending)")
-		end
+	local ok, err = accept_preflight(pass, change)
+	if not ok then
+		return false, err
 	end
-	return M.accept_apply(pass, change, composed)
+	if plan.action == "none" then
+		-- A pass that writes nothing opens neither journal nor checkpoint.
+		return M.commit(nil, change, plan, opts and opts.own_splice, opts and opts.staged_proof)
+	end
+	-- The journal opens BEFORE the checkpoint, which writes inside the diary
+	-- directory the `begin` row names. A failure here leaves the accept
+	-- retryable.
+	local root = apply_sessions.change_root(pass, change)
+	local session, serr = apply_sessions.session_for_root(pass, root)
+	if not session then
+		return false, serr
+	end
+	ok, err = apply_sessions.ensure_checkpoint(pass, root)
+	if not ok then
+		return false, err
+	end
+	return M.commit(session, change, plan, opts and opts.own_splice, opts and opts.staged_proof)
 end
 
 return M

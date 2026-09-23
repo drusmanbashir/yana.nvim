@@ -27,9 +27,15 @@ function I.begin_turn(opts)
 		return nil, jail.OVERLAY_UNAVAILABLE_MSG
 	end
 	local turn_mode = config.resolve_mode(opts.mode or config.options.mode)
+	-- Resolve the open-capture mode once at turn start. The launcher receives
+	-- this pinned value through the session; it must not re-read mutable config
+	-- or infer a second backend selector.
+	local open_capture_mode = config.resolve_open_capture_mode(opts.open_capture_mode)
 
-	local candidate = deps.workspace.workspace_candidate(opts)
-	local flags = opts.single_file_flags or {}
+	local flags = opts.launch_flags or opts.single_file_flags or {}
+	if flags.file then
+		return nil, "Yana --file is retired; open the file normally or use --workspace DIR"
+	end
 	if flags.workspace and flags.workspace ~= "" then
 		opts.workspace = flags.workspace
 	end
@@ -44,47 +50,13 @@ function I.begin_turn(opts)
 	if declared == nil then
 		declared = config.options.write_roots
 	end
-	local single_file_decision
-	if not (flags.workspace and flags.workspace ~= "") then
-		local single_file = require("yana.single_file")
-		local decision, derr = single_file.decide({
-			real_path = deps.workspace.buffer_real_path(opts),
-			candidate_dir = candidate,
-			flags = flags,
-		})
-		if derr then
-			return nil, derr
-		end
-		if decision then
-			if type(declared) == "table" and #declared > 0 then
-				return nil, "single-file mode: declared write roots are not available"
-			end
-			local materialised, merr = single_file.materialise(decision, deps.state_root())
-			if not materialised then
-				return nil, merr
-			end
-			single_file_decision = decision
-			workspace = materialised.workspace
-			opts._single_file_materialised = materialised
-			require("yana.log").lifecycle("single_file_mode", {
-				trigger = decision.trigger,
-				real_path = decision.real_path,
-				scratch_ws = materialised.workspace,
-				flag_lifetime = "next turn only",
-			})
-		end
-	end
 
 	-- THE BROAD ROOT IS CHOSEN BEFORE ANY PER-TURN STATE EXISTS, for the same
 	-- reason the declared set is: a turn that cannot have the scope it was
 	-- configured for must not leave a layer, a claim or a turn directory behind
 	-- for the next one to trip over.
 	local broad_root, broad_why
-	if opts._single_file_materialised then
-		broad_root = workspace
-	else
-		broad_root, broad_why = deps.workspace.broad_root_for(workspace, declared)
-	end
+	broad_root, broad_why = deps.workspace.broad_root_for(workspace, declared)
 	if not broad_root then
 		return nil, broad_why
 	end
@@ -144,25 +116,15 @@ function I.begin_turn(opts)
 		upper_dir = nil,
 		yanad_session_id = yanad_session_id,
 		mode = turn_mode,
+		open_capture_mode = open_capture_mode,
+		read_only_workspace = opts.read_only_workspace == true,
 		-- Under yanad, reclaim evidence comes from status, not disk holder files.
 		reclaimed_from = nil,
 		roots = roots,
 		refused_bytes = 0,
 		refused_retained = {},
 	}
-	if opts._single_file_materialised then
-		session.single_file = {
-			trigger = single_file_decision.trigger,
-			real_path = single_file_decision.real_path,
-			candidate_dir = single_file_decision.candidate_dir,
-			workspace = workspace,
-			copy_path = opts._single_file_materialised.copy_path,
-			records = opts._single_file_materialised.records,
-			map = opts._single_file_materialised.map,
-			base = opts._single_file_materialised.base,
-		}
-	end
-	local lifecycle = require("yana.turn_lifecycle")
+	local lifecycle = require("yana.turn.turn_lifecycle")
 	session.turn_pass = lifecycle.begin_turn({
 		panel_id = opts.panel_id or 0,
 		generation = opts.generation or opts.turn_gen or 0,

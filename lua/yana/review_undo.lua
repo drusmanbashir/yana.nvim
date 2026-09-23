@@ -1,5 +1,5 @@
 -- Open-review local undo and redo controls.
-local turn_register = require("yana.turn_register")
+local turn_register = require("yana.turn.turn_register")
 
 -- Hand-test tracing (tools/handtest). Inert unless YANA_HANDTEST_TRACE is set.
 local function _ht_trace(msg)
@@ -514,6 +514,8 @@ function Factory.new(deps)
 
     --- `<C-r>` inside an open review.
     local function redo_key()
+      local ready, reason = require("yana.review_watch").finalize(bufnr, state)
+      if not ready then undo_refuse("could not finish pending edit: " .. tostring(reason)); return false end
       -- LIFO: `U`'s last act was the turn sweep, so redo owes its removals first.
       if M._redo_staged_restores(state) then
         return
@@ -615,6 +617,8 @@ function Factory.new(deps)
     --- belonging to a FOREIGN turn is nothing for THIS turn too, since its payload died
     --- with the state object that pushed it.
     local function undo_key()
+      local ready, reason = require("yana.review_watch").finalize(bufnr, state)
+      if not ready then undo_refuse("could not finish pending edit: " .. tostring(reason)); return false end
       local workspace = change.review_workspace or (state.opts and state.opts.workspace) or vim.fn.getcwd()
       local register = turn_register.for_workspace(workspace)
       local live_turn = change.turn_id or change.turn_gen

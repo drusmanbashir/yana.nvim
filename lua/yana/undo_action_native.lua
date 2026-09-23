@@ -225,6 +225,9 @@ function Factory.new(env)
       stuck[#stuck + 1] = "paint: " .. tostring(repaint_err)
     end
     release_watcher(snapshot)
+    require("yana.review_undo_trace").capture("native_rollback", state, {
+      direction = direction, original_move = outcome, rollback = rollback,
+      byte_location = byte_location, stuck = stuck, reason = tostring(err) })
     if #stuck == 0 then
       return { ok = false, code = "rolled_back", changed = false,
         byte_location = byte_location, reason = tostring(err) }
@@ -263,6 +266,8 @@ function Factory.new(env)
     local snapshot = capture_transaction()
     state.watch_suspended = true
     local outcome = move_history(command, suppress_rewind)
+    require("yana.review_undo_trace").capture("native_moved", state, {
+      direction = direction, outcome = outcome, expect_seq = expect_seq })
     if not outcome.ok then
       log.write("WARN", "yana.inline_diff native " .. direction .. ": " .. tostring(outcome.reason))
       release_watcher(snapshot)
@@ -306,6 +311,8 @@ function Factory.new(env)
     vim.schedule(function()
       release_watcher(snapshot)
     end)
+    require("yana.review_undo_trace").capture("native_settled", state, {
+      direction = direction, outcome = outcome })
     outcome.touched_blocks = touched
     return outcome
   end

@@ -1,13 +1,12 @@
--- yana: public API. A Cursor-style agent chat panel for Neovim powered by
--- the cursor-agent CLI.
+-- yana: public API for the Neovim agent chat panel.
 local config = require("yana.config")
 local log = require("yana.log")
 
 local M = {}
 
--- Lazily require the UI so that merely `require("yana")` is cheap.
+-- Lazy so that `require("yana")` stays cheap.
 local function ui()
-  return require("yana.ui")
+  return require("yana.panel.ui")
 end
 
 local SETUP_MISSING_MSG = "yana.setup() has not run — load the plugin (lazy) or call setup()"
@@ -20,12 +19,8 @@ local function require_setup()
   return false
 end
 
--- Wraps a plain message so Neovim's own top-level uncaught-error formatter (interactive
--- :lua, init.lua sourcing, `-l` script execution -- all of them route an uncaught error
--- through it) renders a clean one-liner instead of a full Lua stack traceback. Lua's
--- debug.traceback, which that formatter calls internally, only appends "stack
--- traceback:" when the thrown value IS a plain string; a non-string, non-nil value is
--- returned untouched. __tostring/__concat keep the object reading as `msg` everywhere a
+-- Wrap a message as a non-string error so Neovim's top-level formatter prints a clean
+-- one-liner without a Lua traceback; __tostring/__concat keep it reading as `msg`.
 local function clean_error(msg)
   return setmetatable({ message = msg }, {
     __tostring = function(self)
@@ -43,25 +38,13 @@ local function clean_error(msg)
   })
 end
 
--- THE COMPOSITION ROOT. The one place that decides which build of yana this
--- session is, and the only place allowed to load a debug module.
---
--- `factory` -- the default, every user, every gate, every release -- takes the
--- early return below, so no `yana.debug_*` chunk is ever loaded into the
--- process and `package.loaded` proves it (`tests/yana_debug_profile_gate.sh`).
--- `debugger` is the SAME factory build with the modules named in
--- `config.debug_modules` attached on top; each one is `yana.debug_<name>` and
--- gets exactly one `attach(log)` call, with the factory logger handed to it so
--- its lines go into the SAME file, through the SAME append path, in event order.
---
--- Loading is separated from attaching on purpose: every module is resolved and
--- type-checked BEFORE any of them observes anything, so a misspelt name fails
--- setup with nothing half-attached behind it.
---
--- The `yana.profile` row is written LAST, and it is the first line of the log:
--- it names the profile that is actually running and the modules that actually
--- attached, never the ones that were asked for. Evidence readers refuse a log
--- whose first line is not this one (`tests/headless/xrec/record.sh`).
+-- THE COMPOSITION ROOT: the only place allowed to load a debug module.
+-- `factory` (default) returns early so no `yana.debug_*` chunk is ever loaded
+-- (`tests/yana_debug_profile_gate.sh`). `debugger` attaches `config.debug_modules`,
+-- each getting one `attach(log)` with the factory logger. Every module is resolved and
+-- type-checked BEFORE any attaches, so a bad name leaves nothing half-attached. The
+-- `yana.profile` row is written last and names what actually attached; evidence
+-- readers refuse a log whose first line is not this one.
 local function compose_profile()
   local profile = config.options.profile
   if profile ~= "debugger" then
@@ -90,12 +73,10 @@ end
 
 -- Validate Neovim version, apply config, wire keymaps/commands, log startup.
 function M.setup(opts)
-  local deps = require("yana.dependencies")
+  local deps = require("yana.runtime.dependencies")
   if vim.fn.has("nvim-" .. deps.minimum_neovim) == 0 then
-    -- Below the floor: refuse cleanly, not with a crash dump. Catch it, surface it once
-    -- on the real error channel, then re-raise via clean_error() so nothing downstream
-    -- decorates it -- setup() still genuinely does not return to an unprotected caller,
-    -- it just does so without the traceback. Nothing past this block runs.
+    -- Below the floor: surface once on the error channel, re-raise via clean_error()
+    -- so nothing downstream decorates it. Nothing past this block runs.
     local _, raw = pcall(function()
       error("yana requires Neovim " .. deps.minimum_neovim .. "+", 0)
     end)
@@ -107,22 +88,17 @@ function M.setup(opts)
   config.setup(opts)
   compose_profile()
 
-  -- Hand-authored setup{} values for write_roots etc. stay; this merges only the picker
-  -- keys.
+  -- Hand-authored setup{} values stay; this merges only the picker keys.
   pcall(function()
-    local persisted = require("yana.persisted_state")
+    local persisted = require("yana.runtime.persisted_state")
     persisted.apply_model_selection(config.options)
     if persisted.apply_write_roots(config.options) then
       config.options.write_roots = config.normalize_write_roots(config.options.write_roots)
     end
   end)
 
-  -- One canonical STARTUP event: the resolved configuration this session actually runs
-  -- with, not what was declared. Reproduction needs the operator's exact environment
-  -- (which agent binary resolve_cmd() found on THIS machine's PATH, whether the overlay
-  -- sandbox is present) and that is never available after the fact, so this is the
-  -- logging-guidance case where logging WINS over re-deriving it. Read-only:
-  -- resolve_cmd/available are queries, not decisions, so this never changes what
+  -- One canonical STARTUP event: the resolved configuration (agent binary on THIS
+  -- PATH, overlay availability) is not recoverable after the fact. Read-only queries.
   do
     local ok_jail, jail_available = pcall(function()
       return require("yana.shadow.jail").available()
@@ -153,13 +129,11 @@ function M.setup(opts)
     pcall(vim.api.nvim_set_hl, 0, name, { clear = true })
   end
 
-  -- Config-driven, unlike the always-on commands in plugin/yana.lua:
-  -- image_paste.enable must be able to remove the command entirely (not just
-  -- no-op it), and this is the one place config.options is known to be
-  -- final, so it lives here alongside global_keymaps below.
+  -- Config-driven: image_paste.enable must remove the command entirely, and this is
+  -- where config.options is final.
   if config.options.image_paste and config.options.image_paste.enable then
     vim.api.nvim_create_user_command("YanaPasteImage", function()
-      require("yana.recovery_entry").schedule(vim.fn.getcwd())
+      require("yana.runtime.recovery_entry").schedule(vim.fn.getcwd())
       log.guard("YanaPasteImage", function()
         M.paste_image()
       end)
@@ -199,16 +173,15 @@ function M.setup(opts)
   if gk.inline_edit and gk.inline_edit ~= "" then
     vim.keymap.set("x", gk.inline_edit, function()
       log.guard("yana global keymap inline_edit (visual)", function()
-        require("yana.inline_edit").open_visual()
+        require("yana.input.inline_edit").open_visual()
       end)
     end, { silent = true, desc = "yana: inline edit selection" })
   end
 
-  -- Capture set empty → one-line notify naming :YanaRoots (never a window). Deferred so
-  -- setup() itself stays non-blocking.
+  -- Empty capture set: one-line notify naming :YanaRoots; deferred so setup() stays non-blocking.
   vim.schedule(function()
     log.guard("yana capture-set empty notify", function()
-      require("yana.ui_roots").maybe_notify_on_empty()
+      require("yana.panel.ui_roots").maybe_notify_on_empty()
     end)
   end)
 
@@ -283,8 +256,7 @@ function M.pick_backend()
   ui().pick_backend()
 end
 
---- Convenience cascade: vendor picker, then model picker for that vendor.
---- Does not replace pick_backend / pick_model (those stay separate).
+--- Vendor picker, then model picker for that vendor.
 function M.pick_vendor_then_model()
   ui().pick_vendor_then_model()
 end
@@ -330,8 +302,7 @@ function M.queue()
   ui().pick_queue()
 end
 
--- Paste an image from the system clipboard into the current panel's prompt
--- (the image branch unconditionally; see :YanaPasteImage).
+-- Paste an image from the system clipboard into the current prompt.
 function M.paste_image()
   ui().paste_image()
 end
@@ -341,13 +312,12 @@ function M.diff_themes()
   require("yana.diff_preview").open()
 end
 
--- Ask about an explicit line range in a buffer.
--- buf 0 means current buffer. question may be nil (just attach context).
+-- Ask about a line range; buf 0 = current, question may be nil.
 function M.ask_range(buf, l1, l2, question)
   if not require_setup() then
     return
   end
-  local context = require("yana.context")
+  local context = require("yana.input.context")
   if buf == 0 then
     buf = vim.api.nvim_get_current_buf()
   end
@@ -363,23 +333,16 @@ function M.ask(question)
   ui().ask(nil, question)
 end
 
--- Inline edit ("Ctrl-K") over an explicit line range. buf 0 means current
--- buffer. instruction may be nil, in which case the instruction float opens.
+-- Inline edit over a line range; instruction nil opens the float.
 function M.edit_range(buf, l1, l2, instruction)
   if not require_setup() then
     return
   end
-  require("yana.inline_edit").open(buf, l1, l2, instruction)
+  require("yana.input.inline_edit").open(buf, l1, l2, instruction)
 end
 
-----------------------------------------------------------------------
--- diagnostics
-----------------------------------------------------------------------
 
--- Write the diagnostic bundle (every turn ledger as a flow report, review pool
--- state, decoration snapshot, diary introspection) and echo its path. Pure
--- reads plus the one report file; safe to run at any time, including with a
--- review open.
+-- Write the diagnostic bundle and echo its path. Read-only apart from the report file.
 function M.dump()
   local path, err = require("yana.dump").write()
   if not path then
@@ -390,8 +353,7 @@ function M.dump()
   return path
 end
 
--- Write the per-turn flow report (the shape the screencast ground truth uses)
--- and echo its path. `opts.open` splits it open afterwards.
+-- Write the per-turn flow report and echo its path; `opts.open` splits it open.
 function M.flow_report(opts)
   opts = opts or {}
   local lines = require("yana.flow_report").report_lines()
@@ -414,10 +376,8 @@ function M.flow_report(opts)
   return path
 end
 
--- Run the rung-1 render reconciliation on every open review and report it.
--- Identical to the invariant capture that runs after each render, so what this
--- prints is what production recorded. Reports at WARN at worst: a diagnostic
--- that raises an error notification is a diagnostic that changes behaviour.
+-- Run the render reconciliation on every open review. Reports at WARN at worst so
+-- the diagnostic never changes behaviour.
 function M.render_check()
   local results = require("yana.inline_diff").render_check()
   local notify = require("yana.notify")

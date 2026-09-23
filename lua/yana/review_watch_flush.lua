@@ -1,6 +1,39 @@
 -- Size split of review_watch.lua: the batch flush and the InsertLeave partition one attachment runs.
 local M = {}
 
+local function native_groups(changes, previous, flush_seq)
+  local groups, order = {}, {}
+  for _, change in ipairs(changes) do
+    local key = change.undo_marker
+    if key == nil then key = false end
+    local group = groups[key]
+    if not group then
+      group = { marker = change.undo_marker, changes = {} }
+      groups[key] = group
+      order[#order + 1] = group
+    end
+    group.changes[#group.changes + 1] = change
+  end
+  for i, group in ipairs(order) do
+    local label
+    if type(group.marker) == "number"
+      and (type(previous) ~= "number" or group.marker > previous)
+    then
+      label = group.marker
+    else
+      local successor = order[i + 1]
+      label = successor and successor.marker or nil
+      if type(previous) == "number" and type(label) == "number" and label <= previous then
+        label = nil
+      end
+    end
+    if type(label) ~= "number" then label = flush_seq end
+    group.seq = label
+    previous = label
+  end
+  return order
+end
+
 --- `env` carries exactly what the two functions closed over inside `attach`;
 --- `owns()` answers for THIS attachment's generation.
 function M.new(env)
@@ -13,7 +46,14 @@ function M.new(env)
   local reachable_seqs = env.reachable_seqs
   local clear_queue = env.clear_queue
   local diff = env.diff
+  local live_block_range = deps.live_block_range
   local absorb_human_edits = batch.interpret
+  local function publish_timeline(order, reachable)
+    local owner = require("yana.review_watch_timeline_prepare")
+    local context = { state = state, deps = deps, reachable = reachable }
+    local prepared = owner.prepare(context, order, state.watch_timeline)
+    owner.commit(context, prepared, state.watch_timeline)
+  end
   local function process_pending_watch()
     -- FIRST LINE, before anything is read off the state: a scheduled flush
     -- belonging to a retired attachment interprets nothing.
@@ -34,6 +74,17 @@ function M.new(env)
       return
     end
     if not state.hunk_ledger or not state.hunk_ledger:is_open() then return end
+    if state.watch_timeline then
+      state.watch_timeline:seal_live_ranges(state.bufnr, live_block_range)
+      assert(state.watch_timeline:matches_live(state.bufnr),
+        "watch timeline: captured bytes differ from final native buffer")
+      if state.watch_timeline.insert_session then
+        -- The callback has transported the provisional ledger, but the native
+        -- edit groups are still one open Insert session. InsertLeave resolves
+        -- ownership at each captured endpoint before publishing their records.
+        return
+      end
+    end
     -- ONE SCHEDULED FLUSH IS NOT ONE NATIVE SEQUENCE. `vim.schedule` fires
     -- once per event-loop turn, so a synchronous mapping that closes one undo
     -- sequence and opens another before yielding delivers BOTH sequences'
@@ -45,18 +96,6 @@ function M.new(env)
     -- timer's. So the queue is partitioned by the sequence each callback
     -- stamped on its change, and capture selection, interpretation, the
     -- register push and `finish` all run once PER SEQUENCE, in arrival order.
-    local groups, order = {}, {}
-    for _, change in ipairs(changes) do
-      local key = change.undo_marker
-      if key == nil then key = false end
-      local group = groups[key]
-      if not group then
-        group = { marker = change.undo_marker, changes = {} }
-        groups[key] = group
-        order[#order + 1] = group
-      end
-      group.changes[#group.changes + 1] = change
-    end
     -- MARKERS SEPARATE THE GROUPS; THE LABELS COME FROM HERE, because a marker
     -- means one of two things and the flush is the first place that can tell
     -- them apart:
@@ -77,29 +116,20 @@ function M.new(env)
     -- them right back into one record and one register row.
     local flush_seq = deps.buf_undo_seq(state.bufnr)
     local previous = state.hunk_ledger:observed_buffer_seq()
-    for i, group in ipairs(order) do
-      local label
-      if type(group.marker) == "number"
-        and (type(previous) ~= "number" or group.marker > previous)
-      then
-        label = group.marker
-      else
-        local successor = order[i + 1]
-        label = successor and successor.marker or nil
-        if type(previous) == "number" and type(label) == "number" and label <= previous then
-          label = nil
-        end
-      end
-      if type(label) ~= "number" then
-        label = flush_seq
-      end
-      group.seq = label
-      previous = label
+    local order = native_groups(changes, previous, flush_seq)
+    local labels = {}
+    for _, group in ipairs(order) do
+      labels[#labels + 1] = { marker = group.marker, seq = group.seq, changes = #group.changes }
     end
+    require("yana.review_undo_trace").capture("flush_labels", state, { groups = labels })
     -- Read ONCE, after every queued change has landed: the reachable set is a
     -- property of the buffer as it stands now, and every group is pruned
     -- against the same reading.
     local reachable = reachable_seqs(state.bufnr)
+    if #order > 1 then
+      publish_timeline(order, reachable)
+      return
+    end
     -- INTERPRETATION STAYS WHOLE; THE RECORD AND THE REGISTER ARE PARTITIONED.
     -- A hunk split is decided by reading a batch of changes against each
     -- other, and Neovim seals a native sequence part-way through one: a typed
@@ -196,11 +226,13 @@ function M.new(env)
       state.staged_text = snapshot
       state.latest_undo_seq = deps.buf_undo_seq(state.bufnr)
     end
+    state.watch_timeline = nil
   end
 
   -- F-OWN-TRIGGER / F-OWN-HEAL: InsertLeave re-resolves ONLY the insert-touched
   -- rows and absorbs owned ones into the parent via complete_buffer_edit.
   local function on_insert_leave_ownership()
+    state._watch_in_insert = false
     if not owns() then
       return
     end
@@ -222,6 +254,16 @@ function M.new(env)
     -- `<C-r>` never reaches.
     if state.watch_pending then
       process_pending_watch()
+    end
+    local timeline = state.watch_timeline
+    if timeline and timeline.insert_session then
+      timeline:seal_live_ranges(state.bufnr, live_block_range)
+      assert(timeline:matches_live(state.bufnr),
+        "watch timeline: captured bytes differ at InsertLeave")
+      local order = native_groups(timeline.changes, timeline.seq_before,
+        deps.buf_undo_seq(state.bufnr))
+      publish_timeline(order, reachable_seqs(state.bufnr))
+      return
     end
     local dirty = state._ownership_dirty_rows
     if type(dirty) ~= "table" or next(dirty) == nil then

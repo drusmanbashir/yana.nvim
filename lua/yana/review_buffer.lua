@@ -1,5 +1,6 @@
 -- Open and stage buffers for inline review without writing proposal bytes.
 local diff = require("yana.diff")
+local log = require("yana.log")
 
 local M = {}
 
@@ -31,13 +32,14 @@ local function buffer_has_unsaved_beyond_disk(buf_text, disk_bytes)
 end
 
 function M.new(deps)
-  local function open(change, preview)
+  local function open_impl(change, preview)
+	local review_before = change.review_before ~= nil and change.review_before or change.before
     if preview then
       local bufnr = vim.api.nvim_create_buf(false, true)
       vim.bo[bufnr].buftype = "nofile"
       vim.bo[bufnr].bufhidden = "hide"
       vim.bo[bufnr].modifiable = true
-      local lines = deps.buffer_lines(change.before or "")
+      local lines = deps.buffer_lines(review_before or "")
       if #lines == 0 then
         lines = { "" }
       end
@@ -85,20 +87,28 @@ function M.new(deps)
     end
     if existing_modified then
       local current = diff.buffer_text_normalized(existing)
-      if not diff.text_equal_snapshot(current, change.before or "") then
+      local matches_review_before = diff.text_equal_snapshot(current, review_before or "")
+      log.buffer_event("guard_buffer", { change = change, bufnr = existing,
+        matches_review_before = matches_review_before })
+      if not matches_review_before then
         local disk_bytes = diff.read_file_bytes(path)
+        local matches_before = disk_bytes and diff.text_equal_snapshot(disk_bytes, change.before or "")
+        local unsaved = matches_before and buffer_has_unsaved_beyond_disk(current, disk_bytes)
+        log.buffer_event("guard_disk", { change = change, bufnr = existing, disk_bytes = disk_bytes,
+          matches_before = matches_before, unsaved_beyond_disk = unsaved })
         if disk_bytes
-          and diff.text_equal_snapshot(disk_bytes, change.before or "")
-          and not buffer_has_unsaved_beyond_disk(current, disk_bytes)
+          and matches_before
+          and not unsaved
         then
           existing_modified = false
         else
-          return nil, "buffer has unsaved edits unrelated to this review"
+          return nil, "buffer has unsaved edits unrelated to this review", { reason = "dirty_buffer" }
         end
       end
     end
 
     local function stage(bufnr, text)
+      log.buffer_event("baseline_stage_begin", { change = change, bufnr = bufnr })
       vim.fn.bufload(bufnr)
       deps.break_undo_block(bufnr)
       change.undo_pre_stage_seq = deps.buf_undo_seq(bufnr)
@@ -114,6 +124,7 @@ function M.new(deps)
         return nil, "cannot stage review in this buffer (" .. tostring(err) .. ")"
       end
       vim.bo[bufnr].modified = false
+      log.buffer_event("baseline_staged", { change = change, bufnr = bufnr })
       return bufnr, nil
     end
 
@@ -127,14 +138,17 @@ function M.new(deps)
         return nil, err or "could not read file for review"
       end
       if change.before ~= nil and not diff.text_equal_snapshot(disk_bytes, change.before) then
+        log.buffer_event("guard_disk_final", { change = change, disk_bytes = disk_bytes, matches_before = false })
         return deps.stale_refusal("file on disk changed since turn start", change.before, disk_bytes)
       end
+      log.buffer_event("guard_disk_final", { change = change, disk_bytes = disk_bytes, matches_before = true })
       change.disk_at_open = disk_bytes
       local bufnr = vim.fn.bufnr(path, true)
       if not existing_modified then
+        log.buffer_event("reload_begin", { change = change, bufnr = bufnr })
         diff.reload_file(path, { force = true })
       end
-      return stage(bufnr, change.before or "")
+      return stage(bufnr, review_before or "")
     end
 
     if change.after == nil then
@@ -147,7 +161,7 @@ function M.new(deps)
       -- was, and still is, an anti-EXTERNAL-WRITER guard, so it now asks the question
       -- its own reason asks: is what is at this path yana's own empty touch (or
       -- nothing), or did somebody else write CONTENT here?
-      local creation_touch = require("yana.creation_touch")
+      local creation_touch = require("yana.paths.creation_touch")
       local ok_touch, terr = creation_touch.touch(path)
       if not ok_touch then
         return nil, tostring(terr), { reason = "stale_file" }
@@ -162,6 +176,7 @@ function M.new(deps)
       -- NEW file. Re-stat through a forced reload so Vim's view of the file matches the
       -- empty file that is really there.
       if not existing_modified then
+        log.buffer_event("reload_begin", { change = change, bufnr = bufnr })
         diff.reload_file(path, { force = true })
       end
       return stage(bufnr, "")
@@ -181,17 +196,30 @@ function M.new(deps)
     local disk_is_accepted_save = not disk_is_turn_start
       and change._accept_composed_hash ~= nil
       and deps.base_fingerprint(disk_bytes) == change._accept_composed_hash
+    log.buffer_event("guard_disk_final", { change = change, disk_bytes = disk_bytes,
+      matches_before = disk_is_turn_start, outcome = disk_is_accepted_save and "accepted_save" or "baseline_check" })
     if not (disk_is_turn_start or disk_is_accepted_save) then
       return deps.stale_refusal("file on disk changed since turn start", change.before, disk_bytes)
     end
     change.disk_at_open = disk_bytes
     local bufnr = vim.fn.bufnr(path, true)
     if not existing_modified then
+      log.buffer_event("reload_begin", { change = change, bufnr = bufnr })
       diff.reload_file(path, { force = true })
     end
-    return stage(bufnr, change.before)
+    return stage(bufnr, review_before)
   end
 
+  local function open(change, preview)
+    if preview then return open_impl(change, preview) end
+    log.buffer_event("review_attempt", { change = change })
+    local buf, err, refusal = open_impl(change, preview)
+    log.buffer_event("review_result", { change = change, bufnr = buf,
+      outcome = buf and "baseline_ready" or "refused", reason = err, refusal = refusal,
+      -- A refusal stops before hunk building; the study records that, never a manufactured model.
+      engine = (not buf) and { not_reached = "guard refused before the hunk model was built: " .. tostring(err) } or nil })
+    return buf, err, refusal
+  end
   return { open = open }
 end
 

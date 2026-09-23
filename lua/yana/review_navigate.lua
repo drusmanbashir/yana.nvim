@@ -1,7 +1,6 @@
 -- Navigation across hunks, files, workspaces, and registered decisions.
 local review_park_census = require("yana.review_park_census")
 local review_park_snapshot = require("yana.review_park_snapshot")
-local park_teardown = review_park_snapshot.park_teardown
 local M = {}
 
 function M.new(deps)
@@ -127,25 +126,27 @@ end
       target_change._nav_refusal_announced = nil
       st.active.queue_item = target_item
       announce_state()
+      -- Opening bound the target's review keys. Focus that buffer before this
+      -- mapped handler returns; only cursor placement may wait for the next
+      -- event-loop turn.
+      if landing == "none" then
+        -- This branch is part of the mapped undo transaction, and the undo has
+        -- not run yet. Focusing now would make neovim undo in the CURRENT
+        -- window and move its cursor (F-UNDO-CURSOR). The history-move door
+        -- (review_open_actions.report_history_move) focuses this buffer after
+        -- the move, still before the handler returns, so queued typeahead
+        -- reaches its review maps.
+        st.active._focus_after_history_move = true
+        return true, nil
+      end
+      land_on(target_change.path, st.active.bufnr, nil)
       vim.schedule(function()
         local active_state = st.active
         if active_state and active_state.change == target_change then
-          -- "none" is NOT "do nothing": `land_on` is two halves -- `focus_buf`
-          -- (tabpage + window onto the file) and then the cursor placement, and
-          -- only the second is retired. `land_on` with no block is exactly the
-          -- first half (review_geometry.lua, `if not block then return true`),
-          -- so the undo path makes its file current, as F-UNDO-CURSOR says, and
-          -- leaves the cursor wherever neovim left it. Skipping the call
-          -- outright stranded a cross-file `u` in the PARKED file, whose review
-          -- keymaps the park had already deleted, so the next `u` there was raw
-          -- neovim on a parked review's staged bytes.
-          local block = nil
-          if landing ~= "none" then
-            local want_first = (landing == "first")
-              or (landing == nil and direction == "next")
-            local live = active_state.hunk_ledger:pending()
-            block = want_first and live[1] or live[#live]
-          end
+          local want_first = (landing == "first")
+            or (landing == nil and direction == "next")
+          local live = active_state.hunk_ledger:pending()
+          local block = want_first and live[1] or live[#live]
           land_on(target_change.path, active_state.bufnr, block)
         end
       end)
@@ -230,7 +231,7 @@ local function park_and_open_state(state, direction, target_item, landing, allow
     path = change.rel or change.path,
     direction = direction,
   })
-  park_teardown(state, bufnr)
+  require("yana.review_lifecycle").park_review(state)
   change._parked_state = state
   -- A park that CROSSES TO ANOTHER FILE keeps its own
   -- still-pending hunks PAINTED, so it asks the ledger to re-emit its one

@@ -11,9 +11,8 @@
 -- (`change.before`, `model_target(change)`) -- synchronously, in this process, no
 -- buffer and no review.
 --
--- It writes no verdict and touches no disk. The caller decides
--- (`ledger:decide_all("accept")`) only once the applier has actually taken the
--- bytes, so a refused write leaves the turn's pending count honest.
+-- It writes no verdict and touches no disk. The caller records the decision;
+-- ordinary save or Turn exit later projects it through the write owner.
 local hunk_ledger = require("yana.hunk_ledger")
 
 local M = {}
@@ -58,14 +57,19 @@ function M.materialize(deps, change)
 		return nil, nil, {}, "queued change has no after content"
 	end
 	local target = model_target(change)
-	local base = change.before or ""
+	local base = (change.review_before ~= nil and change.review_before or change.before) or ""
 	-- The same diff a review open runs (review_open.lua's `build_diff_blocks`
 	-- call), minus the model stamp: nothing rebuilds a ledger that is decided and
 	-- discarded inside one press, and `model_index` is a rebuild's identity key
 	-- (A4). Geometry and verdicts are all this ledger is asked for.
 	local blocks = facade.build_diff_blocks(base, target)
 
-	local now = M.operator_text(diff, change.path)
+	-- A direct-HOME buffer proposal deliberately has two baselines: disk is the
+	-- diary's compare-and-swap evidence, while the captured unsaved buffer is
+	-- what the operator reviewed. Treating the older disk bytes as fresh drift
+	-- here would either absorb or misattribute the operator's unsaved lines.
+	local capture = change.home_buffer_capture
+	local now = capture and capture.buffer_bytes or M.operator_text(diff, change.path)
 	if now == nil or now == base then
 		-- NO DRIFT. `change.after` IS the composition, byte for byte -- the path every
 		-- unedited queued file has always taken, returned verbatim rather than recomposed so

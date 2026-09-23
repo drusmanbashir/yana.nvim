@@ -1,6 +1,7 @@
 """Per-session store for yanad U1."""
 
 import dataclasses
+import hashlib
 import json
 import os
 import re
@@ -8,7 +9,6 @@ import shutil
 import time
 import uuid
 
-from yanad import slug
 
 
 # Turn states (running -> settling -> reviewing
@@ -129,7 +129,39 @@ def _read_json(path):
         return json.load(fh)
 
 
-def create_session(root, workspace, backend, kind, owner, daemon_owner=None):
+def _plan_canonical(plan):
+    body = dict(plan)
+    body.pop("plan_id", None)
+    return json.dumps(body, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def validate_turn_plan(plan, session_id, turn_id):
+    """Reject malformed or foreign plans before allocating turn state.
+
+    The daemon is the plan's validator, not its author: it recomputes the
+    `plan_id` under the same canonical rule `lua/yana/turn/turn_plan.lua` used to
+    mint it, so a plan edited anywhere between the builder and this call
+    refuses here rather than allocating a turn around it.
+    """
+    required = {
+        "plan_version", "plan_id", "session_id", "turn_id", "mode", "anchor", "label",
+        "seeds", "layers", "protected", "writable_exceptions", "prompt_boundary",
+    }
+    if not isinstance(plan, dict) or set(plan) != required or plan["plan_version"] != 1:
+        raise Refused("invalid_turn_plan")
+    if plan["session_id"] != session_id or plan["turn_id"] != turn_id:
+        raise Refused("turn_plan_owner_mismatch")
+    if plan["mode"] not in {"inline", "ask"}:
+        raise Refused("invalid_turn_plan")
+    if any(not isinstance(plan[key], list) for key in ("seeds", "layers", "protected", "writable_exceptions", "prompt_boundary")):
+        raise Refused("invalid_turn_plan")
+    canonical = _plan_canonical(plan).encode("utf-8")
+    if hashlib.sha256(canonical).hexdigest() != plan["plan_id"]:
+        raise Refused("plan_id_mismatch")
+    return plan
+
+
+def create_session(root, workspace, backend, kind, owner, daemon_owner=None, version=None):
     """Create a session row and return its UUID."""
     root_real = _real(root)
     # Canonical workspaces may be external; paths presented under root may not escape it.
@@ -151,6 +183,8 @@ def create_session(root, workspace, backend, kind, owner, daemon_owner=None):
     }
     if daemon_owner is not None:
         row["daemon_owner"] = daemon_owner
+    if version is not None:
+        row["version"] = version
     # ALL OR NOTHING. The session is built in a tmp dir beside its final name and
     # renamed into place as the LAST step, so `sessions/<id>` never exists unless
     # it is complete. Creating the dir first and writing into it published a
@@ -172,18 +206,29 @@ def create_session(root, workspace, backend, kind, owner, daemon_owner=None):
     return session_id
 
 
-def turn_dir(root, session_id, turn_id, cgroup, owner, mounted_root, roots, mode=None):
+def turn_dir(root, session_id, turn_id, cgroup, owner, mounted_root, roots, mode=None, plan=None):
     """Create turn layer dirs and return daemon launch paths.
 
     `mode` is the per-turn yana mode (ask/inline/agentic/…). Persisted into
     meta.json so recovery can restore confinement without guessing (O8).
     """
+    # Validation precedes every allocation below. `plan` stays optional until
+    # the turn lifecycle (stage S5) builds one for every turn; a plan that IS
+    # supplied is validated completely, and written exactly once.
+    if plan is not None:
+        plan = validate_turn_plan(plan, session_id, turn_id)
     base = _turn_dir(root, session_id, turn_id)
+    plan_path = os.path.join(base, "plan.json")
+    if plan is not None:
+        if os.path.exists(plan_path):
+            raise Refused("turn_plan_exists")
+        _mkdir(base)
+        write_json_atomic(plan_path, plan)
     workspace_layer = os.path.join(base, "layer")
     _bare_layer(workspace_layer)
     root_layers = {}
     for item in roots:
-        key = slug.workspace_slug(item)
+        key = _path_key(item)
         layer = os.path.join(base, "roots", key)
         _bare_layer(layer)
         root_layers[key] = layer
@@ -282,10 +327,19 @@ def _validated_review_bundle(root, session_id, turn_id, bundle):
                 raise Refused("review_unreadable", "bundle upper_path is outside turn layers")
         elif upper_path is not None:
             raise Refused("review_unreadable", "delete bundle row has upper_path")
+        home_buffer_only = item.get("home_buffer_only")
+        review_before = item.get("review_before")
+        if home_buffer_only is not None and home_buffer_only is not True:
+            raise Refused("review_unreadable", "bundle row has invalid home_buffer_only marker")
+        if home_buffer_only is True and not isinstance(review_before, str):
+            raise Refused("review_unreadable", "buffer-only bundle row has no review_before baseline")
+        if home_buffer_only is None and review_before is not None:
+            raise Refused("review_unreadable", "ordinary bundle row carries a buffer-only baseline")
         kept.append({key: item.get(key) for key in (
             "id", "path", "rel", "root", "root_index", "root_is_primary",
             "kind", "base_state", "base_hash", "base_mode",
             "base_hash_captured_ts", "after_mode", "upper_path",
+            "home_buffer_only", "review_before",
         )})
     return kept
 
@@ -305,7 +359,7 @@ def open_review(root, session_id, turn_id, files, tabs, bundle=None):
     write_json_atomic(os.path.join(review_dir, "tabs.json"), tabs)
     write_json_atomic(os.path.join(review_dir, "bundle.json"), bundle)
     for item in file_paths:
-        key = slug.workspace_slug(item)
+        key = _path_key(item)
         pointer_dir = _inside_root(root, os.path.join(os.fspath(root), "claims", key, "reviews"))
         _mkdir(pointer_dir)
         pointer = {"session_id": session_id, "daemon_owner": row.get("daemon_owner")}
@@ -345,13 +399,22 @@ def _remove_review(root, session_id):
     return removed
 
 
-def write_claim_row(root, claim_slug, row):
-    path = _inside_root(root, os.path.join(os.fspath(root), "claims", claim_slug, "row.json"))
+
+# F-CLAIM-KEYS: identity is the ACTUAL path, never a workspace or Git slug.
+# Imported lazily because `claims` imports `daemon_store`, and a module-level
+# import here would close the cycle.
+def _path_key(path):
+    from . import claims
+
+    return claims.path_key(path)
+
+def write_claim_row(root, claim_key, row):
+    path = _inside_root(root, os.path.join(os.fspath(root), "claims", claim_key, "row.json"))
     write_json_atomic(path, row)
 
 
-def clear_claim_row(root, claim_slug):
-    path = _inside_root(root, os.path.join(os.fspath(root), "claims", claim_slug, "row.json"))
+def clear_claim_row(root, claim_key):
+    path = _inside_root(root, os.path.join(os.fspath(root), "claims", claim_key, "row.json"))
     try:
         os.unlink(path)
     except FileNotFoundError:

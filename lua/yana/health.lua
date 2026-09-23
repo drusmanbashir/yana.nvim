@@ -1,6 +1,6 @@
 -- yana: :checkhealth yana
 local config = require("yana.config")
-local dependencies = require("yana.dependencies")
+local dependencies = require("yana.runtime.dependencies")
 
 local M = {}
 
@@ -154,7 +154,7 @@ local function keymap_collision_row()
   local km = config.options.mappings
   local names = {}
   for _, context in ipairs({ "prompt", "panel" }) do
-    for _, name in ipairs(require("yana.config_mappings").CONTEXTS[context]) do
+    for _, name in ipairs(require("yana.configuration.config_mappings").CONTEXTS[context]) do
       names[#names + 1] = name
     end
   end
@@ -406,7 +406,7 @@ local function backend_auth_rows()
 end
 
 -- yana_ui (public repo drusmanbashir/yana-ui.nvim) is a hard dependency:
--- lua/yana/ui_grid.lua is "return require('yana_ui.grid')" with no
+-- lua/yana/panel/ui_grid.lua is "return require('yana_ui.grid')" with no
 -- fallback, so its absence makes parts of the review UI raise rather than
 -- merely degrade. That makes it an ERROR row, unlike the optional-plugin
 -- rows above (completion_menu_row et al.), which only ever info/warn.
@@ -416,7 +416,7 @@ local function yana_ui_row()
     return
   end
   err(
-    "yana_ui not found — parts of yana's UI (lua/yana/ui_grid.lua) require it and will raise without it",
+    "yana_ui not found — parts of yana's UI (lua/yana/panel/ui_grid.lua) require it and will raise without it",
     { "add 'drusmanbashir/yana-ui.nvim' as a plugin dependency" }
   )
 end

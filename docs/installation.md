@@ -37,6 +37,20 @@ sudo dnf install -y bubblewrap libcap python3 util-linux findutils gawk glibc-co
 sudo pacman -S --needed bubblewrap libcap python3 util-linux findutils gawk glibc inetutils
 ```
 
+`overlayfs-fast` does not require FUSE. For `fuse-compat`, also install
+`fuse-overlayfs` and the uid/gid mapping tools:
+
+```sh
+# Debian / Ubuntu
+sudo apt-get install -y fuse-overlayfs uidmap
+
+# Fedora / RHEL
+sudo dnf install -y fuse-overlayfs shadow-utils
+
+# Arch
+sudo pacman -S --needed fuse-overlayfs shadow
+```
+
 **macOS**
 
 Only **agentic** mode works on macOS: the agent writes your real files

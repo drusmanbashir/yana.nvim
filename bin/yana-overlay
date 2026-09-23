@@ -66,6 +66,9 @@ EXTRA_LAYER_ROOTS=()
 EXEC_ALLOW=()
 STATE_DIRS=()
 BROAD_ROOT=""
+READ_ONLY_WORKSPACE=0
+CAPTURE_PLAN=""
+OPEN_CAPTURE_BACKEND=""
 # Every path of the confined tree that a mask, the writable-host exception or
 # TMPDIR must not swallow: the workspace, its layer root, then each extra root
 # and its layer root. Built once by validate_paths. Deliberately does NOT
@@ -82,6 +85,9 @@ OPERATOR_HOME=""
 
 
 source "$DIR/lib/yana-overlay/paths.sh"
+source "$DIR/lib/yana-overlay/capture_plan.sh"
+source "$DIR/lib/yana-overlay/fuse.sh"
+source "$DIR/lib/yana-overlay/open_capture.sh"
 source "$DIR/lib/yana-overlay/yanad.sh"
 source "$DIR/lib/yana-overlay/cgroup.sh"
 
@@ -97,6 +103,24 @@ source "$DIR/lib/yana-overlay/cgroup.sh"
 # reaper. Handing PID 1 to a Node process that performs no init duties would
 # leave them as zombies.
 run_overlay() {
+	if (( READ_ONLY_WORKSPACE == 1 )); then
+		local -a ro_args=(
+			--die-with-parent --new-session --ro-bind / / --tmpfs /tmp
+		)
+		local runtime runtime_base
+		for runtime in "$CURSOR_DIR" ${STATE_DIRS[@]+"${STATE_DIRS[@]}"}; do
+			[[ -n "$runtime" ]] || continue
+			if [[ ! -e "$runtime" ]]; then
+				runtime_base=${runtime##*/}
+				if [[ "${runtime_base#.}" == *.* ]]; then mkdir -p "${runtime%/*}"; : >"$runtime"
+				else mkdir -p "$runtime"; fi
+			fi
+			ro_args+=(--bind "$runtime" "$runtime")
+		done
+		ro_args+=(--dev /dev --proc /proc --unshare-uts --unshare-user --unshare-pid --)
+		"$BWRAP" "${ro_args[@]}" "${CMD[@]}"
+		return $?
+	fi
 	# `mount_root` is the single point that names what gets mounted, on purpose: reverting
 	# WI-1 to a narrow-root mount is then a one-line change (mount_root=$WORKSPACE),
 	# exactly the mutation tests/overlay_broadroot_gate.sh drives.
@@ -354,6 +378,20 @@ parse_run_args() {
 				ANSWER_OUT=$2
 				shift 2
 				;;
+			--capture-plan)
+				[[ $# -ge 2 ]] || die_usage "--capture-plan requires a file path"
+				CAPTURE_PLAN=$2
+				shift 2
+				;;
+			--backend)
+				[[ $# -ge 2 ]] || die_usage "--backend requires a value"
+				OPEN_CAPTURE_BACKEND=$2
+				case "$OPEN_CAPTURE_BACKEND" in
+					overlayfs-fast|fuse-compat) ;;
+					*) die_usage "--backend must be overlayfs-fast or fuse-compat" ;;
+				esac
+				shift 2
+				;;
 			--touched)
 				[[ $# -ge 2 ]] || die_usage "--touched requires an absolute path"
 				TOUCHED_FILES+=("$2")
@@ -363,6 +401,10 @@ parse_run_args() {
 				[[ $# -ge 2 ]] || die_usage "--broad-root requires a directory"
 				BROAD_ROOT=$2
 				shift 2
+				;;
+			--read-only-workspace)
+				READ_ONLY_WORKSPACE=1
+				shift
 				;;
 			--exec-allow)
 				[[ $# -ge 2 ]] || die_usage "--exec-allow requires a path"
@@ -420,7 +462,11 @@ parse_run_args() {
 cmd_run() {
 	parse_run_args "$@"
 	if [[ -n "$UPPER" && -n "$WORK" ]]; then
-		cmd_run_direct
+		if [[ -n "$CAPTURE_PLAN" || -n "${YANA_OPEN_CAPTURE_MODE:-}" ]]; then
+			cmd_run_direct_open_capture
+		else
+			cmd_run_direct
+		fi
 	elif [[ -n "$TURN_ID" && -n "$MODE" && -n "$ANSWER_OUT" ]]; then
 		cmd_run_yanad
 	else

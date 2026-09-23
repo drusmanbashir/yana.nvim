@@ -11,6 +11,7 @@ History.__index = History
 local snapshot = frame.snapshot
 local snapshot_ref = frame.snapshot_ref
 local copied = frame.copied
+local ensure_record
 
 -- BOUNDED BY REACHABILITY, AND BY NOTHING ELSE. Records are keyed by Neovim
 -- undo sequence and a long editing session makes one per absorbed edit, so the
@@ -31,6 +32,119 @@ local copied = frame.copied
 
 function M.new()
 	return setmetatable({ current_seq = nil, records = {}, record_seqs = {} }, History)
+end
+
+-- Preserve the history before the first callback of a queued batch. Existing
+-- records are immutable here; only the ordered batch may add to them later.
+function History:batch_baseline()
+	local out = M.new()
+	out.current_seq = self.current_seq
+	for seq, record in pairs(self.records) do out.records[seq] = record end
+	for i, seq in ipairs(self.record_seqs or {}) do out.record_seqs[i] = seq end
+	return out
+end
+
+local function remap_frames(source, map)
+	local result = {}
+	for block, value in pairs(source or {}) do
+		local target = map[block]
+		assert(target, "history preparation: unresolved block reference")
+		local frame_value = copied(value)
+		frame_value.block = target
+		result[target] = frame_value
+	end
+	return result
+end
+
+-- A native batch prepares only the records it may write. Older records remain
+-- shared read-only; current records are copied and their keys rebound to the
+-- prepared ledger's blocks. No live record receives a partial split rewrite.
+function History:stage_copy(seqs, block_map, before_seq)
+	local out = M.new()
+	out.current_seq = before_seq
+	for seq, record in pairs(self.records) do out.records[seq] = record end
+	for i, seq in ipairs(self.record_seqs or {}) do out.record_seqs[i] = seq end
+	for seq in pairs(seqs or {}) do
+		local record = self.records[seq]
+		if record then
+			local members = nil
+			if record.before_members then
+				members = {}
+				for block in pairs(record.before_members) do
+					assert(block_map[block], "history preparation: unresolved member")
+					members[block_map[block]] = true
+				end
+			end
+			out.records[seq] = { before_seq = record.before_seq,
+				before = remap_frames(record.before, block_map),
+				after = remap_frames(record.after, block_map), before_members = members }
+		end
+	end
+	return out
+end
+
+function History:stage_result(staged, real_map, seqs)
+	local records = {}
+	for seq, record in pairs(staged.records) do records[seq] = record end
+	for seq in pairs(seqs or {}) do
+		local record = staged.records[seq]
+		if record then
+			local members = nil
+			if record.before_members then
+				members = {}
+				for block in pairs(record.before_members) do
+					assert(real_map[block], "history publish: unresolved member")
+					members[real_map[block]] = true
+				end
+			end
+			records[seq] = { before_seq = record.before_seq,
+					before = remap_frames(record.before, real_map),
+					after = remap_frames(record.after, real_map), before_members = members }
+		end
+	end
+	local record_seqs = {}
+	for i, seq in ipairs(staged.record_seqs or {}) do record_seqs[i] = seq end
+	return { records = records, record_seqs = record_seqs, current_seq = staged.current_seq }
+end
+
+function History:publish_stage_result(result)
+	self.records = result.records
+	self.record_seqs = result.record_seqs
+	self.current_seq = result.current_seq
+	self.before_groups = nil
+	self.open_group_marker = nil
+	self.current_group = nil
+	self.current_group_seq = nil
+	self.last_before = nil
+	self.last_before_seq = nil
+	self.last_shifted = nil
+end
+
+-- The chronological Insert-session interpreter has the exact membership at
+-- both native endpoints. Save complete frames for that transition, including
+-- an unchanged split sibling, so a later group never inherits a stale parent
+-- from a callback captured before the first group was resolved.
+function History:seal_exact_endpoint(seq, before_seq, before_frames, after_members)
+	local record = ensure_record(self, seq, before_seq)
+	record.before, record.after, record.before_members = {}, {}, {}
+	for block, value in pairs(before_frames or {}) do
+		record.before[block] = copied(value)
+		record.before_members[block] = true
+	end
+	for _, block in ipairs(after_members or {}) do
+		record.after[block] = snapshot(block)
+	end
+end
+
+function History:publication_snapshot()
+	local result = {}
+	for key, value in pairs(self) do result[key] = value end
+	return result
+end
+
+function History:restore_publication(snapshot)
+	for key in pairs(self) do self[key] = nil end
+	for key, value in pairs(snapshot) do self[key] = value end
 end
 
 -- `before_members` IS THE RECORD'S MEMBERSHIP AT THE MOMENT IT BEGAN, and it is
@@ -58,7 +172,7 @@ end
 -- names the children, which is what a redo re-creates. And when no group is
 -- open (`finish`'s empty record) the field is nil and nothing is gated, which
 -- is the behaviour of every caller that predates capture groups.
-local function ensure_record(self, after_seq, before_seq)
+ensure_record = function(self, after_seq, before_seq)
 	local record = self.records[after_seq]
 	if record then
 		return record
@@ -179,6 +293,8 @@ function History:capture(change, members, marker)
 	self.last_before = group.before
 	self.last_before_seq = group.before_seq
 	self.last_shifted = group.shifted
+	if self.trace then self.trace("history_capture", { marker = marker, splice = change.splice,
+		first = change.first, last_orig = change.last_orig, last_new = change.last_new }) end
 end
 
 --- THE BLOCKS `shift_span` ACTUALLY MOVED, and no others.
@@ -260,6 +376,7 @@ function History:remember(block, before, before_seq, after_seq)
 		record.before[block] = copied(before)
 	end
 	record.after[block] = snapshot(block)
+	if self.trace then self.trace("history_remember", { record_seq = after_seq }) end
 end
 
 -- THE BYSTANDER'S OWN ABSOLUTE GEOMETRY, and only its geometry.
@@ -349,6 +466,7 @@ function History:finish(seq, reachable)
 		ensure_record(self, seq, self.last_before_seq)
 	end
 	self:observe(seq)
+	if self.trace then self.trace("history_finish", { record_seq = seq, marker = self.current_group }) end
 	-- THIS SEQUENCE's group is over, so the capture it accumulated is over too:
 	-- the next sequence's first `capture` starts a fresh one (see `capture`).
 	-- Holding it would hand the NEXT group's destroyed-hunk decision geometry

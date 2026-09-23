@@ -6,7 +6,8 @@ local M = {}
 
 local config = require("yana.config")
 local diff = require("yana.diff")
-local workspace_identity = require("yana.workspace_identity")
+local path_key = require("yana.paths.path_key")
+local repo_root = require("yana.paths.repo_root")
 local uv = vim.uv or vim.loop
 
 --- Build one instance bound to the parent's `state_root()` (which reads the
@@ -83,7 +84,7 @@ function M.new(deps)
 	--- question. Nothing an agent emitted can reach any of them.
 	function I.resolve_workspace(candidate)
 		local abs = diff.abs_path(candidate)
-		local git = workspace_identity.git_root(abs)
+		local git = repo_root.git_root(abs)
 		if git then
 			return git
 		end
@@ -99,17 +100,21 @@ function M.new(deps)
 	function I.workspace_for_turn(opts)
 		opts = opts or {}
 		local candidate = I.workspace_candidate(opts)
-		-- WI-3. Reverting this ONE line to `return candidate` is the pre-WI-3
-		-- shape and is exactly the mutation
-		-- tests/headless/workspace_resolution.lua drives.
+		-- WI-3. Reverting this ONE line to `return candidate` is the pre-WI-3 shape.
 		return I.resolve_workspace(candidate)
 	end
 
-	--- Workspace slug, byte-identical to the one `bin/yana-turn` computes
-	--- (sha256 of the filesystem identity, first 16 hex chars) so a claim taken by the
-	--- editor and a claim taken by the CLI collide as they should.
-	function I.workspace_slug(workspace)
-		return workspace_identity.workspace_slug(workspace)
+	--- F-CLAIM-KEYS (S3). The per-turn state directories below are named by the
+	--- REAL PATH of the root they belong to, through the same rule
+	--- `bin/lib/yanad/claims.py` applies, so the editor's scratch and the layers
+	--- the daemon mints cannot drift apart.
+	---
+	--- This replaces the old repository key, which hashed the nearest `.git`
+	--- directory's `(dev, ino)`. That keyed state by REPOSITORY, so two roots in
+	--- one repository shared a directory, and the same tree keyed differently
+	--- once `git init` ran. Neither is a property state identity may have.
+	function I.path_key(workspace)
+		return path_key.of(workspace)
 	end
 
 	-- Absolute overlay layer directory path for one turn.
@@ -117,7 +122,7 @@ function M.new(deps)
 		return table.concat({
 			state_root(),
 			"layers",
-			I.workspace_slug(workspace),
+			I.path_key(workspace),
 			stream,
 			tostring(turn_id),
 		}, "/")
@@ -129,7 +134,7 @@ function M.new(deps)
 		return table.concat({
 			state_root(),
 			"turns",
-			I.workspace_slug(workspace),
+			I.path_key(workspace),
 			stream,
 			tostring(turn_id),
 		}, "/")

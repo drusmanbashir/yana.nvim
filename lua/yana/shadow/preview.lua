@@ -9,9 +9,8 @@ local M = {}
 local config = require("yana.config")
 local diff = require("yana.diff")
 local hash = require("yana.safety.hash")
-local manifest = require("yana.manifest")
+local manifest = require("yana.paths.manifest")
 local ops = require("yana.shadow.ops")
-local workspace_identity = require("yana.workspace_identity")
 local uv = vim.uv or vim.loop
 
 local REFUSED_MAX_FILE_BYTES = 8 * 1024 * 1024

@@ -2,7 +2,7 @@
 --
 -- A dumb adapter over yana.mentions — reads ONLY that module's
 -- get_mentions() and knows nothing about panel internals beyond the panel
--- handle yana.ui.focused_panel() gives it.
+-- handle yana.panel.ui.focused_panel() gives it.
 --
 -- enabled() is scoped on b:yana_prompt, never filetype (see
 -- blink_yana/commands.lua for why).
@@ -23,11 +23,11 @@ end
 
 function M:get_completions(ctx, callback)
 	local ok, items = pcall(function()
-		local panel = require("yana.ui").focused_panel()
+		local panel = require("yana.panel.ui").focused_panel()
 		if not panel then
 			return {}
 		end
-		local list = require("yana.mentions").get_mentions(panel)
+		local list = require("yana.input.mentions").get_mentions(panel)
 		local kind = require("blink.cmp.types").CompletionItemKind.Variable
 		local out = {}
 		for _, m in ipairs(list) do
@@ -53,11 +53,11 @@ end
 function M:execute(_ctx, item, resolve, default_implementation)
 	default_implementation()
 	local ok, err = pcall(function()
-		local panel = require("yana.ui").focused_panel()
+		local panel = require("yana.panel.ui").focused_panel()
 		if not panel then
 			return
 		end
-		local list = require("yana.mentions").get_mentions(panel)
+		local list = require("yana.input.mentions").get_mentions(panel)
 		local cmd = item.insertText and item.insertText:match("^@(.+)$")
 		for _, m in ipairs(list) do
 			if m.command == cmd and m.callback then

@@ -24,7 +24,7 @@ trap 'rm -f "$list" "$tarball"' EXIT
 mkdir -p "$out"
 (
 	cd "$tree"
-	printf '%s\n' LICENSE NOTICE README.md CHANGELOG.md VERSION
+		printf '%s\n' LICENSE NOTICE README.md CHANGELOG.md VERSION prompt.txt
 	find assets doc docs lua plugin bin -type f -print
 ) | LC_ALL=C sort -u >"$list"
 
@@ -43,16 +43,20 @@ done < <(grep -E '\.md$' "$list")
 # export and build would ship silently (both comparison builds see the same
 # drifted mode). Enforce the Git mode shape while tolerating the checkout
 # umask's group-write bit, which tar normalizes away below. Executable
-# classes: bin launchers (bin/yana-*, bin/yanad) and overlay shell helpers
-# (bin/lib/yana-overlay/*.sh). Non-executable: bin/lib/yanad/*.py and every
-# other archive member.
+# classes: bin launchers (bin/yana-*, bin/yanad). Overlay shell libraries
+# include both sourced 644 files and executable 755 helpers. Non-executable:
+# bin/lib/yanad/*.py and every other archive member.
 while IFS= read -r member; do
 	mode=$(stat -c %a "$tree/$member")
 	case $member in
-	bin/lib/yanad/*.py)
-		[[ "$mode" == 644 || "$mode" == 664 ]] \
-			|| { echo "archive: $member must be mode 644, found $mode" >&2; exit 1; }
-		;;
+		bin/lib/yanad/*.py)
+			[[ "$mode" == 644 || "$mode" == 664 ]] \
+				|| { echo "archive: $member must be mode 644, found $mode" >&2; exit 1; }
+			;;
+		bin/lib/yana-overlay/*.sh)
+			[[ "$mode" == 644 || "$mode" == 664 || "$mode" == 755 || "$mode" == 775 ]] \
+				|| { echo "archive: $member must be mode 644 or 755, found $mode" >&2; exit 1; }
+			;;
 	bin/*)
 		[[ "$mode" == 755 || "$mode" == 775 ]] \
 			|| { echo "archive: $member must be mode 755, found $mode" >&2; exit 1; }

@@ -11,7 +11,7 @@
       "steps": [
         {"uses": "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"},
         {"name": "System dependencies", "run": "sudo apt-get update && sudo apt-get install -y bubblewrap"},
-        {"name": "Verify public tree", "run": "scripts/release/verify.sh ."},
+        {"name": "Verify public tree", "run": "scripts/release/verify.sh . && tests/release/manifest_coverage_gate.sh ."},
         {"name": "Release policy mutations", "run": "tests/release/policy_mutation_gate.sh ."},
         {"name": "Public helpers", "shell": "bash", "run": "set -euo pipefail\nbin=$(scripts/release/install-neovim.sh 0.12.4 \"$RUNNER_TEMP/nvim-helpers\" | tail -1)\ntests/release/helper_gate.sh . \"$bin\""},
         {"name": "Fresh Neovim matrix", "shell": "bash", "run": "set -euo pipefail\nexport YANA_HEADLESS_TMPDIR=\"$RUNNER_TEMP/yana-headless\"\nmkdir -p \"$YANA_HEADLESS_TMPDIR\"\ncase $YANA_HEADLESS_TMPDIR in /tmp|/tmp/*) echo \"YANA_HEADLESS_TMPDIR must lie outside /tmp\" >&2; exit 1;; esac\nfor version in 0.10.4 0.11.2 0.12.4; do\n  bin=$(scripts/release/install-neovim.sh \"$version\" \"$RUNNER_TEMP/nvim-$version\" | tail -1)\n  if [[ $version == 0.10.4 ]]; then\n    tests/release/fresh_install.sh . \"$bin\" --expect-refusal\n  else\n    tests/release/fresh_install.sh . \"$bin\"\n  fi\ndone"},

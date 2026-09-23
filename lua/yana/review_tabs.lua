@@ -11,6 +11,17 @@ local record = require("yana.review_tabs_record")
 
 local M = {}
 
+--- VISIT SUPPRESSION. `T.place` opens and briefly ENTERS the tab it creates
+--- before restoring the operator's tab, and `reuse_win` re-buffers a spare
+--- window: both fire `TabEnter`/`WinEnter`/`BufEnter` for a file nobody looked
+--- at. Opening a tab in the background is not a visit (design :58), so every
+--- placement runs inside this depth and the observer below ignores what it
+--- sees there. A counter, not a flag: placements nest through `init_for_turn`.
+local place_depth = 0
+
+--- One augroup per observer, so two live observers never clear each other's.
+local next_observer = 0
+
 local function tab_for_path(path)
   local abs = diff.abs_path(path)
   for _, tab in ipairs(vim.api.nvim_list_tabpages()) do
@@ -40,7 +51,7 @@ local function tabs_enabled(opts)
 end
 
 local function sidebar_ui()
-  local ok, ui = pcall(require, "yana.ui")
+  local ok, ui = pcall(require, "yana.panel.ui")
   if not ok or type(ui) ~= "table" then
     return nil
   end
@@ -174,7 +185,7 @@ function M.new(deps)
   -- THE placer. Total: always returns `{ kind = ... }` and never raises for a
   -- refusable reason; never moves the cursor (focusing is the caller's job,
   -- review_geometry.focus_buf). The only writer of `rt.owned`.
-  function T.place(st, spec)
+  local function place_impl(st, spec)
     local abs = diff.abs_path(spec.abs or spec.path)
     local rt = st and st.review_tabs or nil
     local rel = spec.rel or (rt and rt.all_paths and rt.all_paths[abs]) or vim.fn.fnamemodify(abs, ":.")
@@ -234,6 +245,19 @@ function M.new(deps)
     })
     if rt and out.owned then
       record.save(rt)
+    end
+    return out
+  end
+
+  --- The placer proper runs with visits suppressed: every tab it enters, it
+  --- enters on Yana's behalf and leaves again. Still total -- a real error is
+  --- re-raised unchanged once the depth is back down.
+  function T.place(st, spec)
+    place_depth = place_depth + 1
+    local ok, out = pcall(place_impl, st, spec)
+    place_depth = place_depth - 1
+    if not ok then
+      error(out, 0)
     end
     return out
   end
@@ -402,6 +426,97 @@ function M.new(deps)
   T.prompt_close_owned_tabs = close.close_owned_tabs
   T.state_path = record.state_path
   return T
+end
+
+--- EXACT Turn membership for an entered buffer's name. The Turn's own file
+--- list is the authority; the pool answers only while the Turn is not yet
+--- bound (the first review's own open). A path that is not a member of THIS
+--- Turn is not a visit this observer has anything to say about.
+local function member_path(turn, pool, abs)
+  for _, file in ipairs((turn and turn.files) or {}) do
+    local p = file and file.path
+    if type(p) == "string" and diff.abs_path(p) == abs then
+      return p
+    end
+  end
+  if turn ~= nil then
+    return nil
+  end
+  local function match(change)
+    if change and type(change.path) == "string" and diff.abs_path(change.path) == abs then
+      return change.path
+    end
+    return nil
+  end
+  local active = pool and pool.active
+  local hit = active and match(active.change) or nil
+  if hit then
+    return hit
+  end
+  for _, item in ipairs((pool and pool.order) or {}) do
+    hit = match((item and item.change) or item)
+    if hit then
+      return hit
+    end
+  end
+  for _, item in ipairs((pool and pool.queue) or {}) do
+    hit = match(item and item.change)
+    if hit then
+      return hit
+    end
+  end
+  return nil
+end
+
+--- Watch for the operator ENTERING a Turn member's window, and report the
+--- first entry of each file. Returns a `dispose()` the Turn's cleanup calls.
+---
+--- What counts as a visit (design :58-60): a human moving INTO the file. Not a
+--- tab Yana opened behind their back -- those run inside `place_depth` and are
+--- ignored -- and not a re-entry of the file they are already in, which is why
+--- the last member entered is remembered: `focus_active` re-focuses the window
+--- the cursor is already in on every navigation press, and a re-focus is not a
+--- new visit. Moving away and back IS a new entry; whether that re-asks is the
+--- resolver's business (proposal identity), not this observer's.
+---
+--- `on_visit(file_path, tab_id, win_id)` is called with the member's own path
+--- spelling, never the buffer name, so the caller can key by File.
+function M.observe_visits(pool, turn, on_visit)
+  assert(type(on_visit) == "function", "review_tabs.observe_visits: on_visit is required")
+  next_observer = next_observer + 1
+  local group = vim.api.nvim_create_augroup("YanaReviewVisits" .. next_observer, { clear = true })
+  local disposed = false
+  local last_abs = nil
+  vim.api.nvim_create_autocmd({ "BufEnter", "WinEnter", "TabEnter" }, {
+    group = group,
+    callback = function()
+      if disposed or place_depth > 0 then
+        return
+      end
+      local bufnr = vim.api.nvim_get_current_buf()
+      local name = vim.api.nvim_buf_is_valid(bufnr) and vim.api.nvim_buf_get_name(bufnr) or ""
+      if name == "" then
+        return
+      end
+      local abs = diff.abs_path(name)
+      if abs == last_abs then
+        return
+      end
+      local path = member_path(turn, pool, abs)
+      if path == nil then
+        return
+      end
+      last_abs = abs
+      on_visit(path, vim.api.nvim_get_current_tabpage(), vim.api.nvim_get_current_win())
+    end,
+  })
+  return function()
+    if disposed then
+      return
+    end
+    disposed = true
+    pcall(vim.api.nvim_del_augroup_by_id, group)
+  end
 end
 
 M._placement_for = placement_for

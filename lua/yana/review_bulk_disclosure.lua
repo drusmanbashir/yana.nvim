@@ -1,4 +1,4 @@
--- Bulk-accept disclosure, emitted before any queued file is written.
+-- Bulk-accept disclosure, emitted before queued verdicts are selected.
 local M = {}
 
 function M.emit(state, drained, log, notify_one_line)
@@ -23,7 +23,7 @@ function M.emit(state, drained, log, notify_one_line)
     disclose_paths[#disclose_paths + 1] = disclose_label(item.change)
   end
   local disclose_msg = string.format(
-    "yana: accept-all about to apply %d change(s) to the real tree: %s",
+    "yana: accept-all selecting %d change(s); projection waits for :w or turn exit: %s",
     #disclose_paths,
     table.concat(disclose_paths, ", ")
   )

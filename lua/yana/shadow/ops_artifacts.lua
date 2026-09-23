@@ -8,7 +8,7 @@ local I = M
 local diff = require("yana.diff")
 local config = require("yana.config")
 local hash = require("yana.safety.hash")
-local manifest = require("yana.manifest")
+local manifest = require("yana.paths.manifest")
 local PAIRED_REFUSAL_REASON = require("yana.shadow.ops_decode").PAIRED_REFUSAL_REASON
 local uv = vim.uv or vim.loop
 
@@ -295,8 +295,7 @@ end
 ---
 --- and then queued `dicom_utils/.agent/INDEX.tsv` and `.../INDEX.lock` as
 --- ordinary reviews anyway. The refusal was false in both directions: nothing
---- had been blocked, and accepting either child created the directory
---- regardless (`tests/headless/agent_dir_children_not_split.lua` measures both).
+--- had been blocked, and accepting either child created the directory regardless.
 ---
 --- The `virgin` / `structural_root` mechanism removed here could never have run in the
 --- shipping product. It required `op.base_evidence.state == "absent"`, and
@@ -336,7 +335,7 @@ function I.classify_artifacts(typed, changes, _base_evidence, tracked)
 
 	for _, op in ipairs(typed or {}) do
 		if op.ignored then
-			-- ON THE OPERATOR'S IGNORE LIST (`lua/yana/ignore.lua`, marked by
+			-- ON THE OPERATOR'S IGNORE LIST (`lua/yana/paths/ignore.lua`, marked by
 			-- `changes_from_session` which alone knows the workspace). Neither offered nor
 			-- refused nor grouped: written through untouched at turn end and disclosed in one
 			-- turn-summary line. It is still in `typed`, so the bundle and the durable record
@@ -376,17 +375,22 @@ function I.classify_artifacts(typed, changes, _base_evidence, tracked)
 				-- always had.
 				structural_dirs[#structural_dirs + 1] = op
 			else
-				-- A regular-file delete outside an artifact root remains an explicit
-				-- review decision. Inside an artifact root it would be silently
-				-- excluded, so trackedness must authorize that exclusion.
+				-- A destructive op (delete or opaque) is safe only when canonical, git status
+				-- is known (repo/no_repo) and it is not inside a submodule, AND one of:
+				--   * it is a regular-file delete outside every artifact root (built-in or
+				--     operator-configured): it falls through to per-file review below, and
+				--     trackedness is not required because nothing is excluded silently;
+				--   * it sits inside a built-in (product) root with nothing tracked at or
+				--     below it: it is grouped, so trackedness must authorize that exclusion.
+				-- Anything else is unsafe and refuses the whole turn.
 				local is_destructive = op.kind == "opaque" or op.kind == "delete"
 				local safe = canonical
 				if is_destructive then
+					local review_delete = op.kind == "delete" and op.detail == "file" and not root
 					safe = safe
-						and safety_root ~= nil
 						and (tracked.status == "repo" or tracked.status == "no_repo")
 						and not inside_submodule(tracked, op.rel)
-						and not tracked_at_or_below(tracked, op.rel)
+						and (review_delete or (safety_root ~= nil and not tracked_at_or_below(tracked, op.rel)))
 				end
 				if not safe then
 					op.refusal_reason = canonical and "unsafe destructive artifact operation" or canonical_error

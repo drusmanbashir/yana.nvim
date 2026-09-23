@@ -52,7 +52,7 @@ function M.request_file_claim(root, rel, owner, done)
 	if type(session_id) ~= "string" or session_id == "" then
 		return false, "yanad session_id missing for file.claim"
 	end
-	local yanad = require("yana.yanad")
+	local yanad = require("yana.runtime.yanad")
 	local request_id = next_request_id(session_id)
 	yanad.file_claim({
 		session_id = session_id,

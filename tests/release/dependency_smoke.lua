@@ -1,7 +1,7 @@
 local source = debug.getinfo(1, "S").source:sub(2)
 local root = vim.fn.fnamemodify(source, ":h:h:h")
 local target = assert(os.getenv("RELEASE_MISSING_EXEC"), "RELEASE_MISSING_EXEC required")
-local dependencies = require("yana.dependencies")
+local dependencies = require("yana.runtime.dependencies")
 local config = require("yana.config")
 
 config.setup({ cmd = root .. "/tests/release/fake-cursor-agent", mode = "inline" })
@@ -60,7 +60,7 @@ if not health_match then
 end
 
 local done_code, done_message
-local job = require("yana.agent").run({
+local job = require("yana.agent.agent").run({
   prompt = "must not start",
   jail_session = {},
   on_done = function(code, message)

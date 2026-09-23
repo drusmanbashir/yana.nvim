@@ -270,13 +270,8 @@ function M.changes_from_session(session, context)
 	-- write-through needs. `classify_artifacts` is pure and stays pure: it reads
 	-- `op.ignored` and never asks what the operator configured.
 	--
-	-- NOT in single-file mode. That mode's whole contract is "only this one
-	-- tracked file may change", enforced by `apply_single_file_filter` further
-	-- down; letting a pattern write a second path through underneath it would
-	-- break the narrower promise to honour the wider one. An ignored path in an
-	-- SFM turn therefore keeps SFM's own refusal, which names the file.
-	local ignore = require("yana.ignore")
-	local ignore_active = not (session and session.single_file)
+	local ignore = require("yana.paths.ignore")
+	local ignore_active = true
 	for _, walk in ipairs(walks) do
 		local root, upper, typed = walk.root, walk.upper, walk.typed
 		if ignore_active then

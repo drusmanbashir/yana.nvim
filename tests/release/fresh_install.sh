@@ -5,6 +5,7 @@ set -euo pipefail
 	|| { echo "Usage: $0 EXPORTED_TREE NVIM [--expect-refusal]" >&2; exit 64; }
 tree=$(realpath "$1")
 nvim=$(realpath "$2")
+. "$tree/tests/lib/sigsafe.sh"
 expect_refusal=0
 [[ ${3:-} == "--expect-refusal" ]] && expect_refusal=1
 tmp=${YANA_HEADLESS_TMPDIR:-${TMPDIR:-/tmp}}
@@ -54,7 +55,7 @@ signal_yanad_under() {
   cmdline=$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null) || return 0
   for root in "$@"; do
     [[ -n "$root" && "$cmdline" == *"-m yanad --root $root/"* ]] || continue
-    kill "-$sig" "$pid" 2>/dev/null || true
+    sigsafe_signal "$sig" "$pid" || true
     return 0
   done
 }
@@ -79,12 +80,12 @@ stop_yanads_under() {
     pids=$(yanad_pids_under "$@")
     [[ -n "$pids" ]] || return 0
     for pid in $pids; do
-      signal_yanad_under TERM "$pid" "$@"
+      signal_yanad_under 15 "$pid" "$@"
     done
     wait_yanads_gone 5 "$@" && continue
     for pid in $(yanad_pids_under "$@"); do
       printf 'fresh install: yanad pid=%s ignored TERM for 5s; sending KILL\n' "$pid" >&2
-      signal_yanad_under KILL "$pid" "$@"
+      signal_yanad_under 9 "$pid" "$@"
     done
     wait_yanads_gone 2 "$@" || {
       printf 'fresh install: yanad survived KILL pids=[%s]\n' "$(yanad_pids_under "$@" | tr '\n' ' ')" >&2
@@ -140,7 +141,7 @@ if (( expect_refusal )); then
 	# Below-floor row: prove setup() refuses with the documented floor message
 	# and without a Lua traceback (same contract as tests/matrix_gate.sh negative).
 	min_nvim=$(sed -n 's/^M\.minimum_neovim = "\([^"]*\)".*/\1/p' \
-		"$plugin/lua/yana/dependencies.lua" | head -n1)
+		"$plugin/lua/yana/runtime/dependencies.lua" | head -n1)
 	[[ -n "$min_nvim" ]] || {
 		echo "fresh-install: cannot read M.minimum_neovim from dependencies.lua" >&2
 		exit 1
@@ -208,8 +209,8 @@ printf 'FRESH INSTALL PASS nvim=%s root=%s\n' "$($nvim --version | head -1)" "$p
 # ---------------------------------------------------------------------------
 # TURN SMOKE: setup()+panel-open above proves the export installs and loads,
 # but it never submits a prompt, so a runtime module reachable only from
-# inside a real turn -- direct require() like lua/yana/agent.lua's
-# require("yana.vendor_stream"), or a guarded pcall(require, ...) like
+# inside a real turn -- direct require() like lua/yana/agent/agent.lua's
+# require("yana.agent.vendor_stream"), or a guarded pcall(require, ...) like
 # lua/yana/inline_diff.lua's cross-file undo -- is invisible to it. Drive
 # ONE turn against the SAME installed tree ($plugin, not $tree/dev) that
 # smoke.lua just proved installs, via tests/release/turn_smoke.lua: hunk

@@ -1,7 +1,48 @@
--- Session settlement and teardown for inline review.
+-- Session settlement and the PUBLIC TEARDOWN FACADE for one inline review.
+--
+-- Teardown mechanics are NOT here. They live in `yana.review_resources`, which
+-- owns the single buffer-owner table and is the only thing entitled to decide
+-- whether this state may still touch a shared resource. This file used to carry
+-- its own copy of that body, keyed on `state.bufnr` alone: it cleared the paint,
+-- authority, anchor and hint namespaces and every `state.keys` entry on that
+-- buffer with no currency or owner test at all, so a review closing after a
+-- NEWER review had attached to the same buffer stripped the live one's marks and
+-- maps. The two functions below are the whole of what remains: a name callers
+-- already use, pointed at the owner.
 local Factory = {}
 local apply_sessions = require("yana.shadow.apply_sessions")
 local hunk_ledger = require("yana.hunk_ledger")
+-- The review leg owns the watcher and hands the applier its splice door.
+local review_watch = require("yana.review_watch")
+
+--- Terminal teardown of one review attachment. Idempotent, and safe to call on a
+--- state that has already been superseded: `review_resources.close` releases the
+--- state's own augroup either way and every SHARED resource only while this state
+--- is still the recorded owner of its buffer.
+---
+--- Public on the module (not only on the facade table below) because the close
+--- is a lifecycle door in its own right: the queue's abandon path, the preview
+--- and the lifetime rows all reach it by name.
+function Factory.cleanup(state)
+  if not state then
+    return
+  end
+  return require("yana.review_resources").close(state)
+end
+
+--- Park: navigation away from this review while it stays alive (R7).
+---
+--- NONTERMINAL. `review_resources.park` keeps the owner entry, the augroup and
+--- therefore the save handlers, the ledger, the marks and the window
+--- highlighting; it releases only the active watcher attachment, this review's
+--- buffer-local keys and any preview tab. It never sets `state.closed`, so the
+--- parked review is still the current owner of its buffer and still resumable.
+function Factory.park_review(state)
+  if not state then
+    return
+  end
+  return require("yana.review_resources").park(state)
+end
 
 function Factory.new(deps)
   local M = deps.facade
@@ -21,11 +62,12 @@ function Factory.new(deps)
   local pool_for_state = deps.pool_for_state
   local announce_state = deps.announce_state
   local schedule_queue_advance = deps.schedule_queue_advance
-  local restore_review_winhl = deps.restore_review_winhl
-  local NS = deps.ns
-  local AUTH_NS = deps.authority_ns
-  local ANCHOR_NS = deps.anchor_ns
-  local HINT_NS = deps.hint_ns
+  -- `deps.restore_review_winhl` / `deps.ns` / `deps.authority_ns` /
+  -- `deps.anchor_ns` / `deps.hint_ns` are deliberately not read here any more.
+  -- Window restoration and namespace clearing are `review_resources.close`'s,
+  -- reached through the hooks the binder registered at claim time, so the actual
+  -- namespace ids and the state-bound restore callback arrive with the claim
+  -- instead of being rediscovered from this factory's construction deps.
 
   -- `restore_blocks` (reject path only) names the hunks whose lines this close must put
   -- back. It captures the list before its own decide loop and hands it in. Every other
@@ -64,6 +106,8 @@ function Factory.new(deps)
       local err = nil
       local applied = nil
       if accepted then
+        -- Accept options carry this review's splice door to the applier's reconcile.
+        local accept_opts = { staged_bufnr = bufnr, own_splice = review_watch.own_splice }
         if change.kind == "delete" then
           -- Same guard the legacy accept path below carries, and it was missing here: a
           -- deletion accept never reads the review buffer, so human text typed into it
@@ -83,7 +127,7 @@ function Factory.new(deps)
               -- No composed content for a deletion: the applier unlinks, and
               -- passing buffer bytes here is what let an empty file be written in
               -- place of the delete.
-              local aok, aerr, aapplied = state.opts.on_shadow_accept(change, nil, { staged_bufnr = bufnr })
+              local aok, aerr, aapplied = state.opts.on_shadow_accept(change, nil, accept_opts)
               ok = aok == true
               err = aerr
               applied = aapplied
@@ -104,7 +148,7 @@ function Factory.new(deps)
               -- The Turn settler (F8) takes the SAME on_shadow_accept door for
               -- creations so apply_accept's write + save_buffer stamp stay the one
               -- implementation.
-              local aok, aerr, aapplied = state.opts.on_shadow_accept(change, composed, { staged_bufnr = bufnr })
+              local aok, aerr, aapplied = state.opts.on_shadow_accept(change, composed, accept_opts)
               ok = aok == true
               err = aerr
               applied = aapplied
@@ -152,14 +196,17 @@ function Factory.new(deps)
             end
             local pre_seq = buf_undo_seq(bufnr)
             local replaced = (end_line >= start_line) and (end_line - start_line + 1) or 0
-            local restore_ok, restore_err = pcall(
-              vim.api.nvim_buf_set_lines,
-              bufnr,
-              start_line - 1,
-              end_line,
-              false,
-              restored
-            )
+            -- THROUGH THE WATCHER'S OWN DOOR. This restoration is Yana putting
+            -- the original side back, and a bare `set_lines` reaches the watch
+            -- timeline as an unexplained change: the InsertLeave seal then finds
+            -- captured bytes that do not match the live buffer and refuses the
+            -- close, leaving the Turn live. `own_splice` mutes interpretation
+            -- only -- the ledger still transports this geometry exactly once.
+            local restore_ok, restore_err = pcall(function()
+              return review_watch.own_splice(bufnr, function()
+                vim.api.nvim_buf_set_lines(bufnr, start_line - 1, end_line, false, restored)
+              end)
+            end)
             if not bulk then
               break_undo_block(bufnr)
             end
@@ -213,7 +260,7 @@ function Factory.new(deps)
           change.status = "rejected"
           if bulk then
             pcall(function()
-              require("yana.turn_register"):push({
+              require("yana.turn.turn_register"):push({
                 kind = "decision",
                 rel = change.rel or change.path,
                 workspace = change.review_workspace or (state.opts and state.opts.workspace) or vim.fn.getcwd(),
@@ -510,88 +557,14 @@ function Factory.new(deps)
     return true
   end
 
-  -- WATCH THE BUFFER, because the paint is only correct at the moment it is computed.
-  -- The shrunk trace is one operation long. Every repaint now retains sticky one-row
-  -- ownership and uses the hunk's `new_lines` multiset only to recover
-  -- deleted/reinserted rows, so the only thing missing was a reason to repaint.
-  --
-  -- Why this did not exist before, and what it costs. The engine deliberately had
-  -- no `nvim_buf_attach`, no `on_lines` and no `TextChanged`; positions came from
-  -- extmarks, which track edits for free, so nothing needed to watch. That is
-  -- true of POSITION and false of OWNERSHIP: an extmark follows the text it was
-  -- put on, it does not notice that the text changed underneath it. gitsigns
-  -- re-diffs on every `on_lines` for the same reason.
-  --
-  -- The callback runs in fast context, where buffer and UI calls are forbidden,
-  -- so it captures nothing and only schedules. One pending render at a time:
-  -- typing a line fires `on_lines` per keystroke and each would otherwise queue
-  -- its own full repaint.
-  function M.cleanup(state)
-    if not state then
-      return
-    end
-    -- The strip is the SIDEBAR's, not this review's: it exists while the Turn
-    -- is live and this review closing is not that event. Re-render only -- the
-    -- strip loses `pool.active` and dims (spec F-BUTTON-STRIP).
-    pcall(require("yana.ui_review_buttons").refresh)
-    -- Stop the watcher before anything else is torn down: its scheduled render
-    -- would otherwise land on a half-dismantled review.
-    state.watch_detached = true
-    -- THE cleanup path for the watcher's per-buffer ownership entry: the flag
-    -- above silences this state, and this removes the entry that named it, so a
-    -- closed review leaves nothing per-buffer behind.
-    if state.bufnr then
-      pcall(require("yana.review_watch").release, state.bufnr, state)
-    end
-    -- A preview owns a tab and a scratch buffer that nothing else will ever
-    -- close. Leaking them per open is not just untidy: the scratch keeps the
-    -- "yana://diff-theme-preview" buffer NAME, so the next preview's
-    -- nvim_buf_set_name fails (E95) and every name-keyed check then matches the
-    -- stale corpse instead of the live review.
-    if state.preview_tab and vim.api.nvim_tabpage_is_valid(state.preview_tab) then
-      -- Resolve the index from the handle at close time so a user who reordered
-      -- tabs does not get an unrelated one closed. Skip when it is the only tab
-      -- (E784), where there is nothing to close back to.
-      if #vim.api.nvim_list_tabpages() > 1 then
-        pcall(vim.cmd, "tabclose! " .. vim.api.nvim_tabpage_get_number(state.preview_tab))
-      end
-      state.preview_tab = nil
-    end
-    if state.opts and state.opts.preview and state.bufnr and vim.api.nvim_buf_is_valid(state.bufnr) then
-      pcall(vim.api.nvim_buf_delete, state.bufnr, { force = true })
-    end
-    local bufnr = state.bufnr
-    if bufnr and vim.api.nvim_buf_is_valid(bufnr) then
-      -- Its watcher must not turn a later plain Neovim undo back into a review action.
-      if type(M._rewind_forget_path) == "function" and state.change and state.change.path then
-        pcall(M._rewind_forget_path, state.change.path)
-      end
-      vim.api.nvim_buf_clear_namespace(bufnr, NS, 0, -1)
-      vim.api.nvim_buf_clear_namespace(bufnr, AUTH_NS, 0, -1)
-      -- The decision anchors go with the review that parked them. They are the
-      -- only marks a repaint does not clear, so this is the one place they die.
-      vim.api.nvim_buf_clear_namespace(bufnr, ANCHOR_NS, 0, -1)
-      vim.api.nvim_buf_clear_namespace(bufnr, HINT_NS, 0, -1)
-      local keys = state.keys or {}
-      for _, key in ipairs(keys) do
-        pcall(vim.keymap.del, "n", key, { buffer = bufnr })
-        pcall(vim.keymap.del, "v", key, { buffer = bufnr })
-      end
-      -- Removing this review's local keys returns `u`/`U`/`<C-r>` to Neovim; no
-      -- post-review maps replace them.
-      require("yana.review_undo_trace").close(state)
-    end
-    if state.bufnr then
-      -- The maintained highlighting profile dies with the review that owned it,
-      -- so a reused bufnr never inherits the previous buffer's colours.
-      pcall(require("yana.review_reread_highlight").forget, state.bufnr)
-    end
-    if state.augroup then
-      pcall(vim.api.nvim_del_augroup_by_id, state.augroup)
-    end
-    restore_review_winhl(state)
-  end
-  
+  -- One implementation, one name. Every existing caller reaches the close
+  -- through the facade table (`review_queue`'s abandon path, `review_api`'s two
+  -- discard doors, `review_open_bind`'s failure door, `diff_preview`'s preview
+  -- teardown and `finish_session_now`'s three tails below), so the facade field
+  -- is pointed at the module function rather than given a body of its own.
+  M.cleanup = Factory.cleanup
+  M.park_review = Factory.park_review
+
   -- The review buffer exists but focus_buf could not display it in any window, so its
   -- buffer-local keymaps are unreachable and the queue would stall forever waiting on a
   -- review the user can never resolve. Unlike finish_session, this must NOT write disk:

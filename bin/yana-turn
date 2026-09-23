@@ -95,34 +95,6 @@ safe_component() {
 	fi
 }
 
-workspace_slug() {
-	local path=$1
-	local root
-	root=$(canonical_workspace_path "$path")
-	local id
-	id=$(stat -c '%d:%i' -- "$root" 2>/dev/null) || true
-	if [[ -n "$id" ]]; then
-		printf '%s' "$id" | sha256sum | awk '{print substr($1,1,16)}'
-	else
-		printf '%s' "$root" | sha256sum | awk '{print substr($1,1,16)}'
-	fi
-}
-
-canonical_workspace_path() {
-	local path=$1
-	local dir
-	dir=$(realpath_safe "$path")
-	local root="$dir"
-	while [[ -n "$dir" && "$dir" != "/" ]]; do
-		if [[ -e "$dir/.git" ]]; then
-			root="$dir"
-			break
-		fi
-		dir=$(dirname -- "$dir")
-	done
-	printf '%s' "$root"
-}
-
 require_disjoint() {
 	local ws=$1 path=$2 label=$3 remedy=${4:-}
 	if path_is_prefix "$ws" "$path" || path_is_prefix "$path" "$ws"; then

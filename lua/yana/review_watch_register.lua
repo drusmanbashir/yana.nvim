@@ -14,7 +14,7 @@ function M.new(deps)
     local change = state.change
     if seq == nil or type(change) ~= "table" then return end
     local workspace = change.review_workspace or (state.opts and state.opts.workspace) or vim.fn.getcwd()
-    local register = require("yana.turn_register").for_workspace(workspace)
+    local register = require("yana.turn.turn_register").for_workspace(workspace)
     local actions = state._buffer_edit_actions or {}
     state._buffer_edit_actions = actions
     if actions[seq] then return actions[seq] end
@@ -89,6 +89,10 @@ function M.new(deps)
     row.turn_id = change.turn_id or change.turn_gen
     action.hunk_merges = action.hunk_merges or {}
     action.hunk_merges[#action.hunk_merges + 1] = row
+    if not state._timeline_stage then
+      require("yana.review_undo_trace").capture("structural_attached", state, {
+        undo_seq = action.undo_seq, structural_kind = row.kind })
+    end
   end
 
   return {

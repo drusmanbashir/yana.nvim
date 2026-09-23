@@ -98,21 +98,8 @@ Every setting has a release default, so you do not need to copy or fill in the
 configuration below. `opts = {}` uses these values. Copy only the settings you
 want to change; Yana combines them with the remaining defaults (a deep merge).
 
-For example, this starts with the Claude backend and one of its models, leaves
-agentic mode out, and adds three optional global mappings; every omitted setting
-keeps the default above:
-
-```lua
-opts = {
-  backend = "claude",        -- initial agent CLI; <C-g> switches CLI and model
-  model = "claude-opus-4-8", -- a model id the claude CLI accepts; omit it to let claude choose
-  modes = { "inline", "ask" }, -- no "agentic": <M-t> cannot reach it
-  mappings = { toggle = "<leader>cc", ask = "<leader>ca", inline_edit = "<C-k>" },
-}
-```
-
 <details>
-<summary>Default (full) configuration</summary>
+<summary>Default configuration</summary>
 
 ```lua
 opts = {
@@ -156,13 +143,14 @@ opts = {
     toggle_mode = "<M-t>", -- cycle the chat's mode through modes, in list order
     resend = "<M-r>", -- prefix: then r resends here, n in a new chat, a in a new agent-mode chat
     review = "<C-y>", -- open the review of pending changes
-    accept = "<C-a>", -- accept pending changes
     reject = "<C-x>", -- reject pending changes
     focus_prompt = "i", -- from the conversation window, jump to the prompt
     close = "q", -- close the panel (normal mode); also closes the inline-edit float
     next_panel = "<M-.>", -- focus (split) or show (rotate) the next chat
     prev_panel = "<M-,>", -- focus or show the previous chat
     completion_menu = "<C-Space>", -- open slash-command/@mention completion (insert mode; needs blink.cmp)
+    -- Global: <C-a> toggles the sidebar from any normal-mode buffer.
+    toggle = "<C-a>", ask = false, inline_edit = false,
   },
   skill_dirs = { -- additional skill directories for / completion; project .cursor/skills is always scanned first
     "~/.cursor/skills",
@@ -181,12 +169,25 @@ opts = {
 
 </details>
 
+For example, this starts with the Claude backend and one of its models, leaves
+agentic mode out, and adds optional global mappings; every omitted setting keeps
+the default above:
 
-Yana sets no global keys by default; add only the ones you want (`toggle`,
-`ask`, `inline_edit`) to `mappings`. `agentic` mode writes your files with no
-review; it is in the default `modes`, so leave it out of your list if `<M-t>`
-should not reach it. Explanations and valid values for every setting, and the
-advanced settings not shown above:
+```lua
+opts = {
+  backend = "claude",        -- initial agent CLI; <C-g> switches CLI and model
+  model = "claude-opus-4-8", -- a model id the claude CLI accepts; omit it to let claude choose
+  modes = { "inline", "ask" }, -- no "agentic": <M-t> cannot reach it
+  mappings = { ask = "<leader>ca", inline_edit = "<C-k>" },
+}
+```
+
+`<C-a>` toggles the Yana sidebar from any normal-mode buffer, including a panel
+buffer. Add `ask` or `inline_edit`, or override `toggle`, in `mappings` if you
+want more global keys. `agentic` mode writes your files with no review; it is in
+the default `modes`, so leave it out of your list if `<M-t>` should not reach
+it. Explanations and valid values for every setting, and the advanced settings
+not shown above:
 [docs/configuration.md](docs/configuration.md#advanced-settings).
 
 ## Usage

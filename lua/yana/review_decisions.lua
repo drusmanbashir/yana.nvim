@@ -1,17 +1,145 @@
 -- Per-hunk and file-level decisions for one open inline review.
-local creation_touch = require("yana.creation_touch")
 local M = {}
 
-local function push_register_decision(state, change, count)
-  pcall(function()
-    require("yana.turn_register"):push({
-      kind = "decision",
-      rel = change.rel or change.path,
-      workspace = change.review_workspace or (state.opts and state.opts.workspace) or vim.fn.getcwd(),
-      turn_id = change.turn_id or change.turn_gen,
-      count = count or 1,
-    })
+-- One semantic owner for a native edit that destroys a pending hunk. It may
+-- run on the live ledger or on the watcher's private chronological ledger.
+-- External anchor/log/Turn effects are published only after the live mutation
+-- or the prepared transaction has committed.
+function M.prepare_destroyed_hunk(state, deps, block, idx, line_delta, pre_seq, reason)
+  local ledger = state.hunk_ledger
+  if not ledger or not ledger:owns(block) then return nil end
+  local recorded = ledger.pre_edit_state and ledger:pre_edit_state(block) or nil
+  local first = recorded and recorded.start_line or block.new_start_line
+  local last = (recorded and recorded.end_line) or block.new_end_line or first
+  ledger:decide(block, "reject", line_delta)
+  if ledger.record_destroyed_hunk then
+    ledger:record_destroyed_hunk(block, deps.buf_undo_seq(state.bufnr))
+  end
+  local seq = deps.buf_undo_seq(state.bufnr)
+  local entry = { action = "reject", idx = idx, block = block, delta = line_delta,
+    pre_seq = pre_seq, post_seq = seq, owner_kind = "buffer_edit", owner_seq = seq }
+  state.decisions[#state.decisions + 1] = entry
+  return { entry = entry, block = block, idx = idx, first = first, last = last,
+    reason = reason, is_last = ledger:count() == 0 }
+end
+
+function M.publish_destroyed_hunk(effect, deps, state, facade, first, last)
+  local block, idx = effect.block, effect.idx
+  local change, bufnr = state.change, state.bufnr
+  first, last = first or effect.first, last or effect.last
+  deps.record_decision(state, "reject_hunk", {
+    hunk = idx, model_index = block.model_index, model_join = block.model_join,
+    row = effect.first, old_count = #(block.old_lines or {}),
+    new_count = #(block.new_lines or {}), reason = effect.reason,
+  })
+  effect.entry.anchor = deps.park_decision_anchor(bufnr, first, last)
+  if effect.is_last then deps.record_last_hunk_decided("reject", block) end
+  facade._emit_review_settled(bufnr, change.turn_id or change.turn_gen, "reject_hunk")
+  facade._poll_leave_edge(state, "hunk_destroyed")
+end
+
+local function push_register_decision(state, change, count, payload)
+  local row = {
+    kind = "decision",
+    rel = change.rel or change.path,
+    workspace = change.review_workspace or (state and state.opts and state.opts.workspace) or vim.fn.getcwd(),
+    turn_id = change.turn_id or change.turn_gen,
+    count = count == nil and 1 or count,
+  }
+  for key, value in pairs(payload or {}) do
+    row[key] = value
+  end
+  local ok, result = pcall(function()
+    return require("yana.turn.turn_register"):push(row)
   end)
+  if not ok then
+    return false, tostring(result)
+  end
+  if result == false then
+    return false, "turn register refused the decision row"
+  end
+  return true
+end
+
+--- `opts.history == false`: the caller's step (cA) carries history; no count=0 row.
+function M.record_mode_decision(file, decision, opts)
+  if type(file) ~= "table" or type(file.decide_mode) ~= "function" then
+    return false, "review_decisions.record_mode_decision needs a File with decide_mode"
+  end
+  if type(decision) ~= "table" then
+    return false, "review_decisions.record_mode_decision needs a decision table"
+  end
+  local change = file.change
+  if type(change) ~= "table" or type(file.path) ~= "string" then
+    return false, "review_decisions.record_mode_decision needs the exact File/change identity"
+  end
+
+  local previous_record = file.mode_verdict
+  local ok, reason = file:decide_mode({
+    proposal_key = decision.proposal_key,
+    previous = decision.previous,
+    next = decision.next,
+    policy = decision.policy,
+    asked = decision.asked,
+  })
+  if ok ~= true then
+    return false, reason
+  end
+
+  if type(opts) == "table" and opts.history == false then
+    return true
+  end
+  local pushed, push_err = push_register_decision(nil, change, 0, {
+    file = file,
+    file_path = file.path,
+    change = change,
+    change_id = file.change_id,
+    mode = {
+      proposal_key = decision.proposal_key,
+      previous = decision.previous,
+      next = decision.next,
+      policy = decision.policy,
+      asked = decision.asked,
+      previous_record = previous_record,
+    },
+  })
+  if not pushed then
+    file.mode_verdict = previous_record
+    return false, "review_decisions.record_mode_decision could not record history: " .. tostring(push_err)
+  end
+  return true
+end
+
+function M.record_operation_decision(file, verdict, state)
+  if type(file) ~= "table" or type(file.decide_operation) ~= "function" then
+    return false, "review_decisions.record_operation_decision needs a File with decide_operation"
+  end
+  local change = file.change
+  if type(change) ~= "table" or type(file.path) ~= "string" then
+    return false, "review_decisions.record_operation_decision needs the exact File/change identity"
+  end
+  local previous = file.operation_verdict or "pending"
+  if previous == verdict then
+    return true
+  end
+  local ok, reason = file:decide_operation(verdict)
+  if ok ~= true then
+    return false, reason
+  end
+  local transition = {
+    file = file,
+    file_path = file.path,
+    change = change,
+    change_id = file.change_id,
+    previous = previous,
+    next = verdict,
+  }
+  local pushed, push_err = push_register_decision(state, change, 0, { operation = transition })
+  if not pushed then
+    file:decide_operation(previous)
+    return false, "review_decisions.record_operation_decision could not record history: " .. tostring(push_err)
+  end
+  return true
 end
 
 function M.new(deps)
@@ -20,91 +148,61 @@ function M.new(deps)
   local bufnr = deps.bufnr
   local facade = deps.facade
 
+  local function current_file()
+    local pool = type(deps.pool_for) == "function" and deps.pool_for(state.opts or {}) or nil
+    local turn = pool and require("yana.turn.turn_bind").get(pool) or nil
+    local path = deps.diff.abs_path(change.path)
+    return turn and turn:file(path) or nil
+  end
+
+  local function operation_transition(next_verdict)
+    local file = current_file()
+    if file == nil or file.operation == nil then
+      return nil
+    end
+    local members = file.ledger and type(file.ledger.members) == "function" and file.ledger:members() or {}
+    if #members > 0 or file.operation_verdict == next_verdict then
+      return nil
+    end
+    return {
+      file = file,
+      file_path = file.path,
+      change = file.change,
+      change_id = file.change_id,
+      previous = file.operation_verdict or "pending",
+      next = next_verdict,
+    }
+  end
+
+  local function apply_operation(transition, forward)
+    if transition == nil then
+      return true
+    end
+    local file = transition.file
+    local expected = forward and transition.previous or transition.next
+    local verdict = forward and transition.next or transition.previous
+    if not rawequal(file.change, transition.change)
+      or file.path ~= transition.file_path
+      or file.change_id ~= transition.change_id
+      or file.operation_verdict ~= expected
+    then
+      return false, "operation decision no longer names the same File state"
+    end
+    return file:decide_operation(verdict)
+  end
+
   local function park_anchor(_, start_line, end_line)
     return deps.park_decision_anchor(bufnr, start_line, end_line)
   end
 
-  -- Record the same reject decision the `cr` door records, while `line_delta` lets the
-  -- ledger own the one physical shift that the deletion caused. The watcher supplies
-  -- the pre-delete undo seq so `u` can take this decision back as one logical step.
   local function reject_destroyed_hunk(block, idx, line_delta, pre_seq, reason)
-    if not state.hunk_ledger or not state.hunk_ledger:owns(block) then
-      return false
-    end
-    -- Geometry comes from the ledger's RECORDED pre-edit frame, not from
-    -- `block.new_start_line` as it stands here. By the time this runs, the
-    -- watcher's shift pass has already moved the live fields by the size of the
-    -- deletion, so an anchor parked on them is off by exactly that many lines
-    -- and one undo restores the bytes against the wrong range. The recorded
-    -- frame is captured before the shift and is keyed by the block itself, so
-    -- it survives a move that invalidates any row anchor.
-    local recorded = state.hunk_ledger.pre_edit_state and state.hunk_ledger:pre_edit_state(block) or nil
-    local start_line = recorded and recorded.start_line or block.new_start_line
-    local end_line = (recorded and recorded.end_line) or block.new_end_line or start_line
-    state.hunk_ledger:decide(block, "reject", line_delta)
-    -- Record the destruction in keyed history AFTER `decide`, because the frame
-    -- pair this writes is BEFORE/AFTER and only the AFTER half is read off the
-    -- live hunk. `remember` snapshots the block as it stands now, so recording
-    -- first stored an after-frame that still said `pending`, and redo compared
-    -- pending against pending and never restored the verdict -- the bytes went
-    -- back but the hunk stayed in the pending set. The BEFORE half does not move
-    -- with this call: `record_destroyed_hunk` takes it from
-    -- `buffer_history.last_before[block]`, captured by the shift pass before the
-    -- edit, and `decide` neither touches that frame nor drops the hunk from the
-    -- ledger, so the pre-edit geometry and the `pending` verdict one undo
-    -- restores are the same either way.
-    --
-    -- An absorbed edit records itself; a hunk deleted outright absorbs nothing,
-    -- so without this call history holds no record of the destruction and the
-    -- replay has nothing to restore.
-    if state.hunk_ledger.record_destroyed_hunk then
-      state.hunk_ledger:record_destroyed_hunk(block, deps.buf_undo_seq(bufnr))
-    end
-    deps.record_decision(state, "reject_hunk", {
-      hunk = idx,
-      model_index = block.model_index,
-      model_join = block.model_join,
-      row = start_line,
-      old_count = #(block.old_lines or {}),
-      new_count = #(block.new_lines or {}),
-      reason = reason,
-    })
-    local anchor = park_anchor(block, start_line, end_line)
-    local post_seq = deps.buf_undo_seq(bufnr)
-    local entry = {
-      action = "reject",
-      idx = idx,
-      block = block,
-      delta = line_delta,
-      pre_seq = pre_seq,
-      post_seq = post_seq,
-      anchor = anchor,
-      -- This reject is a CONSEQUENCE owned by the editor command's own
-      -- `buffer_edit` register row (undo_seq == owner_seq), not a decision the
-      -- register walks on its own. `u` retracts it when it reverses that
-      -- sequence and re-pushes it on redo (undo_action_buffer_edit.lua), so the
-      -- one keystroke stays one reversible action. `owner_kind` marks it apart
-      -- from a `cr` reject, whose entry is otherwise the same shape and which
-      -- the register never owns.
-      owner_kind = "buffer_edit",
-      owner_seq = post_seq,
-    }
-    state.decisions[#state.decisions + 1] = entry
-    -- No register row. The editor command that destroyed this hunk already
-    -- pushes its own `buffer_edit` row (review_watch.lua), and that row is what
-    -- `u` reverses. Pushing a decision row here as well would put TWO rows on
-    -- the register for ONE keystroke, so one press would spend one row and
-    -- leave the other half of the command standing. The `state.decisions` entry
-    -- above still records what was decided, tagged to that buffer_edit so its
-    -- reversal takes it back atomically -- review bookkeeping, not the register.
-    if state.hunk_ledger:count() == 0 then
-      deps.record_last_hunk_decided("reject", block)
-    end
-    facade._emit_review_settled(bufnr, change.turn_id or change.turn_gen, "reject_hunk")
-    -- Edge poll notifies the Turn (`on_decision`); `_poll_leave_edge` never
-    -- returns true, so no try_finalize branch remains here.
-    facade._poll_leave_edge(state, "hunk_destroyed")
+    local effect = M.prepare_destroyed_hunk(state, deps, block, idx, line_delta, pre_seq, reason)
+    if not effect then return false end
+    M.publish_destroyed_hunk(effect, deps, state, facade)
     return true
+  end
+  state._publish_destroyed_effect = function(effect, first, last)
+    return M.publish_destroyed_hunk(effect, deps, state, facade, first, last)
   end
 
   local function anchor_range(id)
@@ -148,6 +246,9 @@ function M.new(deps)
   -- rows for ONE press. The caller passes true and pushes ONE aggregate row itself once
   -- the loop is done.
   local function reject_block_at(idx, suppress_register)
+    if state.hunk_ledger and state.hunk_ledger.frozen_for_end then
+      return false, "turn is frozen for End"
+    end
     local block = state.hunk_ledger:pending()[idx]
     if not block then
       return
@@ -232,6 +333,9 @@ function M.new(deps)
   end
 
   local function accept_block_at(idx)
+    if state.hunk_ledger and state.hunk_ledger.frozen_for_end then
+      return false, "turn is frozen for End"
+    end
     local block = state.hunk_ledger:pending()[idx]
     if not block then
       return
@@ -244,12 +348,7 @@ function M.new(deps)
       deps.notify_one_line("yana: " .. change.review_error, vim.log.levels.WARN)
       return
     end
-    -- Accept passes NO delta: the buffer already holds the agent's lines, so no later
-    -- hunk moves (`remove_block`'s `use_new_lines` branch). `owns` is asked because a
-    -- rebuild can orphan the block this door is holding (amendment log); an orphan
-    -- simply carries no verdict. The band over the accepted hunk goes with the ONE
-    -- coalesced repaint the dirty signal schedules -- this door deletes no extmark and
-    -- repaints nothing by hand.
+    -- Accept changes membership only; the buffer already holds the proposed lines.
     if state.hunk_ledger and state.hunk_ledger:owns(block) then
       state.hunk_ledger:decide(block, "accept")
     end
@@ -276,9 +375,7 @@ function M.new(deps)
       anchor = anchor,
     }
     push_register_decision(state, change, 1)
-    if not creation_write then
-      vim.bo[bufnr].modified = true
-    end
+    vim.bo[bufnr].modified = true
     if state.hunk_ledger:count() == 0 then
       deps.record_last_hunk_decided("accept", block)
     end
@@ -298,8 +395,7 @@ function M.new(deps)
   local function reject_hunk()
     local block, idx = deps.current_block(state.hunk_ledger:pending(), bufnr)
     if block then
-      reject_block_at(idx)
-      return
+      return reject_block_at(idx)
     end
     -- ca/cr act on the hunk under the cursor only; a key that sometimes hits an
     -- off-screen sole pending hunk is what we refuse.
@@ -312,8 +408,7 @@ function M.new(deps)
   local function accept_hunk()
     local block, idx = deps.current_block(state.hunk_ledger:pending(), bufnr)
     if block then
-      accept_block_at(idx)
-      return
+      return accept_block_at(idx)
     end
     -- ca/cr act on the hunk under the cursor only; a key that sometimes hits an
     -- off-screen sole pending hunk is what we refuse.
@@ -324,19 +419,14 @@ function M.new(deps)
   end
 
   local function accept_all()
+    if state.hunk_ledger and state.hunk_ledger.frozen_for_end then
+      return false, "turn is frozen for End"
+    end
     deps.record_decision(state, "accept_file", { hunks_remaining = state.hunk_ledger:count() })
     local pending_before = state.hunk_ledger:pending()
     local members = {}
     --
-    -- Written HERE, in the loop that already walks the pending hunks, and
-    -- BEFORE `decide_all`: each anchor is parked off the block's LIVE range,
-    -- and the repaint the verdicts' dirty signal schedules takes the marks
-    -- those ranges are read from with it.
-    --
-    -- `delta = 0` and `pre_seq == post_seq` for the reason the per-hunk accept
-    -- door uses them: accepting moves no bytes (the buffer already holds the
-    -- agent's lines), so no later hunk shifts and there is no undo-tree
-    -- position to rewind to.
+    -- Park anchors before decide_all removes the live pending ranges.
     local at_seq = deps.buf_undo_seq(bufnr)
     for i, block in ipairs(pending_before) do
       members[#members + 1] = {
@@ -345,12 +435,7 @@ function M.new(deps)
         new_count = #(block.new_lines or {}),
       }
       local a_start, a_end = deps.live_block_range(bufnr, block)
-      -- A hunk whose marks are already gone still gets an entry, anchored off its
-      -- stored geometry: `pop_decision` falls back to `live_block_range` and then
-      -- refuses BY NAME if the position is truly unknowable. Dropping the entry instead
-      -- would silently desync `count` from the array and send the surplus pop into the
-      -- undo-exhausted door -- the very fault this block exists to close. The per-hunk
-      -- door may refuse the whole press on a dead range because it is deciding ONE
+      -- Dead live marks fall back to stored geometry; the history count stays exact.
       a_start = a_start or block.new_start_line
       a_end = a_end or block.new_end_line or a_start
       state.decisions[#state.decisions + 1] = {
@@ -363,7 +448,18 @@ function M.new(deps)
         anchor = a_start and park_anchor(block, a_start, a_end) or nil,
       }
     end
-    push_register_decision(state, change, #members)
+    local operation = operation_transition("accepted")
+    local operation_ok, operation_err = apply_operation(operation, true)
+    if not operation_ok then
+      deps.notify_one_line("yana: could not record operation decision: " .. tostring(operation_err), vim.log.levels.WARN)
+      return false
+    end
+    local pushed, push_err = push_register_decision(state, change, #members, { operation = operation })
+    if not pushed then
+      apply_operation(operation, false)
+      deps.notify_one_line("yana: could not record decision history: " .. tostring(push_err), vim.log.levels.WARN)
+      return false
+    end
     local last_block = state.hunk_ledger:pending()[#state.hunk_ledger:pending()]
     state.hunk_ledger:decide_all("accept")
     deps.record_last_hunk_decided("accept", last_block)
@@ -394,52 +490,15 @@ function M.new(deps)
 
   state._decide_destroyed_hunk = reject_destroyed_hunk
 
-  -- Under the ruling a decision on a created file moves no bytes at all, so there is
-  -- nothing to revert.
-  --
-  -- What the ruling DOES need here is the other direction. So the NEXT decision on any
-  -- of those hunks may arrive with no file underneath it, and it must re-run the touch
-  -- owner's FORWARD before it applies. It cannot be replayed from a register row:
-  -- `turn_register:push` clears forward rows (lua/yana/turn_register.lua:55-58), so a
-  -- row-based redo of the touch is unreachable BY CONSTRUCTION and must not be relied
-  -- on.
-  --
-  -- Hooked on the ledger's three verdict-applying entries rather than on each door, so
-  -- a decision arriving through any door -- per-hunk, file-level, the watcher's
-  -- destroyed-hunk seam, or a redo replay -- re-touches first. FORWARD is idempotent,
-  -- so the ordinary case (file still there) costs one `getftype`. Installed ONCE per
-  -- ledger object.
-  if creation_touch.is_creation(change)
-    and state.hunk_ledger
-    and not state.hunk_ledger._creation_retouch_hooked
-  then
-    local led = state.hunk_ledger
-    led._creation_retouch_hooked = true
-    local function retouch()
-      local ok, err = creation_touch.touch(change.path)
-      if not ok then
-        -- Someone else owns that path now. The decision still lands in the
-        -- ledger; what refuses is putting the file back under it.
-        deps.notify_one_line(
-          "yana: could not re-create " .. (change.rel or change.path) .. ": " .. tostring(err),
-          vim.log.levels.WARN
-        )
+  local function after_pending_edit(fn)
+    return function(...)
+      local ready, reason = require("yana.review_watch").finalize(bufnr, state)
+      if not ready then
+        deps.notify_one_line("yana: could not finish pending edit: " .. tostring(reason),
+          vim.log.levels.WARN)
+        return false
       end
-    end
-    local orig_decide = led.decide
-    function led.decide(self, block, action, line_delta)
-      retouch()
-      return orig_decide(self, block, action, line_delta)
-    end
-    local orig_decide_all = led.decide_all
-    function led.decide_all(self, action)
-      retouch()
-      return orig_decide_all(self, action)
-    end
-    local orig_redo = led.redo_decision
-    function led.redo_decision(self, block, action)
-      retouch()
-      return orig_redo(self, block, action)
+      return fn(...)
     end
   end
 
@@ -448,11 +507,11 @@ function M.new(deps)
     anchor_range = anchor_range,
     drop_anchor = drop_anchor,
     clear_extmarks = clear_extmarks,
-    reject_block_at = reject_block_at,
-    accept_block_at = accept_block_at,
-    reject_hunk = reject_hunk,
-    accept_hunk = accept_hunk,
-    accept_all = accept_all,
+    reject_block_at = after_pending_edit(reject_block_at),
+    accept_block_at = after_pending_edit(accept_block_at),
+    reject_hunk = after_pending_edit(reject_hunk),
+    accept_hunk = after_pending_edit(accept_hunk),
+    accept_all = after_pending_edit(accept_all),
   }
 end
 

@@ -36,7 +36,7 @@ function Factory.new(deps)
   -- (creation_touch.on_proposal); all this owes it is a normalised path, a rel and a
   -- stamped workspace.
   local function touch_proposed_creation(change, opts)
-    local creation_touch = require("yana.creation_touch")
+    local creation_touch = require("yana.paths.creation_touch")
     local path = creation_touch.is_creation(change) and diff.abs_path(change.path) or nil
     if path == nil or path == "" then return end
     change.path = path
@@ -48,6 +48,7 @@ function Factory.new(deps)
 
   function M.enqueue(change, opts)
     opts = opts or {}
+    require("yana.log").buffer_event("enqueue", { change = change, preview = opts.preview })
     touch_proposed_creation(change, opts)
     local st = pool_for(opts)
     if st.active and st.active.change == change then
@@ -78,91 +79,20 @@ function Factory.new(deps)
   -- Drop active and queued reviews owned by one panel/stream epoch inside a workspace
   -- pool. Other owners' work in the same pool survives (H4). No live Turn, or zero
   -- hunks -> silent today.
-  function M.discard_for_owner(owner, opts)
-    if not owner then
-      return M.discard_pool(opts)
-    end
-    opts = opts or {}
-    local st = pool_for(opts)
-    local tb = require("yana.turn_bind")
-    local turn = tb.get(st)
-    if turn then
-      local hunks = 0
-      for _, f in ipairs(turn.files or {}) do
-        if f.ledger and type(f.ledger.members) == "function" then
-          hunks = hunks + #f.ledger:members()
-        end
-      end
-      if hunks > 0 then
-        local ended = turn:end_turn("abort")
-        if not ended then
-          return false
-        end
-      end
-    end
-    local cleared_active = false
-    if st.active then
-      local active_owner = st.active.opts and st.active.opts.review_owner
-      if owners_match(active_owner, owner) then
-        pcall(M.cleanup, st.active)
-        st.active = nil
-        cleared_active = true
-      end
-    end
-    local kept = {}
-    for _, item in ipairs(st.queue) do
-      if not owners_match(queue_item_owner(item), owner) then
-        kept[#kept + 1] = item
-      end
-    end
-    st.queue = kept
-    M._rewind_forget_owner(owner)
-    announce_state()
-    if cleared_active then
-      process_next_for(opts)
-    end
-    return true
-  end
-
-  -- Abandon every review in a workspace pool without resolving hunks. Used when
-  -- the owning conversation is discarded (new_chat) so active/queued work cannot
-  -- outlive the claim release. Same ONE-door rule as discard_for_owner.
-  function M.discard_pool(opts)
-    opts = opts or {}
-    local st = pool_for(opts)
-    local tb = require("yana.turn_bind")
-    local turn = tb.get(st)
-    if turn then
-      local hunks = 0
-      for _, f in ipairs(turn.files or {}) do
-        if f.ledger and type(f.ledger.members) == "function" then
-          hunks = hunks + #f.ledger:members()
-        end
-      end
-      if hunks > 0 then
-        local ended = turn:end_turn("abort")
-        if not ended then
-          return false
-        end
-      end
-    end
-    local tabs_path = review_tabs.state_path(opts)
-    if tabs_path then
-      pcall(vim.fn.delete, tabs_path)
-    end
-    if st.active then
-      pcall(M.cleanup, st.active)
-      st.active = nil
-    end
-    st.queue = {}
-    st.batched = {}
-    st.order = {}
-    st.order_seq = 0
-    st.review_tabs = nil
-    M._rewind_forget_owner(nil)
-    announce_state()
-    return true
-  end
+  -- The two discard doors live in `yana.review_discard`: one question -- may
+  -- this caller drop its review state yet -- with one answer, and the only
+  -- place that carries a pending End's completion into its own cleanup.
+  local discard = require("yana.review_discard").new({
+    facade = M,
+    pool_for = pool_for,
+    review_tabs = review_tabs,
+    owners_match = owners_match,
+    queue_item_owner = queue_item_owner,
+    process_next_for = process_next_for,
+    announce_state = announce_state,
+  })
+  M.discard_for_owner = discard.discard_for_owner
+  M.discard_pool = discard.discard_pool
 
   -- M.open sets the `active` singleton with no guard, so reviewing change B while
   -- change A was open silently overwrote it: A's keymaps, BufWriteCmd guard and
@@ -303,7 +233,18 @@ function Factory.new(deps)
       return false
     end
     if action == "reject" then
-      return finish_session(active, false)
+      -- The SAME lesson as `accept` above, at the other door. Calling
+      -- `finish_session` here closed the review behind the Turn's back: no
+      -- `state.decisions` reversal entry, no turn-register row, and the Turn's
+      -- final-hunk leave edge never ran, so the Turn never learned its last
+      -- decision had been made. The review's own `reject_all` is that edge.
+      local reject_all = active._ops and active._ops.reject_all
+      if type(reject_all) ~= "function" then
+        return false
+      end
+      reject_all()
+      -- Return contract UNCHANGED: a decision STARTED is not a session closed.
+      return false
     end
     return false
   end
@@ -467,13 +408,20 @@ function Factory.new(deps)
     return out
   end
 
-  -- Rejects and tears down the active review in opts' pool.
+  -- Rejects the active review in opts' pool THROUGH ITS OWN DECISION, so the
+  -- Turn's leave edge owns the End. It does not tear the session down itself:
+  -- `finish_session` here bypassed the Turn exactly as the panel Reject door
+  -- did. The answer says a decision was made, not that the session is closed.
   function M.close_active(opts)
     local st = pool_for(opts or {})
     if not st.active then
       return false
     end
-    finish_session(st.active, false)
+    local reject_all = st.active._ops and st.active._ops.reject_all
+    if type(reject_all) ~= "function" then
+      return false
+    end
+    reject_all()
     return true
   end
 

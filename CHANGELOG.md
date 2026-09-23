@@ -3,6 +3,64 @@
 All notable changes to Yana are documented here. Versions follow Semantic
 Versioning.
 
+## 0.1.0-alpha.14 - 2026-09-23
+
+### Changed
+
+- The public checkout now derives its exact file list from documented product
+  directories and narrow development-only exclusions. Release export checks
+  the generated list from the source commit, so newly split runtime modules
+  ship with their parent directories.
+- The inline editing instructions are included in both the public checkout
+  and downloadable archive. Public release checks run without development-only
+  fixtures.
+
+## 0.1.0-alpha.13 - 2026-09-13
+
+### Fixed
+
+- **Live sessions recover after an unexpected `yanad` restart.** The client
+  drops stale in-flight requests and re-establishes a compatible session before
+  the next turn, avoiding `unknown_session` failures and preserving review
+  ownership across a daemon restart.
+
+## 0.1.0-alpha.12 - 2026-09-13
+
+### Fixed
+
+- **Open-capture turns may begin in `$HOME`.** Home dotfile and cross-project
+  turns now use the canonical private CapturePlan, including explicit widening
+  to multiple direct home files, while real files remain unchanged until
+  review acceptance.
+
+## 0.1.0-alpha.11 - 2026-09-13
+
+### Fixed
+
+- **Planless turns no longer crash the `yanad` launcher.** When no turn plan is
+  supplied, the launcher now emits valid turn arguments without expanding an
+  unset `PLAN_JSON` variable under strict shell mode.
+
+## 0.1.0-alpha.10 - 2026-09-13
+
+### Changed
+
+- **Single-file mode is retired.** Yana no longer turns a home dotfile into a
+  single-file scratch review. Workspace turns use the canonical CapturePlan;
+  `--workspace` remains supported, `--file` is refused, and legacy
+  `single_file` configuration is ignored. Ordinary per-file review acceptance
+  remains available.
+
+## 0.1.0-alpha.9 - 2026-09-13
+
+### Added
+
+- **Open capture now has a canonical CapturePlan launch path.** Inline capture
+  can choose `overlayfs-fast` directly for supported topologies and keeps
+  `fuse-compat` as an optional compatibility backend.
+- **The open-capture gate set ships with backend, FUSE runtime, compatibility
+  and optional privileged no-scan coverage.**
+
 ## 0.1.0-alpha.8 - 2026-09-13
 
 Supersedes the unpublished 0.1.0-alpha.7 tag. The alpha.7 public tag was
@@ -95,9 +153,8 @@ without a tag or GitHub release; everything listed under 0.1.0-alpha.6 ships in
 ### Changed
 
 - **`diff_keymaps.both` renamed to `diff_keymaps.reject_file`** (default
-  unchanged: `"cx"`). The old name borrowed Avante's `replace_in_file`
-  "keep both" vocabulary for a binding that has only ever rejected the
-  whole file. `both` still works as a deprecated alias — it wins only when
+  unchanged: `"cx"`). The old name borrowed a "keep both" vocabulary for a
+  binding that has only ever rejected the whole file. `both` still works as a deprecated alias — it wins only when
   `reject_file` is left unset — and warns once per session
   (`yana: diff_keymaps.both is deprecated; use reject_file`) when an
   operator sets it explicitly.

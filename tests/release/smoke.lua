@@ -27,11 +27,11 @@ check(vim.fn.exists(":" .. legacy_name:gsub("^%l", string.upper)) == 0, "old com
 local ok_open, open_err = pcall(vim.cmd, "YanaOpen")
 check(ok_open, "panel entry opens: " .. tostring(open_err))
 if ok_open then
-  check(require("yana.ui").is_open(), "panel is visible to Neovim")
+  check(require("yana.panel.ui").is_open(), "panel is visible to Neovim")
   pcall(vim.cmd, "YanaClose")
 end
 
-local rows = require("yana.dependencies").check("agentic")
+local rows = require("yana.runtime.dependencies").check("agentic")
 local by_id = {}
 for _, item in ipairs(rows) do
   by_id[item.id] = item

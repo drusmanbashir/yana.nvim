@@ -1,8 +1,37 @@
--- Split out of review_open.lua to meet the 500-line ceiling.
--- Keys, state table, watchers, actions, keymaps, and display tail.
+-- Split out of review_open.lua: attachment, state, watchers, actions, keymaps,
+-- and display orchestration; the per-Turn permission driver is a sibling.
 local hunk_ledger = require("yana.hunk_ledger")
+local review_resources = require("yana.review_resources")
+local review_context = require("yana.review_context")
 
 local Factory = {}
+
+--- The four buffer namespaces this review draws in. `nvim_create_namespace` is
+--- idempotent per NAME, so resolving them here yields the same ids
+--- `inline_diff` created; they travel into `claim` as ACTUAL ids because a
+--- namespace the owner table cannot name is a namespace close cannot clear.
+local function review_namespaces()
+  return {
+    vim.api.nvim_create_namespace("YanaInlineDiff"),
+    vim.api.nvim_create_namespace("YanaInlineDiffAuthority"),
+    vim.api.nvim_create_namespace("YanaInlineDiffDecisionAnchor"),
+    vim.api.nvim_create_namespace("YanaInlineHint"),
+  }
+end
+
+--- The review's buffer-local keys as ACTUAL specifications. `review_open_bind_keys`
+--- binds every one of them in both `n` and `v` (`bound_set({"n","v"}, ...)`), and
+--- `claim` refuses a bare string by design: an undescribed key is a key close can
+--- never remove.
+local function key_specs(keys)
+  local specs = {}
+  for _, lhs in ipairs(keys or {}) do
+    if type(lhs) == "string" and lhs ~= "" then
+      specs[#specs + 1] = { lhs = lhs, modes = { "n", "v" } }
+    end
+  end
+  return specs
+end
 
 --- Returns `false` when there is nothing to reinstall (a preview review, or a state
 --- `bind()` never finished) so the caller can fall back to the ordinary open path.
@@ -14,8 +43,31 @@ function Factory.reinstall_keys(state)
   if not bufnr or not vim.api.nvim_buf_is_valid(bufnr) then
     return false
   end
-  for _, def in ipairs(state._key_defs) do
-    vim.keymap.set(def.modes, def.key, def.handler, def.kmopts)
+  -- UNWIND WHAT THIS ATTEMPT LANDED. A resume that throws part-way through
+  -- reinstalling leaves the keys it already set answering on a buffer whose
+  -- review is still parked, and the caller then falls back to the full open
+  -- rebuild -- which would find them there. Only the maps this loop installed
+  -- are removed; the parked review's own definitions are untouched, so the
+  -- fallback rebuild starts from the same baseline the park left.
+  local landed = {}
+  local ok, err = pcall(function()
+    for _, def in ipairs(state._key_defs) do
+      vim.keymap.set(def.modes, def.key, def.handler, def.kmopts)
+      landed[#landed + 1] = def
+    end
+  end)
+  if not ok then
+    for _, def in ipairs(landed) do
+      for _, mode in ipairs(type(def.modes) == "table" and def.modes or { def.modes }) do
+        pcall(vim.keymap.del, mode, def.key, { buffer = bufnr })
+      end
+    end
+    require("yana.log").lifecycle_info("review.resume.reinstall_refusal", {
+      bufnr = bufnr,
+      installed = #landed,
+      reason = tostring(err),
+    })
+    return false
   end
   return true
 end
@@ -175,10 +227,52 @@ function Factory.new(deps)
     staged_text = diff.buffer_bytes_snapshot(bufnr),
     fcs_post_count = 0,
     winhl_restore = {},
-    augroup = vim.api.nvim_create_augroup("YanaInlineDiff" .. change.id, { clear = true }),
+    -- `augroup` is NOT minted here any more: `review_resources.claim` mints it,
+    -- unique per STATE, before any handler can be registered outside it.
     -- Starts false: nothing has happened yet.
     free_standing_edit = false,
   }
+
+  -- A REBUILD retires the old attachment FIRST (design :87). The parked state
+  -- still owns this buffer, and `claim` refuses a different live owner by
+  -- design, so the replacement cannot even start until the retired one has
+  -- given the buffer up. The recovery snapshot (`change._parked_review`) is not
+  -- touched here: it is cleared by `review_open` only once this bind returns
+  -- successfully.
+  local retiring = change._parked_state
+  if type(retiring) == "table" and retiring ~= state and review_resources.is_current(retiring) then
+    review_resources.close(retiring)
+  end
+
+  -- THE CLAIM. Everything below registers handlers and keys on this buffer, and
+  -- every one of them belongs to the group this call mints. `hooks` carry the
+  -- ACTUAL resources -- real key specifications, real namespace ids, callbacks
+  -- bound to this state -- because a resource the owner table cannot name is a
+  -- resource close can never release (F-TRL06-01).
+  local claimed, claim_error = review_resources.claim(state, {
+    keys = key_specs(keys),
+    namespaces = review_namespaces(),
+    -- F-TRL06-02: which windows this state still holds, and whether any other
+    -- live review still needs the shared palette, are knowable only inside the
+    -- owner table, so both travel in the request.
+    restore_windows = function(request)
+      review_context.restore_windows(request)
+    end,
+    forget_rewind = function()
+      if type(M._rewind_forget_path) == "function" and change and change.path then
+        M._rewind_forget_path(change.path)
+      end
+    end,
+  })
+  if not claimed then
+    log.lifecycle_info("review.open.claim_refusal", {
+      rel = change.rel or change.path,
+      turn_id = change.turn_id or change.turn_gen,
+      bufnr = bufnr,
+      reason = claim_error,
+    })
+    return false, tostring(claim_error)
+  end
 
   -- `state` is an upvalue, read at fire time, so it always reflects whatever the
   -- mutation just changed (model_hunks/opts included).
@@ -186,6 +280,13 @@ function Factory.new(deps)
   local function repaint_now(site)
     repaint_scheduled = false
     if not state.bufnr or not vim.api.nvim_buf_is_valid(state.bufnr) then
+      return
+    end
+    -- A repaint is a write to SHARED buffer resources (design :86). A state
+    -- that cannot prove it still owns the buffer must not paint: a queued
+    -- repaint from a closed or superseded review is exactly how a dead review
+    -- puts its marks back over the live one's.
+    if not review_resources.is_current(state) then
       return
     end
     deps.render_blocks(state.bufnr, state.hunk_ledger, {
@@ -202,7 +303,10 @@ function Factory.new(deps)
     end
     repaint_scheduled = true
     vim.schedule(function()
-      if repaint_scheduled then
+      -- The scheduled half is guarded on its own account: `state.closed` and a
+      -- change of owner can both happen between the signal and the tick that
+      -- serves it, and the flag alone would not notice either.
+      if repaint_scheduled and review_resources.is_current(state) then
         repaint_now()
       end
     end)
@@ -262,9 +366,10 @@ function Factory.new(deps)
     -- is left to the caller's rebuild -- `hunk_ledger.open` stamped fresh
     -- lineage on blocks nobody has recorded a frame against.
     repaint_scheduled = false
-    state.closed = true
-    state.watch_detached = true
-    pcall(vim.api.nvim_del_augroup_by_id, state.augroup)
+    -- The claim is the only thing this state holds; giving it back releases the
+    -- augroup, the ownership entry and nothing else, because no key, mark or
+    -- handler has been registered yet.
+    review_resources.close(state)
     log.lifecycle_info("review.open.unwatched_refusal", {
       rel = change.rel or change.path,
       turn_id = change.turn_id or change.turn_gen,
@@ -303,38 +408,25 @@ function Factory.new(deps)
     state.review_tab = owned and owned.tab_id or nil
   end
   st.active = state
-  -- The pool's ONE Turn learns of this file. First sight binds the Turn, registers
-  -- teardown callbacks and fires turn_start; later files just join. The v1teardown
-  -- closure lets v1 pool state die with the Turn until the old doors are deleted.
-	require("yana.turn_bind").observe_open(st, {
-	  path = diff.abs_path(change.path),
-	  ledger = state.hunk_ledger,
-	  base_text = change.before or "",
-	  overlay_text = state.staged_text,
+  -- The pool's ONE Turn learns of this file and its exact review attachment.
+  -- First sight binds the Turn, registers teardown callbacks and fires
+  -- turn_start; later files just join.
+  require("yana.turn.turn_bind").observe_open(st, {
+    path = diff.abs_path(change.path),
+    ledger = state.hunk_ledger,
+    base_text = (change.review_before ~= nil and change.review_before or change.before) or "",
+    overlay_text = state.staged_text,
     bufnr = state.bufnr,
     review_opts = state.opts,
     -- Frozen independently of the shared opts table so Turn teardown can call
     -- each panel owner once when one session-wide Turn spans several panels.
     review_owner = turn_file_owner,
-    -- Turn-end status flip (RED-LEDGER matrix_s4_s8_review_open): the Turn's own End
-    -- settles bytes and tears down WITHOUT the v1 finish_session_now write that retires
-    -- change.status -- _poll_leave_edge reports "stay" on that branch, so
-    -- review_lifecycle.lua's flip is unreachable and nothing in the Turn path writes
-    -- change.status.
+    review_state = state,
+    -- Turn-end status flip: the Turn's own End settles bytes and tears down WITHOUT the
+    -- v1 finish_session_now write that retires change.status -- _poll_leave_edge reports
+    -- "stay" on that branch, so review_lifecycle.lua's flip is unreachable and nothing
+    -- in the Turn path writes change.status.
     change = change,
-    v1_accepted_any = function()
-      if state.hunk_ledger ~= nil and state.hunk_ledger:count("accepted") > 0 then
-        return true
-      end
-      for _, list in ipairs({ state.decisions, state.sealed_decisions }) do
-        for _, decision in ipairs(list or {}) do
-          if decision.action == "accept" then
-            return true
-          end
-        end
-      end
-      return false
-    end,
   }, {
     opts_fn = function()
       return require("yana.config").options
@@ -360,51 +452,57 @@ function Factory.new(deps)
         pcall(M.close_owned_tabs, opts)
       end,
     },
-    -- Same-name namespace ids (nvim_create_namespace is idempotent per name).
-    paint_ns = vim.api.nvim_create_namespace("YanaInlineDiff"),
-    authority_ns = vim.api.nvim_create_namespace("YanaInlineDiffAuthority"),
-    bound_keys = (function()
-      local bk = {}
-      for _, k in ipairs(keys) do
-        bk[#bk + 1] = { "n", k }
-        bk[#bk + 1] = { "v", k }
-      end
-      return bk
-    end)(),
-    v1_teardown = function(ctx)
-      -- Before either: retire each file's change.status from its own ledger verdicts
-      -- (the write finish_session_now would have done on the v1 path -- see the
-      -- file-entry comment in observe_open above). Guarded so a status some other door
-      -- already sealed is never rewritten.
-      for _, f in ipairs(ctx.turn.files) do
-        local c = f.change
-        if c ~= nil and c.status == "pending" then
-          local accepted
-          if f.v1_accepted_any ~= nil then
-            accepted = f.v1_accepted_any()
-          else
-            accepted = f.ledger ~= nil and f.ledger:count("accepted") > 0
-          end
-          c.status = accepted and "accepted" or "rejected"
-        end
-        -- A session-wide Turn may have one active review in each workspace
-        -- pool. Retire only the exact active state owned by this Turn file;
-        -- another owner's active/queued work in that pool remains untouched.
-        local file_pool = pool_for_turn_file(f)
-        local active = file_pool and file_pool.active
-        if active and active.change == c then
-          pcall(M.cleanup, active)
-          if file_pool.active == active then
-            file_pool.active = nil
-          end
-        end
-      end
-      -- Publish the terminal view only after every ended Turn member has its
-      -- final status and the active slot is gone.  An earlier notification
-      -- would repaint these claims as still queued/open.
-      announce_state()
-    end,
   })
+  -- R9 WIRING. The Turn is now bound and holds this file, so the question can
+  -- be asked against the exact Turn member -- and asked BEFORE the first hunk,
+  -- because nothing below has painted or bound a decision key yet.
+  do
+    local turn = require("yana.turn.turn_bind").get(st)
+    local member = turn and type(turn.file) == "function"
+      and turn:file(diff.abs_path(change.path)) or nil
+    if member ~= nil then
+      -- The File's Turn reference (rule 7a): the resolver reads the policy
+      -- snapshot and the Turn's liveness through it, and a late answer for an
+      -- ended Turn is inert because of it.
+      member.turn = turn
+      -- R9 POLICY SNAPSHOT (rule 7a: `review_opts.permissions`; design :54).
+      -- The operator's configuration is read HERE, at bind time, and written
+      -- into the TURN's review options -- which is the first place the resolver
+      -- looks, and the only one every member can read. A member whose own
+      -- review has not bound yet (intake builds the Turn's file list from the
+      -- whole queued batch) carries the intake options and knows no policy at
+      -- all, so a per-file snapshot alone would judge the first visit of an
+      -- unbound file under the default instead of the operator's setting --
+      -- measured: `[policy-deny]` asked one question for exactly that file.
+      -- Written every time, not only when absent: `opts` is a carried table
+      -- (`review_open` stashes `M.carryable_review_opts(opts)` on the change and
+      -- the queue hands it back), so a value left over from an EARLIER turn
+      -- would otherwise decide this one. The agent's payload never reaches this
+      -- line; only `yana.setup`'s stored configuration does.
+      local review_cfg = config.options.review
+      local policy = (type(review_cfg) == "table" and review_cfg.permissions) or "ask"
+      opts.permissions = policy
+      if type(turn.review_opts) ~= "table" then
+        turn.review_opts = {}
+      end
+      turn.review_opts.permissions = policy
+      local driver = require("yana.review_open_bind_permissions").for_turn(st, turn)
+      -- THE ENTRY POINT THE OBSERVER CANNOT SEE. A review whose buffer is
+      -- ALREADY the current one raises no further enter event -- nothing moves,
+      -- so nothing fires -- yet the human is looking at this file right now.
+      -- That is also how a tabs-disabled review arrives when the operator is
+      -- already sitting in the file; when it arrives in a different window the
+      -- observer sees that entry like any other. Background opening still asks
+      -- nothing: a review placed into a tab Yana created is never the current
+      -- buffer, because `T.place` restores the operator's tab before returning.
+      --
+      -- A non-visit is driven as background: under ask it asks and records
+      -- nothing (the first real visit is still owed its question); under
+      -- allow/deny it records the policy verdict so Save/End apply it (I3).
+      driver.drive(member, vim.api.nvim_get_current_buf() == state.bufnr)
+    end
+  end
+
   -- The opening row. Recorded once the state is live, so tl_record can read the
   -- change off it, and after the buffer holds the staged content so the buffer
   -- epoch belongs to the tree the review is about to work in.
@@ -500,7 +598,14 @@ function Factory.new(deps)
   ledger.mark(change_ledger(change, opts), "review_profile_test_seam_ready")
   -- Buffer-local review keymaps: split out to review_open_bind_keys.lua to
   -- hold this file under the 500-line ceiling (S2 P-C, action 14).
-  require("yana.review_open_bind_keys").bind({
+  --
+  -- A PARTIALLY BOUND REPLACEMENT UNWINDS ITS OWN REGISTRATIONS (design :87).
+  -- `bind` installs the keys one at a time; a throw part-way through leaves the
+  -- ones already landed answering on a buffer whose review never became
+  -- reachable. The claim goes back too, so the augroup and the ownership entry
+  -- die with it and the failure is answered as the ordinary refusal
+  -- `review_open` already speaks.
+  local bound_ok, bind_err = pcall(require("yana.review_open_bind_keys").bind, {
     state = state,
     opts = opts,
     maps = maps,
@@ -516,6 +621,24 @@ function Factory.new(deps)
     undo_turn = undo_turn,
     redo_key = redo_key,
   })
+  if not bound_ok then
+    repaint_scheduled = false
+    -- `close` deletes exactly the keys the claim described -- the same list
+    -- `bind` was installing -- so the partial set goes with the augroup and the
+    -- ownership entry, and nothing has to re-derive which of them landed.
+    review_resources.close(state)
+    state._key_defs = {}
+    if st.active == state then
+      st.active = nil
+    end
+    log.lifecycle_info("review.open.bind_refusal", {
+      rel = change.rel or change.path,
+      turn_id = change.turn_id or change.turn_gen,
+      bufnr = bufnr,
+      reason = tostring(bind_err),
+    })
+    return false, "review keys could not be bound: " .. tostring(bind_err)
+  end
   require("yana.review_undo_trace").watch(state)
   review_open_display_factory.new(child_deps({
     state = state,
@@ -537,7 +660,7 @@ function Factory.new(deps)
   -- No chrome policy rides on the review any more: the strip is sidebar
   -- chrome gated ONLY on a live Turn, and `review_tabs.sidebar_open` decides
   -- the tab MIRROR alone.
-  require("yana.turn_bind").announce_review(st)
+  require("yana.turn.turn_bind").announce_review(st)
   flush_open_paint()
   return true, state
   end

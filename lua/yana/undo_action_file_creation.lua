@@ -37,7 +37,7 @@ function Factory.new(env)
   local log = env.log
   local notify_one_line = env.notify_one_line
   local resolve_target = env.resolve_target
-  local creation_touch = require("yana.creation_touch")
+  local creation_touch = require("yana.paths.creation_touch")
 
   --- Say it BOTH ways, as `undo_turn` (review_undo.lua) already does:
   --- `notify.one_line` trims by DISPLAY WIDTH, so an announcement carrying a

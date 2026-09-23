@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import os
 import stat
 import sys
@@ -114,6 +115,18 @@ def die_usage(msg: str) -> None:
     print(f"yana-changeset: {msg}", file=sys.stderr)
     print("yana-changeset: run with --help for usage", file=sys.stderr)
     sys.exit(64)
+
+
+def verify_plan_id(encoded: str) -> dict:
+    try:
+        plan = json.loads(encoded)
+    except json.JSONDecodeError as exc:
+        raise ChangesetError("invalid plan JSON") from exc
+    plan_id = plan.pop("plan_id", None)
+    canonical = json.dumps(plan, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    if not isinstance(plan_id, str) or hashlib.sha256(canonical.encode("utf-8")).hexdigest() != plan_id:
+        raise ChangesetError("plan_id mismatch")
+    return plan
 
 
 def realpath(path: str) -> str:
@@ -447,10 +460,16 @@ def main() -> None:
     parser.add_argument("--workspace", required=True, help="Real workspace (lower) directory")
     parser.add_argument("--upper", required=True, help="Overlay upper directory")
     parser.add_argument("--meta-out", help="Metadata text file (out of band)")
+    # Optional until the turn lifecycle (stage S5) builds and threads the plan:
+    # this leg VERIFIES a plan, it never derives one, and no caller can pass a
+    # plan that nothing yet produces. A supplied plan is always verified.
+    parser.add_argument("--plan-json", help="Immutable turn plan JSON; verified when given")
     args = parser.parse_args()
 
     workspace = realpath(args.workspace)
     upper = realpath(args.upper)
+    if args.plan_json is not None:
+        verify_plan_id(args.plan_json)
 
     if not os.path.isdir(workspace):
         die_usage(f"workspace is not a directory: {args.workspace}")

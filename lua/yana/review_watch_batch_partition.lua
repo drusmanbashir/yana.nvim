@@ -7,60 +7,22 @@ function M.new(env)
   local bufnr = env.bufnr
   local try_split = env.try_split
   local try_merge = env.try_merge
+  local rejoin_owned_siblings = env.rejoin_owned_siblings
 
   local function repartition(changes)
-    local just_changed = {}
-    for _, change in ipairs(changes or {}) do
-      for row = change.first + 1, change.last_new do
-        just_changed[row] = true
-      end
-    end
-    -- ONE classifier: never `just_changed → human`. During insert, blank or
-    -- ERROR rows from the pending edit that sit inside a pending extent are
-    -- held as owned so try_split keeps the parent (provisional paint).
     local inserting = tostring(vim.fn.mode(1)):find("[iR]") ~= nil
-    local function row_in_pending_extent(row)
-      for _, block in ipairs(state.hunk_ledger:pending()) do
-        local start_line = block.new_start_line
-        local end_line = block.new_end_line or start_line
-        if type(start_line) == "number" and type(end_line) == "number"
-          and row >= start_line and row <= end_line
-        then
-          return true
-        end
-        local live_start, live_end = deps.live_block_range(bufnr, block)
-        if live_start and live_end and row >= live_start and row <= live_end then
-          return true
-        end
-      end
-      return false
-    end
+    -- ONE classifier (review_watch_ownership, published as
+    -- `state._row_is_yana_owned`): created file, blanks, the ledger's SETTLED
+    -- record and the container rule are all its single answer. The partition
+    -- kept its own copy of the first three and counted PROVISIONAL anchors as
+    -- ownership, which is the one thing the rule says proves nothing.
     local function classify(row)
-      -- Created file: every row is owned; blanks never open a boundary.
-      if type(state.change) == "table" and state.change.before == nil then
-        return true
-      end
-      -- Ledger identity first (F-OWN-DEF): seeded anchors must survive split
-      -- even when the parent-rule momentarily disagrees (first row of a multi-row insert).
-      for _, block in ipairs(state.hunk_ledger:pending()) do
-        if state.hunk_ledger:row_is_owned(block, row) then
-          return true
-        end
-      end
-      if inserting and just_changed[row] and row_in_pending_extent(row) then
-        local line = (vim.api.nvim_buf_get_lines(bufnr, row - 1, row, false) or {})[1] or ""
-        if line:match("^%s*$") then
-          return true
-        end
-        if type(state._row_is_yana_owned) == "function" and state._row_is_yana_owned(row) then
-          return true
-        end
-      end
       if type(state._row_is_yana_owned) == "function" then
         return state._row_is_yana_owned(row) and true or false
       end
       return false
     end
+
     -- WHICH CHANGE OWNS A SPLIT. `try_split` is driven per BLOCK, not per
     -- change, so the record has to be attributed. The text that owns a split is
     -- the text sitting in the GAP the split opened -- the rows between one
@@ -131,6 +93,9 @@ function M.new(env)
       end
     end
     for _, record in ipairs(try_merge(state, changes) or {}) do
+      records[#records + 1] = record
+    end
+    for _, record in ipairs((rejoin_owned_siblings and rejoin_owned_siblings(state)) or {}) do
       records[#records + 1] = record
     end
     return records

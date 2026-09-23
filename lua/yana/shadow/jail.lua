@@ -206,6 +206,9 @@ function M.wrap_cmd(argv, session)
 	else
 		table.insert(out, "--session-auto")
 	end
+	if session.read_only_workspace then
+		table.insert(out, "--read-only-workspace")
+	end
 
 	-- Touched files for turn.request intersection (absolute). Prefer an
 	-- explicit list; otherwise scan a pre-staged upper if the test path left
@@ -313,6 +316,9 @@ function M.wrap_cmd(argv, session)
 		YANA_OVERLAY_BWRAP = bwrap_bin(),
 		YANA_STATE_ROOT = require("yana.shadow.preview").state_root(),
 	}
+	if type(cfg.options.open_capture) == "table" and type(cfg.options.open_capture.mode) == "string" then
+		env.YANA_OPEN_CAPTURE_MODE = cfg.options.open_capture.mode
+	end
 	if vim.env.XDG_RUNTIME_DIR and vim.env.XDG_RUNTIME_DIR ~= "" then
 		env.XDG_RUNTIME_DIR = vim.env.XDG_RUNTIME_DIR
 	end

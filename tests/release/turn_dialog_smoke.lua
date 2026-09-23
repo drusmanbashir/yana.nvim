@@ -1,4 +1,4 @@
--- turn_dialog_smoke.lua -- the End-turn ask (lua/yana/turn_wiring.lua make_ask) on
+-- turn_dialog_smoke.lua -- the End-turn ask (lua/yana/turn/turn_wiring.lua make_ask) on
 -- the Neovim that runs it, with no UI attached.
 --
 -- A fully decided turn must END headless: Turn:end_turn only proceeds on "end",
@@ -22,7 +22,7 @@ local function check(cond, msg)
 	end
 end
 
-local ask = require("yana.turn_wiring").make_ask(function()
+local ask = require("yana.turn.turn_wiring").make_ask(function()
 	return {}
 end)
 local builtin = vim.fn.confirm

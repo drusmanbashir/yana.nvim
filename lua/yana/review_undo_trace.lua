@@ -57,7 +57,69 @@ local function copy_entries(entries, budget)
   return out
 end
 
-function M.capture(point, subject, extra)
+local function lines_info(lines)
+  return { count = #(lines or {}), sha256 = vim.fn.sha256(vim.json.encode(lines or {})) }
+end
+
+local function block_info(block)
+  return { id = block.lineage_id, parent = block.split_parent_lineage_id,
+    model_index = block.model_index, verdict = block.verdict,
+    first = block.new_start_line, last = block.new_end_line,
+    owners = block.owned_rows, old = lines_info(block.old_lines), new = lines_info(block.new_lines) }
+end
+
+local function frames_info(frames)
+  local out = {}
+  for _, value in pairs(frames or {}) do
+    local row = block_info(value.fields or {})
+    row.id, row.first, row.last = value.lineage_id, value.start_line, value.end_line
+    row.geometry_only = value.geometry_only == true
+    out[#out + 1] = row
+  end
+  table.sort(out, function(a, b) return tostring(a.id) < tostring(b.id) end)
+  return out
+end
+
+local function yana_state(subject)
+  local ledger = subject.hunk_ledger
+  if not ledger then return nil end
+  local out = { members = {}, records = {}, captures = {} }
+  for _, block in ipairs(ledger:members()) do out.members[#out.members + 1] = block_info(block) end
+  local history = ledger.buffer_history
+  out.observed_seq = history.current_seq
+  for _, seq in ipairs(history.record_seqs or {}) do
+    local rec = history.records[seq]
+    if rec then
+      local members = {}
+      for block in pairs(rec.before_members or {}) do members[#members + 1] = block.lineage_id end
+      table.sort(members)
+      out.records[#out.records + 1] = { seq = seq, before_seq = rec.before_seq,
+        before = frames_info(rec.before), after = frames_info(rec.after), before_members = members }
+    end
+  end
+  for marker, group in pairs(history.before_groups or {}) do
+    out.captures[#out.captures + 1] = { marker = marker, before_seq = group.before_seq,
+      before = frames_info(group.before) }
+  end
+  local change = subject.change or {}
+  local workspace = change.review_workspace or (subject.opts or {}).workspace or vim.fn.getcwd()
+  local register = require("yana.turn.turn_register").for_workspace(workspace)
+  out.register = { cursor = register.cursor, actions = {} }
+  for i, action in ipairs(register.actions) do
+    local structural = {}
+    for _, entry in ipairs(action.hunk_merges or {}) do
+      local children = {}
+      for _, child in ipairs(entry.children or {}) do children[#children + 1] = child.lineage_id end
+      structural[#structural + 1] = { kind = entry.kind,
+        parent = entry.parent and entry.parent.lineage_id, children = children }
+    end
+    out.register.actions[i] = { kind = action.kind, rel = action.rel, turn_id = action.turn_id,
+      undo_seq = action.undo_seq, count = action.count, halted = action.halted, structural = structural }
+  end
+  return out
+end
+
+local function capture(point, subject, extra)
   if not log.undo_trace_enabled() then
     return true
   end
@@ -67,9 +129,10 @@ function M.capture(point, subject, extra)
   end
   local tree, keymaps
   local function snapshot()
-    tree = vim.fn.undotree()
+    tree = vim.fn.undotree(bufnr)
     keymaps = {
       normal = { u = map_owner("u", "n"), redo = map_owner("<C-r>", "n") },
+      insert = { enter = map_owner("<CR>", "i"), leave = map_owner("jk", "i") },
       visual = { u = map_owner("u", "x"), redo = map_owner("<C-r>", "x") },
     }
   end
@@ -86,6 +149,9 @@ function M.capture(point, subject, extra)
   local fields = vim.tbl_extend("force", lifecycle_fields(subject), extra or {}, {
     point = point,
     mode = (vim.api.nvim_get_mode() or {}).mode,
+    tick = vim.api.nvim_buf_get_changedtick(bufnr),
+    synced = tree.synced,
+    yana = yana_state(subject),
     seq_cur = tree.seq_cur,
     seq_last = tree.seq_last,
     time_cur = tree.time_cur,
@@ -99,6 +165,17 @@ function M.capture(point, subject, extra)
   return log.lifecycle_later("review.undo_state", fields)
 end
 
+-- Failure is evidence loss, never permission to interrupt the edit being observed.
+function M.capture(point, subject, extra)
+  local ok, result = pcall(capture, point, subject, extra)
+  if not ok or result == false then
+    log.write("WARN", "review.undo_trace capture_failed point=" .. tostring(point)
+      .. " reason=" .. tostring(result))
+    return false
+  end
+  return result
+end
+
 function M.watch(state)
   local bufnr = state and state.bufnr
   if not (bufnr and bufnr > 0 and vim.api.nvim_buf_is_valid(bufnr)) then
@@ -109,6 +186,10 @@ function M.watch(state)
     change = state.change,
     closed = false,
   }
+  local history = state.hunk_ledger and state.hunk_ledger.buffer_history
+  if history then
+    history.trace = function(point, extra) M.capture(point, state, extra) end
+  end
   M.capture("review_open", state)
   return true
 end
@@ -119,7 +200,9 @@ function M.close(state)
   if subject then
     subject.closed = true
   end
-  return M.capture("review_close", state)
+  local result = M.capture("review_close", state)
+  if state.hunk_ledger then state.hunk_ledger.buffer_history.trace = nil end
+  return result
 end
 
 local function key_name(key, typed)

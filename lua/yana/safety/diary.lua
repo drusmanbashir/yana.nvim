@@ -14,7 +14,7 @@ local diff = require("yana.diff")
 local hash = require("yana.safety.hash")
 local control_plane = require("yana.safety.control_plane")
 local flush = require("yana.safety.flush")
-local manifest = require("yana.manifest")
+local manifest = require("yana.paths.manifest")
 local uv = vim.uv or vim.loop
 
 M._config = {

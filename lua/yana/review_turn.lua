@@ -74,14 +74,20 @@ local function mode_perm(mode)
   return mode and (mode % 4096) or nil
 end
 
+--- The ONE canonical disclosure text for an open review: a whole-file delete
+--- ("delete <rel>") and/or a permission change ("mode a → b"), both when both.
 local function compound_mode_text(change)
-  if not change or not change.base_mode or not change.after_mode then
+  if not change then
     return nil
   end
-  if mode_perm(change.base_mode) == mode_perm(change.after_mode) then
-    return nil
+  local parts = {}
+  if change.kind == "delete" then
+    parts[#parts + 1] = "delete " .. tostring(change.rel or change.path)
   end
-  return string.format("mode %o → %o", mode_perm(change.base_mode), mode_perm(change.after_mode))
+  if change.base_mode and change.after_mode and mode_perm(change.base_mode) ~= mode_perm(change.after_mode) then
+    parts[#parts + 1] = string.format("mode %o → %o", mode_perm(change.base_mode), mode_perm(change.after_mode))
+  end
+  return #parts > 0 and table.concat(parts, " · ") or nil
 end
 
 --- Every durable accept waits for the turn's classified bundle to publish.
@@ -90,7 +96,7 @@ local function review_action_allowed(state, change)
   if not pass then
     return true
   end
-  local lifecycle = require("yana.turn_lifecycle")
+  local lifecycle = require("yana.turn.turn_lifecycle")
   if not lifecycle.is_actionable(pass) then
     return false, "refused: the classified bundle for this turn has not published yet"
   end

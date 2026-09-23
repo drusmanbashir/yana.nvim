@@ -6,7 +6,7 @@
 # after showing the exact command and asking [y/N].
 #
 #
-# Mirrors the required-executable list in lua/yana/dependencies.lua's
+# Mirrors the required-executable list in lua/yana/runtime/dependencies.lua's
 # confined_executables and the same package-name table as its
 # EXEC_PACKAGE_HINT -- this script must run standalone, before Neovim (or
 # Lua) exists on a fresh clone, so it carries its own copy; keep both in
@@ -78,6 +78,9 @@ find:findutils:findutils:findutils
 awk:gawk:gawk:gawk
 getent:libc-bin:glibc-common:glibc
 hostname:hostname:hostname:inetutils
+fuse-overlayfs:fuse-overlayfs:fuse-overlayfs:fuse-overlayfs
+newuidmap:uidmap:shadow-utils:shadow
+newgidmap:uidmap:shadow-utils:shadow
 '
 
 package_for() {

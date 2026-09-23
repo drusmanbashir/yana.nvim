@@ -1,11 +1,57 @@
 -- Workspace review state and review-window chrome.
 local M = {}
 
+--- The review palette: ONE set of shared highlight groups for every open
+--- review, so it dies with the LAST one. Module level, not per-instance,
+--- because `review_resources` calls the restore hook below from teardown --
+--- outside any `M.new` closure -- and both sides must name the same groups.
+local palette = {
+  incoming = "YanaHlIncoming",
+  deleted = "YanaHlDeleted",
+  hint = "YanaHlHint",
+}
+
+local function clear_palette_highlights()
+  for _, name in pairs(palette) do
+    local ok, err = pcall(vim.api.nvim_set_hl, 0, name, {})
+    if not ok then
+      require("yana.log").write(
+        "WARN",
+        "yana.inline_diff: could not clear review palette highlight " .. tostring(name) .. ": " .. tostring(err)
+      )
+    end
+  end
+end
+
+--- OWNER-SAFE window restore: the `restore_windows` hook `review_resources`
+--- calls at close (F-TRL06-02). It restores exactly the windows the owner
+--- table proved this state still holds -- `request.windows` is a list of
+--- `{win, winhl}` -- and clears the shared palette only when
+--- `request.clear_palette` says no other live review still needs it.
+---
+--- The difference from `restore_review_winhl` below is the whole point: that
+--- one re-derives "my windows" from `state.winhl_restore` PLUS every window
+--- currently showing `state.bufnr`, and then clears the palette
+--- unconditionally -- so a superseded review closing on a shared buffer strips
+--- the live one's highlighting. Ownership is not knowable here; it travels in
+--- the request, computed by the owner table.
+function M.restore_windows(request)
+  for _, entry in ipairs((request or {}).windows or {}) do
+    local win = entry.win or entry[1]
+    local previous = entry.winhl or entry[2] or ""
+    if type(win) == "number" and vim.api.nvim_win_is_valid(win) then
+      vim.wo[win].winhl = previous
+    end
+  end
+  if request and request.clear_palette then
+    clear_palette_highlights()
+  end
+end
+
 function M.new(deps)
   local facade = deps.facade
   local diff = deps.diff
   local config = deps.config
-  local log = deps.log
   local pools = {}
 
   local function workspace_key(opts)
@@ -101,11 +147,6 @@ function M.new(deps)
     end
   end
 
-  local palette = {
-    incoming = "YanaHlIncoming",
-    deleted = "YanaHlDeleted",
-    hint = "YanaHlHint",
-  }
   local ext_hl = {
     incoming = "YanaDiffIncoming",
     deleted = "YanaDiffDeleted",
@@ -213,15 +254,6 @@ function M.new(deps)
     end
   end
 
-  local function clear_palette_highlights()
-    for _, name in pairs(palette) do
-      local ok, err = pcall(vim.api.nvim_set_hl, 0, name, {})
-      if not ok then
-        log.write("WARN", "yana.inline_diff: could not clear review palette highlight " .. tostring(name) .. ": " .. tostring(err))
-      end
-    end
-  end
-
   local function restore_review_winhl(state)
     local restored = {}
     for win, previous in pairs(state.winhl_restore or {}) do
@@ -260,6 +292,7 @@ function M.new(deps)
     apply_review_winhl = apply_review_winhl,
     ensure_review_render_chrome = ensure_review_render_chrome,
     restore_review_winhl = restore_review_winhl,
+    restore_windows = M.restore_windows,
   }
 end
 

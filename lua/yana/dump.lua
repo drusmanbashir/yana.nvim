@@ -180,7 +180,7 @@ end
 local function section_diary(out)
   out[#out + 1] = "## Applier diary"
   out[#out + 1] = ""
-  local ok_ui, ui = pcall(require, "yana.ui")
+  local ok_ui, ui = pcall(require, "yana.panel.ui")
   local session = nil
   if ok_ui and type(ui.dump_diary_session) == "function" then
     session = ui.dump_diary_session()

@@ -290,7 +290,16 @@ resolve_cursor_dir() {
 	if [[ ! -d "$dir" ]]; then
 		refuse "writable-host exception '$dir' is not a directory"
 	fi
-	if path_is_prefix "$dir" "$WORKSPACE" || path_is_prefix "$WORKSPACE" "$dir"; then
+	# A read-only HOME workspace may contain the backend's one writable runtime
+	# directory. The reverse direction and equality remain forbidden: either
+	# would make the selected workspace writable through the exception.
+	local readonly_workspace_runtime=0
+	if [[ "$READ_ONLY_WORKSPACE" == 1 && "$dir" != "$WORKSPACE" ]] \
+		&& path_is_prefix "$WORKSPACE" "$dir"; then
+		readonly_workspace_runtime=1
+	fi
+	if (( ! readonly_workspace_runtime )) \
+		&& { path_is_prefix "$dir" "$WORKSPACE" || path_is_prefix "$WORKSPACE" "$dir"; }; then
 		refuse "writable-host exception ($dir) must be disjoint from the workspace ($WORKSPACE)"
 	fi
 	if path_is_prefix "$dir" "$LAYER_ROOT" || path_is_prefix "$LAYER_ROOT" "$dir"; then
@@ -311,6 +320,9 @@ resolve_cursor_dir() {
 	local protected
 	for protected in ${PROTECTED_PATHS[@]+"${PROTECTED_PATHS[@]}"}; do
 		[[ -n "$protected" ]] || continue
+		if [[ "$protected" == "$WORKSPACE" && "$readonly_workspace_runtime" == 1 ]]; then
+			continue
+		fi
 		if path_is_prefix "$dir" "$protected" || path_is_prefix "$protected" "$dir"; then
 			refuse "writable-host exception ($dir) must be disjoint from every declared write root and its layer ($protected)"
 		fi
@@ -321,7 +333,7 @@ resolve_cursor_dir() {
 	if [[ -z "$dir_id" || -z "$ws_id" || -z "$layer_id" ]]; then
 		refuse "cannot establish filesystem identity for the writable-host exception ($dir), the workspace ($WORKSPACE) or the layer root ($LAYER_ROOT)"
 	fi
-	if identity_overlaps "$dir" "$WORKSPACE"; then
+	if [[ "$readonly_workspace_runtime" != 1 ]] && identity_overlaps "$dir" "$WORKSPACE"; then
 		refuse "writable-host exception ($dir, $dir_id) aliases the workspace ($WORKSPACE, $ws_id) — same directory or one contains the other despite disjoint pathnames"
 	fi
 	if identity_overlaps "$dir" "$LAYER_ROOT"; then
@@ -329,6 +341,9 @@ resolve_cursor_dir() {
 	fi
 	for protected in ${PROTECTED_PATHS[@]+"${PROTECTED_PATHS[@]}"}; do
 		[[ -n "$protected" ]] || continue
+		if [[ "$protected" == "$WORKSPACE" && "$readonly_workspace_runtime" == 1 ]]; then
+			continue
+		fi
 		if identity_overlaps "$dir" "$protected"; then
 			refuse "writable-host exception ($dir, $dir_id) aliases a declared write root or its layer ($protected) — same directory or one contains the other despite disjoint pathnames"
 		fi
@@ -518,7 +533,12 @@ validate_root_triple() {
 	# Sanity refusal fires only for the primary workspace root, before
 	# resolve_cursor_dir gets a chance to raise the misleading writable-host
 	# disjointness refusal for the same underlying mistake (workspace == $HOME).
-	if [[ "$root_noun" == "workspace" ]]; then
+	# Open capture deliberately allows the primary workspace to be $HOME. Its
+	# CapturePlan owns the private upper and keeps the state root mounted after
+	# the capture view, so the legacy project-depth guard would reject the
+	# supported home-dotfile and cross-project workflow before that plan runs.
+	if [[ "$root_noun" == "workspace" && "$READ_ONLY_WORKSPACE" != 1 && -z "$CAPTURE_PLAN" \
+		&& "${YANA_OPEN_CAPTURE_MODE:-off}" == off ]]; then
 		validate_workspace_sanity "$ws"
 	fi
 	if [[ -e "$upper" && ! -d "$upper" ]]; then

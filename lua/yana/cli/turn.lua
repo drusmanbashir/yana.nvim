@@ -11,7 +11,7 @@ if #vim.api.nvim_list_uis() ~= 0 then
 end
 
 local diff = require("yana.diff")
-local manifest = require("yana.manifest")
+local manifest = require("yana.paths.manifest")
 local ops = require("yana.shadow.ops")
 
 local EXIT_USAGE = 64
