@@ -20,23 +20,19 @@ you review and accept them before they reach disk.
 
 ## Install
 
-You need Neovim 0.11.2+ and an installed, signed-in agent CLI. Choose the
-matching `backend` value below. The example starts with Claude; change it to
-`"codex"` or `"cursor"` for another CLI.
+### Prerequisites
 
-```lua
-{
-  "drusmanbashir/yana.nvim",
-  dependencies = { "drusmanbashir/yana-ui.nvim" },
-  event = "VeryLazy",
-  opts = { backend = "claude" },
-}
-```
+Yana requires Neovim 0.11.2+.
 
-lazy.nvim installs the required `yana-ui.nvim` dependency. If you omit
-`backend`, Yana starts with Cursor; it does not guess from installed CLIs.
+#### 1. Install and sign in to an agent
 
-### Bubblewrap
+Choose an installed, signed-in agent CLI: Claude Code (`claude`), Codex
+(`codex`) or Cursor (`cursor-agent`). Use the matching `backend` value
+`"claude"`, `"codex"` or `"cursor"` in the Neovim setup below.
+
+<a id="bubblewrap"></a>
+
+#### 2. Install Bubblewrap
 
 In Linux `ask` and `inline` modes, Bubblewrap keeps the agent's file writes in
 a private workspace until you accept them. Install it and its capability tool:
@@ -44,6 +40,8 @@ a private workspace until you accept them. Install it and its capability tool:
 ```sh
 sudo apt-get install bubblewrap libcap2-bin
 ```
+
+#### 3. Allow Bubblewrap on Ubuntu
 
 On Ubuntu 24.04 and newer with AppArmor's user-namespace restriction, add this
 one-time permission for Bubblewrap. First check for an existing profile:
@@ -71,6 +69,23 @@ sudo apparmor_parser -r /etc/apparmor.d/yana-bwrap
 This allows Bubblewrap to create its private environment (a user namespace)
 while retaining the restriction for other programs. macOS supports `agentic`
 mode only. See the [full requirements and troubleshooting guide](docs/installation.md).
+
+### Neovim setup
+
+Add this plugin declaration to your lazy.nvim configuration. The example
+starts with Claude; change `backend` to `"codex"` or `"cursor"` for another CLI.
+
+```lua
+{
+  "drusmanbashir/yana.nvim",
+  dependencies = { "drusmanbashir/yana-ui.nvim" },
+  event = "VeryLazy",
+  opts = { backend = "claude" },
+}
+```
+
+lazy.nvim installs the required `yana-ui.nvim` dependency. If you omit
+`backend`, Yana starts with Cursor; it does not guess from installed CLIs.
 
 Restart Neovim in your project, run `:checkhealth yana`, then `:Yana`. The
 opened project is included automatically. Use `:YanaRoots` only to add other
