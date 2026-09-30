@@ -251,6 +251,25 @@ env -i \
 turn_rc=$?
 set -e
 
+if (( turn_rc != 0 )); then
+  # These isolated fixture logs otherwise disappear during trap cleanup.
+  while IFS= read -r -d '' diagnostic; do
+    printf 'fresh-install diagnostic: %s\n' "$diagnostic" >&2
+    diagnostic_lines=$(wc -l <"$diagnostic")
+    if (( diagnostic_lines > 160 )); then
+      printf '... %s earlier lines omitted ...\n' "$((diagnostic_lines - 160))" >&2
+    fi
+    tail -n 160 "$diagnostic" >&2 || true
+    if [[ -n ${YANA_RELEASE_TURN_EVIDENCE:-} ]]; then
+      diagnostic_rel=${diagnostic#"$scratch"/}
+      [[ $diagnostic_rel != "$diagnostic" ]] || diagnostic_rel="turn/${diagnostic#"$turn_scratch"/}"
+      mkdir -p "$YANA_RELEASE_TURN_EVIDENCE/logs/$(dirname "$diagnostic_rel")" || true
+      cp "$diagnostic" "$YANA_RELEASE_TURN_EVIDENCE/logs/$diagnostic_rel" || true
+    fi
+  done < <(find "$state" "$turn_scratch/state" -type f \
+    \( -name yana.log -o -name yanad.log -o -name stderr.log \) -print0 2>/dev/null)
+fi
+
 if [[ $turn_rc == 65 ]]; then
 	echo "fresh-install: turn smoke INCONCLUSIVE -- bwrap unavailable" >&2
 	exit 65
