@@ -137,17 +137,6 @@ plugin="$data/nvim/site/pack/release/start/yana.nvim"
 mkdir -p "$home" "$config/nvim" "$plugin" "$state" "$cache"
 cp -a "$tree/." "$plugin/"
 
-# Capture the daemon process's startup stderr inside this disposable install.
-mv "$plugin/bin/yanad" "$plugin/bin/yanad.original"
-cat >"$plugin/bin/yanad" <<'SH'
-#!/usr/bin/env bash
-set -euo pipefail
-[[ $1 == --root && -n $2 ]]
-mkdir -p "$2"
-exec "$(dirname "$0")/yanad.original" "$@" --log-level debug 2>>"$2/startup.stderr"
-SH
-chmod +x "$plugin/bin/yanad"
-
 if (( expect_refusal )); then
 	# Below-floor row: prove setup() refuses with the documented floor message
 	# and without a Lua traceback (same contract as tests/matrix_gate.sh negative).

@@ -288,9 +288,9 @@ local function bwrap_userns_row()
     "bwrap:userns",
     "error",
     "bwrap cannot create an unprivileged user namespace: " .. detail,
-    "allow unprivileged user namespaces: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 "
-      .. "(Ubuntu) or kernel.unprivileged_userns_clone=1 (Debian/others), or grant bwrap an AppArmor "
-      .. "exception, then restart Neovim"
+    "on Ubuntu, grant /usr/bin/bwrap an AppArmor userns exception as documented in "
+      .. "docs/installation.md#troubleshooting; on Debian/others, check kernel.unprivileged_userns_clone=1; "
+      .. "then restart Neovim and run :checkhealth yana"
   )
 end
 

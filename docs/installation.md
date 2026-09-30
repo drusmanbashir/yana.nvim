@@ -237,6 +237,32 @@ on WSL2. `:checkhealth yana` names which check failed and the fix for your
 setup — installing `bubblewrap`, or the AppArmor/sysctl change needed to
 allow user namespaces again.
 
+On Ubuntu 24.04, `bwrap:userns` reporting `setting up uid map: Permission
+denied` can mean Bubblewrap lacks an AppArmor exception. AppArmor is Ubuntu's
+program permission policy; a user namespace lets Bubblewrap build the private
+environment for a confined turn. If no existing Bubblewrap profile grants this
+permission, an administrator can add this profile for `/usr/bin/bwrap`:
+
+```sh
+sudo apt-get install apparmor
+sudo tee /etc/apparmor.d/yana-bwrap <<'EOF'
+abi <abi/4.0>,
+include <tunables/global>
+profile yana-bwrap /usr/bin/bwrap flags=(unconfined) {
+  userns,
+}
+EOF
+sudo apparmor_parser -r /etc/apparmor.d/yana-bwrap
+```
+
+This permits Bubblewrap to construct its sandbox while retaining Ubuntu's
+user-namespace restriction for other programs. It does not disable AppArmor
+globally. Follow [Ubuntu's application-profile guidance](https://documentation.ubuntu.com/release-notes/24.04/#unprivileged-user-namespace-restrictions)
+if the machine already has a Bubblewrap profile. Restart Neovim and run
+`:checkhealth yana` again. To remove this exception, run
+`sudo apparmor_parser -R /etc/apparmor.d/yana-bwrap`, then remove that file.
+The release CI uses the same exception on its disposable Ubuntu runner.
+
 **The model list times out.** The agent CLI itself may be waiting for you
 to log in before it can list models. Run it once directly in a terminal
 (e.g. `cursor-agent`, `claude`, or `codex`) and sign in there, then retry
