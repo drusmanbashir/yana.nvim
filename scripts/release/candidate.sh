@@ -60,8 +60,8 @@ semver_tag_ok() {
 	[[ "$1" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-(alpha|beta|rc)\.[1-9][0-9]*)?$ ]]
 }
 
-# Narrow retired exception: only this path may appear outside path classes,
-# and only when present in that commit's own manifest (tree==manifest).
+# Retired files still require tree==manifest. Setup files additionally require
+# their exact historical commit/path/blob entry; new occurrences are refused.
 retired_history_exception() {
 	local path=$1 commit=$2 blob=$3
 	[[ "$path" == "bin/yana-ollama-agent" ]] && return 0
@@ -91,14 +91,9 @@ readonly HISTORY_FORBIDDEN_BYTES_EXCEPTIONS=(
 	"dec5e27153c63e0529731ac5ba017028ddb0504b NOTICE fb18d15a1927efc89409fb6cc77085e0481de172"
 	"320498604b018c62aeb80cc8238e22020f2029f0 NOTICE fb18d15a1927efc89409fb6cc77085e0481de172"
 )
-# Private scratch-path comments in legacy public files. The registry's private
-# path pattern was added after these commits shipped; it is named here only by
-# the SHA-256 of its registry line, so the prefix itself never appears in shipped
-# source outside scripts/release/forbidden-patterns.txt. A row is accepted only
-# for a file in HISTORY_PRIVATE_PATH_FILES, never at HEAD, and only when every
-# hit in that blob comes from the private path pattern alone. Rows and blobs were
-# read from public main d3027d895bf8abe387af45fb47eb77c58e2e8b3b.
-# Historical private-path hits are named by exact public commit, path, and blob.
+# Private-path rules are fingerprinted so their literal prefixes occur only in
+# the registry. Exceptions require an exact published commit/path/blob, a
+# declared file, and a clean secondary scan with only these rules removed.
 readonly PRIVATE_PATH_PATTERN_SHA256S=(
 	33a8bc77e3cd8a51c35e64aafe315e4f447abddf693e2d79f0335ae1420d0130
 	12846e174cfd4dc69202bc9c66ff3f586ca1e18d7cfba204a1d6c6e4a8e5c7d7
@@ -259,12 +254,21 @@ readonly HISTORY_PRIVATE_PATH_EXCEPTIONS=(
 )
 readonly HISTORY_RETIRED_PATH_EXCEPTIONS=(
 	"158edf6a78c8fd33e70feceeed873f974449c292 prompt.txt f6ff9cca9f06883f3096ad2a51774bb52cecca15"
-	"7489edc36a692bce8b28e1e2c84d0209afa3adc3 scripts/install-deps.sh 3f81b16fb060835ba9fdb1d4be742875bedcb84f"
-	"dec5e27153c63e0529731ac5ba017028ddb0504b scripts/install-deps.sh 826d166f67e4673ca622e82abdab878bd04f0903"
-	"7a2fe1ecb80e3a84e18ba659c551d80814fe51bb scripts/install-deps.sh 665f7e808171081956ff2f7a9092f23021a89cd1"
-	"d3027d895bf8abe387af45fb47eb77c58e2e8b3b scripts/install-deps.sh 826d166f67e4673ca622e82abdab878bd04f0903"
-	"69103f004f467dd270cdd7ccb5d894c071a95173 scripts/install-deps.sh 665f7e808171081956ff2f7a9092f23021a89cd1"
 	"158edf6a78c8fd33e70feceeed873f974449c292 scripts/install-deps.sh 6e5379273f605791d44210c2f5c96b90617077e9"
+	"320498604b018c62aeb80cc8238e22020f2029f0 scripts/install-deps.sh 826d166f67e4673ca622e82abdab878bd04f0903"
+	"417296195c34106b677da88c6c221982fff88774 scripts/install-deps.sh 3f81b16fb060835ba9fdb1d4be742875bedcb84f"
+	"42615dbe02aa6b08bbd30e736c429d9abd087430 scripts/install-deps.sh 3f81b16fb060835ba9fdb1d4be742875bedcb84f"
+	"540fd07fc58b6c78b430ef27d9567bf3091412e9 scripts/install-deps.sh 826d166f67e4673ca622e82abdab878bd04f0903"
+	"69103f004f467dd270cdd7ccb5d894c071a95173 scripts/install-deps.sh 665f7e808171081956ff2f7a9092f23021a89cd1"
+	"7489edc36a692bce8b28e1e2c84d0209afa3adc3 scripts/install-deps.sh 3f81b16fb060835ba9fdb1d4be742875bedcb84f"
+	"7a2fe1ecb80e3a84e18ba659c551d80814fe51bb scripts/install-deps.sh 665f7e808171081956ff2f7a9092f23021a89cd1"
+	"a7a60922fcf426e524ca1ccb1905d9b6fa44471c scripts/install-deps.sh 826d166f67e4673ca622e82abdab878bd04f0903"
+	"c2b76a60d65016ef8fd3bcc61139a7e40ea8ae6d scripts/install-deps.sh 665f7e808171081956ff2f7a9092f23021a89cd1"
+	"d3027d895bf8abe387af45fb47eb77c58e2e8b3b scripts/install-deps.sh 826d166f67e4673ca622e82abdab878bd04f0903"
+	"dec5e27153c63e0529731ac5ba017028ddb0504b scripts/install-deps.sh 826d166f67e4673ca622e82abdab878bd04f0903"
+	"e4fb25691dcd79e287f7847b3f4ea8c8f9449b3c scripts/install-deps.sh 3f81b16fb060835ba9fdb1d4be742875bedcb84f"
+	"edaff51e254f61a0d1ac0c90f8ac75c5d74ee954 scripts/install-deps.sh 3f81b16fb060835ba9fdb1d4be742875bedcb84f"
+	"f842a14c13548eb4696252c5d62339fd9c49aed0 scripts/install-deps.sh 826d166f67e4673ca622e82abdab878bd04f0903"
 )
 
 history_patterns_minus_private=
