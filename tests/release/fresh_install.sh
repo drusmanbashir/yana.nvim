@@ -144,7 +144,7 @@ cat >"$plugin/bin/yanad" <<'SH'
 set -euo pipefail
 [[ $1 == --root && -n $2 ]]
 mkdir -p "$2"
-exec "$(dirname "$0")/yanad.original" "$@" 2>>"$2/startup.stderr"
+exec "$(dirname "$0")/yanad.original" "$@" --log-level debug 2>>"$2/startup.stderr"
 SH
 chmod +x "$plugin/bin/yanad"
 
@@ -263,6 +263,7 @@ turn_rc=$?
 set -e
 
 if (( turn_rc != 0 )); then
+  find "$state" "$turn_scratch/state" -maxdepth 6 -printf '%y %p\n' >&2 || true
   # These isolated fixture logs otherwise disappear during trap cleanup.
   while IFS= read -r -d '' diagnostic; do
     printf 'fresh-install diagnostic: %s\n' "$diagnostic" >&2
@@ -281,7 +282,7 @@ if (( turn_rc != 0 )); then
       cp "$diagnostic" "$YANA_RELEASE_TURN_EVIDENCE/logs/$diagnostic_rel" || true
     fi
   done < <(find "$state" "$turn_scratch/state" -type f \
-    \( -name yana.log -o -name yanad.log -o -name stderr.log -o -name startup.stderr \) -print0 2>/dev/null)
+    \( -name '*.log' -o -name '*.json' -o -name '*.jsonl' -o -name '*.stderr' -o -name '*.path' -o -name '*.pid' \) -print0 2>/dev/null)
 fi
 
 if [[ $turn_rc == 65 ]]; then
