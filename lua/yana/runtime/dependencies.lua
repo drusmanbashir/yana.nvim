@@ -96,6 +96,9 @@ function M.required_executables(mode)
     return {}
   end
   local list = vim.deepcopy(confined_executables)
+  if dependencies_probe.cgroup_needs_user_scope() then
+    list[#list + 1] = "systemd-run"
+  end
   if type(config.options.inline_exec_allowlist) == "table" then
     list[#list + 1] = "python3"
   end

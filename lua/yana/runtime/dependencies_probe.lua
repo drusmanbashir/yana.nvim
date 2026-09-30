@@ -408,6 +408,25 @@ local function gnu_date_row()
   )
 end
 
+local function cgroup_context()
+  local uv = vim.uv or vim.loop
+  local uid = uv.getuid()
+  local own = "/sys/fs/cgroup/user.slice/user-" .. uid .. ".slice/user@" .. uid .. ".service"
+  local current = ""
+  if vim.fn.filereadable("/proc/self/cgroup") == 1 then
+    for _, line in ipairs(vim.fn.readfile("/proc/self/cgroup")) do
+      if line:sub(1, 3) == "0::" then current = "/sys/fs/cgroup" .. line:sub(4); break end
+    end
+  end
+  local user_scope = uv.fs_access(own, "W") and current ~= own and current:sub(1, #own + 1) ~= own .. "/"
+  return user_scope, own, current
+end
+
+function M.cgroup_needs_user_scope()
+  local needed = cgroup_context()
+  return needed
+end
+
 local function kernel_rows(rows)
   local uname = (vim.uv or vim.loop).os_uname()
   local darwin = uname.sysname == "Darwin"
@@ -455,15 +474,12 @@ local function kernel_rows(rows)
     rows[#rows + 1] = row("kernel:cgroup2", "ok", "cgroup v2 is available")
     local uv = vim.uv or vim.loop
     local uid = uv.getuid()
-    local own = "/sys/fs/cgroup/user.slice/user-" .. uid .. ".slice/user@" .. uid .. ".service"
-    local current = ""
-    for _, line in ipairs(vim.fn.readfile("/proc/self/cgroup")) do
-      if line:sub(1, 3) == "0::" then current = "/sys/fs/cgroup" .. line:sub(4); break end
-    end
-    if uv.fs_access(own, "W") and current ~= own and current:sub(1, #own + 1) ~= own .. "/" then
+    local needs_scope, own, current = cgroup_context()
+    if needs_scope then
       local runtime = vim.env.XDG_RUNTIME_DIR or ("/run/user/" .. uid)
-      local dir, bus = uv.fs_stat(runtime), uv.fs_stat(runtime .. "/bus")
-      if vim.fn.executable("systemd-run") == 1 and dir and dir.uid == uid and bus and bus.type == "socket" then
+      local dir, bus, private = uv.fs_stat(runtime), uv.fs_stat(runtime .. "/bus"), uv.fs_stat(runtime .. "/systemd/private")
+      local manager_socket = (private and private.type == "socket") or (bus and bus.type == "socket")
+      if vim.fn.executable("systemd-run") == 1 and dir and dir.uid == uid and manager_socket then
         rows[#rows + 1] = row("cgroup:delegation", "ok", "launcher will enter the delegated systemd user scope")
       else
         rows[#rows + 1] = row("cgroup:delegation", "error", "launcher is outside the delegated user cgroup and cannot reach its user manager",

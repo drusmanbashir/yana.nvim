@@ -274,8 +274,9 @@ The release CI uses the same exception on its disposable Ubuntu runner.
 **No delegated user cgroup.** A cgroup is the Linux process group used to stop
 and reclaim a confined turn. Yana automatically enters a systemd user scope
 when launched from SSH, tty or a system service. If `cgroup:delegation` fails,
-ensure the login has a running systemd user manager and its owned
-`/run/user/UID/bus`; Yana refuses if that manager is unavailable. Containers
+ensure the login has a running systemd user manager and its owned runtime
+directory (`/run/user/UID`) with `systemd/private` or `bus`; Yana refuses if
+that manager is unavailable. Containers
 need a writable delegated cgroup v2 hierarchy.
 
 **The model list times out.** The agent CLI itself may be waiting for you

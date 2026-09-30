@@ -13,7 +13,10 @@ cgroup_ensure_user_scope() {
 	local rel runtime
 	[[ -d "$own" && -w "$own" ]] || return 0
 	rel=$(sed -n 's/^0:://p' "$CGROUP_PROC_SELF_PATH")
-	[[ "$CGROUP_MOUNT$rel" == "$own" || "$CGROUP_MOUNT$rel" == "$own/"* ]] && return 0
+	if [[ "$CGROUP_MOUNT$rel" == "$own" || "$CGROUP_MOUNT$rel" == "$own/"* ]]; then
+		unset YANA_OVERLAY_USER_SCOPE
+		return 0
+	fi
 	if [[ ${YANA_OVERLAY_USER_SCOPE:-} == 1 ]]; then
 		printf 'yana-overlay: user scope did not enter the delegated cgroup %s (current: %s)\n' "$own" "$rel" >&2
 		return 66
@@ -23,11 +26,12 @@ cgroup_ensure_user_scope() {
 		return 66
 	fi
 	runtime=${XDG_RUNTIME_DIR:-/run/user/$EUID}
-	if [[ ! -d "$runtime" || $(stat -c %u "$runtime") != "$EUID" || ! -S "$runtime/bus" ]]; then
-		printf 'yana-overlay: cannot reach the user manager at %s/bus; log in through a systemd user session\n' "$runtime" >&2
+	if [[ ! -d "$runtime" || $(stat -c %u "$runtime") != "$EUID" ]] \
+		|| [[ ! -S "$runtime/systemd/private" && ! -S "$runtime/bus" ]]; then
+		printf 'yana-overlay: cannot reach the user manager in %s; log in through a systemd user session\n' "$runtime" >&2
 		return 66
 	fi
-	export XDG_RUNTIME_DIR="$runtime" DBUS_SESSION_BUS_ADDRESS="unix:path=$runtime/bus" YANA_OVERLAY_USER_SCOPE=1
+	export XDG_RUNTIME_DIR="$runtime" YANA_OVERLAY_USER_SCOPE=1
 	exec systemd-run --user --scope --quiet --collect -- "$@"
 }
 
