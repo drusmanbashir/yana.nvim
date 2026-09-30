@@ -137,6 +137,17 @@ plugin="$data/nvim/site/pack/release/start/yana.nvim"
 mkdir -p "$home" "$config/nvim" "$plugin" "$state" "$cache"
 cp -a "$tree/." "$plugin/"
 
+# Capture the daemon process's startup stderr inside this disposable install.
+mv "$plugin/bin/yanad" "$plugin/bin/yanad.original"
+cat >"$plugin/bin/yanad" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+[[ $1 == --root && -n $2 ]]
+mkdir -p "$2"
+exec "$(dirname "$0")/yanad.original" "$@" 2>>"$2/startup.stderr"
+SH
+chmod +x "$plugin/bin/yanad"
+
 if (( expect_refusal )); then
 	# Below-floor row: prove setup() refuses with the documented floor message
 	# and without a Lua traceback (same contract as tests/matrix_gate.sh negative).
@@ -255,7 +266,10 @@ if (( turn_rc != 0 )); then
   # These isolated fixture logs otherwise disappear during trap cleanup.
   while IFS= read -r -d '' diagnostic; do
     printf 'fresh-install diagnostic: %s\n' "$diagnostic" >&2
-    diagnostic_lines=$(wc -l <"$diagnostic")
+    if ! diagnostic_lines=$(wc -l <"$diagnostic" 2>/dev/null); then
+      printf 'fresh-install: diagnostic vanished before capture: %s\n' "$diagnostic" >&2
+      continue
+    fi
     if (( diagnostic_lines > 160 )); then
       printf '... %s earlier lines omitted ...\n' "$((diagnostic_lines - 160))" >&2
     fi
@@ -267,7 +281,7 @@ if (( turn_rc != 0 )); then
       cp "$diagnostic" "$YANA_RELEASE_TURN_EVIDENCE/logs/$diagnostic_rel" || true
     fi
   done < <(find "$state" "$turn_scratch/state" -type f \
-    \( -name yana.log -o -name yanad.log -o -name stderr.log \) -print0 2>/dev/null)
+    \( -name yana.log -o -name yanad.log -o -name stderr.log -o -name startup.stderr \) -print0 2>/dev/null)
 fi
 
 if [[ $turn_rc == 65 ]]; then
