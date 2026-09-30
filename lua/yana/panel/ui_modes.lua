@@ -10,6 +10,7 @@ local notify = require("yana.notify")
 local notify_one_line = notify.one_line
 --- Switch itself never renews; renewal.blocked gates review-open / in-flight.
 local renewal = require("yana.agent.renewal")
+local conversation = require("yana.panel.conversation")
 
 local M = {}
 
@@ -23,20 +24,7 @@ function M.new(deps)
   --- Seat key for `mode` under the active backend descriptor (O5/O6). The ONLY
   --- place vendor seat maps are read — never `if backend == "cursor"`.
   local function seat_of(mode, backend_name)
-    local bd = config.backend_descriptor(backend_name or config.options.backend) or {}
-    mode = config.panel_mode(mode)
-    if bd.mode_switch == "two_seat" and type(bd.seats) == "table" then
-      for seat_name, modes in pairs(bd.seats) do
-        if type(modes) == "table" then
-          for _, m in ipairs(modes) do
-            if m == mode then
-              return seat_name
-            end
-          end
-        end
-      end
-    end
-    return "main"
+    return conversation.seat_of(mode, backend_name)
   end
 
   -- G1 first: refuse while a turn is in flight. The old "locked" arm is gone (O4).
@@ -50,37 +38,24 @@ function M.new(deps)
     return false, nil
   end
 
-  -- Seat-keyed conversation map (O1/O6).
+  -- Projection helpers kept for callers; Conversation owns mini records.
   local function remember_seat_session(p)
     if not p then
       return
     end
-    local seat = seat_of(p.mode, config.options.backend)
-    p.session_seats = p.session_seats or {}
-    -- O1: first id on a seat wins. A later vendor echo must not retarget the
-    -- conversation; snap the live panel id back to the seat when it drifts.
-    if p.session_id == nil or p.session_id == "" then
-      return
-    end
-    if p.session_seats[seat] == nil then
-      p.session_seats[seat] = p.session_id
-    else
-      p.session_id = p.session_seats[seat]
-    end
+    conversation.get(p):activate(p.mode, config.options.backend)
   end
 
   local function restore_seat_session(p, mode)
     if not p then
       return
     end
-    local seat = seat_of(mode, config.options.backend)
-    p.session_seats = p.session_seats or {}
-    p.session_id = p.session_seats[seat]
+    conversation.get(p):activate(mode, config.options.backend)
     p.model_actual = nil
   end
 
   ----------------------------------------------------------------------
-  -- MID-CHAT SWITCH: seat re-attach, never session renewal (remember the current seat's id, restore the destination's).
+  -- MID-CHAT SWITCH: seat re-attach via Conversation (never session renewal).
 
   --- Why this chat cannot renew now, or nil: names the failing condition AND the action that clears it.
   local function renewal_blocked_reason(p)

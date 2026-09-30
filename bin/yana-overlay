@@ -53,6 +53,9 @@ TURN_ID=""
 MODE=""
 ANSWER_OUT=""
 TOUCHED_FILES=()
+# Overlay copies: one
+# PATH=FROM per open buffer; yanad.sh checks them and copies them into the uppers.
+SEEDS=()
 # Operator-declared write roots beyond the opened workspace (the external-roots
 # contract). One parallel entry per extra root, in the canonical-path order the
 # caller passed them; index 0 here is root 2 of the turn, because the primary
@@ -395,6 +398,11 @@ parse_run_args() {
 			--touched)
 				[[ $# -ge 2 ]] || die_usage "--touched requires an absolute path"
 				TOUCHED_FILES+=("$2")
+				shift 2
+				;;
+			--seed)
+				[[ $# -ge 2 ]] || die_usage "--seed requires PATH=FROM"
+				SEEDS+=("$2")
 				shift 2
 				;;
 			--broad-root)

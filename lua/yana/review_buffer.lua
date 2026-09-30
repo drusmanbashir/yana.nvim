@@ -4,6 +4,8 @@ local log = require("yana.log")
 
 local M = {}
 
+local NO_AFTER = "agent payload carried no after-content for this edit (nothing to review)"
+
 local function snapshot_lines(text)
   local lines = vim.split(text or "", "\n", { plain = true })
   if #lines > 0 and lines[#lines] == "" then
@@ -73,6 +75,25 @@ function M.new(deps)
       end
     end
 
+    -- A file whose buffer was captured at submit opens in that buffer as it stands (B1). No
+    -- refusal, no disk read, no reload, and nothing is staged here: review open
+    -- places each edit on B1, or stages B0 itself when the extmarks cannot be used.
+    local snap = type(change.buffer_capture) == "table" and change.buffer_capture or nil
+    if snap then
+      if change.kind ~= "delete" and change.after == nil then
+        return nil, NO_AFTER
+      end
+      local bufnr = snap.bufnr
+      if not (bufnr and vim.api.nvim_buf_is_valid(bufnr)) then
+        bufnr = vim.fn.bufnr(path, true)
+      end
+      vim.fn.bufload(bufnr)
+      -- Seals B1 off from what review open writes, so it stays one undo step back.
+      deps.break_undo_block(bufnr)
+      change.undo_pre_stage_seq = deps.buf_undo_seq(bufnr)
+      return bufnr, nil
+    end
+
     local existing_modified = existing > 0
       and vim.api.nvim_buf_is_loaded(existing)
       and vim.bo[existing].modified
@@ -101,9 +122,10 @@ function M.new(deps)
           and not unsaved
         then
           existing_modified = false
-        else
-          return nil, "buffer has unsaved edits unrelated to this review", { reason = "dirty_buffer" }
         end
+        -- Otherwise fall back to B0 (INTERFACE.md section 4): no refusal. The buffer
+        -- is not reloaded; `stage` below puts the base in it and the unsaved text
+        -- stays in its undo history.
       end
     end
 
@@ -133,15 +155,14 @@ function M.new(deps)
         change.disk_at_open = nil
         return vim.fn.bufnr(path, true), nil
       end
-      local disk_bytes, err = diff.read_file_bytes(path)
-      if disk_bytes == nil then
-        return nil, err or "could not read file for review"
-      end
-      if change.before ~= nil and not diff.text_equal_snapshot(disk_bytes, change.before) then
-        log.buffer_event("guard_disk_final", { change = change, disk_bytes = disk_bytes, matches_before = false })
-        return deps.stale_refusal("file on disk changed since turn start", change.before, disk_bytes)
-      end
-      log.buffer_event("guard_disk_final", { change = change, disk_bytes = disk_bytes, matches_before = true })
+      -- Fall back to B0 (spec buffer_state_change SPEC "Fall back to B0", BUILD row 7):
+      -- a delete whose disk no longer holds the agent's base, or cannot be read, is
+      -- never refused; its buffer gets B0 and the hunk is B0 against the deletion.
+      local disk_bytes = diff.read_file_bytes(path)
+      local matches_before = disk_bytes ~= nil
+        and (change.before == nil or diff.text_equal_snapshot(disk_bytes, change.before))
+      log.buffer_event("guard_disk_final", { change = change, disk_bytes = disk_bytes,
+        matches_before = matches_before, outcome = matches_before and "baseline_check" or "fall_back_b0" })
       change.disk_at_open = disk_bytes
       local bufnr = vim.fn.bufnr(path, true)
       if not existing_modified then
@@ -152,58 +173,27 @@ function M.new(deps)
     end
 
     if change.after == nil then
-      return nil, "agent payload carried no after-content for this edit (nothing to review)"
+      return nil, NO_AFTER
     end
     if change.before == nil then
-      -- The guard this replaces refused every existing path outright ("the
-      -- agent-created file has no empty base to review against") -- after the touch
-      -- that is always true, and every created-file review would refuse to open. It
-      -- was, and still is, an anti-EXTERNAL-WRITER guard, so it now asks the question
-      -- its own reason asks: is what is at this path yana's own empty touch (or
-      -- nothing), or did somebody else write CONTENT here?
-      local creation_touch = require("yana.paths.creation_touch")
-      local ok_touch, terr = creation_touch.touch(path)
-      if not ok_touch then
-        return nil, tostring(terr), { reason = "stale_file" }
-      end
-      -- The BYTE baseline of a touched file is the empty string -- the touch happened
-      -- at proposal time, before any decision -- so the review opens against `""`
-      -- exactly as any other file opens against its own bytes.
+      -- An agent-created file: open an empty buffer for the path and write nothing
+      -- on disk; End's save creates the file only if it is accepted (spec
+      -- buffer_state_change BUILD, disk audit; BLOCKERS end-2).
       change.disk_at_open = ""
-      local bufnr = vim.fn.bufnr(path, true)
-      -- The buffer may have been created while the path was still ABSENT (the panel
-      -- names a proposed file before the review opens), and Vim then carries it as a
-      -- NEW file. Re-stat through a forced reload so Vim's view of the file matches the
-      -- empty file that is really there.
-      if not existing_modified then
-        log.buffer_event("reload_begin", { change = change, bufnr = bufnr })
-        diff.reload_file(path, { force = true })
-      end
-      return stage(bufnr, "")
+      return stage(vim.fn.bufnr(path, true), "")
     end
 
-    if vim.fn.filereadable(path) ~= 1 then
-      if vim.fn.getftype(path) ~= "" then
-        return nil, "file exists but is not readable", { reason = "stale_file" }
-      end
-      return nil, "file missing on disk for review", { reason = "stale_file" }
-    end
-    local disk_bytes, err = diff.read_file_bytes(path)
-    if disk_bytes == nil then
-      return nil, err or "could not read file bytes from disk"
-    end
-    local disk_is_turn_start = diff.text_equal_snapshot(disk_bytes, change.before)
-    local disk_is_accepted_save = not disk_is_turn_start
-      and change._accept_composed_hash ~= nil
-      and deps.base_fingerprint(disk_bytes) == change._accept_composed_hash
+    -- Fall back to B0 (spec buffer_state_change SPEC "Fall back to B0", BUILD row 7):
+    -- a file with no snapshot whose disk no longer holds the agent's base (changed,
+    -- missing or unreadable), open or not, is never refused. Its buffer gets B0, so
+    -- its hunks are B0 against the agent's revision; the disk bytes are End's evidence only.
+    local disk_bytes = vim.fn.filereadable(path) == 1 and diff.read_file_bytes(path) or nil
+    local matches_before = disk_bytes ~= nil and diff.text_equal_snapshot(disk_bytes, change.before)
     log.buffer_event("guard_disk_final", { change = change, disk_bytes = disk_bytes,
-      matches_before = disk_is_turn_start, outcome = disk_is_accepted_save and "accepted_save" or "baseline_check" })
-    if not (disk_is_turn_start or disk_is_accepted_save) then
-      return deps.stale_refusal("file on disk changed since turn start", change.before, disk_bytes)
-    end
+      matches_before = matches_before, outcome = matches_before and "baseline_check" or "fall_back_b0" })
     change.disk_at_open = disk_bytes
     local bufnr = vim.fn.bufnr(path, true)
-    if not existing_modified then
+    if not existing_modified and disk_bytes ~= nil then
       log.buffer_event("reload_begin", { change = change, bufnr = bufnr })
       diff.reload_file(path, { force = true })
     end

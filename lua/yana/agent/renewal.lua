@@ -1,10 +1,10 @@
--- Do not extend. CONTEXT-PRESERVING MODE RENEWAL.
+-- Do not extend. CONTEXT-PRESERVING MODE RENEWAL (brief carry only).
 --
--- cursor's upstream session carries a FIXED mode chain, so a mode switch is a
--- seat re-attach: end the upstream session, start a new one in the new mode and
--- hand it a brief. The brief is BUILT from yana's own records, BOUND to the
--- conversation and turn it came from, SHOWN to the operator at the switch, and
--- INJECTED into the next prompt EXACTLY ONCE.
+-- Mode switches re-attach the destination mini-conversation via
+-- yana.panel.conversation; they do not renew an upstream session at switch
+-- time. A renewal brief may still be BUILT from yana's own records, BOUND to
+-- the conversation and turn it came from, SHOWN to the operator, and INJECTED
+-- into the next prompt EXACTLY ONCE when a carry is staged.
 --
 -- Nothing agent-authored may reach a control-plane decision, so the brief is
 -- composed only from the operator's instruction, the ledger's decisions, the

@@ -209,13 +209,12 @@ printf 'FRESH INSTALL PASS nvim=%s root=%s\n' "$($nvim --version | head -1)" "$p
 # ---------------------------------------------------------------------------
 # TURN SMOKE: setup()+panel-open above proves the export installs and loads,
 # but it never submits a prompt, so a runtime module reachable only from
-# inside a real turn -- direct require() like lua/yana/agent/agent.lua's
-# require("yana.agent.vendor_stream"), or a guarded pcall(require, ...) like
-# lua/yana/inline_diff.lua's cross-file undo -- is invisible to it. Drive
+# inside a real turn, such as require("yana.agent.vendor_stream"), is
+# invisible to it. Drive
 # ONE turn against the SAME installed tree ($plugin, not $tree/dev) that
 # smoke.lua just proved installs, via tests/release/turn_smoke.lua: hunk
-# appears, accept it, undo, assert no Lua error AND that undo actually went
-# through yana's own handler rather than silently falling back to Neovim's.
+# appears, accept it, undo and save. Check the buffer and disk at each step,
+# including native buffer undo after End, and reject Lua/Vim errors.
 #
 # Needs real bwrap confinement (mode=inline), same requirement as
 # tests/release/confined_turn_gate.sh: the overlay applies `--tmpfs /tmp`

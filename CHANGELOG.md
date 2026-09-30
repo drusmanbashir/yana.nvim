@@ -3,6 +3,24 @@
 All notable changes to Yana are documented here. Versions follow Semantic
 Versioning.
 
+## 0.1.0-alpha.15 - 2026-09-30
+
+### Changed
+
+- Install through a short Neovim plugin declaration: choose your existing
+  Claude, Codex or Cursor backend and let the plugin manager load the required
+  UI dependency. Optional configuration lives in the reference documentation.
+- The public file list is explicit. Historical development-only exclusions,
+  including snapshot recording, experimental commands and the retired installer,
+  remain enforced even if a prohibited file is added to the release list.
+
+### Fixed
+
+- Include five existing runtime modules missing from the release list.
+- Remove private machine references from shipped text and check SVG and ignore
+  rules for private paths too. Correct manual setup and configuration examples.
+- Match archive permissions to the four non-executable shell libraries.
+
 ## 0.1.0-alpha.14 - 2026-09-23
 
 ### Changed

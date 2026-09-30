@@ -542,6 +542,10 @@ local function release_shadow_turn(p, reason, on_released, opts)
   local turn = p.shadow_turn
   local pass = p.turn_pass
   local defer = type(opts) == "table" and opts.defer_local_release == true
+  -- The turn ends: delete its snapshots' extmarks and listeners by their ids;
+  -- the namespace is never cleared, another turn may share it.
+  require("yana.input.home_buffer_proposal").release_snapshots(p and p.turn_buffer_captures,
+    (turn and turn.turn_gen) or (pass and pass.generation))
   -- Stash the caller reason per generation so on_done's later turn.end emit
   -- (when this call skips because turn_end_outcome is not yet set — the
   -- on_exit_confirmed → finalize path) carries THIS reason, never a

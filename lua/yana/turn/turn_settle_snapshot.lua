@@ -1,5 +1,6 @@
--- Reading the world for one Turn file: disk evidence, line ownership and the
--- frozen projection INPUT. Split out of `turn_settle.lua`, which had grown past
+-- Reading the world for one Turn file: line ownership and the frozen
+-- projection INPUT. The file on disk is not read here
+-- (disk and buffer-write audit). Split out of `turn_settle.lua`, which had grown past
 -- 500 lines carrying two jobs -- deciding what is true, and acting on it. This
 -- half only decides what is true. It calculates no action, no target bytes and
 -- no mode, opens no write door and touches no buffer; `turn_settle` owns all of
@@ -13,20 +14,8 @@ local M = {}
 -- cycle. `current_mode_verdict` stays its published API rather than moving,
 -- because callers outside this pair name it there.
 
-local uv = vim.uv or vim.loop
-
 function M.valid_buffer(bufnr)
   return type(bufnr) == "number" and bufnr > 0 and vim.api.nvim_buf_is_valid(bufnr)
-end
-
-function M.read_disk(path)
-  local file = io.open(path, "rb")
-  if not file then
-    return nil
-  end
-  local text = file:read("*a")
-  file:close()
-  return text
 end
 
 --- THE ONE PLACE A MODE IS NORMALISED. `uv.fs_lstat` reports the full `st_mode`
@@ -42,22 +31,6 @@ function M.mode_perm(mode)
     return nil
   end
   return mode % 4096
-end
-
---- Fresh disk evidence in the frozen `{exists, bytes, mode, identity}` shape.
---- `identity` is inode plus device: a path replaced by a different file is a
---- different file even at the same size and mtime.
-function M.disk_evidence(path)
-  local stat = uv.fs_lstat(path)
-  if not stat then
-    return { exists = false }
-  end
-  return {
-    exists = true,
-    bytes = M.read_disk(path),
-    mode = M.mode_perm(stat.mode),
-    identity = tostring(stat.ino) .. ":" .. tostring(stat.dev),
-  }
 end
 
 --- LINE OWNERSHIP, RESOLVED ONCE, FROM THE RECORDED EXTENT ALONE. Bytes may
@@ -134,13 +107,10 @@ end
 
 --- The projection INPUT for one file. Everything the calculation needs, read
 --- once, with no calculation of its own: original and proposal sides, the
---- resolved hunks, the two verdicts, the verified disk record and fresh disk
---- evidence beside it, and the buffer when one is loaded.
+--- resolved hunks, the two verdicts and the buffer when one is loaded.
 function M.snapshot_of(f, purpose)
   local change = type(f.change) == "table" and f.change or {}
-  local path = change.path or f.path
   local is_creation = M.creation(f, change)
-  local fresh = M.disk_evidence(path)
 
   local buffer
   -- A delete's review buffer shows the proposal (absence), not the file's content:
@@ -182,15 +152,14 @@ function M.snapshot_of(f, purpose)
     -- for a since-revised proposal, the projection defaults to keep, which is
     -- the only safe default.
     mode_verdict = (require("yana.turn.turn_settle").current_mode_verdict(f) or {}).verdict,
-    last_verified_disk = type(f.last_verified_disk) == "table" and f.last_verified_disk or fresh,
-    disk = fresh,
     buffer = buffer,
   }
 end
 
 -- ---------------------------------------------------------- SETTLEMENT EVIDENCE
 -- Whether a recorded settlement still describes this file: the stamp of what
--- its proposal and disk WERE, and the comparison against what they are now.
+-- its proposal, decisions and buffer WERE, and the comparison against what
+-- they are now. The file on disk is not part of it.
 -- Moved here from `turn_settle.lua` at 529 lines because it answers the same
 -- question this module exists for -- what is true -- and never acts on it.
 
@@ -200,9 +169,9 @@ function M.bytes_stamp(bytes)
 end
 
 -- A successful path may be skipped when a later path refuses and End turn is
--- retried, but only while every input and output of that settlement is still
--- the same. A bare boolean would silently ignore an intervening buffer edit,
--- verdict reversal, retarget, chmod, or disk write.
+-- retried, but only while every input of that settlement is still the same. A
+-- bare boolean would silently ignore an intervening buffer edit, verdict
+-- reversal or retarget.
 function M.settlement_state(f)
   local change = f.change or {}
   local hunks = {}
@@ -216,7 +185,6 @@ function M.settlement_state(f)
       new_lines = vim.deepcopy(hunk.new_lines or {}),
     }
   end
-  local stat = uv.fs_lstat(f.path)
   local buffer
   if M.valid_buffer(f.bufnr) then
     local bytes, snapshot_err = diff.buffer_bytes_snapshot(f.bufnr)
@@ -239,9 +207,6 @@ function M.settlement_state(f)
     },
     hunks = hunks,
     buffer = buffer,
-    disk = M.bytes_stamp(M.read_disk(f.path)),
-    disk_mode = stat and stat.mode or nil,
-    disk_type = stat and stat.type or nil,
   }
 end
 

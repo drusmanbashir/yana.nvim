@@ -1,3 +1,5 @@
+/(home)/[^/[:space:]]+
+/(s)/agent_[[:alnum:]_.-]+
 spec/
 specs/
 handoff/
@@ -5,8 +7,6 @@ AGENTS\.md
 launch-profile-design
 NEOCURSOR
 neocursor
-/home/ub
-/s/agent_rw
 spec_v2
 CORE\.md
 BUILD-SHORTLIST

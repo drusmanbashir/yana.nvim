@@ -1,7 +1,9 @@
 # Configuration
 
 Every option below has a default, so `opts = {}` (or no `opts` at all) is a
-valid setup. This page documents what each option is and what it defaults to.
+valid setup for Cursor. Choose `backend = "claude"` or `backend = "codex"`
+when that is your installed agent; Yana does not auto-select it. This page
+documents what each option is and what it defaults to.
 Where the code and a comment in the source disagree, the behavior described
 here follows the code.
 
@@ -9,7 +11,7 @@ here follows the code.
 
 ```lua
 opts = {
-  backend = "cursor",
+  backend = "cursor", -- choose "cursor", "claude" or "codex" for your installed CLI
   modes = { "inline", "agentic", "ask" },
   mappings = {
     toggle = "<leader>cc",
@@ -162,7 +164,7 @@ like `~/.ssh` is the one exception, done explicitly per backend via
 opts = {
   write_roots = {},
   capture_root = nil,
-  capture_root_candidates = { "~/code", "~" },
+  capture_root_candidates = {},
   workspace_roots = {},
   artifact_dir_prefixes = {},
 }
@@ -173,18 +175,14 @@ opts = {
   only — never something the agent's own output, a path found in the
   workspace, or an env var can add. Validated at turn start; overlapping
   roots are merged rather than refused.
-- **`capture_root`** (default `nil`) — the directory whose entire subtree
-  is writable inside the sandbox's overlay. `nil` means "choose it from
-  filesystem position": `$HOME/code` if it's an ancestor of the resolved
-  workspace, else `$HOME`, else the workspace itself. Set it to narrow that
-  choice (e.g. one monorepo instead of all of `~/code`) or to widen it
-  deliberately.
-- **`capture_root_candidates`** (default `{ "~/code", "~" }`) — the ordered
-  list `capture_root` picks from when it's `nil`. Each candidate is
-  filtered at turn start: an entry that doesn't exist, isn't an ancestor of
-  the workspace, or would contain Yana's own state root is skipped (not an
-  error); if none qualify, the workspace itself is the capture root.
-  Replace this list if your projects live somewhere other than `~/code`.
+- **`capture_root`** (default `nil`) — the directory whose subtree is writable
+  inside the sandbox overlay. With the default empty `capture_root_candidates`,
+  `nil` uses the opened workspace itself. Set an ancestor directory to widen
+  the overlay deliberately; the chosen directory cannot contain Yana's state.
+- **`capture_root_candidates`** (default `{}`) — ordered directories to try
+  when `capture_root` is `nil`. A candidate is used only if it exists, contains
+  the workspace, and does not contain Yana's state root. With no candidate,
+  the workspace itself is used. This list does not change `write_roots`.
 - **`workspace_roots`** (default `{}`) — extra directories workspace
   resolution considers when looking for the project root that contains the
   file you opened (checked after the nearest `.git` root, before the file's
@@ -574,10 +572,11 @@ opts = {
   profile = "factory", -- "factory" (normal) or "debugger" (also loads debug_modules); other values are refused
   debug_modules = {}, -- with profile = "debugger" only: names loaded as yana.debug_<name>; ships "keys" (logs keypresses)
   debug_record = false, -- true saves each turn's raw agent output and a meta.json for replay (disk I/O per event)
-  -- Text put before every inline-mode prompt; {{YANA_WRITABLE_BOUNDARY}} names the writable directory; false or "" disables it.
+  -- Text put before every inline-mode prompt; false or "" disables it.
   agent_instructions = [[
-{{YANA_WRITABLE_BOUNDARY}}
-Agent mode: when the user asks to populate, add, change, or give an example in a file, EDIT that file with the Edit File tool immediately — do not only reply in chat or ask whether to paste. Use minimal diffs at the referenced line numbers. When a visual selection is attached, prefer edits inside the stated edit zone; out-of-zone edits may be rejected or flagged before review. The user reviews each edit as inline hunks in the open file (cr/ca/cf) before it is final. Propose edits only — never run compilers, test suites, or import/smoke checks; the user's hunk-by-hunk review is the validation step here, not a shell command. If validation like that is actually needed, say so and let the user switch to agentic mode, where it belongs.
+You are a Neovim inline editor working LIVE during an active editing session. The user may keep editing while you work. Selected excerpts and their line numbers are context captured earlier; current buffer and disk contents may differ. Never save the user's live source buffer.
+
+When the user asks to populate, add, change, or give an example in a file, make the requested change immediately using the file-editing capability exposed by the current backend, writing the proposal into Yana's private layer — do not require a particular tool name, only reply in chat, or ask whether to paste. If no file-editing capability is exposed, say so clearly and provide the proposed patch in chat without claiming the file was edited. Use minimal diffs at the referenced line numbers. When a visual selection is attached, prefer edits inside the stated edit zone; out-of-zone edits may be rejected or flagged before review. The user reviews each edit as inline hunks in the open file (cr/ca/cf) before it is final. Propose edits only — never run compilers, test suites, or import/smoke checks; the user's hunk-by-hunk review is the validation step here, not a shell command. If validation like that is actually needed, say so and let the user switch to agentic mode, where it belongs.
 ]],
 }
 ```

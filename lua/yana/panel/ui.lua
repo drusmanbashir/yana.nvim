@@ -92,8 +92,6 @@ local function new_panel_state()
     prompt_buf = nil,
     -- Per-tabpage window records, owned solely by yana.panel.ui_panel_views.
     views = {},
-    session_id = nil,
-    session_seats = {}, -- seat-keyed vendor conversation ids; not mode-keyed
     model_actual = nil,    -- the model the VENDOR said it ran
     title = nil,           -- short session title (from the first prompt)
     mode = nil,

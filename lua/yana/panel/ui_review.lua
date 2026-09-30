@@ -259,25 +259,28 @@ local function flush_review_batch(p)
   do
     local queued_hunks = require("yana.review_queued_hunks")
     local turn_bind = require("yana.turn.turn_bind")
-    -- inline.build_diff_blocks is a facade field; model_target/absorb_review_blocks_over_drift are plain locals in
-    -- inline_diff, so they are required directly.
+    -- inline.build_diff_blocks is a facade field; model_target is a plain local in inline_diff, so it is required
+    -- directly.
     local materialize_deps = {
       facade = inline,
-      diff = diff,
       model_target = require("yana.review_model").model_target,
-      absorb_review_blocks_over_drift = require("yana.review_ownership").absorb_review_blocks_over_drift,
     }
     local intake_files = {}
     for _, owner in ipairs(batch) do
       if owner.status == "pending" then
-		local L, composed = queued_hunks.materialize(materialize_deps, owner)
-		if L then
-		  intake_files[#intake_files + 1] = {
-			path = diff.abs_path(owner.path),
-			ledger = L,
-			base_text = (owner.review_before ~= nil and owner.review_before or owner.before) or "",
-			overlay_text = composed,
-			change = owner,
+        local L, composed, _, base = queued_hunks.materialize(materialize_deps, owner)
+        if L then
+          intake_files[#intake_files + 1] = {
+            path = diff.abs_path(owner.path),
+            ledger = L,
+            -- End starts from the text the ledger's rows are counted in: B1 when
+            -- the edits were placed on it, else B0. A snapshotted file is placed
+            -- again when its review opens or `cA` takes it, and the Turn file
+            -- keeps the first base it is given, so that base is left to the
+            -- build End will use.
+            base_text = owner.buffer_capture == nil and base or nil,
+            overlay_text = composed,
+            change = owner,
           }
         end
       end

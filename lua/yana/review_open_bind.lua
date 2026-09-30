@@ -414,7 +414,9 @@ function Factory.new(deps)
   require("yana.turn.turn_bind").observe_open(st, {
     path = diff.abs_path(change.path),
     ledger = state.hunk_ledger,
-    base_text = (change.review_before ~= nil and change.review_before or change.before) or "",
+    -- End starts from B1, the buffer as it was when the agent finished, when
+    -- the record has it.
+    base_text = change.buf_updated or change.review_before or change.before or "",
     overlay_text = state.staged_text,
     bufnr = state.bufnr,
     review_opts = state.opts,

@@ -5,6 +5,7 @@ local agent = require("yana.agent.agent")
 local log = require("yana.log")
 local notify = require("yana.notify")
 local notify_one_line = notify.one_line
+local conversation = require("yana.panel.conversation")
 
 local M = {}
 
@@ -172,12 +173,9 @@ function M.new(deps)
       require("yana.runtime.persisted_state").save_model_selection(config.options)
     end)
     for _, q in ipairs(panels) do
-      -- A `--resume` session id belongs to the backend that issued it: drop every panel's upstream session on a
-      -- backend switch; the chat (transcript, title) continues as a fresh session.
-      if q.session_id then
-        q.session_id = nil
-      end
-      q.session_seats = {}
+      -- A `--resume` session id belongs to the backend that issued it: retire every
+      -- panel's upstream minis on a backend switch; the chat (transcript, title) continues.
+      conversation.get(q):reset()
       -- A model id and its confirmation also belong to the issuing vendor.
       q.model_actual = nil
       update_winbar(q)

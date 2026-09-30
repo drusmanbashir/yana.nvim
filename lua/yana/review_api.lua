@@ -31,25 +31,23 @@ function Factory.new(deps)
   local EXT_HL = deps.ext_hl
   local PALETTE = deps.palette
 
-  -- An agent-proposed NEW file is created on disk EMPTY the moment the turn proposes it
-  -- -- not a decision, no prompt. What happens on the far side is the touch owner's
-  -- (creation_touch.on_proposal); all this owes it is a normalised path, a rel and a
-  -- stamped workspace.
-  local function touch_proposed_creation(change, opts)
+  -- An agent-proposed NEW file is NOT created on disk when the turn proposes
+  -- it: the review opens an empty buffer and End's save creates the file if
+    -- its content is accepted. All this owes the proposal is a normalised path, a
+  -- rel and a stamped workspace.
+  local function stamp_proposed_creation(change, opts)
     local creation_touch = require("yana.paths.creation_touch")
     local path = creation_touch.is_creation(change) and diff.abs_path(change.path) or nil
     if path == nil or path == "" then return end
     change.path = path
     change.rel = change.rel or diff.relpath(path)
     stamp_review_workspace(change, opts)
-    creation_touch.on_proposal(change)
   end
-  M._touch_proposed_creation = touch_proposed_creation
 
   function M.enqueue(change, opts)
     opts = opts or {}
     require("yana.log").buffer_event("enqueue", { change = change, preview = opts.preview })
-    touch_proposed_creation(change, opts)
+    stamp_proposed_creation(change, opts)
     local st = pool_for(opts)
     if st.active and st.active.change == change then
       return false
@@ -102,7 +100,7 @@ function Factory.new(deps)
   -- process_next already assumes. The queue is checked as well as `active`: between
   function M.review(change, opts)
     opts = opts or {}
-    touch_proposed_creation(change, opts)
+    stamp_proposed_creation(change, opts)
     local st = pool_for(opts)
     if st.active or #st.queue > 0 then
       M.enqueue(change, opts)

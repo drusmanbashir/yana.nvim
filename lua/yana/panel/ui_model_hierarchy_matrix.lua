@@ -3,13 +3,57 @@
 
 local M = {}
 
-local function sorted_keys(set)
+-- F-MODEL-PICKER: presentation preference, independent of supported tokens.
+local EFFORT_ORDER = {
+	ultra = 1, max = 2, xhigh = 3, high = 4, medium = 5,
+	low = 6, minimal = 7, none = 8,
+}
+local MODEL_FAMILIES = {
+	astra = 1, sol = 2, terra = 3, luna = 4,
+	fable = 1, opus = 2, sonnet = 3, haiku = 4,
+}
+
+local function model_preference(model)
+	local rank = model:match("^gpt%-%d") and 3 or 99
+	for token in model:gmatch("[^-]+") do
+		if MODEL_FAMILIES[token] then rank = MODEL_FAMILIES[token]; break end
+	end
+	local version = {}
+	for number in model:gmatch("%d+") do version[#version + 1] = tonumber(number) end
+	return rank, version
+end
+
+local function sort_values(values, col)
+	table.sort(values, function(a, b)
+		if a == b then return false end
+		if a == "-" then return false end
+		if b == "-" then return true end
+		if col == "model" then
+			if a == "auto" then return false end
+			if b == "auto" then return true end
+			local ar, av = model_preference(a)
+			local br, bv = model_preference(b)
+			if ar ~= br then return ar < br end
+			for i = 1, math.max(#av, #bv) do
+				local an, bn = av[i] or 0, bv[i] or 0
+				if an ~= bn then return an > bn end
+			end
+		end
+		if col == "effort" or col == "reasoning" then
+			local ar, br = EFFORT_ORDER[a] or 99, EFFORT_ORDER[b] or 99
+			if ar ~= br then return ar < br end
+		end
+		return a < b
+	end)
+	return values
+end
+
+local function sorted_keys(set, col)
 	local out = {}
 	for value in pairs(set or {}) do
 		out[#out + 1] = value
 	end
-	table.sort(out)
-	return out
+	return sort_values(out, col)
 end
 
 local function contains(values, wanted)
@@ -29,11 +73,11 @@ function M.values_for_row(row, col)
 		return row.model and { row.model } or {}
 	end
 	if col == "effort" or col == "reasoning" then
-		local values = sorted_keys(row.efforts)
+		local values = sorted_keys(row.efforts, col)
 		return #values > 0 and values or { "-" }
 	end
 	if col == "speed" then
-		local values = sorted_keys(row.speeds)
+		local values = sorted_keys(row.speeds, col)
 		return #values > 0 and values or { "-" }
 	end
 	return {}
@@ -69,8 +113,7 @@ local function matches_before(session, row, col)
 end
 
 function M.axis_values(session, col)
-	-- Descriptor-declared ordered lists (e.g. claude --effort levels) win over
-	-- alphabetical set order so the picker matches the vendor spelling table.
+	-- Descriptors constrain supported values; display preference orders them.
 	do
 		local ok, config = pcall(require, "yana.config")
 		local bd = ok and session and config.backend_descriptor and config.backend_descriptor(session.backend)
@@ -91,7 +134,7 @@ function M.axis_values(session, col)
 					out[#out + 1] = value
 				end
 			end
-			return out
+			return sort_values(out, col)
 		end
 	end
 	local set = {}
@@ -102,7 +145,7 @@ function M.axis_values(session, col)
 			end
 		end
 	end
-	return sorted_keys(set)
+	return sorted_keys(set, col)
 end
 
 function M.axis_dim(session, col, value)

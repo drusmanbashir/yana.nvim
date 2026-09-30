@@ -21,13 +21,35 @@
 # gate reuses it verbatim so "what we scan" and "what we ship" never drift
 # apart from each other.
 forbidden_bytes_allowed_path() {
+	local spec_dir=spec specs_dir=specs handoff_dir=handoff handoffs_dir=handoffs
+	local agents_name=AGENTS
+	agents_name+=.md
 	case $1 in
-	# Buffer snapshots and the operator's toggle are development-only. Keep
-	# these out even if someone later adds them to the export manifest.
-	lua/yana/debug_buffer_states.lua | lua/yana/debug_buffer_states_bundle.lua \
-		| nvim/lua/user/yana.lua) return 1 ;;
+	# Keep private development, diagnostic capture and operator configuration out
+	# even if a manifest edit names them.
+	*/"$agents_name" | "$agents_name" | "$spec_dir"/* | "$specs_dir"/* \
+		| */"$spec_dir"/* | */"$specs_dir"/* \
+		| "$handoff_dir"/* | "$handoffs_dir"/* | notes/* | mcpyana/* | .agent/* | */.agent/* \
+		| .claude/* | */.claude/* | worktrees/* | */worktrees/* \
+		| evidence/* | .evidence/* | out/* \
+		| lua/yana/"$agents_name" | lua/yana/debug_buffer_states.lua \
+		| lua/yana/debug_buffer_states_bundle.lua | nvim/lua/user/yana.lua \
+		| tools/buffer-snapshot-triple.sh | prompt.txt | scripts/install-deps.sh \
+		| .github/workflows/tests.yml | bin/yana-ollama-agent | bin/yana-release \
+		| docs/repl.md | docs/security.md | assets/logo/* \
+		| assets/yana-review-full-still.png | assets/yana-review-full.gif \
+		| assets/yana-review-full.mp4 | assets/yana-review-full.take.json \
+		| assets/yana-review.mp4 | assets/yana-review.take.json \
+		| scripts/release/README.md | scripts/release/hpc-smoke-remote.sh \
+		| scripts/release/manifest_policy.py | scripts/release/paths.conf \
+		| scripts/release/to-release.sh \
+		| tests/release/candidate_check_gate.sh \
+		| tests/release/candidate_history_exceptions_gate.sh \
+		| tests/release/health_yana_ui_smoke.lua \
+		| tests/release/install_remedy_smoke.lua \
+		| tests/release/yana_release_preflight_gate.sh) return 1 ;;
 	.github/workflows/ci.yml | .github/workflows/release.yml) return 0 ;;
-	.gitignore | .stylua.toml | CHANGELOG.md | LICENSE | NOTICE | README.md | VERSION | prompt.txt) return 0 ;;
+	.gitignore | .stylua.toml | CHANGELOG.md | LICENSE | NOTICE | README.md | VERSION) return 0 ;;
 	assets/*.gif | assets/*.mp4 | assets/*.png | assets/*.svg) return 0 ;;
 	doc/yana.txt | plugin/yana.lua) return 0 ;;
 	docs/*.md) return 0 ;;
@@ -36,7 +58,6 @@ forbidden_bytes_allowed_path() {
 	bin/yanad) return 0 ;;
 	bin/lib/yanad/*.py) return 0 ;;
 	bin/lib/yana-overlay/*.sh) return 0 ;;
-	scripts/install-deps.sh) return 0 ;;
 	scripts/release/*) return 0 ;;
 	tests/release/*) return 0 ;;
 	tests/headless/lib/hunks.lua) return 0 ;;
@@ -51,7 +72,7 @@ forbidden_bytes_allowed_path() {
 # are allowed to ship but are not UTF-8 text and cannot be scanned line-wise.
 forbidden_bytes_binary_path() {
 	case $1 in
-	assets/*.gif | assets/*.mp4 | assets/*.png | assets/*.svg) return 0 ;;
+	assets/*.gif | assets/*.mp4 | assets/*.png) return 0 ;;
 	esac
 	return 1
 }
@@ -62,9 +83,9 @@ forbidden_bytes_binary_path() {
 # file (scripts/release/forbidden-patterns.txt format: one extended regex
 # per line, consumed by `grep -f`).
 #
-# Exemptions: - PATH == scripts/release/forbidden-patterns.txt is never scanned: it is
-# the scanner's own registry and must contain the literal pattern text. - PATH == NOTICE
-# has its one audited upstream repository URL line (the recorded fork point citation)
+# Exemptions: the registry is scanned for private paths while its other patterns
+# are exempt from matching themselves. NOTICE's one audited upstream repository URL line
+# (the recorded fork point citation)
 # filtered out of the hits. The exemption is keyed to the URL's own text, not to a line
 # number: NOTICE is prose that gets edited, and coupling the exemption to "line 4" broke
 # on the first legitimate rewrite that moved the line.
@@ -74,12 +95,27 @@ forbidden_bytes_binary_path() {
 # Return code: 0 clean, 1 one or more forbidden hits.
 forbidden_bytes_scan() {
 	local tree=$1 patterns=$2 path=$3
-	[[ "$path" == "scripts/release/forbidden-patterns.txt" ]] && return 0
-	[[ "$path" == ".gitignore" ]] && return 0
 	forbidden_bytes_binary_path "$path" && return 0
 
 	local hits
 	hits=$(LC_ALL=C grep -aEin -f "$patterns" "$tree/$path" || true)
+	if [[ "$path" == ".gitignore" ]]; then
+		# These two exact entries ignore private policy scratch inside the source
+		# checkout. Other additions remain subject to the public-content scan.
+		local spec_dir=spec
+		hits=$(printf '%s\n' "$hits" \
+			| grep -Ev "^[0-9]+:${spec_dir}/council/(runs/|LATEST)$" || true)
+	fi
+	if [[ "$path" == "scripts/release/forbidden-patterns.txt" ]]; then
+		# The registry's non-path prohibitions name their own patterns. Still scan
+		# it for account-specific home and agent scratch paths.
+		local private_patterns
+		private_patterns=$(mktemp)
+		printf '%s\n' '/(home)/[^/[:space:]]+' '/(s)/agent_[[:alnum:]_.-]+' \
+			| grep -Fxf "$patterns" >"$private_patterns"
+		hits=$(LC_ALL=C grep -aEin -f "$private_patterns" "$tree/$path" || true)
+		rm -f "$private_patterns"
+	fi
 
 	if [[ "$path" == "NOTICE" ]]; then
 		local legacy=neo

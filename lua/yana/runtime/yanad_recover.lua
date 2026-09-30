@@ -52,6 +52,16 @@ local function inside(root, path)
 end
 
 local function current_base(row)
+	-- A file snapshotted at submit carries its B0 in the daemon record
+	-- (`review_before`). Recovery reviews against it and reads no disk: the
+	-- review places by B1 only when the loaded buffer equals that B0, otherwise
+		-- it falls back to B0. A created file still has no original side.
+	if type(row.review_before) == "string" and not row.home_buffer_only then
+		if row.base_state == "absent" then
+			return nil
+		end
+		return row.review_before
+	end
 	local st = uv.fs_lstat(row.path)
 	if row.base_state == "absent" then
 		if st ~= nil then

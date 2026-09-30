@@ -231,6 +231,13 @@ function M.wrap_cmd(argv, session)
 		vim.list_extend(out, { "--touched", diff.abs_path(path) })
 	end
 
+		-- Overlay copies: the
+	-- launcher puts each `from` (the buffer text at submit) in the upper layer at
+	-- `path`, so the agent reads the buffer instead of the saved file.
+	for _, seed in ipairs(session.seed_files or {}) do
+		vim.list_extend(out, { "--seed", seed.path .. "=" .. seed.from })
+	end
+
 	--
 	-- Read from the session `preview.begin_turn` built out of filesystem position and
 	-- operator configuration; nothing in this process may widen it, and nothing a turn

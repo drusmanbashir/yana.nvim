@@ -264,6 +264,69 @@ cmd_run_direct() {
 	exit 0
 }
 
+# Overlay copies: the
+# editor's buffer text (B0) for each open file, placed in the upper layer so the
+# agent reads the buffer instead of the saved file. The file on disk is never written.
+
+# The root holding PATH and its upper layer, in SEED_ROOT and SEED_UPPER.
+# Roots never nest (validate_paths refuses it), so at most one matches.
+SEED_ROOT=""
+SEED_UPPER=""
+seed_root_of() {
+	local path=$1 i
+	local -a roots=("${BROAD_ROOT:-$WORKSPACE}" ${EXTRA_ROOTS[@]+"${EXTRA_ROOTS[@]}"})
+	local -a uppers=("$UPPER" ${EXTRA_UPPERS[@]+"${EXTRA_UPPERS[@]}"})
+	for i in "${!roots[@]}"; do
+		if [[ "$path" == "${roots[$i]%/}"/* ]]; then
+			SEED_ROOT=${roots[$i]%/}
+			SEED_UPPER=${uppers[$i]}
+			return 0
+		fi
+	done
+	return 1
+}
+
+# Checked before the daemon is asked for the turn, so a refused seed leaves no
+# turn behind. PATH=FROM splits at the last '=': FROM is Yana's own private file.
+SEED_PATHS=()
+SEED_FROMS=()
+seed_check() {
+	local seed path from
+	for seed in ${SEEDS[@]+"${SEEDS[@]}"}; do
+		path=${seed%=*}
+		from=${seed##*=}
+		[[ "$seed" == *=* && "$path" == /* && "$from" == /* ]] \
+			|| die_usage "--seed '$seed' must be PATH=FROM, both absolute"
+		path=$(realpath_safe "$path")
+		[[ -f "$from" && -r "$from" ]] || refuse "seed source '$from' for '$path' is not a readable file"
+		seed_root_of "$path" || refuse "seed '$path' is outside the turn's roots; it has no upper layer to go in"
+		SEED_PATHS+=("$path")
+		SEED_FROMS+=("$from")
+	done
+}
+
+# After validate_paths has the final uppers, before the overlay is mounted. Keeps
+# the disk file's mode (644 for a file not on disk). A read-only turn mounts no
+# overlay, so nothing would read an upper copy.
+seed_copy() {
+	(( READ_ONLY_WORKSPACE == 1 )) && return 0
+	local i path dest parent mode
+	for i in "${!SEED_PATHS[@]}"; do
+		path=${SEED_PATHS[$i]}
+		seed_root_of "$path" || refuse "seed '$path' is outside the turn's roots; it has no upper layer to go in"
+		dest="$SEED_UPPER/${path#"$SEED_ROOT"/}"
+		# An upper can hold symlinks an agent made; never follow one out of it.
+		parent=$(realpath_safe "${dest%/*}")
+		path_is_prefix "$SEED_UPPER" "$parent" \
+			|| refuse "seed '$path' would be written outside its upper layer (through '$parent')"
+		mode=644
+		[[ -f "$path" ]] && mode=$(stat -c %a -- "$path")
+		mkdir -p -- "$parent"
+		cp --remove-destination -- "${SEED_FROMS[$i]}" "$parent/${dest##*/}"
+		chmod -- "$mode" "$parent/${dest##*/}"
+	done
+}
+
 cmd_run_yanad() {
 	[[ -n "$WORKSPACE" && -n "$TURN_ID" && -n "$MODE" && -n "$ANSWER_OUT" ]] \
 		|| die_usage "--workspace, --turn, --mode and --answer-out are required"
@@ -281,6 +344,7 @@ cmd_run_yanad() {
 		EXTRA_ROOTS[$i]=$(realpath_safe "${EXTRA_ROOTS[$i]}")
 	done
 	[[ -z "$BROAD_ROOT" ]] || BROAD_ROOT=$(realpath_safe "$BROAD_ROOT")
+	seed_check
 	answer_dir=${ANSWER_OUT%/*}
 	[[ "$answer_dir" == "$ANSWER_OUT" ]] && answer_dir=.
 	[[ -d "$answer_dir" && -w "$answer_dir" ]] \
@@ -295,6 +359,7 @@ cmd_run_yanad() {
 
 	OPERATOR_HOME=$(operator_home)
 	validate_paths
+	seed_copy
 	resolve_cursor_dir
 	if run_overlay; then
 		agent_rc=0

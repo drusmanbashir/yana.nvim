@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Refuses private files and machine-specific content even when someone adds
+# them to the public manifest or puts them in a normally exempt text file.
 set -euo pipefail
 
 [[ $# == 1 ]] || { echo "Usage: $0 EXPORTED_TREE" >&2; exit 64; }
@@ -62,6 +64,67 @@ priv+=rw/tmp/private-leak
 printf '\nleak: %s\n' "$priv" >>"$case_tree/README.md"
 expect_red agent-rw-path "forbidden bytes in README.md" \
 	"$case_tree/scripts/release/verify.sh" "$case_tree" "v$version"
+
+# Account names are arbitrary; rejecting only the developer's username is
+# insufficient. SVG and ignore rules are text surfaces of the installed tree.
+for surface in README.md .gitignore assets/yana-logo.svg scripts/release/forbidden-patterns.txt; do
+	case_name="private-home-${surface//\//-}"
+	case_tree=$(copy_case "$case_name")
+	private_home=/home/
+	private_home+=release-fixture/private-checkout
+	printf '\n%s\n' "$private_home" >>"$case_tree/$surface"
+	expect_red "$case_name" "forbidden bytes in $surface" \
+		"$case_tree/scripts/release/verify.sh" "$case_tree" "v$version"
+done
+
+# Reordering valid rules must not exempt private paths in the registry itself.
+case_tree=$(copy_case private-home-reordered-registry)
+registry="$case_tree/scripts/release/forbidden-patterns.txt"
+tac "$registry" >"$scratch/reordered-patterns"
+cat "$scratch/reordered-patterns" >"$registry"
+printf '\n%s\n' "$private_home" >>"$registry"
+expect_red private-home-reordered-registry "forbidden bytes in scripts/release/forbidden-patterns.txt" \
+	"$case_tree/scripts/release/verify.sh" "$case_tree" "v$version"
+
+# These historical exclusions must remain excluded even after a manifest
+# edit. Each fixture otherwise has harmless bytes and exact file membership.
+for forbidden in \
+	lua/yana/debug_buffer_states.lua \
+	lua/yana/debug_buffer_states_bundle.lua \
+	nvim/lua/user/yana.lua \
+	.github/workflows/tests.yml \
+	bin/yana-ollama-agent \
+	bin/yana-release \
+	docs/repl.md \
+	docs/security.md \
+	assets/logo/private.svg \
+	assets/yana-review-full-still.png \
+	assets/yana-review-full.gif \
+	assets/yana-review-full.mp4 \
+	assets/yana-review-full.take.json \
+	assets/yana-review.mp4 \
+	assets/yana-review.take.json \
+	scripts/release/README.md \
+	scripts/release/hpc-smoke-remote.sh \
+	scripts/release/manifest_policy.py \
+	scripts/release/paths.conf \
+	scripts/release/to-release.sh \
+	tests/release/candidate_check_gate.sh \
+	tests/release/candidate_history_exceptions_gate.sh \
+	tests/release/health_yana_ui_smoke.lua \
+	tests/release/install_remedy_smoke.lua \
+	tests/release/yana_release_preflight_gate.sh \
+	scripts/install-deps.sh \
+	prompt.txt; do
+	case_name="excluded-${forbidden//\//-}"
+	case_tree=$(copy_case "$case_name")
+	mkdir -p "$(dirname "$case_tree/$forbidden")"
+	printf '%s\n' 'harmless bytes' >"$case_tree/$forbidden"
+	LC_ALL=C sort -u -o "$case_tree/scripts/release/manifest.txt" \
+		<(cat "$case_tree/scripts/release/manifest.txt"; printf '%s\n' "$forbidden")
+	expect_red "$case_name" "manifest path outside the allowed public classes: $forbidden" \
+		"$case_tree/scripts/release/verify.sh" "$case_tree" "v$version"
+done
 
 case_tree=$(copy_case version-drift)
 printf '%s\n' '0.1.0-alpha.2' >"$case_tree/VERSION"

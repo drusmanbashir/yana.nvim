@@ -1,9 +1,60 @@
 # Installation
 
+## Choose your backend
+
+If Neovim and your agent CLI already work, configure Yana to use that agent:
+
+| Installed agent | Command | Setup option |
+|---|---|---|
+| Claude Code | `claude` | `backend = "claude"` |
+| Codex | `codex` | `backend = "codex"` |
+| Cursor | `cursor-agent` | `backend = "cursor"` |
+
+With lazy.nvim:
+
+```lua
+{
+  "drusmanbashir/yana.nvim",
+  dependencies = { "drusmanbashir/yana-ui.nvim" },
+  event = "VeryLazy",
+  opts = { backend = "claude" }, -- choose "claude", "codex" or "cursor"
+}
+```
+
+The dependency entry installs `yana-ui.nvim` automatically. With `opts = {}`,
+Yana starts with Cursor; it does not select whichever CLI happens to be
+installed. Your existing agent login is used; no separate Yana account or API
+key is required.
+
+## Ubuntu extras and first use
+
+For a normal Ubuntu installation, add the tools used by Yana's sandbox:
+
+```sh
+sudo apt-get install bubblewrap libcap2-bin
+```
+
+These provide `bwrap` and `capsh`. The full system-tool list below covers minimal
+images too; Neovim and agent installation instructions can be skipped when those
+already work.
+
+Restart Neovim in your project directory, run `:checkhealth yana`, then open
+`:Yana`. If health reports `bwrap:userns`, the host is preventing the sandbox
+from starting; installing the packages alone does not clear that restriction.
+Read the reported platform-specific diagnostic. If health cannot find the
+selected agent, see [troubleshooting](#troubleshooting).
+
+The opened project is already included. `:YanaRoots` adds extra folders;
+the startup notice that the extra capture set is empty does not mean your
+project is excluded. No `write_roots` or model setting is needed for normal
+first use; the chosen backend supplies its default model.
+
 ## System requirements
 
-Install each piece yourself with the one-liners below — there is no installer
-script to run.
+For a new setup, install the pieces you do not already have with the commands
+below; there is no Yana installer. If Neovim and your agent CLI already work,
+skip their installation sections. Confined `ask` and `inline` still need the
+Linux sandbox tools listed here.
 
 **Get Neovim 0.11.2+ first.** `apt` on Ubuntu 24.04 and older installs an
 older Neovim (0.9.5 on a stock Ubuntu 24.04 image, verified) with no warning
@@ -67,8 +118,8 @@ opts = {
 
 For hunk review, run Yana on Linux.
 
-Then install whichever agent CLIs you plan to use. All installed CLIs are selectable
-with `backend = "cursor" | "claude" | "codex"`.
+If you still need an agent CLI, install one or more below. Each installed CLI
+is selectable with `backend = "cursor" | "claude" | "codex"`.
 
 - **`cursor-agent`** — install line from Cursor's own docs
   ([cursor.com/docs/cli/installation](https://cursor.com/docs/cli/installation)):
@@ -146,13 +197,24 @@ end
 
 ## Manual installation
 
+Install both plugin repositories as Neovim start packages. The directory is
+derived from your Neovim data path, so XDG settings and `NVIM_APPNAME` are
+respected:
+
 ```sh
-git clone https://github.com/drusmanbashir/yana.nvim ~/.local/share/nvim/yana.nvim
+data=$(nvim --headless -i NONE -u NONE -c 'lua io.write(vim.fn.stdpath("data"))' -c qa)
+test -n "$data" || { echo "Neovim did not report its data directory" >&2; exit 1; }
+start="$data/site/pack/yana/start"
+mkdir -p "$start"
+git clone https://github.com/drusmanbashir/yana.nvim "$start/yana.nvim"
+git clone https://github.com/drusmanbashir/yana-ui.nvim "$start/yana-ui.nvim"
 ```
 
+Then add this to your Neovim configuration, choosing the backend from the table
+above:
+
 ```lua
-vim.opt.runtimepath:prepend("~/.local/share/nvim/yana.nvim")
-opts = {}
+require("yana").setup({ backend = "claude" }) -- or "codex" / "cursor"
 ```
 
 ## Verify installation

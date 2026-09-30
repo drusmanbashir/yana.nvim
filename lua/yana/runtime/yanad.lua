@@ -314,6 +314,43 @@ function M.render_refusal(stderr_text, answer, prompt_opts)
 	require("yana.review_open_prompt").offer_from_refuse(refuse, opts)
 end
 
+-- A daemon started from a tree with another VERSION (or for another identity)
+-- refuses every request, `shutdown` included, so a restart could never reach it.
+-- Stop it by its recorded pid instead, after checking that pid really is the
+-- daemon for this state root; `ensure` then starts a fresh one from this tree.
+local function stop_by_pid()
+	local root = state_root()
+	local f = io.open(root .. "/yanad.pid", "r")
+	if not f then return false, "no yanad.pid in " .. root end
+	local pid = tonumber(((f:read("*l") or ""):match("%d+")))
+	f:close()
+	if not pid then return false, "yanad.pid holds no pid" end
+	local c = io.open("/proc/" .. pid .. "/cmdline", "rb")
+	if not c then return true end -- already gone
+	local cmdline = c:read("*a"):gsub("%z", " ")
+	c:close()
+	if not cmdline:find("yanad", 1, true) or not cmdline:find(root, 1, true) then
+		return false, "pid " .. pid .. " is not the daemon for " .. root
+	end
+	uv.kill(pid, "sigterm")
+	local gone = vim.wait(5000, function() return vim.fn.filereadable("/proc/" .. pid .. "/cmdline") == 0 end, 50)
+	return gone, gone and nil or ("daemon pid " .. pid .. " did not exit")
+end
+M._stop_by_pid = stop_by_pid
+
+local shutdown_request = M.shutdown
+function M.shutdown(args, id, cb)
+	M.ensure(function(ok, res)
+		if ok then return shutdown_request(args, id, cb) end
+		if res == "version_mismatch" or res == "identity_mismatch" then
+			local stopped, why = stop_by_pid()
+			if stopped then return cb(true, { stopped_by_pid = true, reason = res }) end
+			return cb(false, res, { reason_code = res, detail = why })
+		end
+		return cb(false, res, { reason_code = res, unreachable = true })
+	end)
+end
+
 M._test = M._test or {}
 M._test.Client = Client
 

@@ -5,6 +5,7 @@ local ledger = require("yana.ledger")
 local notify = require("yana.notify")
 local notify_one_line = notify.one_line
 local renewal = require("yana.agent.renewal")
+local conversation = require("yana.panel.conversation")
 
 local M = {}
 
@@ -60,8 +61,7 @@ local function new_chat()
     end
     p.review_epoch = p.review_epoch + 1
     drop_review_batch(p)
-    p.session_id = nil
-    p.session_seats = {}
+    conversation.get(p):reset()
     -- New conversation: no vendor confirmation yet.
     p.model_actual = nil
     p.title = nil

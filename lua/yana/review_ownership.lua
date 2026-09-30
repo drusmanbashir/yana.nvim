@@ -1,4 +1,6 @@
 -- Buffer ownership and external-reload composition.
+local line_space = require("yana.review_line_space")
+
 local M = {}
 
 function M.new(deps)
@@ -30,47 +32,11 @@ local function reject_restoration(bufnr, block, start_line, end_line)
     end
     return out, nil
   end
-  -- A hunk with no membership record: tell human rows by content.
-  local new_lines = block.new_lines or {}
-  if #live <= #new_lines then
-    return old_lines, nil
-  end
-  local remaining = {}
-  for _, line in ipairs(new_lines) do
-    remaining[line] = (remaining[line] or 0) + 1
-  end
-  local function standalone_human_line(line)
-    if vim.tbl_contains(new_lines, line) then
-      return false
-    end
-    for _, nl in ipairs(new_lines) do
-      if #nl > 0 and line:sub(1, #nl) == nl and #line > #nl then
-        return false
-      end
-    end
-    return true
-  end
-  local human_inserts = {}
-  local agent_seen = 0
-  for _, line in ipairs(live) do
-    if remaining[line] and remaining[line] > 0 then
-      remaining[line] = remaining[line] - 1
-      agent_seen = agent_seen + 1
-    elseif standalone_human_line(line) then
-      human_inserts[#human_inserts + 1] = { after = agent_seen, text = line }
-    else
-      agent_seen = agent_seen + 1
-    end
-  end
-  if #human_inserts == 0 then
-    return old_lines, nil
-  end
-  local out = vim.deepcopy(old_lines)
-  for _, h in ipairs(human_inserts) do
-    local pos = math.min(h.after + 1, #out + 1)
-    table.insert(out, pos, h.text)
-  end
-  return out, nil
+  -- A hunk with no membership record cannot tell the operator's rows from the
+  -- agent's without comparing texts, so it falls back to its base: the old lines
+  -- come back whole and anything typed inside stays in the undo history
+  --
+  return old_lines, nil
 end
 
 local function resolve_disk_unchanged(change)
@@ -299,7 +265,300 @@ end
     staged_snapshot_unchanged = staged_snapshot_unchanged,
     apply_review_blocks_to_reloaded_disk = apply_review_blocks_to_reloaded_disk,
     absorb_review_blocks_over_drift = absorb_review_blocks_over_drift,
+    place_on_b1 = M.place_on_b1,
   }
+end
+
+-- Buffer drift stage 1 (spec BUILD buffer drift; INTERFACE.md section 3; PLACEMENT.md).
+-- `blocks` are the agent's edits in B0 rows (the buffer at submit). The submit laid one
+-- extmark on every B0 line; this reads where each one sits in B1 (the buffer now) and
+-- re-expresses every block in B1 rows. Nothing here compares texts to find a line: a
+-- line is where its mark is, and a B1 line with no surviving mark is one the operator
+-- typed. The one text comparison left drops an edit whose place already holds the
+-- agent's lines. Returns nil and a reason whenever the marks cannot say where an edit
+-- goes; the caller then reviews against B0 instead.
+function M.place_on_b1(blocks, snap, b1_lines)
+  if type(snap) ~= "table" then
+    return nil, "no buffer snapshot"
+  end
+  if snap.lost then
+    return nil, "buffer snapshot lost (" .. tostring(snap.lost) .. ")"
+  end
+  if snap.no_extmarks then
+    return nil, "buffer was too large to mark at submit"
+  end
+  local bufnr = snap.bufnr
+  if not (bufnr and vim.api.nvim_buf_is_valid(bufnr)) then
+    return nil, "buffer snapshot lost (buffer gone)"
+  end
+  b1_lines = b1_lines or {}
+  local n = #b1_lines
+  local count = vim.api.nvim_buf_line_count(bufnr)
+  if count ~= n and not (n == 0 and count == 1) then
+    return nil, "the buffer changed after B1 was read"
+  end
+
+  -- Where each B0 line (1-based) sits in B1, or nil once its line was deleted.
+  local b0_count = #line_space.buffer_lines(snap.b0 or "")
+  local marks = {}
+  for _, m in ipairs(vim.api.nvim_buf_get_extmarks(bufnr, snap.ns, 0, -1, { details = true })) do
+    marks[m[1]] = m
+  end
+  local at, owners = {}, {}
+  for line = 1, b0_count do
+    local id = snap.ids and snap.ids[line - 1]
+    local m = id and marks[id]
+    if not m then
+      return nil, "missing extmark for B0 line " .. line
+    end
+    if not m[4].invalid then
+      local row = m[2] + 1
+      if row > n then
+        return nil, "the buffer changed after B1 was read"
+      end
+      at[line] = row
+      owners[row] = owners[row] or {}
+      table.insert(owners[row], line)
+    end
+  end
+
+  -- The B1 row of the first surviving B0 line at or after `line`; past the end, the
+  -- end of the buffer.
+  local function next_surviving(line)
+    for l = line, b0_count do
+      if at[l] then
+        return at[l]
+      end
+    end
+    return n + 1
+  end
+
+  local placed, reach = {}, 0
+  for _, block in ipairs(blocks or {}) do
+    local s0, e0 = block.start_line, block.end_line
+    local s, e
+    if e0 < s0 then
+      -- Pure insertion after B0 line e0: before the next surviving line, so typed
+      -- lines at that spot stay first.
+      s = next_surviving(e0 + 1)
+      e = s - 1
+    else
+      local prev
+      for line = s0, e0 do
+        local row = at[line]
+        if row then
+          if prev and row <= prev then
+            return nil, "target lines out of order"
+          end
+          s, prev = s or row, row
+        end
+      end
+      e = prev
+      if not s then
+        -- Every target line is gone. The top and bottom of the buffer count as
+        -- surviving neighbours.
+        local before = s0 == 1 and 0 or at[s0 - 1]
+        local after = e0 >= b0_count and (n + 1) or at[e0 + 1]
+        if before and after then
+          if after <= before then
+            return nil, "target lines out of order"
+          end
+          -- The typed lines between the neighbours are the place; none makes it
+          -- a pure addition before `after`.
+          s, e = before + 1, after - 1
+        else
+          s = next_surviving(e0 + 1)
+          e = s - 1
+        end
+      end
+      for row = s, e do
+        for _, line in ipairs(owners[row] or {}) do
+          if line < s0 or line > e0 then
+            return nil, "a surviving non-target line inside a place"
+          end
+        end
+      end
+    end
+    local old_lines = e >= s and vim.list_slice(b1_lines, s, e) or {}
+    if not vim.deep_equal(old_lines, block.new_lines or {}) then
+      if s <= reach then
+        return nil, "two places overlapping"
+      end
+      reach = math.max(reach, e)
+      local copy = vim.deepcopy(block)
+      copy.start_line, copy.end_line, copy.old_lines = s, e, old_lines
+      placed[#placed + 1] = copy
+    end
+  end
+
+  -- New-file rows recomputed exactly as review_line_space.build_diff_blocks does.
+  local base = 0
+  for _, block in ipairs(placed) do
+    block.new_start_line = block.start_line + base
+    block.new_end_line = block.new_start_line + #(block.new_lines or {}) - 1
+    base = base + #(block.new_lines or {}) - #block.old_lines
+  end
+  return placed
+end
+
+-- Buffer drift stage 3 (INTERFACE.md section 3). For each parent a "restore"
+-- decision names: its B0 lines whose submit extmarks are flagged deleted, each run
+-- put back at its old spot (right before the next surviving B0 line after it), as
+-- insertion blocks shaped like build_diff_blocks output in B1 rows. A surviving
+-- line is never restored. A B0 line an agent edit replaces stays with that edit:
+-- the caller lists the placed edits in `decision.edits` (their `b0_span`). Each
+-- block's `b0_span` names the B0 lines it restores; with no agent hunk behind it, their
+-- count is its render-check reference (`model_span_new_count`). Any other decision: none.
+function M.restore_blocks(decision, snap, b1_lines)
+  if type(decision) ~= "table" or decision.kind ~= "restore" then
+    return {}
+  end
+  local b0 = line_space.buffer_lines(snap.b0 or "")
+  local marks = {}
+  for _, m in ipairs(vim.api.nvim_buf_get_extmarks(snap.bufnr, snap.ns, 0, -1, { details = true })) do
+    marks[m[1]] = m
+  end
+  local function mark(line)
+    return marks[snap.ids[line - 1]]
+  end
+  local carried = {}
+  for _, edit in ipairs(decision.edits or {}) do
+    local span = edit.b0_span
+    for line = span and span.start_line or 1, span and span.end_line or 0 do
+      carried[line] = true
+    end
+  end
+  local wanted = {}
+  for _, parent in ipairs(decision.parents or {}) do
+    for line = parent.start_row + 1, parent.end_row + 1 do
+      local m = mark(line)
+      if m and m[4].invalid and not carried[line] then
+        wanted[line] = true
+      end
+    end
+  end
+  local out, line, base = {}, 1, 0
+  while line <= #b0 do
+    if wanted[line] then
+      local first = line
+      while wanted[line + 1] do
+        line = line + 1
+      end
+      local at = #(b1_lines or {}) + 1
+      for after = line + 1, #b0 do
+        local m = mark(after)
+        if m and not m[4].invalid then
+          at = m[2] + 1
+          break
+        end
+      end
+      local lines = vim.list_slice(b0, first, line)
+      out[#out + 1] = { start_line = at, end_line = at - 1, old_lines = {}, new_lines = lines,
+        new_start_line = at + base, new_end_line = at + base + #lines - 1,
+        b0_span = { start_line = first, end_line = line },
+        model_span_new_count = line - first + 1, model_join = "restored_parent" }
+      base = base + #lines
+    end
+    line = line + 1
+  end
+  return out
+end
+
+-- Per file record: where each B0 row (0-based) sits in B1 (0-based, nil once deleted) and
+-- how many B0 rows were deleted, read from the submit extmarks once per buffer change.
+local b0_rows_by_snap = setmetatable({}, { __mode = "k" })
+
+local function b0_rows_in_b1(snap, bufnr)
+  local tick = vim.b[bufnr].changedtick
+  local cached = b0_rows_by_snap[snap]
+  if cached and cached.tick == tick then
+    return cached
+  end
+  local mark_row = {}
+  for _, m in ipairs(vim.api.nvim_buf_get_extmarks(bufnr, snap.ns, 0, -1, { details = true })) do
+    if not m[4].invalid then
+      mark_row[m[1]] = m[2]
+    end
+  end
+  local count = #line_space.buffer_lines(snap.b0 or "")
+  local at, deleted = {}, 0
+  for row = 0, count - 1 do
+    local id = snap.ids and snap.ids[row]
+    at[row] = id and mark_row[id]
+    if at[row] == nil then
+      deleted = deleted + 1
+    end
+  end
+  cached = { tick = tick, at = at, count = count, deleted = deleted }
+  b0_rows_by_snap[snap] = cached
+  return cached
+end
+
+-- Buffer drift stage 3 (spec BUILD buffer drift; INTERFACE.md sections 2 and 5). `block` is
+-- the agent edit in B0 rows, as place_on_b1 takes it (the placed copy has lost its B0 rows);
+-- call it only for a file whose edits place_on_b1 placed. Decides whether the parents the
+-- edit sat in must be offered back. Rows come from the extmarks and the syntax tree only.
+function M.parent_decision(block, snap, b1_bufnr, lang)
+  local keep = { kind = "keep" }
+  local marks = b0_rows_in_b1(snap, b1_bufnr)
+  if marks.deleted == 0 then
+    return keep -- no deleted B0 line in the file: no conflict, no parse
+  end
+  local at, count = marks.at, marks.count
+  -- The target rows; a pure insertion after line end_line is aimed at the line after it.
+  local first, last = block.start_line - 1, block.end_line - 1
+  if block.end_line < block.start_line then
+    first = math.min(block.end_line, count - 1)
+    last = first
+  end
+  local own = require("yana.review_watch_ownership")
+  local parents = own.parents_of_text(snap.b0, lang, first, last) or {}
+  -- A parent with a deleted line inside may have lost its header; one without is intact.
+  local deleted, any = {}, false
+  for k, p in ipairs(parents) do
+    deleted[k] = at[p.header_row] == nil
+    any = any or deleted[k]
+  end
+  if not any then
+    return keep -- every header survives: no B1 parse
+  end
+
+  -- Each parent whose header was deleted, on its own. None of its lines survive: the whole
+  -- parent was deleted and nothing of it can have moved, so it comes back with no B1 parse.
+  -- Some survive: ask B1 at the first of them (never at the edit's landing spot, which may
+  -- lie in a neighbour) for its innermost parent. Top level, or a parent whose header
+  -- carries the mark of an outer parent of the edit: it comes back. Another line's parent
+  -- or a typed header: the code was moved or merged, keep. A syntax error: unsure.
+  local restore = {}
+  for k, p in ipairs(parents) do
+    if deleted[k] then
+      local survivor
+      for r = p.start_row, p.end_row do
+        if at[r] then
+          survivor = at[r]
+          break
+        end
+      end
+      local back = survivor == nil
+      if not back then
+        local q, why = own.innermost_parent(b1_bufnr, survivor)
+        if q == nil then
+          return { kind = "unsure", reason = why }
+        end
+        back = q == false
+        for j = k + 1, #parents do
+          back = back or (not deleted[j] and at[parents[j].header_row] == q.header_row)
+        end
+      end
+      if back then
+        restore[#restore + 1] = p
+      end
+    end
+  end
+  if #restore == 0 then
+    return keep
+  end
+  return { kind = "restore", parents = restore }
 end
 
 return M

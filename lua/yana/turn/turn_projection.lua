@@ -161,15 +161,6 @@ local function compose_from_original(original_records, proposal_records, hunks)
 	return join_records(records, fallback)
 end
 
--- Fresh disk evidence may only contradict the verified record, never replace it.
-local function evidence_agrees(verified, fresh)
-	if fresh == nil then return true end
-	return verified.exists == fresh.exists
-		and verified.bytes == fresh.bytes
-		and verified.mode == fresh.mode
-		and verified.identity == fresh.identity
-end
-
 -- compute(input) -> {action, bytes, mode, buffer_lines} | nil, reason
 function M.compute(input)
 	if type(input) ~= "table" then return nil, "projection input is not a table" end
@@ -179,8 +170,6 @@ function M.compute(input)
 	local original, proposal = input.original, input.proposal
 	if type(original) ~= "table" then return nil, "projection input has no original side" end
 	if type(proposal) ~= "table" then return nil, "projection input has no proposal side" end
-	local verified = input.last_verified_disk
-	if type(verified) ~= "table" then return nil, "projection input has no verified disk evidence" end
 
 	-- :46 — `""` is evidence only for a known creation or an actually empty file.
 	local original_bytes
@@ -201,9 +190,9 @@ function M.compute(input)
 	if proposal.exists == false then
 		target_exists = not content_accepted -- a pending deletion retains the file
 	elseif original.exists == false then
-		-- An unaccepted creation stays the existing empty touch on save and is
-		-- absent at exit.
-		target_exists = content_accepted or input.purpose == "save"
+		-- A created file has nothing on disk until its content is accepted
+			-- no empty file is written for a creation, so an unaccepted one stays absent.
+		target_exists = content_accepted
 	else
 		target_exists = true
 	end
@@ -250,17 +239,17 @@ function M.compute(input)
 		buffer_lines = {}
 	end
 
+	-- THE ACTION COMES FROM THE DECISIONS ALONE. The file on disk plays no part
+	-- End no longer reads the file's bytes, mode or inode to decide whether to write.
+	-- An End with nothing accepted writes nothing; an own-file save always
+	-- writes what the buffer shows.
 	local action
 	if not target_exists then
-		local present = verified.exists
-		if type(input.disk) == "table" then present = input.disk.exists end
-		action = present and "delete" or "none"
+		action = original.exists and "delete" or "none"
+	elseif content_accepted or target_mode ~= original.mode or input.purpose == "save" then
+		action = "replace"
 	else
-		local settled = verified.exists
-			and verified.bytes == target_bytes
-			and (target_mode == nil or verified.mode == target_mode)
-			and evidence_agrees(verified, input.disk)
-		action = settled and "none" or "replace"
+		action = "none"
 	end
 
 	return { action = action, bytes = target_bytes, mode = target_mode, buffer_lines = buffer_lines }

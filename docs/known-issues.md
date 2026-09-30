@@ -74,6 +74,26 @@ None of these lose data on disk — `:w` always withholds pending agent lines:
 - **Only x86_64 is tested.** Testing installs the x86_64 Neovim tarball.
   aarch64 Linux is expected to work (nothing in Yana is architecture-specific)
   but has not been run.
+- **F-end-shadow-release-retry: an End that stops on a refused preview discard
+  cannot be retried.** After the private layer's discard is refused, the first
+  End ends `partial`, and a retry is refused because an End is reported as
+  already running. That breaks the retryability rule: any step's failure stops the
+  sequence, keeps everything and stays retryable. Nothing on disk is lost; the
+  turn stays held. A focused reproduction fails with
+  `shadow release first_refused=false retry_completed=false`
+  on both the baseline and the buffer-drift candidate. It predates that
+  increment and is not fixed yet.
+- **The specified End freeze is not implemented yet.**
+  The freeze operation is absent and the button strip remains present; a
+  focused check reports `freeze-before-external controls_mutate=true`.
+  This behavior remains unbuilt. The checks fail on both the baseline and the
+  buffer-drift candidate; that increment does not implement the End freeze.
+- **The existing End-retry defect also affects review cleanup, late members,
+  and settlement receipts.** Cleanup retry reports `first=true second=false`;
+  a member arriving during close cannot retry because End is already running;
+  settlement retry does not spend the earlier write's receipt and leaves
+  the turn live. This remains defective across baseline and
+  buffer-drift candidate; it is not a buffer-drift regression.
 - **After End-turn, undo is Neovim's.** Ending the turn drops Yana's review
   keymaps; `u` / `<C-r>` become ordinary Neovim undo/redo on the buffer's own
   undo tree. During a live turn they walk the turn-global register only;

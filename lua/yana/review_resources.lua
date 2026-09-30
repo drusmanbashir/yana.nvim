@@ -236,7 +236,7 @@ end
 --- they are. Setting it first, then suppressing the teardown failures with
 --- `pcall`, made a refused close look complete: the retry hit the `closed`
 --- guard, returned true, and the leaked resource was never released
---- and a failed ordered step must remain repairable.
+--- A failed ordered step stays repairable.
 ---
 --- `watch_detached` is what stops the scheduled render, and it still happens
 --- first -- that is the job the early `closed` was really doing.

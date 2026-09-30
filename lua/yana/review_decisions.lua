@@ -332,7 +332,7 @@ function M.new(deps)
     facade._poll_leave_edge(state, "reject_hunk")
   end
 
-  local function accept_block_at(idx)
+  local function accept_block_at(idx, suppress_register)
     if state.hunk_ledger and state.hunk_ledger.frozen_for_end then
       return false, "turn is frozen for End"
     end
@@ -374,7 +374,9 @@ function M.new(deps)
       post_seq = at_seq,
       anchor = anchor,
     }
-    push_register_decision(state, change, 1)
+    if not suppress_register then
+      push_register_decision(state, change, 1)
+    end
     vim.bo[bufnr].modified = true
     if state.hunk_ledger:count() == 0 then
       deps.record_last_hunk_decided("accept", block)
@@ -392,8 +394,44 @@ function M.new(deps)
     facade._poll_leave_edge(state, "accept_hunk")
   end
 
+  -- A restored parent and the agent edit inside it (INTERFACE.md section 3) are
+  -- one choice: every pending member of the group is decided, bottom-up so the
+  -- earlier positions and rows stay valid, and ONE register row whose count takes
+  -- every member back on one undo. Every member's place is checked first, so the
+  -- group is decided whole or not at all.
+  local function decide_group(positions, door)
+    if state.hunk_ledger.frozen_for_end then
+      return false, "turn is frozen for End"
+    end
+    local pending = state.hunk_ledger:pending()
+    for _, position in ipairs(positions) do
+      local start_line, _, range_err = deps.live_block_range(bufnr, pending[position])
+      if not start_line then
+        deps.notify_one_line("yana: grouped hunk not decided -- a member is "
+          .. tostring(range_err or "invalidated"), vim.log.levels.WARN)
+        return false
+      end
+    end
+    local decided = 0
+    for i = #positions, 1, -1 do
+      local before = state.hunk_ledger:count()
+      door(positions[i], true)
+      if state.hunk_ledger:count() < before then
+        decided = decided + 1
+      end
+    end
+    if decided > 0 then
+      push_register_decision(state, change, decided)
+    end
+    return decided == #positions
+  end
+
   local function reject_hunk()
     local block, idx = deps.current_block(state.hunk_ledger:pending(), bufnr)
+    local group = block and state.hunk_ledger:pending_group(block)
+    if group then
+      return decide_group(group, reject_block_at)
+    end
     if block then
       return reject_block_at(idx)
     end
@@ -407,6 +445,10 @@ function M.new(deps)
 
   local function accept_hunk()
     local block, idx = deps.current_block(state.hunk_ledger:pending(), bufnr)
+    local group = block and state.hunk_ledger:pending_group(block)
+    if group then
+      return decide_group(group, accept_block_at)
+    end
     if block then
       return accept_block_at(idx)
     end

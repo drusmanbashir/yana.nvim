@@ -41,6 +41,8 @@ while IFS= read -r path; do
 done <"$manifest"
 
 required_patterns=(
+	"/(home)/[^/[:space:]]+"
+	"/(s)/agent_[[:alnum:]_.-]+"
 	"sp""ec/"
 	"sp""ecs/"
 	"hand""off/"
@@ -48,8 +50,6 @@ required_patterns=(
 	"launch-profile-""design"
 	"NEO""CURSOR"
 	"neo""cursor"
-	"/home/""ub"
-	"/s/agent_""rw"
 	"sp""ec_v2"
 	"CORE""\\.md"
 	"BUILD-""SHORTLIST"
@@ -118,7 +118,7 @@ else
 		|| note_fail "lua/yana/health.lua does not name the pinned yana-ui repo $ui_repo"
 fi
 
-echo "VERIFY EXEMPT: scripts/release/forbidden-patterns.txt is the scanner registry"
+echo "VERIFY REGISTRY: internal patterns exempt; private paths scanned"
 echo "VERIFY EXEMPT: NOTICE's one audited upstream repository URL line"
 while IFS= read -r path; do
 	if forbidden_bytes_binary_path "$path"; then
@@ -134,7 +134,6 @@ while IFS= read -r path; do
 	if ! iconv -f UTF-8 -t UTF-8 "$tree/$path" >/dev/null 2>&1; then
 		note_fail "not valid UTF-8: $path"
 	fi
-	[[ "$path" == "scripts/release/forbidden-patterns.txt" ]] && continue
 	: >"$hits"
 	forbidden_bytes_scan "$tree" "$patterns" "$path" >"$hits" || true
 	if [[ -s "$hits" ]]; then

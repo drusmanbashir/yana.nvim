@@ -268,6 +268,11 @@ def _bundle_row_stale(row):
     path = row.get("path")
     if not isinstance(path, str) or path == "":
         return None, None
+    # A file snapshotted at submit keeps its B0 in the record (review_before);
+    # its review restores from that, so a changed disk file does not make it
+    # stale.
+    if isinstance(row.get("review_before"), str) and row.get("home_buffer_only") is not True:
+        return None, None
     base_state = row.get("base_state")
     expected = row.get("base_hash")
     if base_state == "absent":

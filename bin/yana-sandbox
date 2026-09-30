@@ -148,7 +148,7 @@ validate_workspace() {
 	fi
 	depth=$(components_below_root "$ws_real")
 	if (( depth < 2 )); then
-		refuse "workspace '$ws_real' has fewer than 2 path components below root — pick a deeper directory (e.g. /home/user/project)"
+		refuse "workspace '$ws_real' has fewer than 2 path components below root — pick a deeper directory (e.g. /projects/demo)"
 	fi
 	if [[ ! -d "$ws_real" ]]; then
 		refuse "workspace '$WORKSPACE' does not exist or is not a directory"

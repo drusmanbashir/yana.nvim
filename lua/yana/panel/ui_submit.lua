@@ -13,6 +13,7 @@ local log = require("yana.log")
 local steer_channel = require("yana.agent.steer_channel")
 local uv = vim.uv or vim.loop
 local renewal = require("yana.agent.renewal")
+local conversation = require("yana.panel.conversation")
 
 local function preview_module()
   return require("yana.shadow.preview")
@@ -344,7 +345,8 @@ function M.new(deps)
       return
     end
     if capture then
-      selection = context.selection_from_range(origin.buf, 1, vim.api.nvim_buf_line_count(origin.buf))
+      selection = context.selection_from_range(origin.buf, 1, vim.api.nvim_buf_line_count(origin.buf),
+        { whole_buffer = true })
       selection.home_buffer_capture = capture
     end
   end
@@ -362,11 +364,20 @@ function M.new(deps)
 
   local enable_diagnostics = p.pending_enable_diagnostics
   p.pending_enable_diagnostics = nil
+  local yana_mode = config.panel_mode(p.mode)
+  local backend_name = config.options.backend or "cursor"
+  local owner = conversation.get(p)
+  local mini = owner:activate(yana_mode, backend_name)
+  local announce = owner:needs_mode_notice(mini, yana_mode)
   local built = context.build(
     agent_question,
     origin,
     selection,
-    { mode = config.panel_mode(p.mode), enable_diagnostics = enable_diagnostics }
+    {
+      mode = yana_mode,
+      enable_diagnostics = enable_diagnostics,
+      announce_mode = announce,
+    }
   )
 
   if opts.redirect then
@@ -442,8 +453,6 @@ function M.new(deps)
     attachments = vim.deepcopy(attachments),
   })
   p.turn_scopes[gen] = (selection and selection.scope) or false
-  p.turn_home_buffer_captures = p.turn_home_buffer_captures or {}
-  p.turn_home_buffer_captures[gen] = selection and selection.home_buffer_capture or nil
   p.turn_modes[gen] = config.panel_mode(p.mode)
   p.turn_backends[gen] = config.options.backend or "cursor"
   p.steer_channel_active = (config.backend_descriptor(p.turn_backends[gen]) or {}).steer_channel
@@ -493,6 +502,33 @@ function M.new(deps)
     p.job_shadow_turn = turn
     update_winbar(p)
   end
+  -- Inline turns snapshot every open buffer in the turn's roots and hand each B0 to the
+  -- overlay before the agent starts.
+  if p.turn_modes[gen] == "inline" then
+    local snapshot = require("yana.input.home_buffer_proposal")
+    local roots = {}
+    for _, root in ipairs(p.shadow_turn and require("yana.shadow.ops").session_roots(p.shadow_turn) or {}) do
+      roots[#roots + 1] = root.workspace
+    end
+    local snaps, order = snapshot.take_snapshots(roots, selection and selection.buf or (origin and origin.buf),
+      selection and selection.home_buffer_capture)
+    p.turn_buffer_captures = p.turn_buffer_captures or {}
+    p.turn_buffer_captures[gen] = next(snaps) and snaps or nil
+    local private_dir = p.shadow_turn and (p.shadow_turn.private_dir
+      or (p.shadow_turn.turn_dir and p.shadow_turn.turn_dir .. "/private"))
+    local seeds, seed_err = p.shadow_turn and snapshot.write_seeds(order, roots, private_dir)
+    if p.shadow_turn and not seeds then
+      snapshot.release_snapshots(p.turn_buffer_captures, gen)
+      preview_module().discard(p.shadow_turn)
+      p.shadow_turn, p.job_shadow_turn, p.busy = nil, nil, false
+      stop_spinner(p)
+      ledger.close_turn(L, { exit_code = nil, confinement_failed = seed_err })
+      render_error(p, seed_err)
+      update_winbar(p)
+      return
+    end
+    if p.shadow_turn then p.shadow_turn.seed_files = seeds end
+  end
   -- Open the lifecycle pass: durable id + owning tuple, explicitly NOT actionable until walked and classified.
   p.turn_pass = lifecycle.begin_turn({
     panel_id = p.id,
@@ -524,7 +560,7 @@ function M.new(deps)
     steer_enabled = true,
     spawn_reason = opts.redirect and "redirect" or (opts.text and "queue_drain" or "submit"),
     on_event = function(obj)
-      on_event(p, gen, obj)
+      on_event(p, gen, obj, mini)
     end,
     on_model_actual = function(model)
       set_model_actual(p, gen, model)
@@ -536,12 +572,17 @@ function M.new(deps)
       on_exit_confirmed(p, gen, code)
     end,
   })
+  local send_ok = true
   if p.job and steer_channel.can_steer(config.backend_descriptor(p.turn_backends[gen])) then
-    steer_channel.open(p, p.job, built.prompt)
+    send_ok = steer_channel.open(p, p.job, built.prompt) and true or false
+  end
+  if p.job and send_ok then
+    owner:mark_sent(mini, p.turn_modes[gen])
   end
   if not p.job then
     log.buffer_event("launch_failed", { panel_id = p.id, generation = gen, turn_id = turn_id, reason = "agent did not start" })
     p.job_spawn_gen = nil
+    require("yana.input.home_buffer_proposal").release_snapshots(p.turn_buffer_captures, gen)
     -- The overlay never ran, so it never took a claim; nothing to release.
     if p.shadow_turn then
       preview_module().discard(p.shadow_turn)

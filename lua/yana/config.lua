@@ -58,6 +58,7 @@ M.mode_hl_groups = _resolve.mode_hl_groups
 M.model_hl_group = _resolve.model_hl_group
 M.normalize_mode = _resolve.normalize_mode
 M.resolve_mode = _resolve.resolve_mode
+M.mode_instruction = _resolve.mode_instruction
 M.overlay_mode = _resolve.overlay_mode
 M.review_mode_active = _resolve.review_mode_active
 M.agent_permission_mode = _resolve.agent_permission_mode

@@ -8,7 +8,7 @@ usage() {
 	cat <<'EOF'
 Usage:
   yana-overlay --workspace DIR --session ID --turn ID --mode MODE
-                    --answer-out FILE [--touched FILE]...
+                    --answer-out FILE [--touched FILE]... [--seed PATH=FROM]...
                     [--broad-root DIR]
                     [--exec-allow FILE]...
                     [--extra-root DIR --extra-upper DIR --extra-work DIR
@@ -49,6 +49,11 @@ absolute path, with its own upper layer and work dir, so its change set is
 separate and reviewable on its own. Roots must be disjoint from each other and
 from every turn layer. Nothing here infers a root: the set comes from the
 caller, which takes it from operator configuration only.
+
+--seed PATH=FROM places FROM's bytes (the editor's buffer text for PATH) in the
+upper layer of the root holding PATH, before the overlay is mounted, so the
+command reads that text instead of the file on disk. The split is at the last
+'=', so FROM may not contain one. A PATH outside every root is refused (65).
 
 Declared roots are mounted, never claimed separately. The launcher asks yanad
 for the turn and receives every layer path in the durable answer file. Refusal

@@ -1,4 +1,4 @@
-*yana.txt*                         Yana                         version 0.1.0-alpha.14
+*yana.txt*                         Yana                         version 0.1.0-alpha.15
 
 ==============================================================================
 CONTENTS                                                        *yana-contents*
@@ -32,30 +32,43 @@ Two public entries reach the same pipeline:
 
 QUICK INSTALLATION WITH LAZY.NVIM ~
 
-Put this complete plugin specification in
-`~/.config/nvim/lua/plugins/yana.lua`: >lua
+Choose the backend for the agent CLI you already use: "claude" for Claude Code,
+"codex" for Codex, or "cursor" for cursor-agent. An empty opts table selects
+Cursor; Yana does not automatically choose another installed agent.
+
+Add this plugin specification to your lazy.nvim configuration: >lua
 
     return {
-      "drusmanbashir/yana.nvim",
-      dependencies = { "drusmanbashir/yana-ui.nvim" },
-      cmd = { "Yana", "YanaAsk", "YanaEdit", "YanaOpen" },
-      opts = {
-        backend = "cursor",  -- "cursor", "claude", or "codex"
-        mappings = {
-          toggle = "<leader>cc",
-          ask = "<leader>ca",
-          inline_edit = "<C-k>",
-        },
-      },
+        "drusmanbashir/yana.nvim",
+        dependencies = { "drusmanbashir/yana-ui.nvim" },
+        opts = { backend = "claude" }, -- choose "claude", "codex" or "cursor"
     }
 <
-Manually: >sh
+lazy.nvim installs yana-ui.nvim through the dependency entry. On Ubuntu the
+extra sandbox packages are bubblewrap and libcap2-bin (bwrap and capsh): >sh
 
-    git clone https://github.com/drusmanbashir/yana.nvim ~/.local/share/nvim/yana.nvim
+    sudo apt-get install bubblewrap libcap2-bin
 <
->lua
-    vim.opt.runtimepath:prepend("~/.local/share/nvim/yana.nvim")
-    require("yana").setup({})
+Restart Neovim in your project directory, run `:checkhealth yana`, then `:Yana`.
+If bwrap:userns fails, read its host-permission diagnostic; having the packages
+installed does not mean the host permits the sandbox. See |yana-health|.
+The opened project is included automatically. :YanaRoots adds other folders;
+an empty extra capture set does not exclude the opened project. No model or
+project-path setting is required for normal first use.
+
+Manual start packages: >sh
+
+    data=$(nvim --headless -i NONE -u NONE -c 'lua io.write(vim.fn.stdpath("data"))' -c qa)
+    test -n "$data" || { echo "Neovim did not report its data directory" >&2; exit 1; }
+    start="$data/site/pack/yana/start"
+    mkdir -p "$start"
+    git clone https://github.com/drusmanbashir/yana.nvim "$start/yana.nvim"
+    git clone https://github.com/drusmanbashir/yana-ui.nvim "$start/yana-ui.nvim"
+<
+
+Then configure your chosen backend in Neovim: >lua
+
+    require("yana").setup({ backend = "claude" }) -- or "codex" / "cursor"
 <
 
 Requirements: Linux, Neovim 0.11.2+, one agent CLI signed in: `cursor-agent`,
@@ -356,9 +369,8 @@ itself. It may be any folder, not only a git project — but never your whole
 home directory, `/`, or a top-level folder such as `/home` or `/tmp`. Those
 are refused by name before the agent starts, with the remedy "pick a project
 subdirectory". Depth is counted in path components below `/` after resolving
-symlinks: `/` is 0, `/home` is 1 (refused), `/home/you` is your home (refused
-by the home rule, via `$HOME` and via your passwd entry), `/home/you/notes` is
-3 (allowed). The rule exists because a top-level folder is never a project:
+symlinks: `/` is 0, `/home` is 1 (refused), `$HOME` is refused by the home rule,
+and `/projects/demo` is 2 (allowed). The rule exists because a top-level folder is never a project:
 accepting it would put every sibling under the agent's write scope. Start
 Yana inside the project or folder you mean to change. `:Yana --workspace DIR`
 binds the next turn to a named directory; `:Yana --file` is retired and
@@ -402,19 +414,12 @@ more overlay mount and one more claim per turn (measured about 180ms). >lua
 
                                                         *yana-capture-root*
 `capture_root` is the ONE directory a turn's single overlay is mounted at. Every
-write beneath it — the opened repository, a sibling repository declared nowhere,
-a directory that did not exist when the turn started — lands in the turn's
-private layer instead of failing read-only, and the review groups the hunks by
-each file's own nearest `.git` root, computed from what the turn wrote rather
-than declared before it. One mount and one claim, however many repositories the
-turn touches. Unset, yana chooses it from filesystem position: `~/code` when the
-resolved workspace is under it, else `$HOME`, else the workspace itself — never
-a directory that contains yana's own state root. Anything outside it is still
-read-only and the refusal still names the line that would allow it. The claim
-stays on the opened repository, so a second turn on a different repository under
-the same capture root starts freely; when two turns propose changes to the same
-file, the second to ACCEPT it is refused by name, naming the holder. Nothing the
-agent says can choose it. >lua
+write beneath it lands in the turn's private layer; anything outside it stays
+read-only. When unset, Yana tries configured `capture_root_candidates` in
+order, then uses the opened workspace itself. The selected directory cannot
+contain Yana's own state root. Review groups hunks by each file's nearest `.git`
+root, and the claim stays on the opened repository. Nothing the agent says can
+choose the capture root. >lua
 
     require("yana").setup({
       capture_root = "~/code",

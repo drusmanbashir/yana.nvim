@@ -16,6 +16,41 @@ local function turn_generation(turn, panel)
   return panel and panel.turn_gen or 0
 end
 
+-- When the agent replies done.
+-- The overlay copy makes every snapshotted buffer with unsaved edits look changed; a record whose agent revision is
+-- still B0 is that copy, not an agent edit, so it is dropped unless it carries a create, delete or permission decision.
+local function drop_snapshot_copies(changes, snaps)
+  if not (changes and snaps) then return end
+  local diff = require("yana.diff")
+  local review_permissions = require("yana.review_permissions")
+  for i = #changes, 1, -1 do
+    local change = changes[i]
+    local snap = type(change.path) == "string" and snaps[diff.abs_path(change.path)] or nil
+    if snap and change.after == snap.b0 and not (change.kind == "delete" or change.kind == "create"
+      or review_permissions.proposes_mode(change)) then
+      table.remove(changes, i)
+    end
+  end
+end
+
+-- Put each file's snapshot on its record, with B1 and the edit counter read once, now.
+local function attach_snapshots(changes, snaps)
+  if not (changes and snaps) then return end
+  local diff = require("yana.diff")
+  for _, change in ipairs(changes) do
+    local snap = type(change.path) == "string" and snaps[diff.abs_path(change.path)] or nil
+    if snap then
+      change.buffer_capture = snap
+      change.buf_org = snap.b0
+      if vim.api.nvim_buf_is_valid(snap.bufnr) and vim.api.nvim_buf_is_loaded(snap.bufnr) then
+        change.buf_updated = diff.buffer_bytes_snapshot(snap.bufnr)
+        change.tick_done = vim.api.nvim_buf_get_changedtick(snap.bufnr)
+      end
+      snap.carried = true
+    end
+  end
+end
+
 -- deps.state: shared S; this module assigns S.finalize_shadow_turn onto it. render_*/turn_ledger/with_render_gen: ui_render and ui_review facade locals.
 function M.new(deps)
   local S = deps.state
@@ -110,7 +145,8 @@ local function finalize_shadow_turn_body(p, turn)
     return
   end
   local turn_gen = turn_generation(turn, p)
-  local home_capture = p.turn_home_buffer_captures and p.turn_home_buffer_captures[turn_gen]
+  local snaps = p.turn_buffer_captures and p.turn_buffer_captures[turn_gen]
+  local home_capture = require("yana.input.home_buffer_proposal").home_capture_of(snaps)
   if home_capture then
     if p.cancelled or p.turn_errored or tonumber(turn.agent_exit_code or 1) ~= 0 then
       release_shadow_turn(p, "buffer-only proposal discarded because the turn did not complete successfully")
@@ -151,8 +187,10 @@ local function finalize_shadow_turn_body(p, turn)
     local changes, cerr, typed, classification = ops.changes_from_session(turn, {
       tracked_evidence = p.turn_pass and p.turn_pass.tracked_evidence or nil,
     })
+    drop_snapshot_copies(changes, snaps)
     changes, typed, classification = require("yana.input.home_buffer_proposal")
       .classify_buffer_restore(turn, home_capture, changes, typed, classification)
+    attach_snapshots(changes, snaps)
     if home_capture then
       if turn.home_buffer_noop and (not changes or #changes == 0) then
         -- Exact unsaved baseline returned: no edit, no review; the unsaved bytes stay unsaved.
@@ -278,7 +316,8 @@ local function finalize_shadow_turn_body(p, turn)
 		    upper_path = change.upper_path,
 		    -- Recovery cannot rebuild an unsaved buffer baseline from disk; keep it in the daemon-owned bundle.
 		    home_buffer_only = change.home_buffer_capture ~= nil or nil,
-		    review_before = change.home_buffer_capture and change.review_before or nil,
+		    -- B0 for every snapshotted file (INTERFACE.md section 1).
+		    review_before = change.buf_org or (change.home_buffer_capture and change.review_before) or nil,
 		  }
         end
         preview_module().arm_review_open(turn, function(ok)
@@ -363,6 +402,8 @@ S.finalize_shadow_turn = function(p, turn)
     return
   end
   with_render_gen(p, shadow_turn_gen(turn, p), finalize_shadow_turn_body, p, turn)
+  -- The agent is done: snapshots no file record carries are deleted now (BUILD.md runtime row 11).
+  require("yana.input.home_buffer_proposal").release_snapshots(p.turn_buffer_captures, turn_generation(turn, p), true)
 end
 
   return {

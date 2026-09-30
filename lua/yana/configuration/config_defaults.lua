@@ -201,7 +201,7 @@ local defaults = {
   -- leaves the standout colour to the mode chip.
   model_highlight = { link = "Identifier" },
 
-  -- Prepended to agent-mode prompts. Read from prompt.txt at the plugin root;
+  -- Prepended to inline-mode prompts. Read from prompt.txt at the plugin root;
   -- empty (and therefore disabled) when that file is missing.
   agent_instructions = (function()
     local root = vim.fn.fnamemodify(debug.getinfo(1, "S").source:sub(2), ":h:h:h:h")

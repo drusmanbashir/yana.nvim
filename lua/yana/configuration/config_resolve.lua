@@ -16,6 +16,13 @@ function M.new(deps)
 
   local MODES = { ask = true, inline = true, agentic = true }
 
+  --- One stable instruction sentence per canonical mode (shared by HOME/normal inline).
+  local MODE_INSTRUCTIONS = {
+    ask = "Yana ask mode: answer without changing files, replacing earlier Yana mode instructions.",
+    inline = "Yana inline mode: propose edits for review without tests or writing live files, replacing earlier Yana mode instructions.",
+    agentic = "Yana agentic mode: make requested file changes directly and validate as needed, replacing earlier Yana mode instructions.",
+  }
+
   --- Highlight group names for the winbar mode chip (one per named mode).
   local mode_hl_groups = {
     ask = "YanaModeAsk",
@@ -147,6 +154,12 @@ function M.new(deps)
 			return m
 		end
 		return options.mode
+  end
+
+  --- Instruction sentence for the resolved mode, or nil when unknown.
+  local function mode_instruction(mode)
+    local m = resolve_mode(mode)
+    return MODE_INSTRUCTIONS[m]
   end
 
   -- True when resolved mode is ask/inline (agent runs under the overlay).
@@ -366,6 +379,7 @@ function M.new(deps)
     normalize_modes = normalize_modes,
     mode_enabled = mode_enabled,
     resolve_mode = resolve_mode,
+    mode_instruction = mode_instruction,
     resolve_open_capture_mode = resolve_open_capture_mode,
     overlay_mode = overlay_mode,
     review_mode_active = review_mode_active,

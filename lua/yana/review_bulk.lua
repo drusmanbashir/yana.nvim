@@ -24,7 +24,6 @@ function Factory.new(deps)
   local HINT_NS = deps.hint_ns
   local process_next_for = deps.process_next_for
   local record_last_hunk_decided = deps.record_last_hunk_decided
-  local absorb_review_blocks_over_drift = deps.absorb_review_blocks_over_drift
   local model_target = deps.model_target
 
   local function operation_transition(file, verdict)
@@ -158,14 +157,12 @@ function Factory.new(deps)
       -- (`turn:add_file`, by-path).
       local turn = require("yana.turn.turn_bind").get(st)
 
-      -- The materialize/absorb inputs, gathered once: this is the whole of what
+      -- The materialize inputs, gathered once: this is the whole of what
       -- `review_queued_hunks` needs, and it is deliberately not the review's
       -- `deps` table -- a queued file has no review to lend it one.
       local queued_deps = {
         facade = M,
-        diff = diff,
         model_target = model_target,
-        absorb_review_blocks_over_drift = absorb_review_blocks_over_drift,
       }
 
       local parked_composition, parked_ledger = parked.new({ diff = diff })
@@ -202,14 +199,18 @@ function Factory.new(deps)
         --
         -- THE DELETED GUARD, named so it cannot come back: `buffer_clash` stood here
         -- and refused any queued file whose buffer was `modified`. It was a per-FILE
-        -- answer to a per-HUNK question. A file whose edit misses every hunk is
-        -- therefore ACCEPTED WITH THAT EDIT rather than skipped.
-        local file_ledger, conflicted, materialize_err
+        -- answer to a per-HUNK question. Nothing is refused for overlapping your
+        -- edit either: each agent edit is placed on B1, the buffer as the agent
+        -- left it.
+        local file_ledger, materialize_err
+        -- End starts from the text the ledger's rows are counted in: B1 when the
+        -- edits were placed on it, else B0.
+        local base_text = change_i.buf_updated or change_i.review_before or change_i.before or ""
         if parked_text ~= nil then
-          file_ledger, conflicted = parked_ledger(change_i), {}
+          file_ledger = parked_ledger(change_i)
         else
           local _composed
-          file_ledger, _composed, conflicted, materialize_err = queued_hunks.materialize(queued_deps, change_i)
+          file_ledger, _composed, materialize_err, base_text = queued_hunks.materialize(queued_deps, change_i)
         end
         if not file_ledger then
           change_i.review_error = change_i.review_error or materialize_err or "queued change has no hunks to decide"
@@ -230,26 +231,13 @@ function Factory.new(deps)
             ledger = file_ledger,
             change = change_i,
             -- The press no longer spends these inputs. Turn exit needs them to
-            -- compose and journal this selected file's projection.
-            base_text = change_i.before or "",
+            -- compose and save this selected file's projection.
+            base_text = base_text,
             bufnr = parked_bufnr,
             review_opts = item.opts,
             review_owner = item.opts and item.opts.review_owner,
           })
         end
-        if #conflicted > 0 then
-          -- REFUSED BY NAME, and the file is left for a review of its own: the
-          -- turn's pending count still holds these hunks, so no close edge is
-          -- crossed and `process_next_for` below opens the file the operator has
-          -- to arbitrate. Nothing of it is written -- a half-written file with a
-          -- reviewable remainder is a worse thing to hand back than an untouched
-          -- one.
-          change_i.review_error = queued_hunks.conflict_reason(change_i, conflicted)
-          table.insert(clashed, change_i.rel or path)
-          table.insert(to_requeue, item)
-          goto continue
-        end
-
         local allowed, why = review_action_allowed({ opts = item.opts }, change_i)
         if not allowed then
           change_i.review_error = tostring(why)

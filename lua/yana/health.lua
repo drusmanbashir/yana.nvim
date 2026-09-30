@@ -124,7 +124,7 @@ end
 -- Neovim's own bundled runtime Lua (its default keymaps among them, defined in
 -- runtime/lua/vim/_core/defaults.lua) loads under a virtual "@vim/..." module-style
 -- debug source; a user's init.lua or an installed plugin's Lua file always shows a real
--- filesystem path instead ("@/home/.../init.lua", "@/.../lazy/<plugin>/lua/...").
+-- filesystem path instead ("@$HOME/init.lua", "@$HOME/.local/share/nvim/lazy/<plugin>/lua/...").
 --
 -- Only Lua-callback mappings can be identified as built-ins this way; a
 -- foreign mapping with no callback (plain rhs, legacy :map) is never

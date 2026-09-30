@@ -5,6 +5,10 @@
 -- module-level local, not a `deps` entry, so it survives `setfenv(open, env)`
 -- as a lexical upvalue rather than an env lookup.
 local hunk_ledger = require("yana.hunk_ledger")
+-- Module-level for the same reason: buffer drift placement (INTERFACE.md section 3).
+local place_on_b1 = require("yana.review_ownership").place_on_b1
+-- Stage 3: a deleted parent comes back with the agent's edit (INTERFACE.md section 3).
+local restore_parents = require("yana.review_queued_hunks").restore_parents
 
 -- Hand-test tracing (tools/handtest). Inert unless YANA_HANDTEST_TRACE is set.
 local function _ht_trace(msg)
@@ -121,29 +125,10 @@ function Factory.new(deps)
     -- disk with nothing to revert to; now a missing `before` is simply a
     -- create, reviewed against an empty base, and nothing is on disk to keep.
     --
-    -- Retryable refusals stay pending. A dirty pre-existing buffer is
-    -- different: Yana must preserve the operator's bytes and retire this
-    -- proposal, because no review was attached that could ever be answered.
+    -- Retryable refusals stay pending. A buffer with unsaved edits no longer
+    -- refuses (buffer drift stage 1): it is placed on B1 or falls back to B0.
     if change.review_error == nil then
       change.review_error = open_err
-    end
-    if refusal and refusal.reason == "dirty_buffer" then
-      local withdrew, withdraw_err = require("yana.turn.turn_bind").withdraw_unopened(
-        diff.abs_path(change.path)
-      )
-      if withdrew then
-        change.status = "system_refused"
-        notify_owner(opts.on_system_refused, change, "on_system_refused")
-        if opts.on_close then
-          vim.schedule(function()
-            notify_owner(function()
-              opts.on_close(nil, false)
-            end, change, "on_close")
-          end)
-        end
-      else
-        change.review_error = tostring(withdraw_err or open_err)
-      end
     end
     -- BURST GUARD (DEFECT C): a refused target keeps getting retried -- `]x`/`[x` parks
     -- the current file and reopens the target on EVERY press, and a target whose
@@ -182,7 +167,15 @@ function Factory.new(deps)
   -- inside the one hunk and add a blank line to the composed file. Drop it from the
   -- target here and drop the buffer's forced blank line after staging; match_eol
   -- restores the real final newline at accept.
-  local review_before = change.review_before ~= nil and change.review_before or change.before
+  -- A file whose buffer was captured at submit is reviewed from B0, the buffer at
+  -- submit (buffer drift stage 1, INTERFACE.md section 1).
+  local snap = type(change.buffer_capture) == "table" and change.buffer_capture or nil
+  local review_before
+  if snap then
+    review_before = change.buf_org ~= nil and change.buf_org or snap.b0
+  else
+    review_before = change.review_before ~= nil and change.review_before or change.before
+  end
   if change._retrace_model == nil and type(review_before) == "string" and type(change.after) == "string" then
     change._retrace_model = { before = review_before, after = change.after }
   end
@@ -204,6 +197,32 @@ function Factory.new(deps)
   local parked_already_staged = change._parked_already_staged
   change._parked_already_staged = nil
   local blocks = stamp_model_index(M.build_diff_blocks(review_before or "", target), model)
+  -- The B0 rows each edit was built on, kept so a reload during the review can
+  -- fall back to B0 without comparing texts (review_open_watchers.lua).
+  for _, block in ipairs(blocks) do
+    block.b0_span = { start_line = block.start_line, end_line = block.end_line }
+  end
+  -- Buffer drift stage 1 (INTERFACE.md sections 3 and 4): the hunk record is
+  -- stamped above on B0; now each edit is placed on B1 by the submit extmarks.
+  -- When they cannot be used the file falls back to B0: the B0 blocks stay and B0
+  -- is staged into the buffer below. `on_b1` = the buffer keeps B1.
+  local on_b1, b0_fallback = false, false
+  if snap ~= nil and not parked then
+    local b1_lines
+    if change.tick_done ~= nil and vim.b[bufnr].changedtick == change.tick_done
+      and type(change.buf_updated) == "string" then
+      b1_lines = buffer_lines(change.buf_updated)
+    else
+      -- The buffer moved on since the agent was done: read B1 again.
+      b1_lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+    end
+    local placed, why = place_on_b1(blocks, snap, b1_lines)
+    if placed then
+      blocks, on_b1 = restore_parents(placed, snap, b1_lines), true
+    else
+      b0_fallback = tostring(why)
+    end
+  end
   if parked then
     local parked_blocks = {}
     for i, block in ipairs(parked.blocks or {}) do
@@ -220,7 +239,8 @@ function Factory.new(deps)
   -- approximation. `blocks` is the live table, so a later capture of the same
   -- facts sees the extmark ids painting adds to it.
   local engine_facts = { review_before = review_before, target = target, model = model,
-    model_source = model_source, blocks = blocks, parked = parked ~= nil }
+    model_source = model_source, blocks = blocks, parked = parked ~= nil,
+    placement = on_b1 and "b1" or (b0_fallback and ("b0_fallback: " .. b0_fallback)) or nil }
 
   -- Zero hunks means `before` equals `after`: disk already holds the accepted
   -- content, so there is nothing to write and nothing to review, and settling
@@ -245,7 +265,10 @@ function Factory.new(deps)
     or review_permissions.proposes_mode(change)
   if #blocks == 0 and change.before ~= nil and not carries_decision then
     log.buffer_event("review_staged", { change = change, bufnr = bufnr, outcome = "no_hunks", engine = engine_facts })
-    vim.bo[bufnr].modified = false
+    -- Neovim owns the modified flag of a captured buffer (INTERFACE.md section 5).
+    if snap == nil then
+      vim.bo[bufnr].modified = false
+    end
     change.status = "accepted"
     notify_owner(opts.on_accept, change, "on_accept")
     focus_buf(change.path, bufnr)
@@ -269,23 +292,32 @@ function Factory.new(deps)
       tostring(parked and type(parked.staged_text) == "string" and #parked.staged_text or "nil"),
       vim.api.nvim_buf_line_count(bufnr)))
     if not parked_already_staged then
+      if b0_fallback then
+        -- Fall back to B0 (INTERFACE.md section 4): B1 leaves the buffer and stays
+        -- in its undo history, sealed off by review_buffer's undo break.
+        vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, buffer_lines(review_before or ""))
+      end
       insert_new_lines(bufnr, blocks)
       if parked and type(parked.staged_text) == "string" then
         vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, buffer_lines(parked.staged_text))
       end
-      if change.before == nil then
+      if change.before == nil and not on_b1 then
         local n = vim.api.nvim_buf_line_count(bufnr)
         if n > 1 and (vim.api.nvim_buf_get_lines(bufnr, n - 1, n, false)[1] or "") == "" then
           vim.api.nvim_buf_set_lines(bufnr, n - 1, n, false, {})
         end
       end
-      vim.bo[bufnr].modified = false
+      if snap == nil then
+        vim.bo[bufnr].modified = false
+      end
     end
   end)
   if not stage_ok then
     break_undo_block(bufnr)
     pcall(vim.api.nvim_buf_set_lines, bufnr, 0, -1, false, pre_stage_lines)
-    vim.bo[bufnr].modified = false
+    if snap == nil then
+      vim.bo[bufnr].modified = false
+    end
     change.review_error = tostring(stage_err)
     log.buffer_event("review_staged", { change = change, bufnr = bufnr, outcome = "stage_failed",
       reason = tostring(stage_err), engine = engine_facts })

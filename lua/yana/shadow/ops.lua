@@ -236,6 +236,40 @@ local function changes_for_root(session, root, upper, typed)
 	return changes
 end
 
+--- The overlay copy of each open buffer (deliver INTERFACE.md section 2) is in the
+--- upper layer before the agent runs, so a buffer the agent never touched still looks
+--- written. A whole-file create or modify on a seeded path whose upper bytes still
+--- equal that seed's B0 is that copy, not an agent change: it leaves the walk here,
+--- before the ignore list, the review changes and the bundle entries are built from
+--- it. A delete, a mode change or different bytes on a seeded path is the agent's.
+--- The B0 is read from the seed's own file in the turn's private folder, never from
+--- the workspace file.
+local function drop_seed_copies(session, upper, typed)
+	local seeds = {}
+	for _, seed in ipairs(type(session.seed_files) == "table" and session.seed_files or {}) do
+		seeds[seed.path] = seed.from
+	end
+	if next(seeds) == nil then
+		return typed
+	end
+	local kept = {}
+	for _, op in ipairs(typed) do
+		local from = seeds[op.path]
+		local copy = from ~= nil
+			and (op.kind == "create" or op.kind == "modify")
+			and op.detail == "file"
+			and not (type(op.base_evidence) == "table" and op.base_evidence["new-mode"])
+		if copy then
+			local after = ops_artifacts.read_tree_bytes(upper, op.upper_rel or op.rel)
+			copy = after ~= nil and after == diff.read_file_bytes(from)
+		end
+		if not copy then
+			kept[#kept + 1] = op
+		end
+	end
+	return kept
+end
+
 --- Build inline review change objects for one turn, across every root it wrote.
 ---
 --- ONE WALK AND ONE CLASSIFICATION PER ROOT. Two declared roots may hold the
@@ -273,7 +307,8 @@ function M.changes_from_session(session, context)
 	local ignore = require("yana.paths.ignore")
 	local ignore_active = true
 	for _, walk in ipairs(walks) do
-		local root, upper, typed = walk.root, walk.upper, walk.typed
+		local root, upper = walk.root, walk.upper
+		local typed = drop_seed_copies(session, upper, walk.typed)
 		if ignore_active then
 			for _, op in ipairs(typed) do
 				if ignore.ignorable(op) and ignore.matches(op.rel, op.detail == "dir") then

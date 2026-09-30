@@ -134,6 +134,23 @@ function Ledger:members()
 	return out
 end
 
+-- A restored parent and the agent edit inside it share one `group_id` (buffer
+-- drift stage 3, INTERFACE.md section 3): one choice. Returns the positions, in
+-- `pending()` order, of every pending member of `block`'s group; nil when the
+-- block has no group or is its only pending member.
+function Ledger:pending_group(block)
+	if block == nil or block.group_id == nil then
+		return nil
+	end
+	local positions = {}
+	for position, member in ipairs(self:pending()) do
+		if member.group_id == block.group_id then
+			positions[#positions + 1] = position
+		end
+	end
+	return #positions > 1 and positions or nil
+end
+
 function Ledger:stamp_frozen()
 	self.frozen_for_end = true
 end

@@ -87,6 +87,93 @@ function M.same_class_scope(bufnr, line_a, line_b, state)
   return class_a == class_b
 end
 
+-- Buffer drift stage 3 (spec BUILD buffer drift; INTERFACE.md section 1). The parents of
+-- rows first_row..last_row, innermost first. A parent is a named node that contains the
+-- rows, starts on an earlier row (so it spans more than one row) and is not the root; its
+-- header is its first row. A node that starts exactly where its first named child starts
+-- only wraps that child (a body block, a decorated definition): its first row belongs to
+-- the child, so it is not a parent. Two parents on one header row count once. No node
+-- type, field name or source text is read.
+local function parents_under(root, first_row, last_row)
+  local parents = {}
+  local node = root:named_descendant_for_range(first_row, 0, last_row, 0) or root
+  while node and node:parent() do
+    local sr, sc, er, ec = node:range()
+    if ec == 0 and er > sr then
+      er = er - 1
+    end
+    local child = node:named_child(0)
+    local cr, cc = -1, -1
+    if child then
+      cr, cc = child:range()
+    end
+    local prev = parents[#parents]
+    if node:named() and sr < first_row and er >= last_row and not (cr == sr and cc == sc)
+      and not (prev and prev.header_row == sr) then
+      parents[#parents + 1] = { start_row = sr, end_row = er, header_row = sr }
+    end
+    node = node:parent()
+  end
+  return parents
+end
+
+-- The last B0 parse, kept so the edits of one file share one string parse (section 5).
+local b0_parse = {}
+
+--- parents_of_text(text, lang, first_row, last_row) -> { {start_row, end_row, header_row}, ... }
+--- innermost first, or nil, "no_parser". Rows are 0-based.
+function M.parents_of_text(text, lang, first_row, last_row)
+  if b0_parse.text ~= text or b0_parse.lang ~= lang then
+    local root = false
+    local ok, parser = pcall(vim.treesitter.get_string_parser, text, lang)
+    if ok and parser then
+      local parsed, trees = pcall(parser.parse, parser)
+      root = parsed and trees and trees[1] and trees[1]:root() or false
+    end
+    b0_parse = { text = text, lang = lang, root = root }
+  end
+  if not b0_parse.root then
+    return nil, "no_parser"
+  end
+  return parents_under(b0_parse.root, first_row, last_row)
+end
+
+-- The last B1 parse, reused while the buffer is unchanged: one B1 parse per file (section 5).
+local b1_parse = {}
+
+--- innermost_parent(bufnr, row) -> {start_row, end_row, header_row} | false (top level)
+--- | nil, "no_parser" | nil, "syntax_error" (a syntax error in any node from the row up to
+--- the root). The language comes from the buffer's filetype (section 4).
+function M.innermost_parent(bufnr, row)
+  local filetype = vim.bo[bufnr].filetype
+  local lang = filetype ~= "" and (vim.treesitter.language.get_lang(filetype) or filetype) or nil
+  local tick = vim.b[bufnr].changedtick
+  if not (b1_parse.bufnr == bufnr and b1_parse.tick == tick and b1_parse.lang == lang) then
+    local root = false
+    local ok, parser = false, nil
+    if lang then
+      ok, parser = pcall(vim.treesitter.get_parser, bufnr, lang)
+    end
+    if ok and parser then
+      local parsed, trees = pcall(parser.parse, parser)
+      root = parsed and trees and trees[1] and trees[1]:root() or false
+    end
+    b1_parse = { bufnr = bufnr, tick = tick, lang = lang, root = root }
+  end
+  local root = b1_parse.root
+  if not root then
+    return nil, "no_parser"
+  end
+  local node = root:named_descendant_for_range(row, 0, row, 0) or root
+  while node and node:parent() do
+    if node:has_error() then
+      return nil, "syntax_error"
+    end
+    node = node:parent()
+  end
+  return parents_under(root, row, row)[1] or false
+end
+
 --- new(bufnr, state) -> { edge_line_is_yana_owned, interior_line_is_yana_owned }
 --- Both are thin wrappers over ONE classifier, `row_is_yana_owned`: the rule
 --- below is the whole rule, and no caller gets a second one.

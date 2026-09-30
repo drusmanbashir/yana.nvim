@@ -11,6 +11,47 @@ local function retired_single_file_reload_refusal(change)
   return "retired single-file review cannot be reloaded for " .. name .. "; close it and rerun Yana on the real file"
 end
 
+--- A reload during review falls back to B0 against the agent's revision. `lines` are B0;
+-- each pending hunk's lines go at the B0 rows it was built on (`b0_span`, stamped
+-- at open), so no text is compared to find where a hunk belongs. Returns the
+-- composed lines, the first row each hunk's lines now start at, and the B0 lines
+-- each hunk replaces; or nil and a reason.
+local function compose_on_b0(lines, pending)
+  local order, rank = {}, {}
+  for i, block in ipairs(pending) do
+    if type(block.b0_span) ~= "table" then
+      return nil, "a pending hunk carries no B0 rows"
+    end
+    order[i], rank[block] = block, i
+  end
+  table.sort(order, function(a, b)
+    if a.b0_span.start_line ~= b.b0_span.start_line then
+      return a.b0_span.start_line < b.b0_span.start_line
+    end
+    return rank[a] < rank[b]
+  end)
+  local out, relocated, olds, cursor = {}, {}, {}, 1
+  for _, block in ipairs(order) do
+    local s, e = block.b0_span.start_line, block.b0_span.end_line
+    if s < cursor then
+      return nil, "two pending hunks share B0 rows"
+    end
+    for i = cursor, s - 1 do
+      out[#out + 1] = lines[i]
+    end
+    relocated[block] = #out + 1
+    olds[block] = e >= s and vim.list_slice(lines, s, e) or {}
+    for _, line in ipairs(block.new_lines or {}) do
+      out[#out + 1] = line
+    end
+    cursor = e + 1
+  end
+  for i = cursor, #lines do
+    out[#out + 1] = lines[i]
+  end
+  return out, relocated, olds
+end
+
 function Factory.new(deps)
   local env = setmetatable({}, {
     __index = function(_, key)
@@ -107,70 +148,35 @@ function Factory.new(deps)
         if change.kind == "delete" then
           return tear_down("the file changed on disk and was reloaded; the staged hunks are gone")
         end
-        local disk_now, disk_err = diff.read_file_bytes(change.path)
-        if disk_now == nil then
-          return tear_down(disk_err or "the file changed on disk and was reloaded; the staged hunks are gone")
+        -- A reload leaves no row Yana can trust for any hunk, and hunks are no
+        -- longer moved by comparing texts: the file falls back to B0 against the
+        -- agent's revision. The disk plays no part. Sealed either side, like every
+        -- other product-initiated edit to this buffer; what the reload brought in
+        -- stays in the undo history. THE RELOAD BARRIER: the rewrite's bytes move
+        -- no membership; the composition's relocation does.
+        local snap = type(change.buffer_capture) == "table" and change.buffer_capture or nil
+        local b0 = snap and (change.buf_org or snap.b0) or change.review_before or change.before or ""
+        local composed_lines, relocated, olds = compose_on_b0(buffer_lines(b0), state.hunk_ledger:pending())
+        if not composed_lines then
+          return tear_down("the file was reloaded and its review cannot fall back to B0: " .. tostring(relocated))
         end
-        local base = change.disk_at_open or ""
-        local was_identical = disk_now == base
-        -- Never trust a surviving extmark across a reload: a displaced
-        -- `authority_extmark_id` still reads as valid. The composition says where
-        -- every pending block's rows went (`relocated`), and nothing else does.
-        local composed, compose_err, _, relocated = apply_review_blocks_to_reloaded_disk(base, disk_now, state.hunk_ledger:pending())
-        if not composed then
-          -- The one branch here that HAS both sides of the disagreement:
-          -- record the fingerprint pair (truncated hashes, never contents) so
-          -- "which of the three versions did the check actually see" is
-          -- answerable after the fact.
-          return tear_down(
-            compose_err or "conflict: file changed on disk inside a reviewed hunk",
-            { expected_fp = fingerprint(base), actual_fp = fingerprint(disk_now) }
-          )
-        end
-        -- Outside-hunk disk edits (or none at all) are kept. The file's base
-        -- evidence is advanced before accept, otherwise the later CAS would
-        -- refuse a merge that this handler has already validated and staged.
-        -- Sealed either side, like every other product-initiated edit to this
-        -- buffer: the re-stage is one undo block of its own, so it neither
-        -- swallows the human's last keystroke nor merges into the next
-        -- decision. THE RELOAD BARRIER: the rewrite's
-        -- bytes move no membership; the composition's relocation does.
         break_undo_block(bufnr)
         state.reload_barrier = true
-        local set_ok, set_err = pcall(vim.api.nvim_buf_set_lines, bufnr, 0, -1, false, buffer_lines(composed))
+        local set_ok, set_err = pcall(vim.api.nvim_buf_set_lines, bufnr, 0, -1, false, composed_lines)
         state.reload_barrier = nil
         if not set_ok then error(set_err) end
         state.hunk_ledger:relocate_membership(relocated)
+        -- Reject now restores the B0 lines each hunk stands on.
+        for block, old in pairs(olds) do
+          state.hunk_ledger:set_old_lines(block, old)
+        end
         state._ownership_dirty_rows = {}
         break_undo_block(bufnr)
-        vim.bo[bufnr].modified = false
-        change.disk_at_open = disk_now
-        -- The CAS the applier runs immediately before the write compares
-        -- `change.base_hash`, NOT `disk_at_open`: shadow/apply.lua:302-320 hands that
-        -- fingerprint to the diary and the diary re-reads the file one step before the
-        -- rename. Advance the fingerprint pair with the bytes, and nothing else: the
-        -- read that authorises the write still happens at the applier, one step before
-        -- it.
-        local rehash = base_fingerprint(disk_now)
-        if rehash then
-          change.base_hash = rehash
-          change.base_state = "file"
-          local st_now = (vim.uv or vim.loop).fs_lstat(change.path)
-          if st_now and st_now.mode then
-            change.base_mode = st_now.mode
-          end
-        end
-        -- `before` is the bytes a reject restores. The review now stands on
-        -- the reloaded composition, so leaving it at the pre-reload base would
-        -- make a reject wipe the human's outside-hunk edit out of the buffer.
-        change.before = disk_now
+        local composed = diff.buffer_bytes_snapshot(bufnr)
         state.staged_text = composed
         state.latest_undo_seq = buf_undo_seq(bufnr)
-        local recomposed, recomposed_source = recomposed_model(disk_now, composed, change.path)
-        -- The payload the review now stands on is the reloaded composition, so the
-        -- model is re-derived from that pair. Comparing the new render against the
-        -- ORIGINAL model would report a violation for a legitimate rebuild, and a check
-        -- that cries wolf gets ignored.
+        -- The model is re-derived from the pair the review now stands on.
+        local recomposed, recomposed_source = recomposed_model(b0, composed, change.path)
         state.model_hunks = recomposed
         state.model_source = recomposed_source
         -- This site asks for the ONE coalesced repaint instead of calling the painter
@@ -216,7 +222,11 @@ function Factory.new(deps)
       end
       local disk_now = diff.read_file_bytes(change.path)
       local base = change.disk_at_open or ""
-      if disk_now ~= base or type(state.staged_text) ~= "string" then
+      -- A captured buffer's review never consults the disk (buffer drift stage 1,
+      -- INTERFACE.md section 1): its read is always swallowed and the review
+      -- restored below; `disk_now` is used only if that restore fails.
+      local captured = type(change.buffer_capture) == "table"
+      if (not captured and disk_now ~= base) or type(state.staged_text) ~= "string" then
         local disk_text = disk_now or ""
         vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, buffer_lines(disk_text))
         local has_eol = disk_text:match("\n$") ~= nil

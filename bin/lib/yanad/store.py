@@ -333,8 +333,9 @@ def _validated_review_bundle(root, session_id, turn_id, bundle):
             raise Refused("review_unreadable", "bundle row has invalid home_buffer_only marker")
         if home_buffer_only is True and not isinstance(review_before, str):
             raise Refused("review_unreadable", "buffer-only bundle row has no review_before baseline")
-        if home_buffer_only is None and review_before is not None:
-            raise Refused("review_unreadable", "ordinary bundle row carries a buffer-only baseline")
+        # An ordinary row may carry B0 (the buffer text at submit) for a snapshotted file.
+        if home_buffer_only is None and review_before is not None and not isinstance(review_before, str):
+            raise Refused("review_unreadable", "ordinary bundle row has a non-string review_before")
         kept.append({key: item.get(key) for key in (
             "id", "path", "rel", "root", "root_index", "root_is_primary",
             "kind", "base_state", "base_hash", "base_mode",

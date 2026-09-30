@@ -48,7 +48,9 @@ local function filetype_for_buf(buf)
   return vim.filetype.match({ filename = name }) or ""
 end
 
-function M.selection_from_range(buf, l1, l2)
+-- opts.whole_buffer: a home-folder file's whole buffer goes to the agent uncut
+-- the line cap does not apply.
+function M.selection_from_range(buf, l1, l2, opts)
   if not (buf and vim.api.nvim_buf_is_valid(buf)) then
     return nil
   end
@@ -57,7 +59,7 @@ function M.selection_from_range(buf, l1, l2)
   local lines = vim.api.nvim_buf_get_lines(buf, l1 - 1, l2, false)
   local cap = config.options.context.max_selection_lines
   local truncated = false
-  if #lines > cap then
+  if #lines > cap and not (opts and opts.whole_buffer) then
     local sliced = {}
     for i = 1, cap do
       sliced[i] = lines[i]
@@ -129,12 +131,27 @@ function M.build(question, origin, selection, opts)
   local o = config.options
   local parts = {}
   local label = nil
-  local mode = opts.mode or config.resolve_mode(nil)
+  local mode = config.resolve_mode(opts.mode)
+  -- Stale HOME metadata must not override ask/agentic; only inline uses it.
+  local home_buffer = mode == "inline" and selection and selection.home_buffer_capture
+  -- Standalone default announces; callers suppress when the mini already heard this mode.
+  local announce = opts.announce_mode
+  if announce == nil then
+    announce = true
+  end
 
-  -- Inline needs review/scope guidance. Raw agentic mode deliberately does
-  -- not: it is the direct cursor-agent surface, with no inline review.
-  if (mode == "inline" or mode == "agent") and o.agent_instructions and o.agent_instructions ~= "" then
-    table.insert(parts, o.agent_instructions)
+  if announce then
+    local sentence = config.mode_instruction(mode)
+    if sentence then
+      table.insert(parts, sentence)
+      table.insert(parts, "")
+    end
+  end
+
+  -- Ordinary inline review/scope template only; HOME buffer-only skips it so
+  -- it cannot contradict the request-only no-file JSON constraint.
+  if mode == "inline" and not home_buffer and o.agent_instructions and o.agent_instructions ~= "" then
+    table.insert(parts, "For this request only: " .. o.agent_instructions)
     table.insert(parts, "")
   end
 
@@ -149,10 +166,11 @@ function M.build(question, origin, selection, opts)
     label = where
     local fence = selection.filetype and selection.filetype ~= "" and selection.filetype or ""
 
-    if selection.scope then
+    -- Scope enforcement text is an inline restriction; selected bytes stay in all modes.
+    if mode == "inline" and selection.scope then
       local describe = selection_scope.describe(selection.scope)
       if describe then
-        table.insert(parts, describe)
+        table.insert(parts, "For this request only: " .. describe)
         table.insert(parts, "")
       end
     end
@@ -174,8 +192,8 @@ function M.build(question, origin, selection, opts)
     table.insert(parts, "")
   end
 
-  if selection and selection.home_buffer_capture then
-    table.insert(parts, "This is a buffer-only HOME edit. Do not write any file. Your entire final response must be one JSON object with exactly one field, replacement_text, containing the complete proposed file text. Do not include a path, markdown fence, explanation, or trailing text.")
+  if home_buffer then
+    table.insert(parts, "This is a buffer-only HOME edit for this request only. Do not write any file. Your entire final response must be one JSON object with exactly one field, replacement_text, containing the complete proposed file text. Do not include a path, markdown fence, explanation, or trailing text.")
     table.insert(parts, "")
   end
 

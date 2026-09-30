@@ -108,6 +108,7 @@ lua/yana/ledger.lua
 lua/yana/ledger_record.lua
 lua/yana/log.lua
 lua/yana/notify.lua
+lua/yana/panel/conversation.lua
 lua/yana/panel/layout_depth.lua
 lua/yana/panel/panel_focus.lua
 lua/yana/panel/ui.lua
@@ -189,7 +190,6 @@ lua/yana/review_ownership.lua
 lua/yana/review_paint.lua
 lua/yana/review_park_census.lua
 lua/yana/review_park_snapshot.lua
-lua/yana/review_partition.lua
 lua/yana/review_permissions.lua
 lua/yana/review_queue.lua
 lua/yana/review_queued_hunks.lua
@@ -218,7 +218,6 @@ lua/yana/roots/model.lua
 lua/yana/roots/view.lua
 lua/yana/runtime/dependencies.lua
 lua/yana/runtime/dependencies_probe.lua
-lua/yana/runtime/long_scheduler.lua
 lua/yana/runtime/persisted_state.lua
 lua/yana/runtime/recovery_entry.lua
 lua/yana/runtime/sessions.lua
@@ -276,8 +275,6 @@ lua/yana/undo_action_split.lua
 lua/yana/undo_action_turn_step.lua
 lua/yana/yanad.lua
 plugin/yana.lua
-prompt.txt
-scripts/install-deps.sh
 scripts/release/archive.sh
 scripts/release/candidate.sh
 scripts/release/export.sh

@@ -12,6 +12,7 @@ local shadow_ops = require("yana.shadow.ops")
 local log = require("yana.log")
 local ledger = require("yana.ledger")
 local steer_channel = require("yana.agent.steer_channel")
+local conversation = require("yana.panel.conversation")
 
 local M = {}
 local uv = vim.uv or vim.loop
@@ -67,7 +68,6 @@ function M.new(deps)
   local update_winbar = deps.update_winbar
   local panel_open = deps.panel_open
   local preview_module = deps.preview_module
-  local remember_seat_session = deps.remember_seat_session
   local note_liveness_event = deps.note_liveness_event
 
 local function turn_evidence_dir(p)
@@ -83,7 +83,7 @@ end
 local function finish_assistant_block(p, result_obj, gen)
 	local o = config.options
 	-- Fallback: nothing rendered at all but we have a final result string.
-	local internal_proposal = p.turn_home_buffer_captures and p.turn_home_buffer_captures[gen]
+	local internal_proposal = require("yana.input.home_buffer_proposal").home_capture_of(p.turn_buffer_captures and p.turn_buffer_captures[gen])
 	if not internal_proposal and not p.rendered_any and result_obj and type(result_obj.result) == "string" and result_obj.result ~= "" then
 		append_stream(p, result_obj.result)
   end
@@ -138,7 +138,7 @@ end
     return true
   end
 
-  local function on_event_body(p, gen, obj)
+  local function on_event_body(p, gen, obj, mini)
   local stale = gen ~= p.turn_gen
   -- Provenance, record 2 of 3. Stamped for EVERY decoded event, stale ones
   -- included, before any gate can drop it: an event the panel never rendered
@@ -165,15 +165,11 @@ end
   end
   if obj.type == "system" and obj.subtype == "init" then
     ledger.mark(L, "session_init")
-    -- O1: once a seat has an id (resume / prior init), do not retarget it from
-    -- a later vendor echo — fixtures and flaky vendors must not drift the seat.
-    if p.session_id == nil or p.session_id == "" then
-      p.session_id = obj.session_id
-    end
-    remember_seat_session(p)
+    -- Bind only through Conversation against the launch-captured mini.
+    conversation.get(p):bind_upstream(mini, obj.session_id)
   elseif obj.type == "assistant" then
     local content = obj.message and obj.message.content or {}
-	local internal_proposal = p.turn_home_buffer_captures and p.turn_home_buffer_captures[gen]
+	local internal_proposal = require("yana.input.home_buffer_proposal").home_capture_of(p.turn_buffer_captures and p.turn_buffer_captures[gen])
     for _, item in ipairs(content) do
       if item.type == "text" then
         -- Streaming deltas carry timestamp_ms but NOT model_call_id. The
@@ -269,9 +265,8 @@ end
       p.turn_answers[gen] = obj.result
       p.last_answer_text = obj.result
     end
-    if p.session_id == nil or p.session_id == "" then
-      p.session_id = obj.session_id
-    end
+    local launch_owner = conversation.get(p)
+    launch_owner:bind_upstream(mini, obj.session_id)
     if usage then
       local lifecycle = require("yana.turn.turn_lifecycle")
       local function persist_usage(pass)
@@ -291,7 +286,6 @@ end
         persist_usage(shadow_pass)
       end
     end
-    remember_seat_session(p)
 		finish_assistant_block(p, obj, gen)
     local self_interrupted = p.self_interrupted
     if self_interrupted then
@@ -325,12 +319,12 @@ end
   end
   ledger.set_current_event(L, nil)
 end
-local function on_event(p, gen, obj)
+local function on_event(p, gen, obj, mini)
   -- Liveness first, and outside the render gate: the stamp is a fact about
   -- the PROCESS ("it produced output just now"), not about what the panel
   -- decided to draw, and it must survive every early return below.
   note_liveness_event(p, gen, obj)
-  with_render_gen(p, gen, on_event_body, p, gen, obj)
+  with_render_gen(p, gen, on_event_body, p, gen, obj, mini)
 end
 function S.maybe_drain_queue(p)
   if p.busy or p.job ~= nil or p.awaiting_exit or #p.queue == 0 or not panel_open(p) then

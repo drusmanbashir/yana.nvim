@@ -1,12 +1,13 @@
--- Turn settlement: ONE projection calculation, ONE journaled write door.
+-- Turn settlement: ONE projection calculation, two write doors.
 --
 -- F-APPLY-JOURNAL, F-HUMAN-SAVE. Ordinary own-file `:w` and End/abort
--- both come here, and both take exactly the same steps in exactly the same
--- order:
+-- both come here:
 --
---   snapshot -> turn_projection.compute -> acquire the existing file claim
---   -> invoke the existing diary-backed apply path -> File:record_projection,
---      and only after the write has actually succeeded.
+--   snapshot -> turn_projection.compute -> then either
+--   End with accepted content: final text into the buffer -> Neovim's `:write`, or
+--   `:w` during review, an accepted deletion, an accepted permission change:
+--   acquire the existing file claim -> the diary-backed apply path
+--   -> File:record_projection, only after the write has actually succeeded.
 --
 -- The composition bodies this module used to carry (its own line splitter,
 -- renderer, disk differ, hunk sorter, `compose_disk` and `compose_buffer`) are
@@ -14,13 +15,10 @@
 -- `yana.turn.turn_projection` is the only one now. Nothing here re-derives an
 -- action, target bytes or a mode.
 local projection = require("yana.turn.turn_projection")
-local creation_touch = require("yana.paths.creation_touch")
 local diff = require("yana.diff")
 local hash = require("yana.safety.hash")
 
 local M = {}
-
-local uv = vim.uv or vim.loop
 
 local snapshot = require("yana.turn.turn_settle_snapshot")
 
@@ -70,25 +68,6 @@ local function claim_context(f)
   }
 end
 
--- Defined below, with the other `record_projection` callers; named here so the
--- two reversal sites above it can reach it.
-local record_own_removal
-
---- Rejecting every hunk of a creation must leave the path ABSENT, and it goes
---- through the touch owner's own only-if-still-empty REVERSE -- R6's "existing
---- safe removal rule" -- not through a delete the applier would journal.
-local function reverse_untouched_creation(f, change, path)
-  local ok, err = creation_touch.remove(path)
-  if not ok then
-    return false, err
-  end
-  record_own_removal(f, path)
-  if type(change) == "table" and change.status == "pending" then
-    change.status = "rejected"
-  end
-  return true
-end
-
 -- The cached settlement evidence -- the stamp and the still-current comparison
 -- -- lives in `turn_settle_snapshot`. Re-exported so the settler interface the
 -- Turn deps table and every caller already use is unchanged.
@@ -106,46 +85,84 @@ local function record(f, projection_record)
   return f:record_projection(projection_record)
 end
 
---- THE REVERSE of the forward rebase `creation_touch.on_proposal` performs.
---- The touch brings the path into existence and stamps the change with
---- `base_state = "file"`; removing that touch has to put the stamp back, or the
---- change still claims a world this Turn itself dismantled. A later accepted
---- decision then prepares its write against that stale claim and the applier
---- refuses Yana's own removal as if a stranger had done it -- "this file
---- existed when the change was prepared and has been removed since".
----
---- Written through `File:record_projection`, the one door for rebased applier
---- evidence: no second writer of change evidence. `base_hash` is restated as
---- the empty hash because the applier requires a well-formed fingerprint for
---- every tag; for an absent base it compares nothing else, so the touch-time
---- mode is simply no longer consulted.
----
---- ONLY after the path is OBSERVED absent. `creation_touch.remove` answering
---- yes is not the same as the path being gone, and a base of "absent" recorded
---- over a path something still occupies would license exactly the overwrite
---- general drift refusal exists to stop.
-function record_own_removal(f, path)
-  local ok, err
-  if uv.fs_lstat(path) ~= nil then
-    ok, err = false, "the path still exists"
-  else
-    ok, err = record(f, {
-      path = path,
-      base_state = "absent",
-      base_hash = hash.hash_bytes(""),
-    })
+--- The buffer End saves a file through: the Turn file's own buffer, else the
+--- buffer snapshotted at submit, else a buffer loaded for the path now. The
+--- second answer says whether this module loaded it, so it can be wiped after.
+local function save_buffer_for(f, change, path)
+  if snapshot.valid_buffer(f.bufnr) and vim.api.nvim_buf_is_loaded(f.bufnr) then
+    return f.bufnr, false
+  end
+  local capture = type(change.buffer_capture) == "table" and change.buffer_capture or nil
+  local captured = capture and capture.bufnr
+  if snapshot.valid_buffer(captured) and vim.api.nvim_buf_is_loaded(captured) then
+    return captured, false
+  end
+  local existing = vim.fn.bufnr(path, false)
+  if existing > 0 and vim.api.nvim_buf_is_loaded(existing) then
+    return existing, false
+  end
+  local bufnr = vim.fn.bufadd(path)
+  vim.fn.bufload(bufnr)
+  return bufnr, true
+end
+
+--- END SAVES THROUGH NEOVIM'S OWN WRITE: the final text goes into the buffer, then
+--- `:write!` saves it. No disk read, no fingerprint check. The bang is what
+--- keeps a file another program changed after submit from stopping End with
+--- Neovim's changed-since-reading question. Yana's own write guard on a review
+--- buffer (`review_open_save.lua`, BufWriteCmd) is skipped for this one write,
+--- so Neovim writes the file itself; every other write event still fires.
+--- The modified flag is Neovim's: the write clears it, Yana never touches it.
+local function write_through_buffer(f, change, path, plan)
+  local bufnr, loaded_here = save_buffer_for(f, change, path)
+  if not vim.bo[bufnr].modifiable then
+    return false, "nomodifiable"
+  end
+  local lines = plan.buffer_lines
+  if lines == nil or bufnr ~= f.bufnr then
+    lines = vim.split(plan.bytes, "\n", { plain = true })
+    if plan.bytes:sub(-1) == "\n" then
+      table.remove(lines)
+    end
+    if vim.bo[bufnr].fileformat == "dos" then
+      for index, line in ipairs(lines) do
+        lines[index] = line:gsub("\r$", "")
+      end
+    end
+    if #lines == 0 then
+      lines = { "" }
+    end
+  end
+  local wants_eol = plan.bytes:sub(-1) == "\n"
+  local ok, err = pcall(function()
+    if not vim.deep_equal(vim.api.nvim_buf_get_lines(bufnr, 0, -1, false), lines) then
+      require("yana.review_watch").own_splice(bufnr, function()
+        vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, lines)
+      end)
+    end
+    vim.bo[bufnr].fixendofline = wants_eol
+    vim.bo[bufnr].endofline = wants_eol
+    local dir = vim.fn.fnamemodify(path, ":h")
+    if dir ~= "" then
+      vim.fn.mkdir(dir, "p")
+    end
+    local ignored = vim.o.eventignore
+    vim.o.eventignore = (ignored == "" and "" or ignored .. ",") .. "BufWriteCmd,FileWriteCmd,FileAppendCmd"
+    local wrote, write_err = pcall(vim.api.nvim_buf_call, bufnr, function()
+      vim.cmd("silent keepalt keepjumps write!")
+    end)
+    vim.o.eventignore = ignored
+    if not wrote then
+      error(write_err, 0)
+    end
+  end)
+  if loaded_here and vim.api.nvim_buf_is_valid(bufnr) then
+    pcall(vim.api.nvim_buf_delete, bufnr, { force = true })
   end
   if not ok then
-    -- Never a settle refusal: the removal itself succeeded. It is a LATER
-    -- accept that will refuse, so say here why, or that refusal arrives with
-    -- no trace of the decision that caused it.
-    pcall(function()
-      require("yana.log").write("WARN", string.format(
-        "turn settle removed its own creation at %s but did not record the absent base: %s",
-        tostring(path), tostring(err)))
-    end)
+    return false, tostring(err)
   end
-  return ok, err
+  return true
 end
 
 --- Validate an ordinary own-file save request against the retained state.
@@ -226,28 +243,6 @@ local function run(f, purpose, request, done)
     finish(false, tostring(input), { phase = "snapshot", written = false })
     return answer()
   end
-  local capture = change.home_buffer_capture
-  if purpose == "exit" and capture and change.status == "rejected" then
-    local expected_identity = tostring(capture.ino) .. ":" .. tostring(capture.dev)
-    if not input.disk.exists or input.disk.bytes ~= capture.disk_bytes or input.disk.identity ~= expected_identity then
-      finish(false, "buffer-only target changed on disk before rejected review could close", {
-        phase = "projection", written = false,
-      })
-      return answer()
-    end
-    local live = snapshot.valid_buffer(f.bufnr) and diff.buffer_bytes_snapshot(f.bufnr) or nil
-    if live ~= capture.buffer_bytes then
-      finish(false, "buffer-only human baseline changed before rejected review could close", {
-        phase = "projection", written = false,
-      })
-      return answer()
-    end
-    -- Rejecting every agent hunk is not permission to save the operator's
-    -- pre-existing unsaved buffer. Preserve it and close with no write door.
-    vim.bo[f.bufnr].modified = capture.buffer_bytes ~= capture.disk_bytes
-    finish(true, nil, { phase = "settled", written = false })
-    return answer()
-  end
   local plan, reason = projection.compute(input)
   if plan == nil then
     finish(false, reason, { phase = "projection", written = false })
@@ -290,51 +285,20 @@ local function run(f, purpose, request, done)
     return true
   end
 
-  -- A CREATION NOBODY ACCEPTED disappears through the touch owner's own
-  -- only-if-still-empty reverse, which is the existing safe removal rule R6
-  -- names. The projection decided that it must be absent; this is how.
-  if plan.action == "delete" and snapshot.creation(f, change) then
-    local removed, remove_err = reverse_untouched_creation(f, change, path)
-    finish(removed, remove_err, { phase = "reverse_creation", written = removed == true })
-    return answer()
-  end
-
   -- A RETAINED COMMIT RECEIPT means an earlier attempt committed this operation
-  -- and only its readback or reconcile failed. The operation is NOT repeated.
+  -- through the journaled writer and only its readback or buffer reconcile
+  -- failed. The operation is NOT repeated when the retry would write exactly
+  -- what that commit wrote: the receipt carries the action, bytes and mode it
+  -- committed, and they are compared with this projection. The file on disk is
+  -- not read.
+  -- A projection that now differs falls through to the write below.
   local receipt = type(f.commit_receipt) == "table" and f.commit_receipt or nil
-
-  -- THE PROJECTION CANNOT ALWAYS SEE THAT COMMIT. `turn_projection` compares
-  -- the target against `last_verified_disk`, and a write whose readback failed
-  -- never got to refresh that record -- it still describes the file from BEFORE
-  -- the write. So the projection says `replace` for an operation already on
-  -- disk, and the write door runs a second time for one End.
-  --
-  -- THE PROOF, AND IT IS THE WHOLE FILE. The retained receipt says an operation
-  -- committed and carries `postcommit`: exactly what that commit left on disk.
-  -- The retry re-reads disk NOW and every part must still agree -- existence,
-  -- bytes, permissions and file IDENTITY -- and the terminal projection's own
-  -- mode must agree too, so a projection that now wants different permissions
-  -- is not silently satisfied by the old ones.
-  --
-  -- Bytes alone were not enough, and that was the earlier mistake here: a file
-  -- can hold the right text with the wrong mode, and a different inode can hold
-  -- an identical copy. Neither is the operation we committed. A receipt is
-  -- never proof by itself; it only says which operation to look for.
-  --
-  -- Anything short of full agreement falls through to the guarded write door
-  -- below, where a real refusal is still a real refusal.
-  local committed_already = false
-  if receipt ~= nil and plan.action == "replace" and type(receipt.postcommit) == "table" then
-    local landed, now = receipt.postcommit, input.disk
-    committed_already = type(now) == "table"
-      and now.exists == true
-      and landed.exists == true
-      and now.bytes == plan.bytes
-      and now.bytes == landed.bytes
-      and now.mode == landed.mode
-      and now.identity == landed.identity
-      and (plan.mode == nil or plan.mode == now.mode)
-  end
+  local committed = receipt and type(receipt.committed) == "table" and receipt.committed or nil
+  local committed_already = committed ~= nil
+    and plan.action ~= "none"
+    and committed.action == plan.action
+    and committed.bytes == plan.bytes
+    and committed.mode == plan.mode
 
   if plan.action == "none" or committed_already then
     -- A confirmed no-op IS an outcome: nothing to write, so the terminal text
@@ -353,9 +317,28 @@ local function run(f, purpose, request, done)
       diary_dir = receipt and receipt.diary_dir or nil,
       op_id = receipt and receipt.op_id or nil,
     }
+    f:clear_receipt()
+    finish(true, nil, detail)
+    return answer()
+  end
+
+  -- END SAVES ACCEPTED CONTENT THROUGH THE BUFFER. Only an accepted deletion
+  -- and an accepted permission change stay on the journaled writer below, as
+  -- does an own-file `:w` during review (purpose "save").
+  if purpose == "exit" and plan.action == "replace" and plan.mode == input.original.mode then
+    local wrote, write_err = write_through_buffer(f, change, path, plan)
+    if not wrote then
+      finish(false, write_err, { phase = "write", written = false })
+      return answer()
+    end
+    local detail = { phase = "write", written = true, via = "buffer" }
+    -- What was written is known exactly, so the change's evidence moves to it
+    -- without reading the file back.
     local recorded, record_err = record(f, {
       path = path,
-      last_verified_disk = input.disk,
+      bytes = plan.bytes,
+      base_hash = hash.hash_bytes(plan.bytes),
+      base_state = "file",
     })
     if not recorded then
       detail.unrecorded = record_err
@@ -430,17 +413,14 @@ local function run(f, purpose, request, done)
       written = true,
       diary_dir = type(applied) == "table" and applied.diary_dir or nil,
       op_id = type(applied) == "table" and applied.op_id or nil,
+      -- The operation this commit performed, as the projection described it:
+      -- a retry spends this receipt only while it would write the same thing.
+      committed = { action = plan.action, bytes = plan.bytes, mode = plan.mode },
     }
     if type(applied) == "table" and applied.reconcile_error ~= nil then
-      -- COMMITTED, BUT NOT READ BACK. Disk holds the operation; the receipt is
-      -- retained on the File so the retry reuses it instead of writing again.
-      -- WHAT THE COMMIT LEFT ON DISK is captured here, in full -- existence,
-      -- bytes, permissions and file identity -- because on the retry that is
-      -- the only description of the operation we actually performed. Bytes
-      -- alone cannot stand for it: a file can carry the right text with the
-      -- wrong mode, or be a different inode holding an identical copy.
+      -- COMMITTED, BUT NOT READ BACK. The receipt is retained on the File so
+      -- the retry reuses it instead of writing again.
       detail.phase = "readback"
-      detail.postcommit = snapshot.disk_evidence(path)
       record(f, { path = path, receipt = detail })
       f:hold_commit(detail)
       finish(false, applied.reconcile_error, detail)
@@ -458,14 +438,15 @@ local function run(f, purpose, request, done)
       finish(false, reconcile_err, detail)
       return
     end
-    local on_disk = snapshot.disk_evidence(path)
+    -- The applier verified what it committed; the evidence moves to those
+    -- known values without this module reading the file back.
+    local deleted = plan.action == "delete"
     local recorded, record_err = record(f, {
       path = path,
-      bytes = on_disk.exists and on_disk.bytes or nil,
-      base_hash = on_disk.exists and on_disk.bytes and hash.hash_bytes(on_disk.bytes) or nil,
-      base_state = on_disk.exists and "file" or nil,
-      base_mode = on_disk.mode,
-      last_verified_disk = on_disk,
+      bytes = (not deleted) and plan.bytes or nil,
+      base_hash = hash.hash_bytes(deleted and "" or plan.bytes),
+      base_state = deleted and "absent" or "file",
+      base_mode = (not deleted) and plan.mode or nil,
       receipt = detail,
     })
     if not recorded then
@@ -522,50 +503,20 @@ local function run(f, purpose, request, done)
   return answer()
 end
 
---- Settle one Turn file at End or abort. A real-tree projection is
---- asynchronous because its file.claim is won at this write door, then consumed
---- immediately by the journaled applier. `done` is called once; a pending
+--- Settle one Turn file at End or abort. Accepted content is saved through
+--- the buffer, synchronously. An accepted deletion or permission change is
+--- asynchronous because its file.claim is won at the journaled write door,
+--- then consumed immediately by the applier. `done` is called once; a pending
 --- return is not success.
 function M.settle(f, done)
   return run(f, "exit", nil, done)
 end
 
---- Ordinary own-file `:w`. Same steps, same order, same single projection
---- calculation and same journaled write door as `settle`; only the purpose and
---- the withheld buffer reconcile differ.
+--- Ordinary own-file `:w`. Same steps, same order and same single projection
+--- calculation as `settle`, always through the journaled write door; End
+--- saves accepted content through the buffer instead.
 function M.save(f, request, done)
   return run(f, "save", request, done)
-end
-
---- Remove the creation touches of files an Abort leaves UNDECIDED. An ACCEPTED
---- creation is a decision the Abort preserves.
----
---- BOTH questions are answered by the File, never by `change.before`. That
---- field is REBASED -- by an accepted write, and by an ordinary save -- so
---- `creation_touch.is_creation`, which reads it, silently changes its answer
---- under both. It hid two opposite defects: a non-empty accepted creation
---- survived only because its write had rebased it, while a zero-byte accepted
---- one was deleted, and a saved unaccepted empty creation was left behind.
---- `f.operation` is fixed from `change.kind` when the change is first seen and
---- never replaced; `f:accepted()` is the verdict. `is_creation` remains only as
---- the fallback for a turn entry that never became a File.
-function M.reverse_turn_creations(files)
-  local refused = {}
-  for _, f in ipairs(files or {}) do
-    local change = f.change
-    local accepted = type(f.accepted) == "function" and f:accepted() == true
-    local created_here = (f.operation == "create") or creation_touch.is_creation(change)
-    if created_here and not accepted then
-      local path = (type(change) == "table" and change.path) or f.path
-      local ok, err = creation_touch.remove(path)
-      if not ok then
-        refused[#refused + 1] = { path = path, err = tostring(err) }
-      else
-        record_own_removal(f, path)
-      end
-    end
-  end
-  return refused
 end
 
 return M

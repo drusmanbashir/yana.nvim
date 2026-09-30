@@ -1,27 +1,18 @@
 local hunks_lib = dofile((debug.getinfo(1, "S").source:sub(2)):match("^(.*)/tests/") .. "/tests/headless/lib/hunks.lua")
 -- turn_smoke.lua — the fresh-install smoke that actually spawns a turn.
 --
--- tests/release/smoke.lua (the pre-existing fresh-install check) calls
--- yana.setup() and opens/closes the panel, but never submits a prompt, so a
--- runtime module reachable only from inside a real turn is invisible to it
--- either way it can go missing: a direct, unconditional require() (like
--- lua/yana/agent/agent.lua's `require("yana.agent.vendor_stream")`, which runs on every
--- turn-launch) or a guarded pcall(require, ...) (like
--- lua/yana/inline_diff.lua's `pcall(require, "yana.timeline.retrace")`,
--- which degrades SILENTLY -- no error at all, undo just stops crossing
--- files -- exactly the operator's live-nvim symptom this lane was opened
--- to fix). Both holes shipped once with every ordinary gate green; this is
--- the test that would have caught either regardless of how the missing
--- module was loaded.
+-- Setup alone cannot prove that modules reached only during a turn shipped.
+-- Drive a real confined turn from the installed tree, then exercise acceptance,
+-- native undo after review closes, and an explicit save of the undone buffer.
 --
 -- Driven through the ORDINARY product path, no shortcuts: yana.panel.ui.open() +
 -- yana.panel.ui.submit(), mode = "inline" (the confined path, real bwrap overlay,
 -- same mechanism tests/release/confined_turn_smoke.lua already proves
 -- works from an exported tree), with tests/release/turn_smoke_agent as the
 -- fixture -- see that file's header for why it differs from
--- tests/release/fake-cursor-agent. One turn: hunk appears, the real file is
--- proven unchanged while review is open, then accept and prove safe End applies
--- the fixture's exact edit to the buffer and disk.
+-- tests/release/fake-cursor-agent. Accepting the only hunk ends the review and
+-- saves the accepted bytes. After End, ordinary Neovim undo changes only the
+-- buffer; writing that buffer saves the restored bytes.
 --
 -- ENVIRONMENT: needs YANA_TURN_SMOKE_SCRATCH, a writable directory OUTSIDE
 -- /tmp (same requirement, same reason, as tests/headless_gate.sh and
@@ -70,9 +61,16 @@ local workspace = scratch .. "/ws"
 vim.fn.delete(workspace, "rf")
 vim.fn.mkdir(workspace, "p")
 local target = workspace .. "/notes.txt"
+local expected = "alpha\nbeta\ngamma\n"
 local fh = assert(io.open(target, "wb"))
-fh:write("alpha\nbeta\ngamma\n")
+fh:write(expected)
 fh:close()
+local function disk_bytes()
+  local file = assert(io.open(target, "rb"))
+  local bytes = file:read("*a")
+  file:close()
+  return bytes
+end
 
 vim.env.YANA_TURN_SMOKE_TARGET = "notes.txt"
 require("yana.shadow.preview")._test.force_state_root = scratch .. "/state"
@@ -168,16 +166,11 @@ vim.api.nvim_win_set_cursor(win, { live_start, 0 })
 local cursor_row = vim.api.nvim_win_get_cursor(win)[1]
 check(cursor_row >= live_start and cursor_row <= live_end, "cursor is inside the live accept range")
 vim.cmd("redraw")
+check(disk_bytes() == expected, "pending review has not saved its proposal")
 
 -- Accept the (only) hunk -- "ca", the exact key the product's own
 -- notification names ("yana: review notes.txt — ca accept · cr reject").
-local original = "alpha\nbeta\ngamma\n"
-local expected = original .. "turn smoke edit\n"
-local fh = assert(io.open(target, "rb"))
-local before_accept_disk = fh:read("*a")
-fh:close()
-check(before_accept_disk == original, "notes.txt on disk stays original while the hunk is open")
-
+-- The final hunk invokes End; subsequent undo is Neovim's own buffer undo.
 local accept_sent = false
 vim.schedule(function()
   vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("ca", true, false, true), "x", false)
@@ -190,18 +183,34 @@ local closed = vim.wait(15000, function()
 end, 25)
 check(closed, "review closed after accepting the hunk")
 
--- When no pending hunks remain, ca triggers the safe End path. Wait for both
--- the review to close and the journaled applier to update the buffer and file.
-local applied = vim.wait(15000, function()
-  local read_fh = assert(io.open(target, "rb"))
-  local disk_bytes = read_fh:read("*a")
-  read_fh:close()
-  local buffer_bytes = table.concat(vim.api.nvim_buf_get_lines(review_bufnr, 0, -1, false), "\n") .. "\n"
-  return inline.active_state({ workspace = workspace }) == nil
-    and disk_bytes == expected
-    and buffer_bytes == expected
-end, 25)
-check(applied, "safe End applies exact fixture edit to review buffer and disk")
+-- The review buffer already shows the hunk before accept (the closed check
+-- above is what proves accept ran); this proves undo has bytes to restore,
+-- so the buffer check after undo cannot pass on an unchanged buffer.
+local accepted_bytes = table.concat(vim.api.nvim_buf_get_lines(review_bufnr, 0, -1, false), "\n") .. "\n"
+check(accepted_bytes ~= expected, "review buffer holds the turn's change before undo")
+check(disk_bytes() == accepted_bytes, "accepting the last hunk saved the accepted bytes")
+
+vim.cmd("messages clear")
+local undo_ok, undo_err = pcall(function()
+  vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("u", true, false, true), "x", false)
+end)
+check(undo_ok, "undo keypress did not throw: " .. tostring(undo_err))
+vim.cmd("redraw")
+
+local msgs = vim.fn.execute("messages")
+local looks_like_error = msgs:find("E%d%d%d", 1) ~= nil
+  or msgs:find("stack traceback", 1, true) ~= nil
+  or msgs:find("attempt to", 1, true) ~= nil
+check(not looks_like_error, "no Lua/Vim error appears in :messages after undo (got: " .. msgs .. ")")
+
+local buffer_bytes = table.concat(vim.api.nvim_buf_get_lines(review_bufnr, 0, -1, false), "\n") .. "\n"
+check(buffer_bytes == expected, "undo restored review buffer bytes exactly")
+check(disk_bytes() == accepted_bytes, "native undo leaves the accepted disk bytes until a save")
+local write_ok, write_err = pcall(vim.api.nvim_buf_call, review_bufnr, function()
+  vim.cmd("write")
+end)
+check(write_ok, "saving the undone buffer did not throw: " .. tostring(write_err))
+check(disk_bytes() == expected, "explicit save restored the original disk bytes")
 
 if #failures > 0 then
   print(string.format("FAILED %d check(s)", #failures))

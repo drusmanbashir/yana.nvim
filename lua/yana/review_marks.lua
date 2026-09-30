@@ -3,7 +3,6 @@ local M = {}
 
 function M.new(deps)
   local M = deps.facade
-  local diff = deps.diff
   local NS = deps.ns
   local AUTH_NS = deps.authority_ns
   local late = deps.late
@@ -215,27 +214,10 @@ function M._compose_buffer_owned_lines(bufnr, blocks, range)
   return out, #kept, first_reason, skipped
 end
 
----
---- True iff buffer-owned text differs from the bytes on disk. Human text outside every
---- pending hunk passes through the substitution unchanged and is exactly what can make
---- this true.
----
---- `blocks` is the caller's current PENDING set (nil/empty means "none
---- pending here", e.g. after the buffer has been fully reset to turn-start
---- bytes) -- a block already decided (no live extmark) is harmlessly skipped
---- by `_compose_buffer_owned_lines` rather than substituted.
----
---- `path` with no readable disk bytes (new/unwritten file) yields
---- `modified = true`, matching Vim's own reading of a buffer with nothing on
---- disk yet.
-function M._recompute_modified(bufnr, blocks, path)
-  if not (bufnr and vim.api.nvim_buf_is_valid(bufnr)) then
-    return
-  end
-  local composed = M._compose_buffer_owned_lines(bufnr, blocks or {})
-  local composed_bytes = M._encode_buffer_lines(bufnr, composed)
-  local on_disk = path and diff.read_file_bytes(path) or nil
-  vim.bo[bufnr].modified = not (on_disk ~= nil and composed_bytes == on_disk)
+--- Neovim owns the modified flag, so a decision no longer sets it by
+--- comparing the buffer with the file on disk. Kept as a no-op for its four
+--- callers outside this module until they are removed.
+function M._recompute_modified(_bufnr, _blocks, _path)
 end
 
   return {

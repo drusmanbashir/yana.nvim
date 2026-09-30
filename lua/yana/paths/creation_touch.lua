@@ -1,5 +1,10 @@
 -- The creation TOUCH OWNER.
 --
+-- A proposed new file is NOT touched when the turn proposes it any more: the
+-- review opens an empty buffer and nothing reaches disk until End saves an
+-- accepted creation through that buffer. The pair below stays only for its remaining
+-- callers (the review-open creation branch and the file-creation undo action).
+--
 -- ONE small module holding ONE pair, and nothing else creates or removes a
 -- proposed file:
 --   FORWARD  `touch`  -- bring the proposed path into existence, EMPTY.
@@ -178,40 +183,6 @@ end
 --- Test seam: forget every live touch without touching disk.
 function M._reset()
   M._live = {}
-end
-
---- Called once per agent-proposed NEW file, the moment the turn proposes it, with
---- `change.path` absolute, `change.rel` set and `change.review_workspace` stamped.
----
---- Three things happen here and nowhere else: 1. FORWARD -- the file comes into
---- existence, EMPTY. An OCCUPIED path is REFUSED, never adopted; the refusal is stamped
---- on the change so the panel renders it instead of claiming a queued review.
-function M.on_proposal(change)
-  if not M.is_creation(change) or change._creation_touched then
-    return false
-  end
-  local path = change.path
-  local ok, err = M.touch(path)
-  if not ok then
-    change.review_error = tostring(err)
-    return false
-  end
-  change._creation_touched = true
-  local st = diff._fs.stat(path)
-  change.base_state = "file"
-  change.base_hash = require("yana.safety.hash").hash_bytes("")
-  change.base_mode = st and (st.mode % 0x1000) or change.base_mode
-  change.base_hash_captured_ts = os.time()
-  pcall(function()
-    require("yana.turn.turn_register"):owe({
-      kind = "file_touch",
-      rel = change.rel,
-      path = path,
-      workspace = change.review_workspace,
-      turn_id = change.turn_id or change.turn_gen,
-    })
-  end)
-  return true
 end
 
 return M

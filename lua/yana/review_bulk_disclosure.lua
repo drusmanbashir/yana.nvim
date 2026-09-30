@@ -28,11 +28,11 @@ function M.emit(state, drained, log, notify_one_line)
     table.concat(disclose_paths, ", ")
   )
 
-  log.write("WARN", disclose_msg)
+  log.write("INFO", disclose_msg)
   notify_one_line(disclose_msg, vim.log.levels.INFO)
 
-  -- Durable too, since INFO never reaches disk (log.lua) and this is the half a live
-  -- run is read back for.
+  -- Logged as well as notified: INFO reaches disk at the default floor (log.lua),
+  -- and the log file is the half a live run is read back for.
   local parked_covered = 0
   for _, item in ipairs(drained) do
     if item.change and item.change._parked_review then
@@ -44,7 +44,7 @@ function M.emit(state, drained, log, notify_one_line)
       "yana: accept-all covers %d parked change(s) -- parking is navigation, not a decision",
       parked_covered
     )
-    log.write("WARN", parked_msg)
+    log.write("INFO", parked_msg)
     notify_one_line(parked_msg, vim.log.levels.INFO)
   end
 end
