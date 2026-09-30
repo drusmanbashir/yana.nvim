@@ -20,6 +20,8 @@ Versioning.
 - Remove private machine references from shipped text and check SVG and ignore
   rules for private paths too. Correct manual setup and configuration examples.
 - Match archive permissions to the four non-executable shell libraries.
+- Audit already-published legacy files using exact historical exceptions while
+  retaining the stricter exclusions for new releases.
 
 ## 0.1.0-alpha.14 - 2026-09-23
 

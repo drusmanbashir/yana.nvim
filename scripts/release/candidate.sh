@@ -63,7 +63,9 @@ semver_tag_ok() {
 # Narrow retired exception: only this path may appear outside path classes,
 # and only when present in that commit's own manifest (tree==manifest).
 retired_history_exception() {
-	[[ "$1" == "bin/yana-ollama-agent" ]]
+	local path=$1 commit=$2 blob=$3
+	[[ "$path" == "bin/yana-ollama-agent" ]] && return 0
+	history_exception HISTORY_RETIRED_PATH_EXCEPTIONS "$commit" "$path" "$blob"
 }
 
 # Exact legacy-history exceptions. Public main history published before
@@ -96,12 +98,25 @@ readonly HISTORY_FORBIDDEN_BYTES_EXCEPTIONS=(
 # for a file in HISTORY_PRIVATE_PATH_FILES, never at HEAD, and only when every
 # hit in that blob comes from the private path pattern alone. Rows and blobs were
 # read from public main d3027d895bf8abe387af45fb47eb77c58e2e8b3b.
-readonly PRIVATE_PATH_PATTERN_SHA256=0f1d582a544678750f92acc606ba88b8c229843da20bd0c2f51723f58e14783a
+# Historical private-path hits are named by exact public commit, path, and blob.
+readonly PRIVATE_PATH_PATTERN_SHA256S=(
+	33a8bc77e3cd8a51c35e64aafe315e4f447abddf693e2d79f0335ae1420d0130
+	12846e174cfd4dc69202bc9c66ff3f586ca1e18d7cfba204a1d6c6e4a8e5c7d7
+)
 readonly HISTORY_PRIVATE_PATH_FILES=(
+	README.md
+	bin/yana-overlay
+	bin/yana-sandbox
+	doc/yana.txt
 	lua/yana/config.lua
 	lua/yana/debug_keys.lua
+	lua/yana/health.lua
+	lua/yana/inline_diff.lua
+	lua/yana/review_hunk_split.lua
+	lua/yana/review_watch_ownership.lua
 	lua/yana/timeline/retrace.lua
 	scripts/release/candidate.sh
+	scripts/release/forbidden-patterns.txt
 	scripts/release/verify.sh
 	tests/release/blink_gate.sh
 	tests/release/confined_turn_gate.sh
@@ -112,26 +127,85 @@ readonly HISTORY_PRIVATE_PATH_FILES=(
 	tests/release/policy_mutation_gate.sh
 )
 readonly HISTORY_PRIVATE_PATH_EXCEPTIONS=(
+	"0a28a882bd28f4c2992ae222efc25254d6bd15d0 bin/yana-sandbox 3801796811668c8c5a2f4d80d2cf68209be47cbd"
+	"0a28a882bd28f4c2992ae222efc25254d6bd15d0 lua/yana/health.lua 9a0ea52438a46fffb32805d064a6462e35911121"
+	"0a28a882bd28f4c2992ae222efc25254d6bd15d0 scripts/release/forbidden-patterns.txt 4af141cf6607f09b22f25dd9e13c3985bc0156ca"
+	"0a28a882bd28f4c2992ae222efc25254d6bd15d0 scripts/release/verify.sh 319a66568d35f7d2d8c01c1e22cb0da35600bd24"
+	"158edf6a78c8fd33e70feceeed873f974449c292 bin/yana-sandbox 0b898c9d4df88d90500accb42a7470b50a26b064"
+	"158edf6a78c8fd33e70feceeed873f974449c292 doc/yana.txt 9685d3795a83fcfb1571cfadb28dbad71230be13"
+	"158edf6a78c8fd33e70feceeed873f974449c292 lua/yana/health.lua ffe2ea782880baf2c735778192815cd38538971d"
+	"158edf6a78c8fd33e70feceeed873f974449c292 scripts/release/forbidden-patterns.txt cd0f94a93b08a9fd310b9f0f4fc6b38c42fc9882"
+	"158edf6a78c8fd33e70feceeed873f974449c292 scripts/release/verify.sh a965e55c339b62964d472ba3512d7b529b246434"
+	"320498604b018c62aeb80cc8238e22020f2029f0 bin/yana-overlay f8c1ba7d24de089aff0832164c6fbe5cc33bfc23"
+	"320498604b018c62aeb80cc8238e22020f2029f0 bin/yana-sandbox 3801796811668c8c5a2f4d80d2cf68209be47cbd"
+	"320498604b018c62aeb80cc8238e22020f2029f0 doc/yana.txt 70b417e60e9d71dca3a67b9072d2b81a5fc2a204"
 	"320498604b018c62aeb80cc8238e22020f2029f0 lua/yana/config.lua e2d30b58f58cef5376942d3e5f840a45f5043c06"
-	"417296195c34106b677da88c6c221982fff88774 lua/yana/config.lua 84c2de174ab6f8831c275e610bc9de71ee18b9dd"
-	"42615dbe02aa6b08bbd30e736c429d9abd087430 lua/yana/config.lua e2d30b58f58cef5376942d3e5f840a45f5043c06"
-	"540fd07fc58b6c78b430ef27d9567bf3091412e9 lua/yana/config.lua e9fece2078e33b8770a492bdfe94b2afeb6ee592"
-	"a7a60922fcf426e524ca1ccb1905d9b6fa44471c lua/yana/config.lua e9fece2078e33b8770a492bdfe94b2afeb6ee592"
-	"d3027d895bf8abe387af45fb47eb77c58e2e8b3b lua/yana/config.lua e9fece2078e33b8770a492bdfe94b2afeb6ee592"
-	"dec5e27153c63e0529731ac5ba017028ddb0504b lua/yana/config.lua e2d30b58f58cef5376942d3e5f840a45f5043c06"
-	"e4fb25691dcd79e287f7847b3f4ea8c8f9449b3c lua/yana/config.lua 12b75d623587663c56d2ffd4bdd74ce3db8653ba"
-	"edaff51e254f61a0d1ac0c90f8ac75c5d74ee954 lua/yana/config.lua e2d30b58f58cef5376942d3e5f840a45f5043c06"
-	"f842a14c13548eb4696252c5d62339fd9c49aed0 lua/yana/config.lua e9fece2078e33b8770a492bdfe94b2afeb6ee592"
-	"7a2fe1ecb80e3a84e18ba659c551d80814fe51bb lua/yana/debug_keys.lua b01c44090de42d93123cf7b842ee5eb027a27372"
+	"320498604b018c62aeb80cc8238e22020f2029f0 lua/yana/health.lua 1cbda453e46b403e3cb1d8826432f8569f514bf9"
+	"320498604b018c62aeb80cc8238e22020f2029f0 lua/yana/inline_diff.lua caf793af8272b43b417cc1fb2a2d441f931ad47b"
 	"320498604b018c62aeb80cc8238e22020f2029f0 lua/yana/timeline/retrace.lua b0868fe28b536915e6b0e9924ea92ca287206d50"
+	"320498604b018c62aeb80cc8238e22020f2029f0 scripts/release/forbidden-patterns.txt 4af141cf6607f09b22f25dd9e13c3985bc0156ca"
+	"320498604b018c62aeb80cc8238e22020f2029f0 scripts/release/verify.sh 2fa32c79cc6129036aaa2111f34afd55bc20cc1d"
+	"417296195c34106b677da88c6c221982fff88774 bin/yana-sandbox 3801796811668c8c5a2f4d80d2cf68209be47cbd"
+	"417296195c34106b677da88c6c221982fff88774 lua/yana/config.lua 84c2de174ab6f8831c275e610bc9de71ee18b9dd"
+	"417296195c34106b677da88c6c221982fff88774 lua/yana/health.lua 60807bdcc5aab93803d08c9122d3e509a10c4ac5"
+	"417296195c34106b677da88c6c221982fff88774 scripts/release/forbidden-patterns.txt 4af141cf6607f09b22f25dd9e13c3985bc0156ca"
+	"417296195c34106b677da88c6c221982fff88774 scripts/release/verify.sh 2fa32c79cc6129036aaa2111f34afd55bc20cc1d"
+	"42615dbe02aa6b08bbd30e736c429d9abd087430 bin/yana-overlay f8c1ba7d24de089aff0832164c6fbe5cc33bfc23"
+	"42615dbe02aa6b08bbd30e736c429d9abd087430 bin/yana-sandbox 3801796811668c8c5a2f4d80d2cf68209be47cbd"
+	"42615dbe02aa6b08bbd30e736c429d9abd087430 doc/yana.txt 70b417e60e9d71dca3a67b9072d2b81a5fc2a204"
+	"42615dbe02aa6b08bbd30e736c429d9abd087430 lua/yana/config.lua e2d30b58f58cef5376942d3e5f840a45f5043c06"
+	"42615dbe02aa6b08bbd30e736c429d9abd087430 lua/yana/health.lua 36d3a8dba0e035880058e2e9e9ed74330a8345d2"
+	"42615dbe02aa6b08bbd30e736c429d9abd087430 lua/yana/inline_diff.lua caf793af8272b43b417cc1fb2a2d441f931ad47b"
 	"42615dbe02aa6b08bbd30e736c429d9abd087430 lua/yana/timeline/retrace.lua b0868fe28b536915e6b0e9924ea92ca287206d50"
+	"42615dbe02aa6b08bbd30e736c429d9abd087430 scripts/release/forbidden-patterns.txt 4af141cf6607f09b22f25dd9e13c3985bc0156ca"
+	"42615dbe02aa6b08bbd30e736c429d9abd087430 scripts/release/verify.sh 2fa32c79cc6129036aaa2111f34afd55bc20cc1d"
+	"540fd07fc58b6c78b430ef27d9567bf3091412e9 README.md cfdee9016ee7492ae14cd6b87db7c2806ec7de0b"
+	"540fd07fc58b6c78b430ef27d9567bf3091412e9 bin/yana-sandbox 3801796811668c8c5a2f4d80d2cf68209be47cbd"
+	"540fd07fc58b6c78b430ef27d9567bf3091412e9 doc/yana.txt 6c5ff960ba27cbeabb47098c8efda9bee48df9a7"
+	"540fd07fc58b6c78b430ef27d9567bf3091412e9 lua/yana/config.lua e9fece2078e33b8770a492bdfe94b2afeb6ee592"
+	"540fd07fc58b6c78b430ef27d9567bf3091412e9 lua/yana/health.lua 1cbda453e46b403e3cb1d8826432f8569f514bf9"
+	"540fd07fc58b6c78b430ef27d9567bf3091412e9 lua/yana/inline_diff.lua 54b56b14751ca1bdfc190c679f7407455e93403e"
 	"540fd07fc58b6c78b430ef27d9567bf3091412e9 lua/yana/timeline/retrace.lua 71df249ab3a6d206dbe15e7d03cc653b4e5c574b"
+	"540fd07fc58b6c78b430ef27d9567bf3091412e9 scripts/release/forbidden-patterns.txt 4af141cf6607f09b22f25dd9e13c3985bc0156ca"
+	"540fd07fc58b6c78b430ef27d9567bf3091412e9 scripts/release/verify.sh 4fdd3069b3d1e7bfce9e73bf1f2b9fdf1e01a809"
+	"69103f004f467dd270cdd7ccb5d894c071a95173 bin/yana-sandbox 0b898c9d4df88d90500accb42a7470b50a26b064"
+	"69103f004f467dd270cdd7ccb5d894c071a95173 doc/yana.txt 42de623f5716a31bedcdec76059e778f119bb8fc"
+	"69103f004f467dd270cdd7ccb5d894c071a95173 lua/yana/health.lua 83a36863bc6aa42a1d0b3766d70143b04f01950e"
+	"69103f004f467dd270cdd7ccb5d894c071a95173 lua/yana/review_hunk_split.lua 902fc2a21d3fe282c6c2aba899686faec7ab5228"
+	"69103f004f467dd270cdd7ccb5d894c071a95173 lua/yana/review_watch_ownership.lua f20b47613cc91f30fffec08f9291092dda9f3602"
+	"69103f004f467dd270cdd7ccb5d894c071a95173 scripts/release/forbidden-patterns.txt cd0f94a93b08a9fd310b9f0f4fc6b38c42fc9882"
+	"69103f004f467dd270cdd7ccb5d894c071a95173 scripts/release/verify.sh a965e55c339b62964d472ba3512d7b529b246434"
+	"7489edc36a692bce8b28e1e2c84d0209afa3adc3 bin/yana-sandbox 3801796811668c8c5a2f4d80d2cf68209be47cbd"
+	"7489edc36a692bce8b28e1e2c84d0209afa3adc3 lua/yana/health.lua 60807bdcc5aab93803d08c9122d3e509a10c4ac5"
+	"7489edc36a692bce8b28e1e2c84d0209afa3adc3 scripts/release/forbidden-patterns.txt 4af141cf6607f09b22f25dd9e13c3985bc0156ca"
+	"7489edc36a692bce8b28e1e2c84d0209afa3adc3 scripts/release/verify.sh 1f20aad3285c22f3424f49405f7f35fe201c0d6a"
+	"7a2fe1ecb80e3a84e18ba659c551d80814fe51bb bin/yana-sandbox 0b898c9d4df88d90500accb42a7470b50a26b064"
+	"7a2fe1ecb80e3a84e18ba659c551d80814fe51bb doc/yana.txt 54d4a5b17f141b6dd6cc064988079c89a5e3aadf"
+	"7a2fe1ecb80e3a84e18ba659c551d80814fe51bb lua/yana/debug_keys.lua b01c44090de42d93123cf7b842ee5eb027a27372"
+	"7a2fe1ecb80e3a84e18ba659c551d80814fe51bb lua/yana/health.lua 52695d8e5cb3e771b129e0679e1b7d1fea04cf90"
+	"7a2fe1ecb80e3a84e18ba659c551d80814fe51bb lua/yana/review_hunk_split.lua 902fc2a21d3fe282c6c2aba899686faec7ab5228"
+	"7a2fe1ecb80e3a84e18ba659c551d80814fe51bb lua/yana/review_watch_ownership.lua f20b47613cc91f30fffec08f9291092dda9f3602"
+	"7a2fe1ecb80e3a84e18ba659c551d80814fe51bb scripts/release/forbidden-patterns.txt 4af141cf6607f09b22f25dd9e13c3985bc0156ca"
+	"7a2fe1ecb80e3a84e18ba659c551d80814fe51bb scripts/release/verify.sh 978fd81a493d7c09fa87270bc4340f67af70add4"
+	"a7a60922fcf426e524ca1ccb1905d9b6fa44471c README.md 8445fe55f09ff6a15e9baeca8d453f0cbc13f8da"
+	"a7a60922fcf426e524ca1ccb1905d9b6fa44471c bin/yana-sandbox 3801796811668c8c5a2f4d80d2cf68209be47cbd"
+	"a7a60922fcf426e524ca1ccb1905d9b6fa44471c doc/yana.txt 6c5ff960ba27cbeabb47098c8efda9bee48df9a7"
+	"a7a60922fcf426e524ca1ccb1905d9b6fa44471c lua/yana/config.lua e9fece2078e33b8770a492bdfe94b2afeb6ee592"
+	"a7a60922fcf426e524ca1ccb1905d9b6fa44471c lua/yana/health.lua 1cbda453e46b403e3cb1d8826432f8569f514bf9"
+	"a7a60922fcf426e524ca1ccb1905d9b6fa44471c lua/yana/inline_diff.lua 54b56b14751ca1bdfc190c679f7407455e93403e"
 	"a7a60922fcf426e524ca1ccb1905d9b6fa44471c lua/yana/timeline/retrace.lua 71df249ab3a6d206dbe15e7d03cc653b4e5c574b"
-	"d3027d895bf8abe387af45fb47eb77c58e2e8b3b lua/yana/timeline/retrace.lua 71df249ab3a6d206dbe15e7d03cc653b4e5c574b"
-	"dec5e27153c63e0529731ac5ba017028ddb0504b lua/yana/timeline/retrace.lua b0868fe28b536915e6b0e9924ea92ca287206d50"
-	"edaff51e254f61a0d1ac0c90f8ac75c5d74ee954 lua/yana/timeline/retrace.lua b0868fe28b536915e6b0e9924ea92ca287206d50"
-	"f842a14c13548eb4696252c5d62339fd9c49aed0 lua/yana/timeline/retrace.lua 71df249ab3a6d206dbe15e7d03cc653b4e5c574b"
+	"a7a60922fcf426e524ca1ccb1905d9b6fa44471c scripts/release/forbidden-patterns.txt 4af141cf6607f09b22f25dd9e13c3985bc0156ca"
+	"a7a60922fcf426e524ca1ccb1905d9b6fa44471c scripts/release/verify.sh 4fdd3069b3d1e7bfce9e73bf1f2b9fdf1e01a809"
+	"c2b76a60d65016ef8fd3bcc61139a7e40ea8ae6d bin/yana-sandbox 0b898c9d4df88d90500accb42a7470b50a26b064"
+	"c2b76a60d65016ef8fd3bcc61139a7e40ea8ae6d doc/yana.txt 7c4a58921a7ef82139e88a875f113f9e657533f3"
+	"c2b76a60d65016ef8fd3bcc61139a7e40ea8ae6d lua/yana/health.lua 83a36863bc6aa42a1d0b3766d70143b04f01950e"
+	"c2b76a60d65016ef8fd3bcc61139a7e40ea8ae6d lua/yana/review_hunk_split.lua 902fc2a21d3fe282c6c2aba899686faec7ab5228"
+	"c2b76a60d65016ef8fd3bcc61139a7e40ea8ae6d lua/yana/review_watch_ownership.lua f20b47613cc91f30fffec08f9291092dda9f3602"
+	"c2b76a60d65016ef8fd3bcc61139a7e40ea8ae6d scripts/release/forbidden-patterns.txt cd0f94a93b08a9fd310b9f0f4fc6b38c42fc9882"
+	"c2b76a60d65016ef8fd3bcc61139a7e40ea8ae6d scripts/release/verify.sh a965e55c339b62964d472ba3512d7b529b246434"
+	"c6e97e8717c0d5ccfae179ab1cf79a16f84f3b93 bin/yana-sandbox 3801796811668c8c5a2f4d80d2cf68209be47cbd"
 	"c6e97e8717c0d5ccfae179ab1cf79a16f84f3b93 scripts/release/candidate.sh 1dabf1ccf27669ee319ec66fd6fa547abef8fa23"
+	"c6e97e8717c0d5ccfae179ab1cf79a16f84f3b93 scripts/release/forbidden-patterns.txt 4af141cf6607f09b22f25dd9e13c3985bc0156ca"
 	"c6e97e8717c0d5ccfae179ab1cf79a16f84f3b93 scripts/release/verify.sh 9b03bf07f59ab476eca8077d8d54f358f259df1b"
 	"c6e97e8717c0d5ccfae179ab1cf79a16f84f3b93 tests/release/blink_gate.sh 786ffa1050c860b47b5abe553674e979a2d4662e"
 	"c6e97e8717c0d5ccfae179ab1cf79a16f84f3b93 tests/release/confined_turn_gate.sh 7f3b4bfa8911139b12bc99980921953704b8439f"
@@ -140,7 +214,59 @@ readonly HISTORY_PRIVATE_PATH_EXCEPTIONS=(
 	"c6e97e8717c0d5ccfae179ab1cf79a16f84f3b93 tests/release/gate.sh 3dfbe5ed20906a5ebc9f6d0425781e5b08338c2f"
 	"c6e97e8717c0d5ccfae179ab1cf79a16f84f3b93 tests/release/helper_gate.sh d4d0c991300fb4581e95493bb051d6197641b745"
 	"c6e97e8717c0d5ccfae179ab1cf79a16f84f3b93 tests/release/policy_mutation_gate.sh 8c4e6c5ad879c5f96c4ae9971f16c44d3be17407"
+	"d3027d895bf8abe387af45fb47eb77c58e2e8b3b README.md 8445fe55f09ff6a15e9baeca8d453f0cbc13f8da"
+	"d3027d895bf8abe387af45fb47eb77c58e2e8b3b bin/yana-sandbox 3801796811668c8c5a2f4d80d2cf68209be47cbd"
+	"d3027d895bf8abe387af45fb47eb77c58e2e8b3b doc/yana.txt 6c5ff960ba27cbeabb47098c8efda9bee48df9a7"
+	"d3027d895bf8abe387af45fb47eb77c58e2e8b3b lua/yana/config.lua e9fece2078e33b8770a492bdfe94b2afeb6ee592"
+	"d3027d895bf8abe387af45fb47eb77c58e2e8b3b lua/yana/health.lua 1cbda453e46b403e3cb1d8826432f8569f514bf9"
+	"d3027d895bf8abe387af45fb47eb77c58e2e8b3b lua/yana/inline_diff.lua 54b56b14751ca1bdfc190c679f7407455e93403e"
+	"d3027d895bf8abe387af45fb47eb77c58e2e8b3b lua/yana/timeline/retrace.lua 71df249ab3a6d206dbe15e7d03cc653b4e5c574b"
+	"d3027d895bf8abe387af45fb47eb77c58e2e8b3b scripts/release/forbidden-patterns.txt 4af141cf6607f09b22f25dd9e13c3985bc0156ca"
+	"d3027d895bf8abe387af45fb47eb77c58e2e8b3b scripts/release/verify.sh 4fdd3069b3d1e7bfce9e73bf1f2b9fdf1e01a809"
+	"dec5e27153c63e0529731ac5ba017028ddb0504b README.md fdaa5224a485eb2f03d2b1b0ced54146c26f84e8"
+	"dec5e27153c63e0529731ac5ba017028ddb0504b bin/yana-overlay f8c1ba7d24de089aff0832164c6fbe5cc33bfc23"
+	"dec5e27153c63e0529731ac5ba017028ddb0504b bin/yana-sandbox 3801796811668c8c5a2f4d80d2cf68209be47cbd"
+	"dec5e27153c63e0529731ac5ba017028ddb0504b doc/yana.txt 70b417e60e9d71dca3a67b9072d2b81a5fc2a204"
+	"dec5e27153c63e0529731ac5ba017028ddb0504b lua/yana/config.lua e2d30b58f58cef5376942d3e5f840a45f5043c06"
+	"dec5e27153c63e0529731ac5ba017028ddb0504b lua/yana/health.lua 1cbda453e46b403e3cb1d8826432f8569f514bf9"
+	"dec5e27153c63e0529731ac5ba017028ddb0504b lua/yana/inline_diff.lua caf793af8272b43b417cc1fb2a2d441f931ad47b"
+	"dec5e27153c63e0529731ac5ba017028ddb0504b lua/yana/timeline/retrace.lua b0868fe28b536915e6b0e9924ea92ca287206d50"
+	"dec5e27153c63e0529731ac5ba017028ddb0504b scripts/release/forbidden-patterns.txt 4af141cf6607f09b22f25dd9e13c3985bc0156ca"
+	"dec5e27153c63e0529731ac5ba017028ddb0504b scripts/release/verify.sh 2fa32c79cc6129036aaa2111f34afd55bc20cc1d"
+	"e4fb25691dcd79e287f7847b3f4ea8c8f9449b3c bin/yana-sandbox 3801796811668c8c5a2f4d80d2cf68209be47cbd"
+	"e4fb25691dcd79e287f7847b3f4ea8c8f9449b3c lua/yana/config.lua 12b75d623587663c56d2ffd4bdd74ce3db8653ba"
+	"e4fb25691dcd79e287f7847b3f4ea8c8f9449b3c lua/yana/health.lua 60807bdcc5aab93803d08c9122d3e509a10c4ac5"
+	"e4fb25691dcd79e287f7847b3f4ea8c8f9449b3c scripts/release/forbidden-patterns.txt 4af141cf6607f09b22f25dd9e13c3985bc0156ca"
+	"e4fb25691dcd79e287f7847b3f4ea8c8f9449b3c scripts/release/verify.sh 2fa32c79cc6129036aaa2111f34afd55bc20cc1d"
+	"edaff51e254f61a0d1ac0c90f8ac75c5d74ee954 bin/yana-overlay f8c1ba7d24de089aff0832164c6fbe5cc33bfc23"
+	"edaff51e254f61a0d1ac0c90f8ac75c5d74ee954 bin/yana-sandbox 3801796811668c8c5a2f4d80d2cf68209be47cbd"
+	"edaff51e254f61a0d1ac0c90f8ac75c5d74ee954 doc/yana.txt 70b417e60e9d71dca3a67b9072d2b81a5fc2a204"
+	"edaff51e254f61a0d1ac0c90f8ac75c5d74ee954 lua/yana/config.lua e2d30b58f58cef5376942d3e5f840a45f5043c06"
+	"edaff51e254f61a0d1ac0c90f8ac75c5d74ee954 lua/yana/health.lua 36d3a8dba0e035880058e2e9e9ed74330a8345d2"
+	"edaff51e254f61a0d1ac0c90f8ac75c5d74ee954 lua/yana/inline_diff.lua caf793af8272b43b417cc1fb2a2d441f931ad47b"
+	"edaff51e254f61a0d1ac0c90f8ac75c5d74ee954 lua/yana/timeline/retrace.lua b0868fe28b536915e6b0e9924ea92ca287206d50"
+	"edaff51e254f61a0d1ac0c90f8ac75c5d74ee954 scripts/release/forbidden-patterns.txt 4af141cf6607f09b22f25dd9e13c3985bc0156ca"
+	"edaff51e254f61a0d1ac0c90f8ac75c5d74ee954 scripts/release/verify.sh 2fa32c79cc6129036aaa2111f34afd55bc20cc1d"
+	"f842a14c13548eb4696252c5d62339fd9c49aed0 README.md d6a2b90c2a28eea4b0e651b8d6b49af9a001bd96"
+	"f842a14c13548eb4696252c5d62339fd9c49aed0 bin/yana-sandbox 3801796811668c8c5a2f4d80d2cf68209be47cbd"
+	"f842a14c13548eb4696252c5d62339fd9c49aed0 doc/yana.txt 6c5ff960ba27cbeabb47098c8efda9bee48df9a7"
+	"f842a14c13548eb4696252c5d62339fd9c49aed0 lua/yana/config.lua e9fece2078e33b8770a492bdfe94b2afeb6ee592"
+	"f842a14c13548eb4696252c5d62339fd9c49aed0 lua/yana/health.lua 1cbda453e46b403e3cb1d8826432f8569f514bf9"
+	"f842a14c13548eb4696252c5d62339fd9c49aed0 lua/yana/inline_diff.lua 54b56b14751ca1bdfc190c679f7407455e93403e"
+	"f842a14c13548eb4696252c5d62339fd9c49aed0 lua/yana/timeline/retrace.lua 71df249ab3a6d206dbe15e7d03cc653b4e5c574b"
+	"f842a14c13548eb4696252c5d62339fd9c49aed0 scripts/release/forbidden-patterns.txt 4af141cf6607f09b22f25dd9e13c3985bc0156ca"
+	"f842a14c13548eb4696252c5d62339fd9c49aed0 scripts/release/verify.sh 4fdd3069b3d1e7bfce9e73bf1f2b9fdf1e01a809"
 )
+readonly HISTORY_RETIRED_PATH_EXCEPTIONS=(
+	"158edf6a78c8fd33e70feceeed873f974449c292 prompt.txt f6ff9cca9f06883f3096ad2a51774bb52cecca15"
+	"7489edc36a692bce8b28e1e2c84d0209afa3adc3 scripts/install-deps.sh 3f81b16fb060835ba9fdb1d4be742875bedcb84f"
+	"dec5e27153c63e0529731ac5ba017028ddb0504b scripts/install-deps.sh 826d166f67e4673ca622e82abdab878bd04f0903"
+	"7a2fe1ecb80e3a84e18ba659c551d80814fe51bb scripts/install-deps.sh 665f7e808171081956ff2f7a9092f23021a89cd1"
+	"d3027d895bf8abe387af45fb47eb77c58e2e8b3b scripts/install-deps.sh 826d166f67e4673ca622e82abdab878bd04f0903"
+	"69103f004f467dd270cdd7ccb5d894c071a95173 scripts/install-deps.sh 665f7e808171081956ff2f7a9092f23021a89cd1"
+	"158edf6a78c8fd33e70feceeed873f974449c292 scripts/install-deps.sh 6e5379273f605791d44210c2f5c96b90617077e9"
+)
+
 history_patterns_minus_private=
 history_head=
 
@@ -232,15 +358,23 @@ audit_main_history() {
 	# registry without that pattern leaves the private-path exceptions unavailable.
 	history_patterns_minus_private=$scratch/patterns-minus-private
 	: >"$history_patterns_minus_private"
-	local pattern_line private_pattern_seen=0
+	local pattern_line fingerprint private_pattern_seen=0
 	while IFS= read -r pattern_line || [[ -n $pattern_line ]]; do
-		if [[ $(printf '%s' "$pattern_line" | sha256sum | cut -c1-64) == "$PRIVATE_PATH_PATTERN_SHA256" ]]; then
-			private_pattern_seen=1
+		local matched_private=0 private_fingerprint
+		fingerprint=$(printf '%s' "$pattern_line" | sha256sum | cut -c1-64)
+		for private_fingerprint in "${PRIVATE_PATH_PATTERN_SHA256S[@]}"; do
+			if [[ $fingerprint == "$private_fingerprint" ]]; then
+				matched_private=1
+				private_pattern_seen=$((private_pattern_seen + 1))
+				break
+			fi
+		done
+		if ((matched_private)); then
 			continue
 		fi
 		printf '%s\n' "$pattern_line" >>"$history_patterns_minus_private"
 	done <"$patterns"
-	((private_pattern_seen)) || history_patterns_minus_private=
+	((private_pattern_seen == ${#PRIVATE_PATH_PATTERN_SHA256S[@]})) || history_patterns_minus_private=
 
 	mkdir -p "$hist_root"
 	while IFS= read -r c; do
@@ -275,7 +409,7 @@ audit_main_history() {
 			fi
 
 			[[ $type == blob ]] || continue
-			if retired_history_exception "$path"; then
+			if retired_history_exception "$path" "$c" "$sha"; then
 				:
 			elif history_path_class_ok "$path"; then
 				:
@@ -307,7 +441,12 @@ audit_main_history() {
 		# Every manifest path must satisfy history path policy (incl. retired).
 		while IFS= read -r path; do
 			[[ -n $path ]] || continue
-			if retired_history_exception "$path"; then
+			if [[ $path == prompt.txt || $path == scripts/install-deps.sh ]]; then
+				manifest_blob=$(git -C "$clone" rev-parse "$c:$path" 2>/dev/null || true)
+			else
+				manifest_blob=
+			fi
+			if retired_history_exception "$path" "$c" "$manifest_blob"; then
 				continue
 			fi
 			if ! history_path_class_ok "$path"; then
