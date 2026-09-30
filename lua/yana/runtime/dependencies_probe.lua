@@ -453,6 +453,29 @@ local function kernel_rows(rows)
 
   if vim.fn.filereadable("/sys/fs/cgroup/cgroup.controllers") == 1 then
     rows[#rows + 1] = row("kernel:cgroup2", "ok", "cgroup v2 is available")
+    local uv = vim.uv or vim.loop
+    local uid = uv.getuid()
+    local own = "/sys/fs/cgroup/user.slice/user-" .. uid .. ".slice/user@" .. uid .. ".service"
+    local current = ""
+    for _, line in ipairs(vim.fn.readfile("/proc/self/cgroup")) do
+      if line:sub(1, 3) == "0::" then current = "/sys/fs/cgroup" .. line:sub(4); break end
+    end
+    if uv.fs_access(own, "W") and current ~= own and current:sub(1, #own + 1) ~= own .. "/" then
+      local runtime = vim.env.XDG_RUNTIME_DIR or ("/run/user/" .. uid)
+      local dir, bus = uv.fs_stat(runtime), uv.fs_stat(runtime .. "/bus")
+      if vim.fn.executable("systemd-run") == 1 and dir and dir.uid == uid and bus and bus.type == "socket" then
+        rows[#rows + 1] = row("cgroup:delegation", "ok", "launcher will enter the delegated systemd user scope")
+      else
+        rows[#rows + 1] = row("cgroup:delegation", "error", "launcher is outside the delegated user cgroup and cannot reach its user manager",
+          "install systemd-run and log in through a systemd user session; see docs/installation.md#troubleshooting")
+      end
+    elseif (uv.fs_access(own, "W") and (current == own or current:sub(1, #own + 1) == own .. "/"))
+        or (current ~= "" and uv.fs_access(current, "W")) then
+      rows[#rows + 1] = row("cgroup:delegation", "ok", "current user cgroup is delegated")
+    else
+      rows[#rows + 1] = row("cgroup:delegation", "error", "no writable delegated user cgroup is available",
+        "log in through a systemd user session or delegate the container's cgroup v2 hierarchy")
+    end
   else
     rows[#rows + 1] = row(
       "kernel:cgroup2",

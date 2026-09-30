@@ -2,6 +2,7 @@
 import json
 import pathlib
 import re
+import shlex
 import sys
 
 
@@ -17,8 +18,8 @@ if ci.get("permissions") != {"contents": "read"}:
     fail("CI permissions must be contents: read only")
 if set(ci.get("on", {})) != {"pull_request", "push"}:
     fail("CI must run only on pull_request and push")
-if release.get("permissions") != {"contents": "write"}:
-    fail("release permissions must be contents: write only")
+if release.get("permissions") != {"contents": "write", "actions": "read"}:
+    fail("release permissions must be contents: write and actions: read only")
 release_events = release.get("on", {})
 if set(release_events) != {"push"} or not release_events["push"].get("tags"):
     fail("release workflow must be tag-push bound")
@@ -49,6 +50,34 @@ def inspect_steps(workflow: dict, name: str) -> None:
 
 inspect_steps(ci, "ci")
 inspect_steps(release, "release")
+profile_lines = [
+    "abi <abi/4.0>,", "include <tunables/global>",
+    "profile yana-bwrap /usr/bin/bwrap flags=(unconfined) {", "  userns,", "}",
+]
+profile_text = "\n".join(profile_lines)
+for doc in ("README.md", "docs/installation.md"):
+    if profile_text not in (root / doc).read_text():
+        fail(f"Bubblewrap AppArmor profile differs in {doc}")
+ci_steps = ci["jobs"]["release-tree"]["steps"]
+setup = next(step["run"] for step in ci_steps if step.get("name") == "Permit Bubblewrap namespaces on the disposable runner")
+if not all(line in shlex.split(setup) for line in profile_lines) or "sudo apparmor_parser -r /etc/apparmor.d/yana-bwrap" not in setup:
+    fail("CI Bubblewrap AppArmor setup differs from the documented profile")
+release_steps = release["jobs"]["draft"]["steps"]
+guards = [step for step in release_steps if step.get("name") == "Require successful CI for the tag commit"]
+if len(guards) != 1 or release_steps.index(guards[0]) >= next(
+    index for index, step in enumerate(release_steps) if step.get("name") == "Create draft"
+):
+    fail("release must require exact-commit CI before creating the draft")
+guard_run = guards[0]["run"]
+for required in (
+    '--workflow ci.yml --branch main --event push --commit "$GITHUB_SHA" --limit 1',
+    '--json headSha,status,conclusion',
+    '''.[0] | [.headSha,.status,.conclusion] | @tsv''',
+    '''[[ "$result" == "${GITHUB_SHA}"$'\\tcompleted\\tsuccess' ]] ||''',
+    'exit 1;',
+):
+    if required not in guard_run:
+        fail("release exact-commit CI guard differs from its required contract")
 release_text = json.dumps(release)
 if "--prerelease" not in release_text or "GITHUB_REF_NAME == *-*" not in release_text:
     fail("release workflow does not distinguish prerelease tags from stable tags")

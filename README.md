@@ -46,7 +46,15 @@ sudo apt-get install bubblewrap libcap2-bin
 ```
 
 On Ubuntu 24.04 and newer with AppArmor's user-namespace restriction, add this
-one-time permission for Bubblewrap if it has no existing profile:
+one-time permission for Bubblewrap. First check for an existing profile:
+
+```sh
+grep -rl /usr/bin/bwrap /etc/apparmor.d/
+```
+
+If a file is printed, ask your administrator to add `userns,` to that profile
+and reload it with `sudo apparmor_parser -r FILE`. Otherwise, create it below.
+Do not add a second profile for the same executable.
 
 ```sh
 sudo apt-get install apparmor

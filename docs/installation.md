@@ -240,8 +240,16 @@ allow user namespaces again.
 On Ubuntu 24.04, `bwrap:userns` reporting `setting up uid map: Permission
 denied` can mean Bubblewrap lacks an AppArmor exception. AppArmor is Ubuntu's
 program permission policy; a user namespace lets Bubblewrap build the private
-environment for a confined turn. If no existing Bubblewrap profile grants this
-permission, an administrator can add this profile for `/usr/bin/bwrap`:
+environment for a confined turn. Check for an existing profile first:
+
+```sh
+grep -rl /usr/bin/bwrap /etc/apparmor.d/
+```
+
+If a file is printed, an administrator should add `userns,` to that profile
+and reload it with `sudo apparmor_parser -r FILE`. Do not create another profile
+for `/usr/bin/bwrap`: competing attachments can prevent either from applying.
+If no file is printed, an administrator can create the profile below:
 
 ```sh
 sudo apt-get install apparmor
@@ -262,6 +270,13 @@ if the machine already has a Bubblewrap profile. Restart Neovim and run
 `:checkhealth yana` again. To remove this exception, run
 `sudo apparmor_parser -R /etc/apparmor.d/yana-bwrap`, then remove that file.
 The release CI uses the same exception on its disposable Ubuntu runner.
+
+**No delegated user cgroup.** A cgroup is the Linux process group used to stop
+and reclaim a confined turn. Yana automatically enters a systemd user scope
+when launched from SSH, tty or a system service. If `cgroup:delegation` fails,
+ensure the login has a running systemd user manager and its owned
+`/run/user/UID/bus`; Yana refuses if that manager is unavailable. Containers
+need a writable delegated cgroup v2 hierarchy.
 
 **The model list times out.** The agent CLI itself may be waiting for you
 to log in before it can list models. Run it once directly in a terminal

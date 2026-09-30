@@ -6,6 +6,31 @@
 CGROUP_PROC_SELF_PATH="${CGROUP_PROC_SELF_PATH:-/proc/self/cgroup}"
 
 CGROUP_UNAVAILABLE_REASON=""
+# A process outside the delegated user subtree cannot migrate into it: the
+# kernel also requires write access to the common ancestor's cgroup.procs.
+cgroup_ensure_user_scope() {
+	local own="$CGROUP_MOUNT/user.slice/user-$EUID.slice/user@$EUID.service"
+	local rel runtime
+	[[ -d "$own" && -w "$own" ]] || return 0
+	rel=$(sed -n 's/^0:://p' "$CGROUP_PROC_SELF_PATH")
+	[[ "$CGROUP_MOUNT$rel" == "$own" || "$CGROUP_MOUNT$rel" == "$own/"* ]] && return 0
+	if [[ ${YANA_OVERLAY_USER_SCOPE:-} == 1 ]]; then
+		printf 'yana-overlay: user scope did not enter the delegated cgroup %s (current: %s)\n' "$own" "$rel" >&2
+		return 66
+	fi
+	if ! command -v systemd-run >/dev/null; then
+		printf 'yana-overlay: launching from outside the delegated user cgroup requires systemd-run\n' >&2
+		return 66
+	fi
+	runtime=${XDG_RUNTIME_DIR:-/run/user/$EUID}
+	if [[ ! -d "$runtime" || $(stat -c %u "$runtime") != "$EUID" || ! -S "$runtime/bus" ]]; then
+		printf 'yana-overlay: cannot reach the user manager at %s/bus; log in through a systemd user session\n' "$runtime" >&2
+		return 66
+	fi
+	export XDG_RUNTIME_DIR="$runtime" DBUS_SESSION_BUS_ADDRESS="unix:path=$runtime/bus" YANA_OVERLAY_USER_SCOPE=1
+	exec systemd-run --user --scope --quiet --collect -- "$@"
+}
+
 cgroup_delegated_base() {
 	local fstype uid own
 	fstype=$(stat -fc %T "$CGROUP_MOUNT" 2>/dev/null || true)

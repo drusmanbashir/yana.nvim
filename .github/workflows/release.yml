@@ -1,12 +1,13 @@
 {
   "name": "Draft release",
   "on": {"push": {"tags": ["v*.*.*"]}},
-  "permissions": {"contents": "write"},
+  "permissions": {"contents": "write", "actions": "read"},
   "jobs": {
     "draft": {
       "runs-on": "ubuntu-24.04",
       "steps": [
         {"uses": "actions/checkout@11d5960a326750d5838078e36cf38b85af677262", "with": {"fetch-depth": 0}},
+        {"name": "Require successful CI for the tag commit", "shell": "bash", "env": {"GH_TOKEN": "${{ github.token }}"}, "run": "set -euo pipefail\nresult=$(gh run list --repo \"$GITHUB_REPOSITORY\" --workflow ci.yml --branch main --event push --commit \"$GITHUB_SHA\" --limit 1 --json headSha,status,conclusion --jq '.[0] | [.headSha,.status,.conclusion] | @tsv')\n[[ \"$result\" == \"${GITHUB_SHA}\"$'\\tcompleted\\tsuccess' ]] || { echo 'Release refused: latest main CI for this exact commit is not completed successfully' >&2; exit 1; }"},
         {"name": "Verify tag and public tree", "run": "scripts/release/verify.sh . \"$GITHUB_REF_NAME\""},
         {"name": "Build reproducibly", "shell": "bash", "run": "set -euo pipefail\nepoch=$(git show -s --format=%ct HEAD)\nSOURCE_DATE_EPOCH=$epoch scripts/release/archive.sh . \"$RUNNER_TEMP/a\"\nsleep 1\n(umask 077; TZ=Pacific/Auckland SOURCE_DATE_EPOCH=$epoch scripts/release/archive.sh . \"$RUNNER_TEMP/b\")\ncmp \"$RUNNER_TEMP/a/yana.nvim-${GITHUB_REF_NAME#v}.tar.gz\" \"$RUNNER_TEMP/b/yana.nvim-${GITHUB_REF_NAME#v}.tar.gz\""},
         {"name": "Create draft", "shell": "bash", "env": {"GH_TOKEN": "${{ github.token }}"}, "run": "set -euo pipefail\nstatus=()\nif [[ $GITHUB_REF_NAME == *-* ]]; then status+=(--prerelease); fi\ngh release create \"$GITHUB_REF_NAME\" \"$RUNNER_TEMP/a/yana.nvim-${GITHUB_REF_NAME#v}.tar.gz\" \"$RUNNER_TEMP/a/SHA256SUMS\" --draft --verify-tag \"${status[@]}\" --title \"Yana ${GITHUB_REF_NAME#v}\" --notes-file CHANGELOG.md"}

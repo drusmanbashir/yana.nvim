@@ -242,6 +242,7 @@ env -i \
 	XDG_STATE_HOME="$state" \
 	XDG_CACHE_HOME="$cache" \
 	YANA_TURN_SMOKE_SCRATCH="$turn_scratch" \
+	XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}" \
 	PYTHONPATH="$plugin/bin/lib" \
 	LC_ALL=C TZ=UTC \
 	"$nvim" --clean --headless -u NONE -i NONE \

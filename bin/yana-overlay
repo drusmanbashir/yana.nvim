@@ -468,6 +468,7 @@ parse_run_args() {
 }
 
 cmd_run() {
+	local -a launch_args=("$@")
 	parse_run_args "$@"
 	if [[ -n "$UPPER" && -n "$WORK" ]]; then
 		if [[ -n "$CAPTURE_PLAN" || -n "${YANA_OPEN_CAPTURE_MODE:-}" ]]; then
@@ -476,6 +477,7 @@ cmd_run() {
 			cmd_run_direct
 		fi
 	elif [[ -n "$TURN_ID" && -n "$MODE" && -n "$ANSWER_OUT" ]]; then
+		cgroup_ensure_user_scope "$0" "${launch_args[@]}" || exit "$EXIT_NO_SANDBOX"
 		cmd_run_yanad
 	else
 		die_usage "--workspace, --turn, --mode and --answer-out are required"

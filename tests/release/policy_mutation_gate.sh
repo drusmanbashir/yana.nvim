@@ -34,6 +34,35 @@ expect_red() {
 legacy_upper=NEO
 legacy_upper+=CURSOR
 
+python3 - "$tree" "$scratch" <<'PY'
+import json, os, pathlib, subprocess, sys
+tree, scratch = map(pathlib.Path, sys.argv[1:])
+steps = json.loads((tree / ".github/workflows/release.yml").read_text())["jobs"]["draft"]["steps"]
+guard = next((step for step in steps if step.get("name") == "Require successful CI for the tag commit"), None)
+assert guard is not None, "release guard missing"
+stub_dir = scratch / "ci-stub"
+stub_dir.mkdir()
+stub = stub_dir / "gh"
+stub.write_text('#!/bin/sh\nprintf "%s\\n" "$CI_TEST_RESPONSE"\n')
+stub.chmod(0o755)
+sha = "1" * 40
+cases = {
+    "passed": (f"{sha}\tcompleted\tsuccess", True),
+    "wrong-commit": (f"{'2' * 40}\tcompleted\tsuccess", False),
+    "missing": ("", False),
+    "failed": (f"{sha}\tcompleted\tfailure", False),
+    "running": (f"{sha}\tin_progress\t", False),
+}
+for name, (response, accepted) in cases.items():
+    env = dict(os.environ, PATH=str(stub_dir) + ":" + os.environ["PATH"],
+               GITHUB_SHA=sha, GITHUB_REPOSITORY="example/plugin", CI_TEST_RESPONSE=response)
+    result = subprocess.run(["bash", "-c", guard["run"]], env=env, capture_output=True, text=True)
+    assert (result.returncode == 0) == accepted, (name, result.stdout, result.stderr)
+    if not accepted:
+        assert "Release refused:" in result.stderr, (name, result.stderr)
+    print(f"CI GUARD PASS: {name}")
+PY
+
 stable_tree=$(copy_case stable-control)
 printf '%s\n' '0.1.0' >"$stable_tree/VERSION"
 escaped_version=$(printf '%s' "$version" | sed 's/[.[\\*^$+?{}|()]/\\&/g')
@@ -244,6 +273,23 @@ job["permissions"] = {"contents": "write", "id-token": "write"}
 open(path, "w").write(json.dumps(doc))
 PY
 expect_red job-permissions "declares job-level permissions" \
+	"$case_tree/scripts/release/verify.sh" "$case_tree" "v$version"
+
+case_tree=$(copy_case missing-ci-guard)
+python3 - "$case_tree/.github/workflows/release.yml" <<'PY'
+import json, pathlib, sys
+path = pathlib.Path(sys.argv[1])
+doc = json.loads(path.read_text())
+steps = doc["jobs"]["draft"]["steps"]
+steps[:] = [step for step in steps if step.get("name") != "Require successful CI for the tag commit"]
+path.write_text(json.dumps(doc))
+PY
+expect_red missing-ci-guard "release must require exact-commit CI" \
+	"$case_tree/scripts/release/verify.sh" "$case_tree" "v$version"
+
+case_tree=$(copy_case bubblewrap-doc-drift)
+sed -i 's/^  userns,$/  network,/' "$case_tree/README.md"
+expect_red bubblewrap-doc-drift "Bubblewrap AppArmor profile differs in README.md" \
 	"$case_tree/scripts/release/verify.sh" "$case_tree" "v$version"
 
 case_tree=$(copy_case mode-drift)
