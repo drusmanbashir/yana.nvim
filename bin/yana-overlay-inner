@@ -228,6 +228,7 @@ source "$INNER_DIR/lib/yana-overlay/mount.sh"
 source "$INNER_DIR/lib/yana-overlay/fuse.sh"
 
 inner_run_agent_without_caps() {
+	mount_user_manager_endpoints
 	local capsh_path cap_now
 	local -a cmd=( "$@" )
 	capsh_path=$(command -v capsh) || {
@@ -259,6 +260,7 @@ fi
 mount_overlays
 mount_cursor_exception
 mount_state_dirs
+mount_user_manager_endpoints
 
 # Markers are written only after the FULL set has mounted: yana-overlay reads
 # them to tell a pre-agent mount failure from an agent that itself exited 67, so

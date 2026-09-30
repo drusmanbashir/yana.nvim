@@ -233,6 +233,11 @@ fi
 mkdir -p "$jail_tmpdir"
 turn_scratch=$(mktemp -d "$jail_tmpdir/yana-fresh-turn.XXXXXX")
 
+# A real positive control prevents an absent user manager from making the
+# confined fixture's negative execution check pass accidentally.
+systemd-run --user --quiet --wait --pipe --collect -- /usr/bin/true
+echo 'fresh-install: host user-manager execution control passed'
+
 set +e
 env -i \
 	HOME="$home" \

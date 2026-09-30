@@ -25,6 +25,12 @@ for arg in "$@"; do
 		exit 0
 	fi
 done
+# The fresh-install harness first proves this manager can execute on the host.
+# The same request from the real confined turn must be refused.
+if systemd-run --user --quiet --wait --pipe --collect -- /usr/bin/true; then
+	echo 'turn smoke: host user manager executed from inside confinement' >&2
+	exit 1
+fi
 target="${YANA_TURN_SMOKE_TARGET:-notes.txt}"
 printf 'turn smoke edit\n' >>"$target"
 printf '%s\n' \

@@ -93,6 +93,7 @@ source "$DIR/lib/yana-overlay/fuse.sh"
 source "$DIR/lib/yana-overlay/open_capture.sh"
 source "$DIR/lib/yana-overlay/yanad.sh"
 source "$DIR/lib/yana-overlay/cgroup.sh"
+source "$DIR/lib/yana-overlay/mount.sh"
 
 
 # --unshare-pid is the read half of the boundary (the isolation contract,
@@ -120,6 +121,10 @@ run_overlay() {
 			fi
 			ro_args+=(--bind "$runtime" "$runtime")
 		done
+		local endpoint
+		while IFS= read -r endpoint; do
+			ro_args+=(--ro-bind /dev/null "$endpoint")
+		done < <(user_manager_endpoints)
 		ro_args+=(--dev /dev --proc /proc --unshare-uts --unshare-user --unshare-pid --)
 		"$BWRAP" "${ro_args[@]}" "${CMD[@]}"
 		return $?

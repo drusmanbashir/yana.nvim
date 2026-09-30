@@ -1,8 +1,28 @@
 #!/usr/bin/env bash
 # shellcheck shell=bash
 # Mount-phase functions for bin/yana-overlay-inner.
-# Sourced by bin/yana-overlay-inner only, from inside the bwrap jail. No shebang exec; do not run directly.
+# Sourced by the launcher and inner helper. No shebang exec; do not run directly.
 # Must not call `set` or install traps: it shares the parent's set -eu.
+
+# These sockets can ask the host user manager to execute outside the jail.
+# Hide only those endpoints, preserving other runtime sockets such as SSH agents.
+user_manager_endpoints() {
+	local runtime endpoint
+	for runtime in "/run/user/$(id -u)" "${XDG_RUNTIME_DIR:-}"; do
+		[[ -n "$runtime" ]] || continue
+		for endpoint in "$runtime/bus" "$runtime/systemd/private"; do
+			[[ -S "$endpoint" ]] && printf '%s\n' "$endpoint"
+		done
+	done
+}
+
+mount_user_manager_endpoints() {
+	local endpoint
+	while IFS= read -r endpoint; do
+		mount --bind /dev/null "$endpoint" || exit "$EXIT_MOUNT"
+		mount -o bind,remount,ro "$endpoint" || exit "$EXIT_MOUNT"
+	done < <(user_manager_endpoints)
+}
 
 # mount_overlays — one overlay per entry of ROOTS.
 mount_overlays() {
