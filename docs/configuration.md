@@ -107,8 +107,12 @@ Fields that matter when reading or overriding an entry:
   model and resume a session.
 - `list_models_args` — how to list models; `false` (as on `claude`) means
   there's no live listing and a static `models` table is used instead.
-- `whoami_args`, `auth_login_hint`, `auth_output_patterns` — how
+- `whoami_args`, `auth_login_hint`, `auth_output_patterns`, `auth_json_field` — how
   `:checkhealth yana` and the login flow detect whether you're signed in.
+- `login_args` — official interactive login tokens used by `:YanaLogin` after
+  the configured executable; `false` disables this action for a custom backend.
+- `auth_env` — names of vendor authentication environment variables; values
+  remain with the vendor and suppress browser-login advice when present.
 - `install_hint` — the one-line install command shown by health checks.
 - `state_dirs` — paths under `$HOME` this backend needs to write at
   startup (its own config/session state); everything else under `$HOME`

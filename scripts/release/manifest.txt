@@ -216,6 +216,7 @@ lua/yana/review_watch_timeline.lua
 lua/yana/review_watch_timeline_prepare.lua
 lua/yana/roots/model.lua
 lua/yana/roots/view.lua
+lua/yana/runtime/auth.lua
 lua/yana/runtime/dependencies.lua
 lua/yana/runtime/dependencies_probe.lua
 lua/yana/runtime/persisted_state.lua

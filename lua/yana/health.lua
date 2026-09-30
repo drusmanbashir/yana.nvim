@@ -321,75 +321,16 @@ local function backend_auth_row(name, entry)
     return
   end
 
-  local cmd = { resolved }
-  vim.list_extend(cmd, entry.whoami_args)
-  local args_str = table.concat(entry.whoami_args, " ")
-  local ok_probe, result, probe_err = dependencies.probe(cmd, 2000)
-  if not ok_probe then
-    info("auth (" .. name .. "): unknown — auth probe " .. tostring(probe_err))
-    return
+  local auth = require("yana.runtime.auth")
+  local state = auth.check(name)
+  if state == "signed_in" then
+    ok("auth (" .. name .. "): signed in")
+  elseif state == "signed_out" then
+    warn("auth (" .. name .. "): NOT signed in", { auth.hint(name) })
+  else
+    info("auth (" .. name .. "): unknown — the vendor status check did not confirm authentication")
   end
 
-  local hint = entry.auth_login_hint
-  if type(hint) ~= "string" or hint == "" then
-    hint = "run " .. resolved .. "'s own login/auth command (see its --help or docs)"
-  end
-
-  local patterns = entry.auth_output_patterns
-  if patterns then
-    -- Exit code is not trusted at all for this backend (that is exactly
-    -- why it declared this field -- e.g. cursor-agent's `status` exits 0
-    -- regardless of auth state): judge captured output only.
-    local output = (result.stdout or "") .. "\n" .. (result.stderr or "")
-    local matched_in = patterns.signed_in ~= nil and output:find(patterns.signed_in) ~= nil
-    local matched_out = patterns.signed_out ~= nil and output:find(patterns.signed_out) ~= nil
-    if matched_in and not matched_out then
-      ok("auth (" .. name .. "): signed in (" .. resolved .. " " .. args_str .. ", output matched signed-in pattern)")
-      return
-    elseif matched_out and not matched_in then
-      warn(
-        "auth ("
-          .. name
-          .. "): NOT signed in ("
-          .. resolved
-          .. " "
-          .. args_str
-          .. ", output matched signed-out pattern)",
-        { hint }
-      )
-      return
-    end
-    local reason = (matched_in and matched_out) and "matched BOTH declared patterns" or "matched NEITHER declared pattern"
-    info(
-      "auth ("
-        .. name
-        .. "): unknown — "
-        .. resolved
-        .. " "
-        .. args_str
-        .. " output "
-        .. reason
-        .. " (declared auth_output_patterns); ambiguous output is never guessed"
-    )
-    return
-  end
-
-  if result.code == 0 then
-    ok("auth (" .. name .. "): signed in (" .. resolved .. " " .. args_str .. ")")
-    return
-  end
-  warn(
-    "auth ("
-      .. name
-      .. "): NOT signed in ("
-      .. resolved
-      .. " "
-      .. args_str
-      .. " exited "
-      .. tostring(result.code)
-      .. ")",
-    { hint }
-  )
 end
 
 -- One row per configured backend name, sorted so the output order is

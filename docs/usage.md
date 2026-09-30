@@ -63,6 +63,7 @@ stable: `ask` appears as **Ask**, `inline` as **Inline**, and `agentic` as
 |---|---|
 | `:Yana` / `:YanaToggle` | Toggle the panel |
 | `:YanaOpen` / `:YanaClose` | Open or close the panel |
+| `:YanaLogin` | Sign in to the selected agent in a Neovim terminal; close it to cancel |
 | `:YanaAsk [question]` | Ask about the current line or visual selection |
 | `:YanaEdit [instruction]` | Edit the current line or visual selection through inline review |
 | `:YanaNew` | Start a new chat |

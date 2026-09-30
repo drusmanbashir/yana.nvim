@@ -79,6 +79,8 @@ local backends = {
     -- signal, but it is a real network round-trip (disqualified by the "no network
     whoami_args = { "status" },
     auth_login_hint = "cursor-agent login",
+    login_args = { "login" },
+    auth_env = { "CURSOR_API_KEY" },
     -- README.md and doc/yana.txt carry the same line by hand (docs are not generated
     -- from this table), so keep the three in sync when a vendor changes its installer.
     install_hint = "curl https://cursor.com/install -fsS | bash",
@@ -130,6 +132,9 @@ local backends = {
     -- pattern needed.
     whoami_args = { "auth", "status" },
     auth_login_hint = "claude auth login",
+    login_args = { "auth", "login" },
+    auth_json_field = "loggedIn",
+    auth_env = { "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY" },
     -- See the cursor entry's install_hint comment for who consumes this field.
     install_hint = "curl -fsSL https://claude.ai/install.sh | bash",
     -- Probe p6_claude_per_turn.sh, turn c3, verified that -p --resume <id>
@@ -199,6 +204,9 @@ local backends = {
     list_models_format = "json_models",
     whoami_args = { "login", "status" },
     auth_login_hint = "codex login",
+    login_args = { "login" },
+    auth_output_patterns = { signed_in = "Logged in using", signed_out = "^%s*Not logged in%s*$" },
+    auth_env = { "OPENAI_API_KEY", "CODEX_API_KEY", "CODEX_ACCESS_TOKEN" },
     -- See the cursor entry's install_hint comment for who consumes this field.
     install_hint = "npm install -g @openai/codex",
     close_stdin = true, -- piped stdin makes codex wait to read a

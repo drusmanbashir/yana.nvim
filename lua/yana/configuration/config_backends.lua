@@ -439,6 +439,10 @@ function M.new(deps)
         check_no_reserved_tokens(entry.whoami_args, name, "whoami_args")
       end
       entry.auth_login_hint = optional_flag(entry.auth_login_hint, name, "auth_login_hint")
+      if entry.login_args == false then entry.login_args = nil end
+      entry.login_args = optional_arglist(entry.login_args, name, "login_args")
+      entry.auth_json_field = optional_flag(entry.auth_json_field, name, "auth_json_field")
+      entry.auth_env = optional_arglist(entry.auth_env, name, "auth_env")
       entry.install_hint = optional_flag(entry.install_hint, name, "install_hint")
       entry.auth_output_patterns = optional_output_patterns(entry.auth_output_patterns, name, "auth_output_patterns")
 

@@ -24,17 +24,20 @@ you review and accept them before they reach disk.
 
 Yana requires Neovim 0.11.2+.
 
-#### 1. Install and sign in to an agent
+#### 1. Install an agent
 
-Choose an installed, signed-in agent CLI: Claude Code (`claude`), Codex
+Choose an installed agent CLI: Claude Code (`claude`), Codex
 (`codex`) or Cursor (`cursor-agent`). Use the matching `backend` value
 `"claude"`, `"codex"` or `"cursor"` in the Neovim setup below.
+After setup, run `:YanaLogin` to sign in through that agent's official login
+in a Neovim terminal. Existing API-key authentication keeps working.
 
 <a id="bubblewrap"></a>
 
 #### 2. Install Bubblewrap
 
-In Linux `ask` and `inline` modes, Bubblewrap keeps the agent's file writes in
+In Linux `ask` and `inline` modes, Bubblewrap, also used by
+[Flatpak](https://github.com/containers/bubblewrap), keeps the agent's file writes in
 a private workspace until you accept them. Install it and its capability tool:
 
 ```sh
@@ -42,6 +45,8 @@ sudo apt-get install bubblewrap libcap2-bin
 ```
 
 #### 3. Allow Bubblewrap on Ubuntu
+
+AppArmor is [Ubuntu's application security system](https://documentation.ubuntu.com/security/security-features/privilege-restriction/apparmor/).
 
 On Ubuntu 24.04 and newer with AppArmor's user-namespace restriction, add this
 one-time permission for Bubblewrap. First check for an existing profile:

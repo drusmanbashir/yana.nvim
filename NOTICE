@@ -82,6 +82,7 @@ Runtime provenance inventory:
 - upstream-derived: `lua/yana/config.lua`
 - upstream-derived: `lua/yana/input/context.lua`
 - post-fork original: `lua/yana/runtime/dependencies.lua`
+- post-fork original: `lua/yana/runtime/auth.lua`
 - upstream-derived: `lua/yana/diff.lua`
 - post-fork original: `lua/yana/diff_preview.lua`
 - post-fork original: `lua/yana/dump.lua`

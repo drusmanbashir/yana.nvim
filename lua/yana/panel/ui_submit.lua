@@ -559,6 +559,9 @@ function M.new(deps)
     turn_id = turn_id,
     steer_enabled = true,
     spawn_reason = opts.redirect and "redirect" or (opts.text and "queue_drain" or "submit"),
+    is_current = function()
+      return p.turn_gen == gen and type(p.conv_buf) == "number" and vim.api.nvim_buf_is_valid(p.conv_buf)
+    end,
     on_event = function(obj)
       on_event(p, gen, obj, mini)
     end,

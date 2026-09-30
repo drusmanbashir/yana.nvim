@@ -60,6 +60,10 @@ cmd("YanaOpen", function()
   end)
 end, { desc = "Open the yana agent panel" })
 
+raw_cmd("YanaLogin", function()
+  yana().login()
+end, { desc = "Sign in to the selected agent in an interactive terminal" })
+
 cmd("YanaClose", function()
   log.guard("YanaClose", function()
     yana().close()

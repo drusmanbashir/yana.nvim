@@ -307,6 +307,12 @@ function M.paste_image()
   ui().paste_image()
 end
 
+-- Start vendor-owned interactive sign-in outside edit-turn execution.
+function M.login()
+  if not require_setup() then return end
+  return require("yana.runtime.auth").login()
+end
+
 -- Open the live playground for inline diff-highlight themes.
 function M.diff_themes()
   require("yana.diff_preview").open()

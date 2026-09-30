@@ -26,6 +26,14 @@ Yana starts with Cursor; it does not select whichever CLI happens to be
 installed. Your existing agent login is used; no separate Yana account or API
 key is required.
 
+If your agent is installed but not signed in, run `:YanaLogin` after configuring
+Yana. It opens the selected agent's official interactive login in a Neovim
+terminal. Follow its browser or terminal instructions, then submit your prompt
+again. In normal mode, `q` closes the login terminal; use `<C-\\><C-n>` to
+leave terminal input mode first. Yana does not store login tokens, log this
+terminal or replay a turn. The agent owns its credentials; existing API-key
+authentication is preserved.
+
 ## Ubuntu extras and first use
 
 For a normal Ubuntu installation, add the tools used by Yana's sandbox:

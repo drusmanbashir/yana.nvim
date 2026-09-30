@@ -162,6 +162,11 @@ PLATFORM WARNINGS ~
 
                                                     *:YanaOpen* *:YanaClose*
 :YanaOpen           Open the panel.
+                                                    *:YanaLogin*
+:YanaLogin          Sign in to the selected agent through its official login
+                    in a Neovim terminal. Leave terminal input with <C-\><C-n>,
+                    then q to close or cancel. Submit your prompt again after
+                    login; no turn is replayed. The vendor owns credentials.
 :YanaClose          Close the panel without accepting or rejecting changes.
 
                                                     *:YanaAsk*

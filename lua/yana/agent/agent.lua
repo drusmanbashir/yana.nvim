@@ -295,6 +295,7 @@ function M.run(req)
   -- system event that names a model.
   local model_mismatch_checked = false
   local got_result = false
+  local result_failed = false
 
   -- Opt-in raw tee (config.debug_record, default off); nil when off, so the default
   -- path performs no I/O.
@@ -336,6 +337,7 @@ function M.run(req)
     if ok and type(obj) == "table" then
       if obj.type == "result" then
         got_result = true
+        result_failed = obj.is_error == true
       end
       local described = M.describe_event(obj)
       if described then
@@ -553,6 +555,11 @@ function M.run(req)
             req.on_exit_confirmed(code)
           end
           if req.on_done then
+            if (code ~= 0 or result_failed) and not stopped_by_yana then
+              require("yana.runtime.auth").after_failure({
+                backend = resolution.backend, command = resolution.value, is_current = req.is_current,
+              })
+            end
             req.on_done(code, table.concat(stderr_acc, "\n"), {
               argv0 = resolved_cmd,
               elapsed_ms = elapsed_ms,
