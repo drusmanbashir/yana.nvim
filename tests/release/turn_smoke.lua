@@ -137,6 +137,15 @@ check(got_hunk and state ~= nil and hunks_lib.hunks(state) and hunks_lib.pending
   "a hunk appeared after the turn (overlay walk + inline_diff review, proves vendor_stream loaded)")
 
 if not state then
+  print("TURN SMOKE panel state: " .. vim.inspect({
+    busy = p.busy, job = p.job, awaiting_exit = p.awaiting_exit,
+    turn_gen = p.turn_gen, job_spawn_gen = p.job_spawn_gen,
+    got_result = p.got_result, session_error = p.yanad_session_err,
+  }))
+  if p.conv_buf and vim.api.nvim_buf_is_valid(p.conv_buf) then
+    print("TURN SMOKE conversation:\n" .. table.concat(vim.api.nvim_buf_get_lines(p.conv_buf, 0, -1, false), "\n"))
+  end
+  print("TURN SMOKE messages:\n" .. vim.fn.execute("messages"))
   die("no review state — cannot continue to the undo half of this smoke")
 end
 

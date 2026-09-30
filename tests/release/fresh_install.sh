@@ -282,7 +282,7 @@ if (( turn_rc != 0 )); then
       cp "$diagnostic" "$YANA_RELEASE_TURN_EVIDENCE/logs/$diagnostic_rel" || true
     fi
   done < <(find "$state" "$turn_scratch/state" -type f \
-    \( -name '*.log' -o -name '*.json' -o -name '*.jsonl' -o -name '*.stderr' -o -name '*.path' -o -name '*.pid' \) -print0 2>/dev/null)
+    \( -name '*.log' -o -name '*.json' -o -name '*.jsonl' -o -name '*.ndjson' -o -name '*.stderr' -o -name '*.path' -o -name '*.pid' \) -print0 2>/dev/null)
 fi
 
 if [[ $turn_rc == 65 ]]; then
