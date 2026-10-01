@@ -32,8 +32,10 @@ case "${1:-}" in
 	*) usage >&2; exit 64 ;;
 esac
 
-sudo=(sudo)
-((EUID == 0)) && sudo=()
+if ((EUID == 0)); then
+	echo "Run this as your normal user; it calls sudo only where needed." >&2
+	exit 64
+fi
 fail=0
 
 say() { printf '%s\n' "$*"; }
@@ -49,11 +51,11 @@ confirm() {
 privileged() {
 	local cmd
 	say "About to run:"
-	for cmd in "$@"; do say "  ${sudo[*]:+${sudo[*]} }$cmd"; done
+	for cmd in "$@"; do say "  sudo $cmd"; done
 	confirm || { say "Skipped."; return 1; }
 	for cmd in "$@"; do
 		# shellcheck disable=SC2086 # each command is a fixed, space-split word list
-		"${sudo[@]}" $cmd || return 1
+		sudo $cmd || return 1
 	done
 }
 
@@ -113,10 +115,14 @@ install_bubblewrap() {
 	fi
 }
 
-bwrap_starts() { bwrap --ro-bind / / --unshare-user true >/dev/null 2>&1; }
+# The same check :checkhealth yana runs before a confined turn.
+bwrap_starts() {
+	bwrap --unshare-user --unshare-pid --die-with-parent --ro-bind / / \
+		--dev /dev --proc /proc --uid "$(id -u)" --gid "$(id -g)" -- true >/dev/null 2>&1
+}
 
 allow_bubblewrap() {
-	local restrict="" existing tmp
+	local restrict="" existing foreign tmp
 	command -v bwrap >/dev/null 2>&1 || return
 	if bwrap_starts; then
 		say "ok    Bubblewrap can start its sandbox"
@@ -129,9 +135,10 @@ allow_bubblewrap() {
 		return
 	fi
 	existing=$(grep -rl /usr/bin/bwrap /etc/apparmor.d/ 2>/dev/null)
-	if [[ -n "$existing" && "$existing" != "$profile_path" ]]; then
+	foreign=$(grep -vxF "$profile_path" <<<"$existing")
+	if [[ -n "$foreign" ]]; then
 		say "need  an AppArmor profile for /usr/bin/bwrap already exists:"
-		say "$existing"
+		say "$foreign"
 		say "      Ask your administrator to add 'userns,' to it and reload it with"
 		say "      sudo apparmor_parser -r FILE. Do not add a second profile."
 		fail=1
@@ -150,6 +157,7 @@ allow_bubblewrap() {
 	fi
 	if bwrap_starts; then
 		say "ok    Bubblewrap can start its sandbox"
+		say "      To undo: sudo apparmor_parser -R $profile_path && sudo rm $profile_path"
 	else
 		say "need  Bubblewrap still cannot start: $docs#troubleshooting"
 		fail=1
