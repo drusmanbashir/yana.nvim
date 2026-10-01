@@ -143,7 +143,6 @@ for forbidden in \
 	tests/release/health_yana_ui_smoke.lua \
 	tests/release/install_remedy_smoke.lua \
 	tests/release/yana_release_preflight_gate.sh \
-	scripts/install-deps.sh \
 	prompt.txt; do
 	case_name="excluded-${forbidden//\//-}"
 	case_tree=$(copy_case "$case_name")

@@ -276,6 +276,7 @@ lua/yana/undo_action_split.lua
 lua/yana/undo_action_turn_step.lua
 lua/yana/yanad.lua
 plugin/yana.lua
+scripts/install-deps.sh
 scripts/release/archive.sh
 scripts/release/candidate.sh
 scripts/release/export.sh

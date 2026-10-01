@@ -24,6 +24,15 @@ you review and accept them before they reach disk.
 
 Yana requires Neovim 0.11.2+.
 
+Use the optional prerequisite installer script or follow the manual steps
+below. Run it as your normal user, not with `sudo`: it checks Neovim and your
+agent, then shows each system command and asks before running it with `sudo`.
+
+```sh
+curl -fsSLO https://raw.githubusercontent.com/drusmanbashir/yana.nvim/main/scripts/install-deps.sh
+bash install-deps.sh
+```
+
 #### 1. Install an agent
 
 Choose an installed agent CLI: Claude Code (`claude`), Codex

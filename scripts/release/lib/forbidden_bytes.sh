@@ -34,7 +34,7 @@ forbidden_bytes_allowed_path() {
 		| evidence/* | .evidence/* | out/* \
 		| lua/yana/"$agents_name" | lua/yana/debug_buffer_states.lua \
 		| lua/yana/debug_buffer_states_bundle.lua | nvim/lua/user/yana.lua \
-		| tools/buffer-snapshot-triple.sh | prompt.txt | scripts/install-deps.sh \
+		| tools/buffer-snapshot-triple.sh | prompt.txt \
 		| .github/workflows/tests.yml | bin/yana-ollama-agent | bin/yana-release \
 		| docs/repl.md | docs/security.md | assets/logo/* \
 		| assets/yana-review-full-still.png | assets/yana-review-full.gif \
@@ -58,7 +58,7 @@ forbidden_bytes_allowed_path() {
 	bin/yanad) return 0 ;;
 	bin/lib/yanad/*.py) return 0 ;;
 	bin/lib/yana-overlay/*.sh) return 0 ;;
-	scripts/release/*) return 0 ;;
+	scripts/install-deps.sh | scripts/release/*) return 0 ;;
 	tests/release/*) return 0 ;;
 	tests/headless/lib/hunks.lua) return 0 ;;
 	tests/lib/sigsafe.sh) return 0 ;;

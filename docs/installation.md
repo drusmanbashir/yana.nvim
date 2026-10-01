@@ -60,9 +60,9 @@ first use; the chosen backend supplies its default model.
 ## System requirements
 
 For a new setup, install the pieces you do not already have with the commands
-below; there is no Yana installer. If Neovim and your agent CLI already work,
-skip their installation sections. Confined `ask` and `inline` still need the
-Linux sandbox tools listed here.
+below or the optional `scripts/install-deps.sh`. If Neovim and your agent
+CLI already work, skip their installation sections. Confined `ask` and `inline`
+still need the Linux sandbox tools listed here.
 
 **Get Neovim 0.11.2+ first.** `apt` on Ubuntu 24.04 and older installs an
 older Neovim (0.9.5 on a stock Ubuntu 24.04 image, verified) with no warning

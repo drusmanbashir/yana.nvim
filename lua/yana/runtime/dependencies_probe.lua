@@ -59,8 +59,7 @@ local function package_hint(name)
     .. "' on Arch"
 end
 
--- Detects the host's package manager the same way the retired
--- scripts/install-deps.sh used to: /etc/os-release's ID/ID_LIKE first,
+-- Detects the host's package manager: /etc/os-release's ID/ID_LIKE first,
 -- confirmed against which package-manager binary is actually on PATH, then
 -- falling back to whichever of those binaries resolves at all when
 -- os-release is missing, unreadable, or names a manager not on PATH.
@@ -109,8 +108,7 @@ local function detect_pkg_manager()
   return "unknown"
 end
 
--- The exact copy-paste install command for THIS machine -- the one-liner
--- users now get instead of the retired scripts/install-deps.sh.
+-- The exact copy-paste install command for THIS machine.
 local function install_command(name)
   local pkg_manager = detect_pkg_manager()
   local pkg = package_name(name, pkg_manager)
