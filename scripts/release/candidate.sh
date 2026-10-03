@@ -316,11 +316,11 @@ scan_text_blob() {
 	fi
 	if [[ $(LC_ALL=C tr -dc '\0' <"$hist_root/$path" | wc -c) -gt 0 ]]; then
 		note_fail "NUL bytes in main history: $path"
-		return 0
+		return 1
 	fi
 	if ! iconv -f UTF-8 -t UTF-8 "$hist_root/$path" >/dev/null 2>&1; then
 		note_fail "not valid UTF-8 in main history: $path"
-		return 0
+		return 1
 	fi
 	set +e
 	hits=$(forbidden_bytes_scan "$hist_root" "$patterns" "$path")
@@ -334,7 +334,11 @@ scan_text_blob() {
 		else
 			note_fail "forbidden bytes in main history: $path"
 		fi
+		# Exceptions are commit-specific, so a blob with hits must be checked
+		# again wherever it appears, even when this commit was allowed.
+		return 1
 	fi
+	return 0
 }
 
 # Fail-closed per-commit audit of main (not side branches).
@@ -343,7 +347,8 @@ audit_main_history() {
 	local lib=$clone/scripts/release/lib/forbidden_bytes.sh
 	local patterns=$clone/scripts/release/forbidden-patterns.txt
 	local hist_root=$scratch/hist_blob
-	local c path mode type sha
+	local c path mode type sha key
+	local -A clean_scanned=()
 
 	[[ -f $lib && -f $patterns ]] || {
 		note_fail "clone missing forbidden-byte policy ($lib / $patterns)"
@@ -422,13 +427,20 @@ audit_main_history() {
 				continue
 			fi
 
-			mkdir -p "$hist_root/$(dirname -- "$path")"
-			if ! git -C "$clone" cat-file blob "$sha" >"$hist_root/$path"; then
-				note_fail "cannot read blob $sha at $path (commit $c)"
-				continue
+			# The policy is fixed for this check; an unchanged clean path/blob
+			# pair needs no second byte scan. Historical exceptions are not cached.
+			key="$sha:$path"
+			if [[ -z ${clean_scanned[$key]:-} ]]; then
+				mkdir -p "$hist_root/$(dirname -- "$path")"
+				if ! git -C "$clone" cat-file blob "$sha" >"$hist_root/$path"; then
+					note_fail "cannot read blob $sha at $path (commit $c)"
+					continue
+				fi
+				if scan_text_blob "$hist_root" "$patterns" "$path" "$c" "$sha"; then
+					clean_scanned[$key]=1
+				fi
+				rm -f "$hist_root/$path"
 			fi
-			scan_text_blob "$hist_root" "$patterns" "$path" "$c" "$sha"
-			rm -f "$hist_root/$path"
 		done <"$scratch/lstree.$c"
 
 		if ! git -C "$clone" show "$c:scripts/release/manifest.txt" >"$scratch/manifest.$c" 2>/dev/null; then
@@ -591,9 +603,6 @@ check() {
 
 	"$clone/scripts/release/verify.sh" "$clone" || note_fail "verify.sh failed on the fresh clone"
 
-	# A rejected candidate needs no full-history audit. Keep that expensive scan
-	# for trees whose refs, tags and HEAD export have passed their own checks.
-	(( fail == 0 )) || return 1
 	audit_main_history "$clone" "$scratch"
 
 	(( fail == 0 )) || exit 1

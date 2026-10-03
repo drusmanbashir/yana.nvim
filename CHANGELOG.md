@@ -9,8 +9,8 @@ Versioning.
 
 - README links the optional prerequisite installer and explains its confirmed
   system changes.
-- Release checks skip the full history scan once an earlier check has already
-  rejected the candidate; valid candidates still receive the complete audit.
+- Release history checks reuse scans of unchanged clean files while still
+  checking every commit and re-evaluating any historical exception.
 
 ### Added
 
