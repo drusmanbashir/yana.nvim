@@ -2,11 +2,32 @@
 local M = {}
 
 function M.new(deps)
+  -- The row's register event part records the sequence's ordered on_bytes
+  -- splices as on_bytes' own arguments `{sr, sc, oer, oec, ner, nec}`, in applied
+  -- order (plan "### M0" S1 record schema), from the changes the flush grouped
+  -- under it; a sequence re-sealed by a later flush (`:undojoin`) appends to the
+  -- same part. Read through `Register:event_of(row).parts[rel].splices` by the
+  -- follow-up's composed maps (turn_cycle_reconcile).
+  local function record_splices(register, action, changes)
+    local event = changes and changes[1] and register:event_of(action)
+    local part = event and event.parts[action.rel]
+    if not part then return end
+    part.splices = part.splices or {}
+    for _, change in ipairs(changes) do
+      local s = change.splice
+      local oer, ner = s.er - s.sr, s.nr - s.sr
+      part.splices[#part.splices + 1] = { s.sr, s.sc, oer, oer == 0 and s.ec - s.sc or s.ec,
+        ner, ner == 0 and s.nc - s.sc or s.nc }
+    end
+  end
+
   -- `seq` is the NATIVE UNDO SEQUENCE this action belongs to, passed in by the
   -- flush rather than read here: one flush can carry several sequences, and
   -- reading the live one would give every action the last sequence's number and
-  -- collapse them all into the single `actions[seq]` entry.
-  local function push_buffer_edit(state, seq)
+  -- collapse them all into the single `actions[seq]` entry. `changes` (optional):
+  -- that sequence's grouped changes, whose splices the row's event records; the
+  -- row is pushed once per sequence either way.
+  local function push_buffer_edit(state, seq, changes)
     local bufnr = state.bufnr
     if seq == nil then
       seq = (deps.buf_undo_seq and bufnr) and deps.buf_undo_seq(bufnr) or nil
@@ -17,15 +38,18 @@ function M.new(deps)
     local register = require("yana.turn.turn_register").for_workspace(workspace)
     local actions = state._buffer_edit_actions or {}
     state._buffer_edit_actions = actions
-    if actions[seq] then return actions[seq] end
-    local action = require("yana.undo_action_buffer_edit").new({
-      rel = change.rel or change.path,
-      workspace = workspace,
-      turn_id = change.turn_id or change.turn_gen,
-      undo_seq = seq,
-    })
-    register:push(action)
-    actions[seq] = action
+    local action = actions[seq]
+    if not action then
+      action = require("yana.undo_action_buffer_edit").new({
+        rel = change.rel or change.path,
+        workspace = workspace,
+        turn_id = change.turn_id or change.turn_gen,
+        undo_seq = seq,
+      })
+      register:push(action)
+      actions[seq] = action
+    end
+    record_splices(register, action, changes)
     return action
   end
 

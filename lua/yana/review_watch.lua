@@ -53,8 +53,8 @@ local function clear_queue(state)
 end
 
 --- One splice of Yana's own on `bufnr`, run with this buffer's watcher
---- suspended: the ledger still transports its geometry exactly once, only
---- interpretation is muted. The door for a caller outside the review holding no
+--- suspended: the ledger still transports its geometry exactly once, while
+--- interpretation and InsertLeave ownership capture are muted. A caller holding no
 --- `state`. Suspension is restored on both legs; a failure re-raises unchanged.
 function Watcher.own_splice(bufnr, fn)
   local owner = bufnr and owner_by_buf[bufnr]
@@ -62,12 +62,22 @@ function Watcher.own_splice(bufnr, fn)
   if type(state) ~= "table" then
     return fn()
   end
+  local had_captured = state.watch_pending or state.watch_timeline ~= nil
+    or next(state._ownership_dirty_rows or {}) ~= nil
   local previous = state.watch_suspended
   state.watch_suspended = true
   local ok, result = pcall(fn)
   state.watch_suspended = previous
   if not ok then
     error(result, 0)
+  end
+  -- This splice is Yana's own terminal/reject text. The callback transported
+  -- ledger geometry but deliberately queued no human interpretation, so move
+  -- the watcher baseline only when no human transaction is still captured.
+  if not had_captured and not state.watch_pending and state.watch_timeline == nil
+    and next(state._ownership_dirty_rows or {}) == nil then
+    local bytes = diff.buffer_bytes_snapshot(bufnr)
+    if bytes ~= nil then state.staged_text = bytes end
   end
   return result
 end
@@ -127,19 +137,52 @@ local function owns(bufnr, generation)
   return owner ~= nil and owner.generation == generation
 end
 
---- Park: the buffer stops having an absorbing owner and queued work dies with
---- the generation, having been queued against a ledger the park has sealed. A
---- park arriving after another review attached must not silence the live one.
-function Watcher.invalidate(bufnr, state)
+-- End closes admission for the exact owning attachment, then lets that owner
+-- publish work it captured before confirmation. The caller retires the token
+-- only after its File and ledger have been frozen and the End plan is stored.
+function Watcher.begin_end(bufnr, state)
+  if type(state) ~= "table" then return true, nil end
   local owner = owner_by_buf[bufnr]
-  if not owner or (state ~= nil and owner.state ~= state) then
-    return false
+  if owner == nil then
+    if state.watch_pending or state.watch_timeline
+      or next(state._ownership_dirty_rows or {}) ~= nil then
+      return false, "unowned review has captured edits"
+    end
+    return true, nil
   end
-  local done, err = Watcher.finalize(bufnr, owner.state)
-  if not done then return false, err end
-  clear_queue(owner.state)
-  owner_by_buf[bufnr] = nil
-  return true
+  if owner.state ~= state then
+    return false, "a different review owns the buffer watcher"
+  end
+  owner.admission_closed = true
+  local drained, reason = pcall(function()
+    if state.watch_pending then
+      assert(type(state.flush_pending_watch) == "function", "watch queue has no flush")
+      state.flush_pending_watch()
+    end
+    if state.watch_timeline or next(state._ownership_dirty_rows or {}) ~= nil then
+      assert(type(state.on_insert_leave_ownership) == "function", "watch timeline has no finalizer")
+      state.on_insert_leave_ownership()
+    end
+    assert(owner.admission_error == nil, owner.admission_error)
+    assert(not state.watch_pending and #(state.watch_changes or {}) == 0,
+      "watch queue remained after End drain")
+    assert(state.watch_timeline == nil, "watch timeline remained after End drain")
+    assert(next(state._ownership_dirty_rows or {}) == nil, "watch ownership rows remained after End drain")
+    local bytes, err = diff.buffer_bytes_snapshot(bufnr)
+    assert(bytes ~= nil, err or "End buffer snapshot failed")
+    assert(bytes == state.staged_text, "drained watcher text differs from live buffer")
+  end)
+  if not drained then return false, tostring(reason) end
+  return true, { bufnr = bufnr, generation = owner.generation, state = state }
+end
+
+function Watcher.retire_end(token)
+  if token == nil then return true end
+  local owner = owner_by_buf[token.bufnr]
+  if owner == nil or owner.generation ~= token.generation or owner.state ~= token.state then
+    return false, "End watcher generation changed before retirement"
+  end
+  return release_generation(token.bufnr, token.generation)
 end
 
 --- Lifecycle teardown: THE cleanup path for the entry itself.
@@ -170,6 +213,11 @@ function Watcher.resume(bufnr, state)
   local owner = owner_by_buf[bufnr]
   if owner and owner.state ~= state then
     return false
+  end
+  -- A park keeps the attachment (review_resources.park), so the parked review is
+  -- usually still watching: nothing to re-attach, and its queued work stays.
+  if owner and owns(bufnr, state._watch_generation) then
+    return true, "attached"
   end
     -- `_watch_reattach` is published by `attach` alone, so its absence means the
     -- park took nothing away. A hook that runs and still leaves this state not
@@ -286,6 +334,11 @@ function Watcher.new(deps)
         if not owns(bufnr, generation) then
           return true
         end
+        local end_owner = owner_by_buf[bufnr]
+        if end_owner.admission_closed and not state.watch_suspended then
+          end_owner.admission_error = "new buffer edit arrived during End seal"
+          return
+        end
         local s = splice.splice(sr, sc, oer, oec, ner, nec)
         if splice.is_noop(s) then
           return
@@ -335,15 +388,17 @@ function Watcher.new(deps)
         else
           state.watch_timeline = nil
         end
-        -- Stamp the rows this splice wrote with the sequence its edit DEPARTS
-        -- FROM (`false` when unreadable), so InsertLeave can absorb before the
-        -- coalesced flush and PARTITION that absorb by sequence (UNDO.md).
-        local marker = change.undo_marker
-        if marker == nil then marker = false end
+        -- Every splice moves existing stamps with the text. Only human edits
+        -- stamp the rows they wrote with the sequence they depart from
+        -- (`false` when unreadable), for InsertLeave's partition (UNDO.md).
         local dirty = splice.rows(s, state._ownership_dirty_rows)
-        local lo, hi = splice.touched(s)
-        for row = lo or 1, hi or 0 do
-          dirty[row] = marker
+        if not state.watch_suspended then
+          local marker = change.undo_marker
+          if marker == nil then marker = false end
+          local lo, hi = splice.touched(s)
+          for row = lo or 1, hi or 0 do
+            dirty[row] = marker
+          end
         end
         state._ownership_dirty_rows = dirty
         local ledger = state.hunk_ledger
@@ -355,7 +410,7 @@ function Watcher.new(deps)
             for i, block in ipairs(ledger:members()) do
               -- New text is visible, but Neovim has not moved extmarks when it
               -- invokes on_bytes. This is the actual PRE mark even for deletion.
-              local first, last = deps.live_block_range(bufnr, block)
+              local first, last = timeline.member_range(deps.live_block_range, bufnr, block)
               assert(first ~= nil and last ~= nil,
                 "watch timeline: no observed pre-edit authority range")
               local observed = { first = first, last = last,
@@ -393,8 +448,8 @@ function Watcher.new(deps)
         end
         require("yana.review_undo_trace").capture("bytes_transported", state, {
           marker = change.undo_marker, splice = change.splice, suspended = state.watch_suspended == true })
-        -- Suspension mutes interpretation only. The ledger geometry callback
-        -- above already consumed the edit, including native undo's inverse.
+        -- Suspension mutes interpretation and ownership capture. The ledger
+        -- geometry callback above consumed the edit, including native undo's inverse.
         if state.watch_suspended then
           return
         end

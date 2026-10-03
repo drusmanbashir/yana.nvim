@@ -79,8 +79,9 @@ function Factory.new(env)
     if not ok or type(pool) ~= "table" then
       return nil
     end
-    if state_rel(pool.active) == rel then
-      return pool.active
+    local attached = facade._state_for_rel and facade._state_for_rel(pool, rel)
+    if attached and not attached.closed and attached.change._parked_state ~= attached then
+      return attached
     end
     return nil
   end

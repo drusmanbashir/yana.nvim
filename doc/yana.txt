@@ -1,4 +1,4 @@
-*yana.txt*                         Yana                         version 0.1.0-alpha.15
+*yana.txt*                         Yana                         version 0.1.0-alpha.16
 
 ==============================================================================
 CONTENTS                                                        *yana-contents*

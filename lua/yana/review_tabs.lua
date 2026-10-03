@@ -393,9 +393,10 @@ function M.new(deps)
   function T.place_for_path(path, bufnr)
     local abs = diff.abs_path(path)
     local function holds(pool)
-      if pool.active and pool.active.change and pool.active.change.path
-        and diff.abs_path(pool.active.change.path) == abs then
-        return true
+      for change, state in pairs(pool.open or {}) do
+        if not state.closed and change.path and diff.abs_path(change.path) == abs then
+          return true
+        end
       end
       for _, item in ipairs(pool.order or {}) do
         local c = (item and item.change) or item
@@ -419,6 +420,29 @@ function M.new(deps)
       end
     end
     return T.place(st or deps.pool_for({}), { abs = abs, bufnr = bufnr })
+  end
+
+  -- A published follow-up may leave a reviewed file without a window. The Turn
+  -- owns membership and each File's ledger owns pending hunks; tab placement
+  -- remains here. Decided files that the operator hid stay hidden.
+  function T.reopen_pending(turn, opts_for_file)
+    for _, file in ipairs(turn.files) do
+      local pending = file.ledger and file.ledger:pending() or {}
+      if #pending > 0 then
+        local opts = opts_for_file(file)
+        if tabs_enabled(opts) then
+          local abs = diff.abs_path(file.path)
+          if not tab_for_path(abs) then
+            local state = file.review_state
+            T.place(deps.pool_for(opts), {
+              abs = abs,
+              rel = file.change and file.change.rel,
+              bufnr = state and state.bufnr,
+            })
+          end
+        end
+      end
+    end
   end
 
   T.close_owned_tabs = close.close_owned_tabs
@@ -448,10 +472,10 @@ local function member_path(turn, pool, abs)
     end
     return nil
   end
-  local active = pool and pool.active
-  local hit = active and match(active.change) or nil
-  if hit then
-    return hit
+  local hit
+  for change, state in pairs(pool and pool.open or {}) do
+    hit = not state.closed and match(change) or nil
+    if hit then return hit end
   end
   for _, item in ipairs((pool and pool.order) or {}) do
     hit = match((item and item.change) or item)

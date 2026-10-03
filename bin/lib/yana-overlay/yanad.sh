@@ -1,6 +1,12 @@
 # Launcher-side yanad protocol wrappers.
 
 YANAD_RESPONSE=""
+# The run generation (the editor's lifecycle pass; PANEL.md F-ADDENDUM-TURN) and
+# whether this run resumes a reviewing Turn on its own layer (turn.resume).
+YANAD_GENERATION=""
+YANAD_RESUME=0
+YANAD_CANCELLED=0
+YANAD_AGENT_CHILD=""
 
 yanad_session_create() {
 	local args_json
@@ -52,7 +58,7 @@ yanad_turn_args() {
 	local mounted_root=$WORKSPACE
 	[[ -n "$BROAD_ROOT" ]] && mounted_root=$BROAD_ROOT
 	python3 - "$SESSION_ID" "$TURN_ID" "$MODE" "$mounted_root" "$TURN_CGROUP" "${PLAN_JSON-}" \
-		${TOUCHED_FILES[@]+"${TOUCHED_FILES[@]}"} -- \
+		"$YANAD_GENERATION" ${TOUCHED_FILES[@]+"${TOUCHED_FILES[@]}"} -- \
 		${EXTRA_ROOTS[@]+"${EXTRA_ROOTS[@]}"} <<'PY'
 import json
 import sys
@@ -60,7 +66,7 @@ import sys
 args = sys.argv[1:]
 sep = args.index("--")
 head, roots = args[:sep], args[sep + 1 :]
-session_id, turn_id, mode, mounted_root, cgroup, plan_json, *files = head
+session_id, turn_id, mode, mounted_root, cgroup, plan_json, generation, *files = head
 payload = {
     "session_id": session_id,
     "turn_id": turn_id,
@@ -74,6 +80,8 @@ payload = {
 # the absence, never a plan the daemon would have to guess at.
 if plan_json:
     payload["plan"] = json.loads(plan_json)
+# Run identity (F-ADDENDUM-TURN); a launch with no pass generation is run 0.
+payload["generation"] = int(generation or 0)
 print(json.dumps(payload, separators=(",", ":")))
 PY
 }
@@ -170,9 +178,13 @@ yanad_turn_request() {
 		printf 'yana-overlay: %s\n' "$CGROUP_UNAVAILABLE_REASON" >&2
 		return 66
 	fi
-	local args_json rc
+	local args_json rc command=turn.request request_id="$TURN_ID:turn.request"
 	args_json=$(yanad_turn_args)
-	if yanad_client_call launcher "$$" "$TURN_ID:turn.request" turn.request "$args_json"; then
+	if (( YANAD_RESUME == 1 )); then
+		command=turn.resume
+		request_id="$TURN_ID:g$YANAD_GENERATION:turn.resume"
+	fi
+	if yanad_client_call launcher "$$" "$request_id" "$command" "$args_json"; then
 		rc=0
 	else
 		rc=$?
@@ -189,17 +201,35 @@ yanad_turn_request() {
 
 yanad_turn_end() {
 	local outcome=$1 args_json
-	args_json=$(python3 - "$SESSION_ID" "$TURN_ID" "$outcome" <<'PY'
+	args_json=$(python3 - "$SESSION_ID" "$TURN_ID" "$outcome" "$YANAD_GENERATION" <<'PY'
 import json
 import sys
-print(json.dumps({
-    "session_id": sys.argv[1],
-    "turn_id": sys.argv[2],
-    "outcome": sys.argv[3],
-}, separators=(",", ":")))
+args = {"session_id": sys.argv[1], "turn_id": sys.argv[2], "outcome": sys.argv[3],
+        "generation": int(sys.argv[4] or 0)}
+print(json.dumps(args, separators=(",", ":")))
 PY
 )
 	yanad_client_call launcher "$$" "$TURN_ID:turn.end" turn.end "$args_json"
+}
+
+# turn.end, then the editor's verdict on it. A refusal -- writer_unconfirmed when
+# the daemon could not confirm the writer's cgroup empty -- replaces the answer
+# file, so the editor's finalize stops at the refusal instead of classifying.
+yanad_finish_turn() {
+	local rc=0
+	yanad_turn_end "$1" || rc=$?
+	(( rc != 65 )) || yanad_render_refusal >&2
+	return "$rc"
+}
+
+# The launch transaction of a resumed Turn: from turn.resume until its agent's
+# exec is confirmed. Any exit inside it -- a setup refusal, a mount failure, a
+# post-mount setup failure, a stop -- rolls the layer back through layer_launch_failed.
+YANAD_LAUNCH_OPEN=0
+yanad_launch_guard() {
+	(( YANAD_LAUNCH_OPEN == 1 )) || return 0
+	LAYER_EDIT_REASON=${LAYER_EDIT_REASON:-"the launch exited before its agent started"}
+	layer_launch_failed
 }
 
 yanad_file_claim() {
@@ -305,26 +335,22 @@ seed_check() {
 	done
 }
 
-# After validate_paths has the final uppers, before the overlay is mounted. Keeps
-# the disk file's mode (644 for a file not on disk). A read-only turn mounts no
-# overlay, so nothing would read an upper copy.
-seed_copy() {
-	(( READ_ONLY_WORKSPACE == 1 )) && return 0
-	local i path dest parent mode
-	for i in "${!SEED_PATHS[@]}"; do
-		path=${SEED_PATHS[$i]}
-		seed_root_of "$path" || refuse "seed '$path' is outside the turn's roots; it has no upper layer to go in"
-		dest="$SEED_UPPER/${path#"$SEED_ROOT"/}"
-		# An upper can hold symlinks an agent made; never follow one out of it.
-		parent=$(realpath_safe "${dest%/*}")
-		path_is_prefix "$SEED_UPPER" "$parent" \
-			|| refuse "seed '$path' would be written outside its upper layer (through '$parent')"
-		mode=644
-		[[ -f "$path" ]] && mode=$(stat -c %a -- "$path")
-		mkdir -p -- "$parent"
-		cp --remove-destination -- "${SEED_FROMS[$i]}" "$parent/${dest##*/}"
-		chmod -- "$mode" "$parent/${dest##*/}"
+# `stop` reaches the editor only after the writer is gone: the agent runs as a
+# child this launcher waits for, so a TERM ends that child, and the turn cgroup is
+# left and sealed by turn.end before the launcher exits (plan "Execution,
+# failure and recovery"). An explicit stdin keeps the steer pipe (`&` alone
+# would give the child /dev/null).
+yanad_run_agent() {
+	local rc=0
+	run_overlay 0<&0 &
+	YANAD_AGENT_CHILD=$!
+	trap 'YANAD_CANCELLED=1; kill -TERM "$YANAD_AGENT_CHILD" 2>/dev/null || true' TERM INT HUP
+	while true; do
+		if wait "$YANAD_AGENT_CHILD"; then rc=0; else rc=$?; fi
+		kill -0 "$YANAD_AGENT_CHILD" 2>/dev/null || break
 	done
+	trap - TERM INT HUP
+	return "$rc"
 }
 
 cmd_run_yanad() {
@@ -345,6 +371,7 @@ cmd_run_yanad() {
 	done
 	[[ -z "$BROAD_ROOT" ]] || BROAD_ROOT=$(realpath_safe "$BROAD_ROOT")
 	seed_check
+	layer_check
 	answer_dir=${ANSWER_OUT%/*}
 	[[ "$answer_dir" == "$ANSWER_OUT" ]] && answer_dir=.
 	[[ -d "$answer_dir" && -w "$answer_dir" ]] \
@@ -357,17 +384,33 @@ cmd_run_yanad() {
 	set -e
 	(( request_rc == 0 )) || exit "$request_rc"
 
+	if (( YANAD_RESUME == 1 )); then
+		YANAD_LAUNCH_OPEN=1
+		trap yanad_launch_guard EXIT
+	fi
 	OPERATOR_HOME=$(operator_home)
 	validate_paths
-	seed_copy
+	layer_clear_mount_markers
 	resolve_cursor_dir
-	if run_overlay; then
+	layer_apply || layer_launch_failed
+	if yanad_run_agent; then
 		agent_rc=0
 	else
 		agent_rc=$?
 	fi
+	if (( YANAD_LAUNCH_OPEN == 1 )); then
+		# Started = the agent command's exec succeeded (agent_started), never just
+		# mounted; a started agent's failure or partial result stays reviewable.
+		if ! agent_started; then
+			LAYER_EDIT_REASON="the agent never started (overlay setup exited $agent_rc)"
+			layer_launch_failed
+		fi
+		YANAD_LAUNCH_OPEN=0
+		trap - EXIT
+	fi
 	outcome=ok
 	(( agent_rc == 0 )) || outcome=failed
+	(( YANAD_CANCELLED == 0 )) || outcome=cancelled
 	# Leave the turn cgroup BEFORE turn.end so seal's cgroup.kill cannot
 	# SIGKILL this launcher (or its turn.end client child). Failure is
 	# deterministic nonzero and skips turn.end.
@@ -380,7 +423,7 @@ cmd_run_yanad() {
 		exit "$EXIT_NO_SANDBOX"
 	fi
 	set +e
-	yanad_turn_end "$outcome"
+	yanad_finish_turn "$outcome"
 	end_rc=$?
 	set -e
 	(( agent_rc == 0 )) || exit "$agent_rc"

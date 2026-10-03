@@ -86,6 +86,7 @@ local pools = review_context.pools
 local pool_for = review_context.pool_for
 local pool_for_state = review_context.pool_for_state
 local state_for_rel = review_context.state_for_rel
+local state_for_buf = review_context.state_for_buf
 local owners_match = review_context.owners_match
 
 -- Walk plumbing published as PRODUCT facade fields, next to
@@ -143,7 +144,6 @@ local review_ownership = review_ownership_factory.new({
   base_fingerprint = base_fingerprint,
 })
 local reject_restoration = review_ownership.reject_restoration
-local resolve_disk_unchanged = review_ownership.resolve_disk_unchanged
 local staged_snapshot_unchanged = review_ownership.staged_snapshot_unchanged
 local apply_review_blocks_to_reloaded_disk = review_ownership.apply_review_blocks_to_reloaded_disk
 local absorb_review_blocks_over_drift = review_ownership.absorb_review_blocks_over_drift
@@ -153,7 +153,6 @@ local review_marks = review_marks_factory.new({
   ns = NS,
   authority_ns = AUTH_NS,
   late = late,
-  reject_restoration = reject_restoration,
 })
 live_block_range = review_marks.live_block_range
 -- The sidebar button strip must use the same live authority decoder as the
@@ -261,6 +260,7 @@ local queue_insert_original = review_queue.queue_insert_original
 local review_tabs = review_queue.review_tabs
 local review_navigate = review_navigate_factory.new({
   facade = M,
+  state_for_buf = state_for_buf,
   pools = pools,
   pool_for = pool_for,
   freeze_review_owner = freeze_review_owner,
@@ -501,6 +501,10 @@ review_abort_factory.new({
 })
 function M.process_next(opts)
   process_next_for(opts)
+end
+
+function M.reopen_pending_review_tabs(turn, opts_for_file)
+  return review_tabs.reopen_pending(turn, opts_for_file)
 end
 
 -- Counts batched paths in opts' pool, or across all pools.

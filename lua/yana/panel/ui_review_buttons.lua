@@ -136,7 +136,7 @@ local function pending_count(state, where)
   if not (state and state.hunk_ledger) then return 0 end
   return ledger_call(where, function() return state.hunk_ledger:count("pending") end)
 end
--- `state` is `pool.active` READ AT RENDER TIME and is legitimately nil while
+-- `state` is the focused live review READ AT RENDER TIME and is legitimately nil while
 -- the Turn is live with nothing open (parked, or between files): the strip
 -- stays, every button dims.
 local function button_list(state, tab, where)
@@ -447,10 +447,12 @@ local function redistribute(entry, strip_h)
   apply_heights(entries, false)
 end
 
--- THE review a strip renders: its pool's active one, read fresh every time.
+-- THE review a strip renders: the file under the cursor, read fresh every time.
 -- The entry never caches a review, so park, resume and file switches need no
 -- teardown -- only a refresh.
-local function cur_state(e) return e and e.pool and e.pool.active or nil end
+local function cur_state(e)
+  return e and require("yana.review_context").state_for_buf(e.pool, nil, e.tab) or nil
+end
 local function entry_for_win(win) for _, e in ipairs(strips) do if e.win == win then return e end end end
 function M.tab_for_win(win) local e = entry_for_win(win); return e and e.tab or nil end
 
@@ -567,7 +569,7 @@ function refresh_entry_impl(e)
 end
 local function schedule_refresh(e) if e.timer then return end; e.timer = vim.defer_fn(function() e.timer = nil; refresh_entry(e) end, 35) end
 
--- CursorMoved/TextChanged follow `pool.active.bufnr`, which CHANGES under a
+-- CursorMoved/TextChanged follow the focused review buffer, which changes under a
 -- live strip (park, resume, next file). Binding once at open left the strip
 -- listening to a buffer nobody is reviewing any more, so the binding is
 -- re-derived on every refresh. Rebinding from inside one of these callbacks is
@@ -620,7 +622,7 @@ M.close = M.detach_windows
 
 local function open_impl(panel, pool, tab)
   local anchor = views.conv(panel, tab); if not valid_win(anchor) then return false end
-  local state = pool and pool.active
+  local state = cur_state({ pool = pool, tab = tab })
   local old = entry_for(panel, tab); if old then refresh_entry(old); return true end
   local e = { tab = tab, anchor_win = anchor, panel = panel, pool = pool }; local ps = panes(e); if #ps == 0 then return false end
   local pre, hs, ms = {}, {}, {}; for i, p in ipairs(ps) do p.height = height(p.win); pre[i] = { win = p.win, height = p.height }; hs[i], ms[i] = p.height, p.min end
@@ -683,6 +685,9 @@ local function open_impl(panel, pool, tab)
   e.grid:attach(e.buf, e.win)
   -- Resize NEVER closes the strip: it re-lays out and re-renders.
   e.augroup = vim.api.nvim_create_augroup("YanaReviewButtons" .. tostring(e.win), { clear = true }); vim.api.nvim_create_autocmd({ "WinResized", "VimResized" }, { group = e.augroup, callback = function() refresh_entry(e) end }); vim.api.nvim_create_autocmd("User", { group = e.augroup, pattern = "YanaReviewSettled", callback = function() refresh_entry(e) end })
+  vim.api.nvim_create_autocmd({ "BufEnter", "WinEnter" }, { group = e.augroup, callback = function()
+    if vim.api.nvim_get_current_tabpage() == e.tab then refresh_entry(e) end
+  end })
   bind_buf_autocmds(e, false)
   log.lifecycle_later("review.strip_open", { tab = tab, panel_id = panel and panel.id or nil, height = e.height, anchor = "panel" })
   if valid_win(prev) then pcall(vim.api.nvim_set_current_win, prev) end; return true
@@ -707,7 +712,7 @@ end
 local function host_panel(pool, tab, asked)
   local ok, ui = pcall(require, "yana.panel.ui")
   if not ok then return asked end
-  local st = pool and pool.active
+  local st = cur_state({ pool = pool, tab = tab })
   local owner = st and st.opts and st.opts.review_owner
   local by_owner = type(ui.panel_for_owner) == "function" and ui.panel_for_owner(owner) or nil
   local primary = type(ui.panel_for_owner) == "function" and ui.panel_for_owner(nil) or nil
@@ -746,7 +751,7 @@ end
 
 -- Open (or refresh) `panel`'s strip in `tab`. Idempotent, and refuses unless a
 -- live Turn owns the panel. Every sidebar-open path ends here.
--- `pool` is the pool the entry will RENDER (`pool.active`). It is only ever
+-- `pool` is the pool the entry will RENDER. It is only ever
 -- the caller's own pool or the live Turn's; a nil one means "no live Turn" and
 -- takes the strip down.
 local function attach_pool(pool, tab, asked)

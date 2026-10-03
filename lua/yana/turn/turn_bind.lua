@@ -3,6 +3,7 @@ local Turn = require("yana.turn.turn")
 local wiring = require("yana.turn.turn_wiring")
 local settle = require("yana.turn.turn_settle")
 local turn_overlay = require("yana.turn.turn_overlay")
+local end_plan = require("yana.turn.turn_end_plan")
 
 local M = {}
 
@@ -18,12 +19,12 @@ local current_advance = nil
 
 -- ACK record per panel AND epoch, written only here, so a retry re-requests only
 -- owners still owed and never closes a review twice.
-local function ack_key(f)
-	local owner = f.review_owner
+local function ack_key(item, binding)
+	local owner = item.owner
 	if type(owner) == "table" and owner.panel_id ~= nil and owner.epoch ~= nil then
 		return "panel:" .. tostring(owner.panel_id) .. "/epoch:" .. tostring(owner.epoch)
 	end
-	return f.review_opts and f.review_opts.on_close or nil
+	return binding.close
 end
 
 -- Ask each distinct un-acknowledged panel owner to close its review. "pending"
@@ -36,13 +37,14 @@ local function close_review_owners(turn, cause, done)
 	end
 	local owners = {}
 	local seen = {}
-	for _, f in ipairs(turn.files) do
-		local opts = f.review_opts
-		if type(opts) == "table" and type(opts.on_close) == "function" then
-			local key = ack_key(f)
+	for _, member in ipairs(end_plan.bindings(turn)) do
+		local f, binding = member.binding.file, member.binding
+		local opts = binding.close_opts
+		if type(binding.close) == "function" then
+			local key = ack_key(member.item, binding)
 			if key ~= nil and not seen[key] and not acks[key] then
 				seen[key] = true
-				owners[#owners + 1] = { opts = opts, close = opts.on_close, key = key }
+				owners[#owners + 1] = { opts = opts, close = binding.close, key = key }
 			end
 		end
 	end
@@ -97,10 +99,11 @@ local function cleanup_turn_members(turn, hooks)
 	local failures = {}
 	local members = {}
 
-	for _, f in ipairs(turn.files) do
-		local change = f.change
+	for _, member in ipairs(end_plan.bindings(turn)) do
+		local f, binding = member.binding.file, member.binding
+		local change = binding.change
 		local file_pool = hooks and hooks.queue_pool_for and hooks.queue_pool_for(f) or current_pool
-		local active = file_pool and file_pool.active
+		local active = file_pool and file_pool.open and file_pool.open[change]
 
 		-- EXACT states, active and parked, each closed once.
 		local states, seen = {}, {}
@@ -110,20 +113,20 @@ local function cleanup_turn_members(turn, hooks)
 				states[#states + 1] = state
 			end
 		end
-		consider(f.review_state)
+		consider(binding.review_state)
 		if type(change) == "table" then
-			consider(change._parked_state)
-			consider(change._parked_review)
+			consider(binding.parked_state)
+			consider(binding.parked_review)
 			if active ~= nil and active.change == change then
 				consider(active)
 			end
 		end
 
 		members[#members + 1] = {
+			item = member.item,
+			binding = binding,
 			file = f,
 			change = change,
-			pool = file_pool,
-			active = active,
 			states = states,
 		}
 		for _, state in ipairs(states) do
@@ -145,19 +148,15 @@ local function cleanup_turn_members(turn, hooks)
 	for _, member in ipairs(members) do
 		local f, change = member.file, member.change
 		if type(change) == "table" and change.status == "pending" then
-			change.status = f:accepted() and "accepted" or "rejected"
+			change.status = end_plan.accepted(member.item) and "accepted" or "rejected"
 		end
 		for _, state in ipairs(member.states) do
 			if rawequal(f.review_state, state) then
-				local detached, detach_err = turn:detach_review(f.path, state)
+				local detached, detach_err = turn:retire_planned_review(member.item, member.binding, state)
 				if not detached then
 					return false, tostring(f.path) .. ": " .. tostring(detach_err)
 				end
 			end
-		end
-		local file_pool, active = member.pool, member.active
-		if file_pool ~= nil and active ~= nil and active.change == change and file_pool.active == active then
-			file_pool.active = nil
 		end
 	end
 	return true
@@ -176,9 +175,11 @@ end
 -- (may be nil); opts_fn() config accessor; on_gone(turn) v1 pool cleanup.
 function M.bind(pool, files, hooks)
 	if current and current:is_live() then
+		if current:is_frozen() then return false, "turn is frozen for End" end
 		for _, file in ipairs(files or {}) do
+			local added, reason = current:add_file(file)
+			if not added then return false, reason end
 			current_overlay:add_file(file)
-			current:add_file(file)
 		end
 		return current
 	end
@@ -186,6 +187,12 @@ function M.bind(pool, files, hooks)
 	current = Turn.new(files, {
 		ask = wiring.make_ask(hooks.opts_fn),
 		settler = settle,
+		on_sealed = function()
+			-- A strip can only exist after its module was loaded. Direct Turn tests
+			-- and headless owners have no panel chrome to remove.
+			local buttons = package.loaded["yana.panel.ui_review_buttons"]
+			if type(buttons) == "table" then buttons.remove() end
+		end,
 		close = function(turn, cause, _refused, done)
 			return close_review_owners(turn, cause, done)
 		end,
@@ -193,6 +200,7 @@ function M.bind(pool, files, hooks)
 			return cleanup_turn_members(turn, hooks)
 		end,
 		on_gone = function(turn)
+			require("yana.turn.turn_save_record").forget_turn(turn)
 			clear_if_current(turn)
 			if hooks_on_gone then
 				hooks_on_gone(turn)
@@ -210,18 +218,25 @@ function M.observe_open(pool, file_entry, hooks)
 	if type(review_opts) == "table" and review_opts.preview then
 		return nil
 	end
-	local t = M.bind(pool, {}, hooks)
-		-- THE one write of the live Turn's pool: intake binds with `pool = nil`, and it
-		-- must be known before `t:start()` so `turn_start` subscribers can ask.
-	if pool ~= nil then
-		current_pool = pool
+	if current and current:is_live() and current:is_frozen() then
+		return false, "turn is frozen for End"
 	end
+	local t, bind_err = M.bind(pool, {}, hooks)
+	if not t then return false, bind_err end
 	local fresh = not t._wired
+	local file, file_err = t:add_file(file_entry)
+	if not file then return false, file_err end
 	current_overlay:add_file(file_entry)
-	local file = assert(t:add_file(file_entry), "turn_bind.observe_open: file must join the Turn")
+	-- Intake binds with `pool = nil`; publish the pool after admission succeeds
+	-- and before `t:start()` emits to subscribers.
+	if pool ~= nil then current_pool = pool end
 	if file_entry.review_state ~= nil then
 		local attached, attach_err = t:attach_review(file.path, file_entry.review_state)
 		assert(attached, attach_err)
+	end
+	-- A creation's buffer: observe the operator's own saves (bookkeeping only, N51).
+	if require("yana.turn.turn_settle_snapshot").creation(file, file.change or {}) then
+		require("yana.turn.turn_save_record").watch(file.path, file.bufnr, t)
 	end
 	if fresh then
 		t._wired = true
@@ -233,10 +248,11 @@ function M.observe_open(pool, file_entry, hooks)
 			t:register({
 				name = "queue",
 				turn_end = function(_cb, ctx)
-					for _, f in ipairs(ctx.turn.files) do
-						if f.change then
+					for _, member in ipairs(end_plan.bindings(ctx.turn)) do
+						local f, binding = member.binding.file, member.binding
+						if binding.change then
 							local owning_pool = hooks.queue_pool_for and hooks.queue_pool_for(f) or pool
-							hooks.queue_remove_change(owning_pool, f.change)
+							hooks.queue_remove_change(owning_pool, binding.change)
 						end
 					end
 				end,
@@ -244,8 +260,8 @@ function M.observe_open(pool, file_entry, hooks)
 		end
 		t:register(wiring.tabs_callback(hooks.tabs))
 			-- Namespaces and keys are released by `review_resources.close` through the owner
-			-- table. The button strip's only existence condition is a live Turn; `pool.active`
-			-- decides dimming at render time.
+			-- table. The button strip's only existence condition is a live Turn; the
+			-- focused live attachment decides dimming at render time.
 		t:register({
 			name = "buttons",
 			turn_start = function(_cb, _ctx)
@@ -269,7 +285,7 @@ end
 
 -- The live Turn's pool, or nil when none is live.
 function M.live_pool()
-	if current and current:is_live() then
+	if current and current:is_live() and not current:is_frozen() then
 		return current_pool
 	end
 	return nil
@@ -312,10 +328,29 @@ function M.overlay(pool)
 	return nil
 end
 
+-- F-ADDENDUM-END: while a follow-up agent can still write -- its run is not yet published
+-- back to `reviewing` (turn/turn_cycle.lua), an unconfirmed writer exit included -- the closing DOORS refuse before
+-- any change: End (the zero-pending End offer and `cA`), Abort (`cR`), undo below the floor and the panel's
+-- reject-all. Keyed on the door, not on a shared function: `cx` shares the panel reject-all's code and stays a
+-- decision. True (and one line said) when `door` is refused.
+function M.closing_refused(door)
+	local t = M.get()
+	local state = t and t.cycle_owner and t.cycle_owner.state
+	-- recovery_required (a publication that needs recovery) keeps End and Abort reachable: they close the durable
+	-- review too (Reset refuses then, review_undo_turn_all.lua).
+	if state == nil or state == "reviewing" or state == "recovery_required" then
+		return false
+	end
+	require("yana.turn.turn_cycle_log").door_refused((door:lower():gsub("%-", "_")), state)
+	-- INFO: ruled behaviour, not an actionable problem (2026-09-27 logging ruling).
+	require("yana.notify").one_line("yana: " .. door .. " refused -- follow-up is running", vim.log.levels.INFO)
+	return true
+end
+
 -- `u` walked the decision history back to pending; the Turn runs the one End process.
 function M.on_undo_exhausted(pool)
 	local t = M.get(pool)
-	if t then
+	if t and not M.closing_refused("End") then
 		t:on_undo_exhausted()
 	end
 end
@@ -328,6 +363,9 @@ function M.on_decision(pool, state, trigger)
 	local t = M.get(pool)
 	if not t then
 		return
+	end
+	if t.cycle_owner and t:pending_count() == 0 and M.closing_refused("End") then
+		return t:refresh_review_liveness()
 	end
 	t:on_decision(trigger, state and state.opts and state.opts.review_owner or nil)
 		-- No advance while ACK-waiting or with cleanup owed: the next queued owner would
@@ -361,7 +399,7 @@ end
 --- what the operator did.
 function M.abort(pool, owner)
 	local t = M.get(pool)
-	if t then
+	if t and not M.closing_refused("Abort") then
 		return t:end_turn("abort", { source = "abort_control", owner = owner })
 	end
 	return false

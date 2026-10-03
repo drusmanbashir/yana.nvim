@@ -55,7 +55,7 @@ profile_lines = [
     "profile yana-bwrap /usr/bin/bwrap flags=(unconfined) {", "  userns,", "}",
 ]
 profile_text = "\n".join(profile_lines)
-for doc in ("README.md", "docs/installation.md"):
+for doc in ("README.md", "docs/installation.md", "scripts/install-deps.sh"):
     if profile_text not in (root / doc).read_text():
         fail(f"Bubblewrap AppArmor profile differs in {doc}")
 ci_steps = ci["jobs"]["release-tree"]["steps"]

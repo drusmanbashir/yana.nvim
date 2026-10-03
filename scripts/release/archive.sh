@@ -24,7 +24,7 @@ trap 'rm -f "$list" "$tarball"' EXIT
 mkdir -p "$out"
 (
 	cd "$tree"
-	printf '%s\n' LICENSE NOTICE README.md CHANGELOG.md VERSION
+	printf '%s\n' LICENSE NOTICE README.md CHANGELOG.md VERSION scripts/install-deps.sh
 	find assets doc docs lua plugin bin -type f -print
 ) | LC_ALL=C sort -u >"$list"
 
@@ -43,7 +43,8 @@ done < <(grep -E '\.md$' "$list")
 # export and build would ship silently (both comparison builds see the same
 # drifted mode). Enforce the Git mode shape while tolerating the checkout
 # umask's group-write bit, which tar normalizes away below. Executable
-# classes: bin launchers (bin/yana-*, bin/yanad) and executable overlay shell
+# classes: bin launchers (bin/yana-*, bin/yanad), the optional dependency
+# installer, and executable overlay shell
 # helpers. The four sourced overlay modules below remain non-executable, as do
 # bin/lib/yanad/*.py and every other archive member.
 while IFS= read -r member; do
@@ -54,11 +55,12 @@ while IFS= read -r member; do
 			|| { echo "archive: $member must be mode 644, found $mode" >&2; exit 1; }
 		;;
 	bin/lib/yana-overlay/capture_plan.sh | bin/lib/yana-overlay/fuse.sh \
+		| bin/lib/yana-overlay/layer_edit.sh \
 		| bin/lib/yana-overlay/mount.sh | bin/lib/yana-overlay/open_capture.sh)
 		[[ "$mode" == 644 || "$mode" == 664 ]] \
 			|| { echo "archive: $member must be mode 644, found $mode" >&2; exit 1; }
 		;;
-	bin/*)
+	bin/* | scripts/install-deps.sh)
 		[[ "$mode" == 755 || "$mode" == 775 ]] \
 			|| { echo "archive: $member must be mode 755, found $mode" >&2; exit 1; }
 		;;

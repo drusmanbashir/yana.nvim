@@ -64,16 +64,16 @@ end
 -- mutation of `state.model_hunks` that no snapshot covers is one no `u` can take
 -- back. These two functions are the one place that reads and writes that array
 -- as a whole; `undo_action_split` calls `M.restore_model_snapshot` rather than
--- keeping a second copy of the rule. A SHALLOW ARRAY COPY IS LOSSLESS: no writer
--- mutates an existing entry table, each ASSIGNS a freshly-built one into a slot,
--- so holding the old entry by reference holds its old content too.
+-- keeping a second copy of the rule. ENTRIES ARE COPIED BY VALUE (one level):
+-- live writers assign new_end_line/new_count INTO an existing entry
+-- (undo_action_native, review_watch, review_watch_batch).
 function M.snapshot_model(model)
   if type(model) ~= "table" then
     return nil
   end
   local out = { n = #model }
   for i = 1, out.n do
-    out[i] = model[i]
+    out[i] = type(model[i]) == "table" and vim.tbl_extend("force", {}, model[i]) or model[i]
   end
   return out
 end

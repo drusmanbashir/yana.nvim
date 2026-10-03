@@ -145,7 +145,13 @@ function M.new(deps)
       if not ok then
         return nil, "cannot stage review in this buffer (" .. tostring(err) .. ")"
       end
-      vim.bo[bufnr].modified = false
+      -- Unsaved operator text stays unsaved (a modified buffer is never marked clean; review_open keeps it).
+      change._dirty_kept = existing_modified and true or nil
+      if change._dirty_kept then
+        log.lifecycle_info("review.dirty_kept", { rel = change.rel or change.path, reason = "unsaved_before_stage" })
+      else
+        vim.bo[bufnr].modified = false
+      end
       log.buffer_event("baseline_staged", { change = change, bufnr = bufnr })
       return bufnr, nil
     end

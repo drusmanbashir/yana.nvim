@@ -261,8 +261,7 @@ function M.new(deps)
       return
     end
     local restored = deps.reject_restoration(bufnr, block, start_line, end_line)
-    local replaced = (end_line >= start_line) and (end_line - start_line + 1) or 0
-    local delta = #restored - replaced
+    local last, delta = require("yana.review_restore").span(bufnr, change, start_line, end_line, restored)
     local pre_seq = deps.buf_undo_seq(bufnr)
     -- The decided hunk leaves `paint_membership` the instant the ledger knows, and the
     -- band it leaves behind is removed by the ONE coalesced repaint the dirty signal
@@ -287,7 +286,7 @@ function M.new(deps)
     -- global, always nil, so the replay branch it guarded was unreachable.
     -- Removed with the whole-tree undeclared-globals gate
     -- (tests/undeclared_globals_gate.sh).
-    vim.api.nvim_buf_set_lines(bufnr, start_line - 1, end_line, false, restored)
+    vim.api.nvim_buf_set_lines(bufnr, start_line - 1, last, false, restored)
     state.watch_suspended = false
     deps.break_undo_block(bufnr)
     facade._recompute_modified(bufnr, state.hunk_ledger:pending(), change.path)
@@ -522,12 +521,6 @@ function M.new(deps)
     -- — `_poll_leave_edge` never yields true.) Creation already wrote above;
     -- finish_session still closes the review.
     deps.finish_session(state, true)
-    if state._redo_hold_active then
-      local pool = deps.pool_for(state.opts or {})
-      if pool.active == nil then
-        pool.active = state
-      end
-    end
   end
 
   state._decide_destroyed_hunk = reject_destroyed_hunk

@@ -81,6 +81,8 @@ function M.read_records(workspace, upper)
 			declared = declared or line:match("^#%s*(%S+)")
 		end
 	end
+	-- Transient: a follow-up resumes this layer, whose root may hold only upper/, work/ and the mount marker.
+	os.remove(meta_out)
 	if declared ~= EXPECTED_PRODUCER then
 		return nil, "refusing a change set from an unknown producer: " .. tostring(declared)
 	end

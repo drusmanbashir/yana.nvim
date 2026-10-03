@@ -78,6 +78,39 @@ function M.new(deps)
 		return mode and (mode % 4096) or nil
 	end
 
+	--- THE ONE DERIVATION of complete tagged before-evidence from an observed
+	--- state: `{base_state, base_hash, base_mode, base_link_target}`, for a caller
+	--- whose evidence is the present file rather than a turn-start record -- a
+	--- checkpoint restore, and End's journaled write.
+	local function evidence_of(state)
+		local ev = { base_state = state.kind }
+		if state.kind == "absent" then
+			ev.base_hash = hash_bytes("")
+		elseif state.kind == "file" then
+			ev.base_hash = state.hash
+			ev.base_mode = mode_perm(state.mode)
+		else
+			ev.base_hash = hash_bytes(state.target or "")
+			ev.base_mode = mode_perm(state.mode)
+			ev.base_link_target = state.target
+		end
+		return ev
+	end
+
+	--- `evidence_of` the path as it is NOW, stamped with this read's time, or nil
+	--- plus the named refusal. End's journaled write takes its evidence here
+	--- (CORE "Saving is Neovim's", LEDGER N51): a file the operator saved with
+	--- `:w` during review is the file End acts on, not drift.
+	local function current_evidence(path)
+		local state, serr = observe_state(path)
+		if not state then
+			return nil, serr
+		end
+		local ev = evidence_of(state)
+		ev.base_hash_captured_ts = os.time()
+		return ev
+	end
+
 	--- Is this a mode a restore could actually set?
 	---
 	--- `uv.fs_chmod` takes a number. A string, a float or a negative is not a mode
@@ -216,6 +249,8 @@ function M.new(deps)
 
 	return {
 		observe_state = observe_state,
+		evidence_of = evidence_of,
+		current_evidence = current_evidence,
 		mode_perm = mode_perm,
 		valid_mode = valid_mode,
 		identity_of = identity_of,

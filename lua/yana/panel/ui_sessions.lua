@@ -16,6 +16,17 @@ local function clean_path(path)
   return vim.fn.fnamemodify(tostring(path or ""), ":p"):gsub("/+$", "")
 end
 
+-- Picker recovery diagnostics: INFO lifecycle rows.
+local function plog(kind, fields)
+  pcall(function()
+    require("yana.log").lifecycle_info(kind, fields)
+  end)
+end
+
+local function sid8(choice)
+  return choice and type(choice.session_id) == "string" and choice.session_id:sub(1, 8) or ""
+end
+
 local function pending_state(row)
   if row.review then
     return "reviewing"
@@ -213,6 +224,7 @@ function M.new(deps)
 
       local function delete_session(choice, after)
         if not choice or type(choice.session_id) ~= "string" or choice.session_id == "" then
+          plog("recover.delete_result", { ok = false, reason = "no_session_id" })
           if after then
             after(false)
           end
@@ -223,11 +235,13 @@ function M.new(deps)
         require("yana.runtime.yanad").session_delete({ session_id = choice.session_id }, req, function(ok, res)
           if not panel_is_current(target, target_id, workspace) then
             recovery_picker_open = false
+            plog("recover.delete_result", { ok = false, reason = "panel_not_current" })
             if after then
               after(false)
             end
             return
           end
+          plog("recover.delete_result", { ok = ok and true or false, reason = ok and "deleted" or tostring(res) })
           if not ok then
             notify_one_line(
               "yana: delete session failed: " .. tostring(res),
@@ -256,12 +270,18 @@ function M.new(deps)
       end
 
       recovery_picker_open = true
+      local mode_at_open = vim.api.nvim_get_mode().mode
 
       if deps.select then
+        plog("recover.picker_open", { ui = "select", rows = #live_rows, mode_at_open = mode_at_open })
         deps.select(live_rows, {
           prompt = "yana: recover an unattached session  [" .. tip .. "]",
           format_item = recovery_label,
         }, function(choice, action)
+          plog("recover.picker_action", {
+            action = action or (choice and "recover" or "cancel"),
+            session_id = sid8(choice),
+          })
           if action == "delete" then
             delete_session(choice, function(ok, remaining)
               if not ok then
@@ -309,6 +329,7 @@ function M.new(deps)
         -- <Del> not x: global leap map `xs` makes bare x wait on timeoutlen (live
         -- fail).
         local nowait = { nowait = true }
+        plog("recover.picker_open", { ui = "telescope", rows = #live_rows, mode_at_open = mode_at_open })
         pickers
           .new(themes.get_dropdown({
             prompt_title = "yana recover  [" .. tip .. "]",
@@ -318,6 +339,14 @@ function M.new(deps)
             finder = make_finder(live_rows),
             sorter = conf.generic_sorter({}),
             attach_mappings = function(prompt_bufnr, map)
+              -- Opened from insert mode (or any caller mode) the prompt must still be
+              -- normal, or Del/n type text.
+              vim.schedule(function()
+                if vim.api.nvim_buf_is_valid(prompt_bufnr) and vim.api.nvim_get_current_buf() == prompt_bufnr then
+                  vim.cmd("stopinsert")
+                end
+              end)
+
               local function close_picker()
                 recovery_picker_open = false
                 actions.close(prompt_bufnr)
@@ -325,6 +354,7 @@ function M.new(deps)
 
               local function delete_selected()
                 local entry = action_state.get_selected_entry()
+                plog("recover.picker_action", { action = "delete", session_id = sid8(entry and entry.value) })
                 if not entry or not entry.value then
                   notify_one_line("yana: no session selected", vim.log.levels.WARN)
                   return
@@ -345,6 +375,10 @@ function M.new(deps)
 
               actions.select_default:replace(function()
                 local entry = action_state.get_selected_entry()
+                plog("recover.picker_action", {
+                  action = entry and entry.value and "recover" or "cancel",
+                  session_id = sid8(entry and entry.value),
+                })
                 close_picker()
                 if entry and entry.value then
                   -- Flag already cleared; recover without toggling again.
@@ -355,17 +389,21 @@ function M.new(deps)
                 end
               end)
 
-              map("n", "<Del>", delete_selected, nowait)
-              map("n", "<Delete>", delete_selected, nowait)
+              map({ "i", "n" }, "<Del>", delete_selected, nowait)
+              map({ "i", "n" }, "<Delete>", delete_selected, nowait)
 
               map("n", "n", function()
+                plog("recover.picker_action", { action = "new", session_id = "" })
                 close_picker()
                 if panel_is_current(target, target_id, workspace) then
                   start_new()
                 end
               end, nowait)
 
-              map({ "i", "n" }, "<Esc>", close_picker)
+              map({ "i", "n" }, "<Esc>", function()
+                plog("recover.picker_action", { action = "cancel", session_id = "" })
+                close_picker()
+              end)
 
               return true
             end,
@@ -383,10 +421,15 @@ function M.new(deps)
         fallback[#fallback + 1] = row
       end
       fallback[#fallback + 1] = { _yana_action = "new", label = "New session" }
+      plog("recover.picker_open", { ui = "select", rows = #live_rows, mode_at_open = mode_at_open })
       vim.ui.select(fallback, {
         prompt = "yana: recover an unattached session (install telescope for Del/n keys)",
         format_item = recovery_label,
       }, function(choice)
+        plog("recover.picker_action", {
+          action = not choice and "cancel" or choice._yana_action == "new" and "new" or "recover",
+          session_id = sid8(choice),
+        })
         if not choice then
           recovery_picker_open = false
           return

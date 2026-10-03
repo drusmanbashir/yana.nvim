@@ -118,10 +118,6 @@ function Factory.new(deps)
       end
       record_last_hunk_decided("reject", pending[#pending])
       local ok = M._settle_bulk_reject(state, "reject_all") -- A1/call 2: the same edge + finalize as every other door
-      local pool = pool_for(state)
-      if state._redo_hold_active and pool.active == nil then
-        pool.active = state
-      end
       return ok
     end
 
@@ -285,6 +281,22 @@ function Factory.new(deps)
       local active_entry = nil
       local active_file = turn and turn:file(diff.abs_path(change.path)) or nil
       local active_operation = operation_transition(active_file, "accepted")
+      for sibling, sibling_state in pairs(st.open) do
+        if sibling_state ~= state and not sibling_state.closed
+          and sibling._parked_state ~= sibling_state
+          and sibling_state.hunk_ledger:is_open() then
+          local sibling_file = turn and turn:file(diff.abs_path(sibling.path)) or nil
+          bulk_files[#bulk_files + 1] = {
+            rel = sibling.rel or sibling.path,
+            ledger = sibling_state.hunk_ledger,
+            blocks = sibling_state.hunk_ledger:pending(),
+            change = sibling,
+            file = sibling_file,
+            operation = operation_transition(sibling_file, "accepted"),
+            band_bufnr = sibling_state.bufnr,
+          }
+        end
+      end
       if state.hunk_ledger and state.hunk_ledger:is_open()
         and (#active_blocks > 0 or active_operation ~= nil)
       then
@@ -419,7 +431,7 @@ function Factory.new(deps)
 
     local function accept_everything()
       local st = pool_for(state.opts or {})
-      if st.active ~= state then
+      if st.open[state.change] ~= state then
         return false
       end
       local turn = require("yana.turn.turn_bind").get(st)

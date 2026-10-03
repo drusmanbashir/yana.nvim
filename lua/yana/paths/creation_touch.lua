@@ -69,9 +69,7 @@ function M.disk_is_ours(path)
     return false, "could not stat " .. abs
   end
   if (st.size or 0) > 0 then
-    -- Someone ELSE wrote content here. Refused in the shape
-    -- `review_ownership.resolve_disk_unchanged` already refuses an
-    -- appearance in (review_ownership.lua's disk_absent_at_open branch).
+    -- Someone ELSE wrote content here: refused as an appearance.
     return false, "file appeared on disk since review opened"
   end
   return true, nil

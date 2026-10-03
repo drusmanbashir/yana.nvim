@@ -47,8 +47,12 @@ function Factory.new(deps)
   --- Yes-abort itself releases the key back to Neovim (see `M.cleanup` above).
   function M.abort_active(opts)
     local st = pool_for(opts or {})
-    local state = st.active
-    if not state then
+    local tb = require("yana.turn.turn_bind")
+    -- Abort belongs to the Turn, so any live attachment names its owner (the one in
+    -- the current buffer first); a live Turn stays abortable even with none.
+    local live_state = require("yana.review_context").state_for_buf
+    local state = live_state(st)
+    if not state and not tb.get(st) then
       notify_one_line("yana: no review is open to abort", vim.log.levels.WARN)
       return false
     end
@@ -56,14 +60,12 @@ function Factory.new(deps)
     -- changes nothing. The v1 undo-every-buffer-by-hand body (the whole-review confirm
     -- dialog plus the per-file rewind it drove) is gone: every review now binds a Turn,
     -- so this door always defers to `turn_bind.abort`.
-    local tb = require("yana.turn.turn_bind")
     -- The owning review travels with the Abort so its End result names both
     -- what was pressed and which review it belonged to. `turn_bind.abort`
     -- already took the owner; this was the caller that never supplied it.
-    return tb.abort(st, state.opts and state.opts.review_owner or nil)
+    return tb.abort(st, state and state.opts and state.opts.review_owner or nil)
   end
 
-  -- Opens the next queued change in opts' pool, if any is pending.
   return M
 end
 

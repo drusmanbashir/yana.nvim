@@ -79,8 +79,13 @@ function M.reconcile_applied_buffer(applied, own_splice)
 	-- pre-turn text during the wait is a new action, not permission to
 	-- overwrite. Refuse, and leave the buffer and its tick exactly as they are.
 	if applied.staged_tick ~= nil and not (M._test.fault and M._test.fault.skip_unsaved_guard) then
-		local live_tick = vim.api.nvim_buf_get_changedtick(bufnr)
-		if live_tick ~= applied.staged_tick then
+		-- Neovim's write of a modified buffer moves changedtick and nothing else
+		-- (CORE "Saving is Neovim's", N51): an unmodified buffer still at the
+		-- pinned undo position is not an edit. Its bytes are checked below.
+		local moved = vim.api.nvim_buf_get_changedtick(bufnr) ~= applied.staged_tick
+			and (vim.bo[bufnr].modified or applied.staged_seq == nil
+				or vim.api.nvim_buf_call(bufnr, vim.fn.changenr) ~= applied.staged_seq)
+		if moved then
 			return false,
 				"the buffer has unsaved edits of its own; disk was updated with the accepted change "
 					.. "but the buffer was left untouched so your edits are not lost -- save or discard them, "
@@ -247,7 +252,7 @@ function M.reconcile_applied_buffer(applied, own_splice)
 end
 
 --- THE EXPLICIT WRITE DESCRIPTION both accept routes consume:
---- `{action, bytes, mode, purpose, preserve_review}`. `turn.turn_projection`
+--- `{action, bytes, mode, purpose}`. `turn.turn_projection`
 --- is the ONE calculation of final bytes, existence and mode; this only
 --- NORMALISES it, never reading `change.kind` or `change.after_mode`.
 --- `opts.projection`'s `mode` is the ONLY thing that can authorise a
@@ -274,7 +279,6 @@ function M.write_plan(change, composed, opts)
 			bytes = bytes,
 			mode = supplied.mode,
 			purpose = supplied.purpose,
-			preserve_review = supplied.preserve_review == true,
 		}
 	end
 	return {
@@ -282,7 +286,6 @@ function M.write_plan(change, composed, opts)
 		bytes = composed or "",
 		mode = change.base_mode,
 		purpose = nil,
-		preserve_review = false,
 	}
 end
 
@@ -314,8 +317,7 @@ M.accept_preflight = accept_preflight
 
 --- THE ONE GUARDED DIARY WRITE: both accept routes reach disk through exactly
 --- this body -- intent row with the drift CAS, displaced copy, post-rename
---- verification, receipt. `plan.preserve_review` withholds the BUFFER
---- RECONCILE only, never a disk identity or content check. `own_splice` is an
+--- verification, receipt. `own_splice` is an
 --- argument only: never onto `plan` or `applied`.
 ---
 --- Returns `true, nil, applied` or `false, reason`. `applied.reconcile_error`
@@ -328,6 +330,20 @@ function M.commit(session, change, plan, own_splice, staged_proof)
 		return true, nil, { path = change.path, kind = "none", written = false }
 	end
 	local is_delete = plan.action == "delete"
+	-- THE BEFORE-EVIDENCE. An End write (`purpose == "exit"`) acts on the file as
+	-- End finds it, so whatever the operator's own `:w` left during the review is
+	-- never drift (CORE "Saving is Neovim's", LEDGER N51; RULINGS whole-agent-hunk
+	-- row: End checks no disk bytes against the turn). Read here, inside the
+	-- claim, so the diary's last-instant identity and content re-check still
+	-- guards the window up to the write. Every other route keeps the turn record.
+	local evidence = change
+	if plan.purpose == "exit" then
+		local current, cerr = diary.current_evidence(change.path)
+		if not current then
+			return false, cerr
+		end
+		evidence = current
+	end
 	-- Predicted as diary.next_op_id mints it, so the timeline can revert by
 	-- (diary_dir, op_id).
 	local predicted_op_id = string.format("%s:%d", session.stream, (session.op_seq or 0) + 1)
@@ -336,15 +352,15 @@ function M.commit(session, change, plan, own_splice, staged_proof)
 		path = change.path,
 		target = plan.bytes,
 		op_kind = is_delete and "delete" or "replace",
-		base_hash = change.base_hash,
+		base_hash = evidence.base_hash,
 		-- WHEN it was captured, so a stale-file refusal tells a human edit
 		-- from a stale capture.
-		base_hash_captured_ts = change.base_hash_captured_ts,
+		base_hash_captured_ts = evidence.base_hash_captured_ts,
 		-- Absence and an empty file are different states; only this tag
 		-- separates them at accept time.
-		base_state = change.base_state,
-		base_mode = change.base_mode,
-		base_link_target = change.base_link_target,
+		base_state = evidence.base_state,
+		base_mode = evidence.base_mode,
+		base_link_target = evidence.base_link_target,
 		-- THE MODE VERDICT, AND NOTHING ELSE: `change.after_mode` is the
 		-- agent's PROPOSAL and is never read here.
 		target_mode = plan.mode,
@@ -389,15 +405,12 @@ function M.commit(session, change, plan, own_splice, staged_proof)
 		-- back, and the hash would agree while the undo history, marks and
 		-- extmarks have all moved underneath the review.
 		staged_tick = type(staged_proof) == "table" and staged_proof.tick or nil,
+		-- The pin's undo position (`changenr()`): with `modified`, what tells
+		-- Neovim's own write, which moves the tick, from an edit.
+		staged_seq = type(staged_proof) == "table" and staged_proof.seq or nil,
 		written = true,
 		purpose = plan.purpose,
 	}
-	if plan.preserve_review then
-		-- Buffer and file are SUPPOSED to differ here, so reconciling would
-		-- overwrite the live review. The diary's own checks already ran.
-		applied.preserved_review = true
-		return true, nil, applied
-	end
 	local rok, rerr = M.reconcile_applied_buffer(applied, own_splice)
 	if not rok then
 		applied.reconcile_error = rerr

@@ -327,6 +327,8 @@ class Daemon(LifecycleMixin):
                 return self.session_attach(frame)
             if cmd == "turn.request":
                 return self.turn_request(frame)
+            if cmd == "turn.resume":
+                return await self.turn_resume(frame)
             if cmd == "turn.end":
                 return self.exit_checked(self.turn_end(frame))
             if cmd == "review.open":
@@ -464,14 +466,14 @@ class Daemon(LifecycleMixin):
                 "claim event action=acquire key=%s session=%s turn=%s"
                 % (key, sid, args["turn_id"]),
             )
-        self.watch_owner(sid, args["turn_id"], owner, "launcher")
+        self.watch_owner(sid, args["turn_id"], owner, "launcher", store.run_generation(args))
         return protocol.ok(frame["id"], {"launch": launch})
 
     def make_turn_dir(self, sid, args, owner, mode):
         try:
             return store.turn_dir(
                 self.root, sid, args["turn_id"], args["cgroup"], owner,
-                args["mounted_root"], args.get("roots", []), mode, args.get("plan"),
+                args["mounted_root"], args.get("roots", []), mode, args.get("plan"), store.run_generation(args),
             )
         except Exception as exc:
             self.log.write(
@@ -479,52 +481,6 @@ class Daemon(LifecycleMixin):
                 "overlay mount failure turn=%s: %s" % (args["turn_id"], exc),
             )
             raise
-
-    def reconcile_prior_turns(self, sid, requested_tid):
-        """Clear dead launch state before minting the next turn's layers.
-
-        A live or unclassifiable owner is never reclaimed. A dead turn with an
-        open review remains available for recovery; only an unreviewed dead
-        turn is disposable.
-        """
-        cleaned = []
-        review_path = self.root / "sessions" / sid / "review" / "open"
-        review_tid = None
-        if review_path.exists():
-            try:
-                review_tid = store.read_json(review_path).get("turn_id")
-            except (OSError, AttributeError, TypeError, ValueError):
-                review_tid = None
-        for turn in store.iter_turns(self.root, sid):
-            tid = turn["turn_id"]
-            state = turn.get("state")
-            if state == "running":
-                kind = liveness.owner_kind(turn.get("owner"))
-                if kind == "live":
-                    return {"turn_id": tid, "reason": "turn is still live"}, cleaned
-                if kind != "dead":
-                    return {"turn_id": tid, "reason": "turn liveness is unconfirmed"}, cleaned
-                self.owner_dead(sid, tid, "launcher")
-                try:
-                    state = store.read_json(
-                        self.root / "sessions" / sid / "turns" / tid / "meta.json"
-                    ).get("state")
-                except OSError:
-                    state = "dead"
-            # dead_unsealed preserves its residue refusal for
-            # session.delete, but never excludes another launch.
-            if state == "dead_unsealed":
-                continue
-            if state not in {"dead", "sealed"} or tid == review_tid:
-                continue
-            store.clear_claim_rows_for_turn(self.root, sid, tid)
-            store.remove_turn(self.root, sid, tid, log=self.log)
-            cleaned.append(tid)
-        return None, cleaned
-
-    def warn_dead_turn_cleanup(self, turn_ids, requested_tid):
-        names = ", ".join(turn_ids)
-        self.log.write("WARN", "self-healed dead turn %s before turn %s" % (names, requested_tid))
 
     def turn_end(self, frame):
         args = frame["args"]
@@ -540,12 +496,15 @@ class Daemon(LifecycleMixin):
         meta_path = self.root / "sessions" / sid / "turns" / tid / "meta.json"
         if not meta_path.exists():
             return protocol.ok(frame["id"])
+        self.require_run(args, sid, tid)
         held = [
             row for row in store.iter_claims(self.root)
             if row["session_id"] == sid and row["turn_id"] == tid
         ]
         state, reason = liveness.seal_cgroup(store.read_json(meta_path).get("cgroup", ""))
-        next_state = "settling" if state == "sealed" else state
+        next_state = self.settled_state(sid, tid, args, state)
+        if next_state == "reviewing":  # a verified launch rollback: that run never became a cycle
+            store.uncount_cycle(self.root, sid, tid)
         for row in held:
             store.write_claim_row(self.root, row["key"], sid, tid, next_state)
         store.set_turn_state(
@@ -556,6 +515,8 @@ class Daemon(LifecycleMixin):
         session = store.load_session(self.root, sid)
         if session.get("kind") == "cli":
             self.unwatch(sid, None, "editor")
+        if next_state == "dead_unsealed":  # a named seal failure: the writer's exit is unconfirmed
+            raise store.Refused("writer_unconfirmed", reason)
         return protocol.ok(frame["id"])
 
     def review_open(self, frame):
@@ -567,6 +528,7 @@ class Daemon(LifecycleMixin):
             turn = store.read_json(meta_path)
         except OSError:
             return protocol.refuse(frame["id"], "not_holder")
+        self.require_run(args, sid, tid)
         if turn.get("state") not in {"running", "settling"}:
             return protocol.refuse(frame["id"], "not_holder")
         files = args["files"]
@@ -580,6 +542,7 @@ class Daemon(LifecycleMixin):
         store.open_review(
             self.root, sid, tid, files, args.get("tabs", []), args.get("bundle", []),
         )
+        store.publish_run(self.root, sid, tid, int(args["generation"]))
         store.clear_claim_rows(self.root, sid)
         for key in incoming_keys:
             store.write_claim_row(self.root, key, sid, tid, "reviewing")
@@ -593,6 +556,9 @@ class Daemon(LifecycleMixin):
         args = frame["args"]
         sid = args["session_id"]
         tid = args["turn_id"]
+        self.require_run(args, sid, tid)
+        if self.open_review_turn(sid) is not None:  # a follow-up republishes; it never drops the review
+            raise store.Refused("review_is_open", "turn %s has an open review" % self.open_review_turn(sid))
         store.set_turn_state(
             self.root, sid, tid, "closed", log=self.log,
             clear_workdirs=self.defer_workdir_cleanup,
@@ -617,6 +583,8 @@ class Daemon(LifecycleMixin):
             tid = holder and holder["turn_id"]
         if not tid:
             raise store.Refused("no_review")
+        if frame["cmd"] == "review.close" or {"turn_id", "generation"} & set(frame["args"]):
+            self.require_run(frame["args"], sid, tid, review_run=True)
         store.close_review(self.root, sid)
         store.set_turn_state(
             self.root, sid, tid, "closed", log=self.log,

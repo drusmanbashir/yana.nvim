@@ -25,9 +25,14 @@ local function copy(lines)
   return out
 end
 
-local function splice_lines(lines, s, inserted)
+-- on_bytes counts a newline after every row, so the end of the text is (#lines, 0): an empty row past the last,
+-- which an edit at the end of the buffer (`o` on the last row, `dd` of it, an append) addresses. It is spliced
+-- like any row and must come out last and empty; Neovim keeps one empty row in a buffer emptied of text.
+local function splice_lines(source, s, inserted)
   assert(type(s.sr) == "number" and type(s.sc) == "number"
     and type(s.er) == "number" and type(s.ec) == "number")
+  local lines = copy(source)
+  lines[#lines + 1] = ""
   assert(lines[s.sr + 1] ~= nil and lines[s.er + 1] ~= nil)
   assert(s.sc <= #lines[s.sr + 1] and s.ec <= #lines[s.er + 1])
   assert(type(inserted) == "table" and #inserted > 0)
@@ -45,7 +50,27 @@ local function splice_lines(lines, s, inserted)
   for i = 1, s.sr do out[#out + 1] = lines[i] end
   vim.list_extend(out, replacement)
   for i = s.er + 2, #lines do out[#out + 1] = lines[i] end
+  assert(out[#out] == "", "watch timeline: a splice removed the final newline")
+  out[#out] = nil
+  if #out == 0 then out[1] = "" end
   return out
+end
+
+-- The slice a splice wrote, read inside its own callback; nil while the buffer does not hold it yet. A slice that
+-- ends at the end of the text ends with the final newline, past the last row the buffer API can address.
+local function written(bufnr, s)
+  local count = vim.api.nvim_buf_line_count(bufnr)
+  if s.nr > count or (s.nr == count and s.nc ~= 0) then return nil end
+  if s.sr == count then return { "" } end
+  local function row(r) return vim.api.nvim_buf_get_lines(bufnr, r, r + 1, false)[1] end
+  if s.sc > #row(s.sr) then return nil end
+  if s.nr == count then
+    local text = vim.api.nvim_buf_get_text(bufnr, s.sr, s.sc, count - 1, #row(count - 1), {})
+    text[#text + 1] = ""
+    return text
+  end
+  if s.nc > #row(s.nr) then return nil end
+  return vim.api.nvim_buf_get_text(bufnr, s.sr, s.sc, s.nr, s.nc, {})
 end
 
 function M.new(before_text, opts)
@@ -59,7 +84,14 @@ end
 -- `shadow`. Reading the new slice is permitted under Neovim's callback textlock.
 function Timeline:capture(change, bufnr)
   local s = change.splice
-  local inserted = vim.api.nvim_buf_get_text(bufnr, s.sr, s.sc, s.nr, s.nc, {})
+  local inserted = written(bufnr, s)
+  if inserted == nil then
+    -- A join (`J`, `3J`, visual `J`) reports each joined row's splice before it writes the joined line: the
+    -- callback still sees the rows apart (measured on Neovim 0.12.4). What a join writes between the parts is
+    -- spaces only; the flush still checks the whole shadow against the buffer (`matches_live`).
+    assert(s.nr == s.sr, "watch timeline: a multi-row splice was reported before its text was written")
+    inserted = { string.rep(" ", s.nc - s.sc) }
+  end
   if #inserted == 0 then inserted = { "" } end
   local updated = splice_lines(self.shadow, s, inserted)
   change._timeline_inserted = copy(inserted)
@@ -67,6 +99,20 @@ function Timeline:capture(change, bufnr)
   self.shadow = updated
   self.changes[#self.changes + 1] = change
   return true
+end
+
+-- Replays one captured splice on another buffer, so its marks move as the live buffer's did. The buffer API
+-- cannot address the end of the text, so a splice reaching it (whole rows there, by the final-newline rule) is
+-- replayed as the whole-row replacement Neovim reports with that same splice.
+function M.replay_splice(bufnr, s, inserted)
+  local count = vim.api.nvim_buf_line_count(bufnr)
+  if s.er < count then
+    vim.api.nvim_buf_set_text(bufnr, s.sr, s.sc, s.er, s.ec, inserted)
+    return
+  end
+  assert(s.sc == 0 and s.ec == 0 and inserted[#inserted] == "",
+    "watch timeline: a splice reaching the end of the text is not whole rows")
+  vim.api.nvim_buf_set_lines(bufnr, s.sr, s.er, false, vim.list_slice(inserted, 1, #inserted - 1))
 end
 
 function Timeline:states()
@@ -86,6 +132,20 @@ function Timeline:matches_live(bufnr)
   return true
 end
 
+-- The range the timeline observes for one member: its live authority mark, else -- for a decided member, which the
+-- painter leaves without marks (review_paint repaints pending hunks only) -- its band as the ledger transports it.
+-- Without this, an edit in a buffer whose hunks are all decided filed no register row (LEDGER N46).
+function M.member_range(read_range, bufnr, block)
+  local first, last = read_range(bufnr, block)
+  if first == nil and block.verdict ~= "pending" and type(block.new_start_line) == "number" then
+    -- In the staged mark's own convention (review_watch_timeline_prepare `mark_range`): a band of at least one
+    -- row, or the empty band before `first` for a hunk with no rows.
+    first = block.new_start_line
+    last = #(block.new_lines or {}) == 0 and first - 1 or math.max(block.new_end_line or first, first)
+  end
+  return first, last
+end
+
 -- At the scheduled flush Neovim has finished moving marks for the final
 -- on_bytes. Every earlier endpoint was observed as the next callback's PRE
 -- mark; this closes only the last endpoint, without reversing a deletion.
@@ -102,7 +162,7 @@ function Timeline:seal_live_ranges(bufnr, read_range)
     assert(prior.authority_id == block.authority_extmark_id
       and prior.incoming_id == block.incoming_extmark_id,
       "watch timeline: final authority mark rebound")
-    local first, final = read_range(bufnr, block)
+    local first, final = M.member_range(read_range, bufnr, block)
     assert(first ~= nil and final ~= nil,
       "watch timeline: final endpoint has no authority range")
     last._timeline_live_after[block] = { first = first, last = final,

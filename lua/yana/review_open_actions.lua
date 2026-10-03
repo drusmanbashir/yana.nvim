@@ -1,5 +1,4 @@
-local review_open_save_factory = require("yana.review_open_save")
--- Decision, undo, save, and bulk actions for one open review.
+-- Decision, undo and bulk actions for one open review.
 local Factory = {}
 
 function Factory.new(deps)
@@ -131,12 +130,16 @@ function Factory.new(deps)
       local moved = door(...)
       -- A cross-file undo opened another review without focusing it; focus it
       -- now that neovim's undo has run there. No block: focus only, no cursor.
-      local active = pool_for(opts or {}).active
-      if active and active ~= state and active._focus_after_history_move then
-        active._focus_after_history_move = nil
-        land_on(active.change.path, active.bufnr, nil)
+      local pool = pool_for(opts or {})
+      for _, attached in pairs(pool.open or {}) do
+        if not attached.closed and attached._focus_after_history_move then
+          attached._focus_after_history_move = nil
+          land_on(attached.change.path, attached.bufnr, nil)
+        end
       end
       require("yana.turn.turn_bind").refresh_review_liveness(pool_for(opts or {}))
+      -- A move can withdraw or re-admit a file's review; re-guard its buffer before the next key.
+      require("yana.review_open_bind_keys").sync_queued()
       return moved
     end
   end
@@ -144,26 +147,8 @@ function Factory.new(deps)
   local undo_key = report_history_move(review_undo.undo_key)
   local undo_turn = report_history_move(review_undo.undo_turn)
 
-  if not opts.preview then
-    -- BufWriteCmd on the review buffer. `:w!` is IDENTICAL to `:w` -- withholding is
-    -- not a refusal, so `!` has nothing to force. Product saves use `noautocmd write!`
-    -- (diff.save_buffer) and bypass this handler entirely; keep it that way.
-    --
-    -- The representation relied on is `state.hunk_ledger:pending()`. Either way this
-    -- loop iterates exactly the undecided hunks.
-    --
-    -- THE WRITE MECHANISM, and why it is neither of the two obvious ones.
-    -- `diff.save_buffer` writes the buffer VERBATIM (diff.lua:494-499) and so cannot
-    -- write a composition at all.
-    --
-    -- What is NOT recovered by construction: Neovim's recorded file info for this
-    -- buffer, because the bytes did not travel through `buf_write`. Neovim exposes no
-    -- way to re-stamp it that does not RELOAD the buffer, and a reload would replace
-    -- the review composition. * a `:checktime` in between lands on the
-    -- FileChangedShellPost handler's tier-1 branch, which is exactly why `disk_at_open`
-    -- advances to the bytes written and `state.staged_text` stays the BUFFER snapshot
-    review_open_save_factory.new(deps)
-  end
+  -- No write autocmds on the review buffer: `:w` in every form is Neovim's own and
+  -- writes the buffer as it is (CORE "Saving is Neovim's", LEDGER N51).
 
   local review_bulk = M._review_bulk_factory.new({
     facade = M,
@@ -214,6 +199,8 @@ function Factory.new(deps)
     redo_local = redo_local,
     pop_decision = pop_decision,
     native_undo = native_undo,
+    undo_key = undo_key,
+    redo_key = redo_key,
     undo_turn = undo_turn,
     rerender = function()
       -- This site asks for the ONE coalesced repaint instead of calling the painter

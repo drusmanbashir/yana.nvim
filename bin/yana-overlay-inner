@@ -248,7 +248,7 @@ if [ "$cap_now" != 0000000000000000 ]; then
 	echo open_capture_capabilities >&2
 	exit 65
 fi
-exec "$@"
+shopt -s execfail; [ -z "$YANA_AGENT_STARTED" ] || echo started >"$YANA_AGENT_STARTED"; exec "$@"; [ -z "$YANA_AGENT_STARTED" ] || echo exec_failed >"$YANA_AGENT_STARTED"; exit 127
 ' capsh "${cmd[@]}"
 }
 
@@ -269,6 +269,7 @@ for layer in "${LAYERS[@]}"; do
 	touch "${layer}/${MOUNT_MARKER}"
 	echo "$MOUNT_MARKER_CONTENT" >"${layer}/${MOUNT_MARKER}"
 done
+export YANA_AGENT_STARTED="${LAYERS[0]}/.yana-overlay-started"  # start evidence, builtins only: started, or exec_failed
 
 cmd=( "$@" )
 
@@ -487,10 +488,10 @@ if syscall(SYS_landlock_restrict_self, ruleset_fd, 0) != 0:
     die("Landlock restrict_self failed (errno=%s)" % ctypes.get_errno())
 os.close(ruleset_fd)
 
-# capsh's `--` hands its remaining arguments to a shell; `-c 'exec "$@"' capsh
+# capsh's `--` hands its remaining arguments to a shell; `-c '... exec "$@"' capsh
 # <cmd...>` is the argv-safe idiom for crossing that boundary, so cmd_argv
-# arrives verbatim with no argument's own bytes re-parsed.
-argv = [capsh_path, "--drop=all", "--caps=", "--", "-c", 'exec "$@"', "capsh"] + cmd_argv
+# arrives verbatim with no argument's own bytes re-parsed. The start evidence: see YANA_AGENT_STARTED.
+argv = [capsh_path, "--drop=all", "--caps=", "--", "-c", 'shopt -s execfail; [ -z "$YANA_AGENT_STARTED" ] || echo started >"$YANA_AGENT_STARTED"; exec "$@"; [ -z "$YANA_AGENT_STARTED" ] || echo exec_failed >"$YANA_AGENT_STARTED"; exit 127', "capsh"] + cmd_argv
 try:
     os.execv(capsh_path, argv)
 except OSError as exc:

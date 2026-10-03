@@ -367,7 +367,7 @@ local function render_tool_change(p, change)
   local block = { "", header, "" }
   local claim_index = nil
   do
-    -- Observed, not asserted: only one review is open at a time; refresh_review_claim overwrites this placeholder.
+    -- The turn has not finished yet; refresh_review_claim replaces this placeholder for each changed file.
     claim_index = #block + 1
     table.insert(block, "_Review opens when the turn ends._")
   end

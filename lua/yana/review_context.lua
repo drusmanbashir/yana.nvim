@@ -48,6 +48,59 @@ function M.restore_windows(request)
   end
 end
 
+--- The live, unparked attachment shown in `bufnr`; with `bufnr` nil, prefer
+--- the current window, then the previous window in this tab, then lowest rel.
+--- Reads only `pool.open`, so doors outside the facade call it directly.
+function M.state_for_buf(pool, bufnr, tab)
+  local found, found_rel = nil, nil
+  if bufnr == nil then
+    tab = tab or vim.api.nvim_get_current_tabpage()
+    if vim.api.nvim_tabpage_is_valid(tab) then
+      local current_win = vim.api.nvim_tabpage_get_win(tab)
+      local current = M.state_for_buf(pool, vim.api.nvim_win_get_buf(current_win))
+      if current then return current end
+      local tabnr = vim.api.nvim_tabpage_get_number(tab)
+      local previous = vim.fn.win_getid(vim.fn.tabpagewinnr(tabnr, "#"), tabnr)
+      if previous > 0 and vim.api.nvim_win_is_valid(previous)
+        and vim.api.nvim_win_get_tabpage(previous) == tab then
+        local prior = M.state_for_buf(pool, vim.api.nvim_win_get_buf(previous))
+        if prior then return prior end
+      end
+    end
+  end
+  for change, state in pairs(pool and pool.open or {}) do
+    if not state.closed and change._parked_state ~= state then
+      local rel = tostring(change.rel or change.path)
+      if bufnr ~= nil and state.bufnr == bufnr then
+        return state
+      elseif bufnr == nil and (found_rel == nil or rel < found_rel) then
+        found, found_rel = state, rel
+      end
+    end
+  end
+  return found
+end
+
+-- The indexed attachment is still this exact live, unparked review. Resource
+-- ownership can outlive parking, so resource currency alone is insufficient.
+function M.is_live_attachment(pool, state)
+  return state ~= nil and pool ~= nil and pool.open[state.change] == state
+    and not state.closed and state.change._parked_state ~= state
+end
+
+function M.attach(pool, state)
+  assert(pool and state and state.change, "review attachment needs a pool and change")
+  pool.open[state.change] = state
+end
+
+function M.detach(pool, state)
+  if pool and state and pool.open[state.change] == state then
+    pool.open[state.change] = nil
+    return true
+  end
+  return false
+end
+
 function M.new(deps)
   local facade = deps.facade
   local diff = deps.diff
@@ -71,7 +124,7 @@ function M.new(deps)
     local key = workspace_key(opts or {})
     local state = pools[key]
     if not state then
-      state = { queue = {}, active = nil, batched = {}, order = {}, order_seq = 0 }
+      state = { queue = {}, open = {}, batched = {}, order = {}, order_seq = 0 }
       pools[key] = state
     end
     return state, key
@@ -90,9 +143,10 @@ function M.new(deps)
     if not pool or rel == nil then
       return nil
     end
-    local active = pool.active
-    if active and active.change and (active.change.rel or active.change.path) == rel then
-      return active
+    for change, state in pairs(pool.open or {}) do
+      if (change.rel or change.path) == rel and not state.closed then
+        return state
+      end
     end
     for _, item in ipairs(pool.queue or {}) do
       local c = item.change
@@ -102,6 +156,8 @@ function M.new(deps)
     end
     return nil
   end
+
+  local state_for_buf = M.state_for_buf
 
   local function owners_match(a, b)
     if not a or not b then
@@ -126,7 +182,7 @@ function M.new(deps)
 
   local function find_active_for_change(change)
     for _, state in pairs(pools) do
-      if state.active and state.active.change == change then
+      if state.open[change] then
         return state
       end
     end
@@ -279,6 +335,7 @@ function M.new(deps)
     pool_for = pool_for,
     pool_for_state = pool_for_state,
     state_for_rel = state_for_rel,
+    state_for_buf = state_for_buf,
     owners_match = owners_match,
     queue_item_owner = queue_item_owner,
     freeze_review_owner = freeze_review_owner,

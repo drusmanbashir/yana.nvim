@@ -3,6 +3,29 @@
 All notable changes to Yana are documented here. Versions follow Semantic
 Versioning.
 
+## 0.1.0-alpha.16 - 2026-10-03
+
+### Changed
+
+- README links the optional prerequisite installer and explains its confirmed
+  system changes.
+- Release checks skip the full history scan once an earlier check has already
+  rejected the candidate; valid candidates still receive the complete audit.
+
+### Added
+
+- Backends can declare `state_dirs` for CLI startup and authentication writes;
+  other home files stay read-only, and protected or out-of-home paths are
+  refused.
+
+### Fixed
+
+- Keep the agent running as the invoking user so it cannot act as root inside
+  the sandbox or leave root-owned files. Vendor CLI authentication updates in
+  configured state directories persist after a turn.
+- Reopen files with pending hunks after a successful follow-up; keep decided
+  files closed.
+
 ## 0.1.0-alpha.15 - 2026-09-30
 
 ### Changed
@@ -472,15 +495,3 @@ without a tag or GitHub release; everything listed under 0.1.0-alpha.6 ships in
 
 - Direct workspace-writing mode is disabled unless explicitly enabled.
 - Confined turns fail closed when their host enforcement cannot be established.
-
-## Unreleased
-
-### Added
-
-- **Backend `state_dirs` configuration**: Each backend can declare directories that need to be writable at startup (e.g., cursor `~/.cursor`, `~/.config/cursor`; codex `~/.codex`; claude `~/.claude`, `~/.claude.json`). The overlay bind-mounts exactly those paths read-write; everything else under `$HOME` remains read-only. Paths outside `$HOME` or under protected directories (`~/.ssh`, `~/.gnupg`, `~/.aws`) are refused at setup with an error.
-
-### Fixed
-
-- **The agent runs as the invoking user; root is never exposed to it**: the sandbox launched with `bwrap --unshare-user --uid 0 --gid 0`, so every turn's agent ran as root. Electron-based CLIs refuse outright ("You are trying to start Cursor as a super user which isn't recommended..."), and everything a turn wrote came back root-owned. The launcher now passes the invoking `--uid`/`--gid`, so the namespace maps exactly one uid and uid 0 does not exist inside the sandbox to be reached. Because bwrap reaches a non-zero sandbox uid through an intermediate user namespace — leaving its mount namespace owned by an ancestor, where CAP_SYS_ADMIN does not satisfy `may_mount()` — `yana-overlay-inner` now re-execs itself under `unshare --mount` and mounts into a mount namespace of its own. `unshare` (util-linux) joins `bwrap` and `capsh` as a required executable. Capabilities are still dropped in full before the agent starts.
-
-- **Vendor CLI state directory failures**: fixed "Read-only file system (os error 30)" when vendor CLIs (codex, claude, cursor) wrote their state directories at startup, which happens before the prompt is read and so refused the whole turn. The launcher binds each declared `state_dirs` entry read-write. They are staged inside bwrap's private `/tmp` and mounted onto their real paths after the overlay — so the write reaches the REAL host directory instead of the turn's disposable upper layer, where a refreshed credential would be discarded at release and the next turn would re-authenticate forever. The `~/.cursor` exception was corrected the same way, and for the same reason.

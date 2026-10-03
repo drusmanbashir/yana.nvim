@@ -571,7 +571,7 @@ validate_root_triple() {
 	for entry in "$layer_root"/*; do
 		base=${entry##*/}
 		case "$base" in
-			upper | work | "$MOUNT_MARKER") ;;
+			upper | work | "$MOUNT_MARKER" | "$AGENT_START_MARKER") ;;
 			*) extra=1; break ;;
 		esac
 	done

@@ -263,6 +263,12 @@ function Factory.new(env)
   --- undoes a hook that applied but could not settle; the native layer stays
   --- unaware of what the effect actually is.
   local function move_and_settle(command, suppress_rewind, direction, expect_seq, hooks)
+    -- Past End's confirmation barrier the ledger refuses every restore, so a move would leave the bytes ahead
+    -- of a ledger that stood still (LEDGER N46): refuse before the bytes move.
+    if state.hunk_ledger and state.hunk_ledger.frozen_for_end then
+      return { ok = false, code = "frozen", changed = false, byte_location = "pre_call",
+        reason = "turn is frozen for End" }
+    end
     local snapshot = capture_transaction()
     state.watch_suspended = true
     local outcome = move_history(command, suppress_rewind)

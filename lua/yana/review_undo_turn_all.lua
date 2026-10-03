@@ -24,6 +24,15 @@ function Factory.new(env)
   local turn_register = env.turn_register
 
 	local function undo_turn()
+	  -- PANEL.md F-ADDENDUM-PUBLISH recovery: a publication that needs recovery is settled only by End or Abort,
+	  -- which close the durable review too; a reset would restore the first review locally only (U, cU, :YanaReset).
+	  local live = require("yana.turn.turn_bind").get()
+	  if live and live.cycle_owner and live.cycle_owner.state == "recovery_required" then
+		require("yana.turn.turn_cycle_log").door_refused("reset", "recovery_required")
+		notify_one_line("yana: reset is unavailable while the follow-up publication needs recovery: End or Abort",
+		  vim.log.levels.WARN)
+		return
+	  end
 	  local n = #state.decisions
 	  local loaded, load_err = M._load_turn_start(state)
 	  if not loaded then
@@ -51,7 +60,7 @@ function Factory.new(env)
         #names,
         table.concat(names, ", ")
       )
-      log.write("WARN", summary)
+      log.write("INFO", summary)
       notify_one_line(summary, vim.log.levels.INFO)
 	  if #refused > 0 then
         local rmsg = string.format(

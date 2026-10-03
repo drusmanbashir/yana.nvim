@@ -146,7 +146,7 @@ end
 --- review). Checkpoint is omitted: preview turns discard the overlay without a
 --- pass, but a real-tree accept during review still routes through the diary.
 --- The standalone route consumes the SAME explicit `{action, bytes, mode,
---- purpose, preserve_review}` record as the pass route, takes the same
+--- purpose}` record as the pass route, takes the same
 --- preflight, and reaches disk through the same `apply_accept.commit`. It has
 --- no transfer-only shortcut and it never reads `change.kind` or
 --- `change.after_mode` to decide what to do.

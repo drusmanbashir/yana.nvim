@@ -1,4 +1,5 @@
--- Decision-stack snapshot and in-place resume for a review that is parking.
+-- Decision-stack snapshot and in-place resume for a review that is parking, and
+-- one file's review endpoint capture/install (bottom of this file).
 --
 -- Park-time teardown is NOT here any more. The removed park teardown stripped
 -- this review's buffer-local keymaps by `state.keys` on a bare buffer number, which is
@@ -19,25 +20,26 @@ end
 
 local M = {}
 
-function M.capture(state, bufnr)
-  local anchor_ns = vim.api.nvim_create_namespace("YanaInlineDiffDecisionAnchor")
-  local function anchor_rows(id)
-    if not id then
-      return nil
-    end
-    local ok, ext = pcall(vim.api.nvim_buf_get_extmark_by_id, bufnr, anchor_ns, id, { details = true })
-    if not ok or type(ext) ~= "table" or ext[1] == nil then
-      return nil
-    end
-    local meta = ext[3] or {}
-    return { ext[1] + 1, (meta.end_row or ext[1]) + 1 }
+-- One decision anchor's rows, 1-based inclusive, or nil once the mark is gone.
+local function anchor_rows(bufnr, id)
+  if not id then
+    return nil
   end
+  local anchor_ns = vim.api.nvim_create_namespace("YanaInlineDiffDecisionAnchor")
+  local ok, ext = pcall(vim.api.nvim_buf_get_extmark_by_id, bufnr, anchor_ns, id, { details = true })
+  if not ok or type(ext) ~= "table" or ext[1] == nil then
+    return nil
+  end
+  local meta = ext[3] or {}
+  return { ext[1] + 1, (meta.end_row or ext[1]) + 1 }
+end
 
+function M.capture(state, bufnr)
   local sealed = vim.deepcopy(state.sealed_decisions or {})
   for _, d in ipairs(state.decisions or {}) do
     local copy = vim.deepcopy(d)
     -- Cleanup clears the anchor namespace; preserve rows, not a dead id.
-    copy.anchor_rows = anchor_rows(d.anchor) or copy.anchor_rows
+    copy.anchor_rows = anchor_rows(bufnr, d.anchor) or copy.anchor_rows
     copy.anchor = nil
     sealed[#sealed + 1] = copy
   end
@@ -103,8 +105,9 @@ function M.reactivate_factory(pool_for, announce_state)
       return false
     end
     local st = pool_for(opts or state.opts or {})
-    if st.active then
-      return false
+    for other_change, other in pairs(st.open or {}) do
+      if other ~= state and not other.closed and other_change._parked_state ~= other
+        and other.bufnr == state.bufnr then return false end
     end
     local review_open_bind = require("yana.review_open_bind")
     if type(review_open_bind.reinstall_keys) ~= "function" then
@@ -137,21 +140,6 @@ function M.reactivate_factory(pool_for, announce_state)
     if not bound then
       return false
     end
-    -- ORDER IS LOAD-BEARING, and it is the fresh-open path's order
-    -- (review_open_bind.lua:245 sets `st.active` before its own strip open at
-    -- :512, and has never carried this bug).
-    --
-    -- `is_reviewing` is published to outside callers -- review_api.lua:266-268 says so
-    -- in the product's own words -- and answers off `st.active`. Opening the strip
-    -- calls `nvim_win_set_buf` (ui_review_buttons.lua:312), which fires `BufLeave` on
-    -- the review buffer.
-    --
-    -- Nothing in the open reads pool state: the only `active` in
-    -- ui_review_buttons.lua is `inline.abort_active` at :226, inside the abort
-    -- button's press handler, which runs on a click long after this. And the
-    -- `if st.active then return false end` guard above is unaffected -- it
-    -- runs before `reinstall_keys`, which is still the last thing that can
-    -- refuse this revival.
     -- The park invalidated this buffer's watch ownership (`review_resources.park`) and
     -- the first edit made while parked uninstalled that attachment's callback
     -- outright. A resume that reuses the state in place must therefore RE-ATTACH
@@ -171,7 +159,7 @@ function M.reactivate_factory(pool_for, announce_state)
       pcall(require("yana.review_lifecycle").park_review, state)
       return false
     end
-    st.active = state
+    change._parked_state = nil
     -- ONE LIVE LEDGER. A restored review is not re-bound, so a decision made
     -- while it was parked (cA) leaves the Turn File counting that ledger copy
     -- while this review decides its own. Re-attach this review the way a bind
@@ -184,18 +172,308 @@ function M.reactivate_factory(pool_for, announce_state)
       live_turn:attach_review(live_file.path, state)
     end
     -- The panel is the Turn's `review_alive` subscriber's to render,
-    -- never this file's to open. `st.active` one line above is what that
-    -- subscriber reads, which is why the assignment stays first. A direct
+    -- never this file's to open. Clear the parked marker before announcing
+    -- so the strip's live-attachment lookup can see it. A direct
     -- `ui_review_buttons.open` here was the last render route outside the bus:
     -- it put a panel on screen without the Turn ever announcing the review was
     -- alive again, so the panel and the lifecycle could disagree.
     require("yana.turn.turn_bind").announce_review(st)
-    change._parked_state = nil
     change._parked_review = nil
     change.status = "pending"
     announce_state()
     return true
   end
+end
+
+-- ENDPOINT CAPTURE AND INSTALL (follow-up plan, "M0: history
+-- mapping": S1 record schema `EndpointState`, blocker B1; Reuse decisions row). One file's complete review state at one register endpoint,
+-- composed from the existing doors: the ledger half (`capture_ledger_endpoint` over
+-- `capture_buffer_snapshot` and the retained history), the decision stacks, the
+-- model mirror (`review_hunk_split`) and the facts that validate a landing. Neovim
+-- owns the bytes, so neither function writes buffer text; the register owns the
+-- endpoint, its `NativePos` and its revisions, so neither keeps a record.
+local STACKS = { "decisions", "undone_decisions", "sealed_decisions" }
+
+local function copy_entry(entry)
+  local copy = {}
+  for key, value in pairs(entry) do
+    copy[key] = value
+  end
+  return copy
+end
+
+local function same_rows(a, b)
+  return type(a) == "table" and type(b) == "table" and a[1] == b[1] and a[2] == b[2]
+end
+
+-- What installing `ep`'s stacks does to decision anchors, which mark exactly the
+-- live stacks' decided hunks. `stale`: target entries whose anchor no longer marks
+-- the rows it was captured on (only an entry that held an anchor at capture
+-- qualifies) and is re-parked there. `drop`: live anchors no installed entry keeps.
+local function anchor_plan(state, ep)
+  local stale, keep, drop = {}, {}, {}
+  for _, name in ipairs(STACKS) do
+    for _, entry in ipairs(ep[name] or {}) do
+      if entry.anchor ~= nil and type(entry.anchor_rows) == "table"
+        and not same_rows(anchor_rows(state.bufnr, entry.anchor), entry.anchor_rows) then
+        stale[entry] = true
+      elseif entry.anchor ~= nil then
+        keep[entry.anchor] = true
+      end
+    end
+  end
+  for _, name in ipairs(STACKS) do
+    for _, entry in ipairs(state[name] or {}) do
+      if entry.anchor ~= nil and not keep[entry.anchor] then
+        keep[entry.anchor] = true
+        drop[#drop + 1] = entry.anchor
+      end
+    end
+  end
+  return stale, drop
+end
+
+--- `env.revision`: the endpoint revision the caller is sealing, stored with the
+--- ledger history. `env.file`: the Turn's File for this path, owner of the
+--- operation and mode verdicts; nil when no Turn holds the file. Returns the
+--- EndpointState, or nil and a reason. Stack entries are new tables keeping
+--- `block` by identity (it names a ledger member) with each live anchor's rows
+--- resolved now, while the bytes are the endpoint's.
+function M.capture_endpoint(state, env)
+  env = env or {}
+  local ledger = type(state) == "table" and state.hunk_ledger or nil
+  if not (ledger and ledger:is_open()) then
+    return nil, "endpoint capture needs an open ledger"
+  end
+  local bufnr = state.bufnr
+  if not (bufnr and vim.api.nvim_buf_is_valid(bufnr)) then
+    return nil, "endpoint capture needs a live review buffer"
+  end
+  local bytes, bytes_err = require("yana.diff").buffer_bytes_snapshot(bufnr)
+  if bytes == nil then
+    return nil, "endpoint capture: " .. tostring(bytes_err)
+  end
+  local ep = ledger:capture_ledger_endpoint(env.revision)
+  for _, name in ipairs(STACKS) do
+    local out = {}
+    for i, entry in ipairs(state[name] or {}) do
+      out[i] = copy_entry(entry)
+      out[i].anchor_rows = anchor_rows(bufnr, entry.anchor) or entry.anchor_rows
+    end
+    ep[name] = out
+  end
+  ep.model_hunks = require("yana.review_hunk_split").snapshot_model(state.model_hunks)
+  local change = state.change or {}
+  local file = env.file
+  local kind = file and file.operation or change.kind
+  local verdict = file and file.operation_verdict or nil
+  local mv = file and type(file.mode_verdict) == "table" and copy_entry(file.mode_verdict) or nil
+  ep.proposal_view = { before = change.before, after = change.after, after_mode = change.after_mode,
+    kind = change.kind, turn_gen = change.turn_gen }
+  ep.operation_view = { exists = kind ~= "delete", kind = kind, mode = change.after_mode,
+    operation_verdict = verdict, mode_verdict = mv }
+  ep.staged_text_ref = state.staged_text
+  ep.bytes_ref = bytes
+  ep.existence = not ((kind == "create" and verdict == "rejected") or (kind == "delete" and verdict == "accepted"))
+  ep.eol = { fileformat = vim.bo[bufnr].fileformat, endofline = vim.bo[bufnr].endofline, bomb = vim.bo[bufnr].bomb }
+  ep.mode = (mv and mv.verdict == "allow" and change.after_mode) or change.base_mode or change.before_mode
+  ep.attachment_state = { bufnr = bufnr, watch_generation = state._watch_generation,
+    watch_detached = state.watch_detached == true, closed = state.closed == true }
+  return ep
+end
+
+-- The review half of an install, after the ledger half: the stacks as fresh entry
+-- copies (stale anchors re-parked), the staged text the decision doors keep beside
+-- them, the model mirror in place from fresh entry copies (so the record's entries
+-- never become live), and last the anchors no installed entry keeps, so a failure
+-- before it leaves the start's anchors live. Anchors parked before the stacks
+-- go live belong to nobody yet: any failure there releases them before raising,
+-- and a release that fails raises `{msg, leaked}` so the caller cannot claim
+-- unchanged. `env.park_anchor(block, first, last)` / `env.drop_anchor(id)` are
+-- the review's own pair (review_decisions' `park_anchor` / `drop_anchor`).
+local function install_review_half(state, ep, env)
+  local stale, drop = anchor_plan(state, ep)
+  local stacks, parked = {}, {}
+  local built, err = pcall(function()
+    for _, name in ipairs(STACKS) do
+      local out = {}
+      for i, entry in ipairs(ep[name] or {}) do
+        out[i] = copy_entry(entry)
+        if stale[entry] then
+          local rows = entry.anchor_rows
+          out[i].anchor = env.park_anchor(entry.block, rows[1], rows[2] or rows[1])
+          parked[#parked + 1] = out[i].anchor
+        end
+      end
+      stacks[name] = out
+    end
+  end)
+  if not built then
+    local leaked = 0
+    for _, id in ipairs(parked) do
+      if not pcall(env.drop_anchor, id) then leaked = leaked + 1 end
+    end
+    error(leaked > 0 and { msg = tostring(err), leaked = leaked } or err, 0)
+  end
+  for name, out in pairs(stacks) do
+    state[name] = out
+  end
+  state.staged_text = ep.staged_text_ref
+  if ep.model_hunks ~= nil then
+    local split = require("yana.review_hunk_split")
+    split.restore_model_snapshot(state.model_hunks, split.snapshot_model(ep.model_hunks))
+  end
+  for _, id in ipairs(drop) do
+    env.drop_anchor(id)
+  end
+end
+
+local function same_entry(a, b, skip)
+  for key, value in pairs(a) do
+    if key ~= skip and b[key] ~= value then return false end
+  end
+  for key in pairs(b) do
+    if key ~= skip and a[key] == nil then return false end
+  end
+  return true
+end
+
+-- What of the review half differs from `ep`, or nil: staged text, each stack entry
+-- by value (its anchor by the rows it marks), and each model entry by value.
+local function review_half_error(state, ep)
+  if state.staged_text ~= ep.staged_text_ref then
+    return "staged text differs"
+  end
+  for _, name in ipairs(STACKS) do
+    local live, want = state[name] or {}, ep[name] or {}
+    if #live ~= #want then
+      return name .. " length differs"
+    end
+    for i, entry in ipairs(want) do
+      if not same_entry(entry, live[i], "anchor") or (entry.anchor ~= nil and type(entry.anchor_rows) == "table"
+        and not same_rows(anchor_rows(state.bufnr, live[i].anchor), entry.anchor_rows)) then
+        return name .. " entry " .. i .. " differs"
+      end
+    end
+  end
+  local model = ep.model_hunks
+  if model ~= nil then
+    if #state.model_hunks ~= model.n then
+      return "model length differs"
+    end
+    for i = 1, model.n do
+      local want, got = model[i], state.model_hunks[i]
+      if type(want) == "table" and type(got) == "table" then
+        if not same_entry(want, got) then return "model entry " .. i .. " differs" end
+      elseif want ~= got then
+        return "model entry " .. i .. " differs"
+      end
+    end
+  end
+  return nil
+end
+
+local function refused(reason)
+  return { ok = false, changed = false, code = "refused", reason = reason, byte_location = "pre_call" }
+end
+
+local function reason_of(err)
+  return type(err) == "table" and err.msg or tostring(err)
+end
+
+-- Where the buffer is, against where the endpoint says it must be; nil when it is there.
+local function position_error(state, ep, env)
+  local seq = env.current_seq()
+  if seq ~= env.seq then
+    return string.format("native history is at %s, the endpoint at %s", tostring(seq), tostring(env.seq))
+  end
+  if require("yana.diff").buffer_bytes_snapshot(state.bufnr) ~= ep.bytes_ref then
+    return "buffer bytes differ from the endpoint's"
+  end
+  return nil
+end
+
+--- Install EndpointState `ep` on review `state`, whose buffer Neovim has already
+--- put at the endpoint. `env.seq`: the endpoint's native sequence (its NativePos);
+--- `env.current_seq()`: reads the buffer's; `env.park_anchor` / `env.drop_anchor`:
+--- the review's anchor pair, needed only when an anchor must move;
+--- `env.revision`/`env.file`: label the start capture used for compensation.
+--- Order: ledger history, members, frames, decision stacks, model. Native seq and
+--- bytes are verified before anything is written and again before ok.
+--- Outcome {ok, changed, code, reason, byte_location, stuck}. An install never moves
+--- bytes, so byte_location is always "pre_call". changed=false: nothing moved --
+--- refused before writing, or written and compensated back to the start.
+--- ok=false with changed=true ("install_stuck") is a halt naming what stayed out.
+function M.install_endpoint(state, ep, env)
+  env = env or {}
+  local ledger = type(state) == "table" and state.hunk_ledger or nil
+  if not (ledger and ledger:is_open()) then
+    return refused("endpoint install needs an open ledger")
+  end
+  if state.closed or not (state.bufnr and vim.api.nvim_buf_is_valid(state.bufnr)) then
+    return refused("endpoint install needs a live review buffer")
+  end
+  if state.watch_timeline then
+    return refused("endpoint install needs the watcher finalized first")
+  end
+  if type(ep) ~= "table" or type(env.current_seq) ~= "function" or type(env.seq) ~= "number" then
+    return refused("endpoint install needs an EndpointState, its native seq and a seq reader")
+  end
+  if type(ep.attachment_state) ~= "table" or ep.attachment_state.bufnr ~= state.bufnr then
+    return refused("endpoint was captured on another buffer; its native sequence means nothing here")
+  end
+  if (ep.model_hunks == nil) ~= (type(state.model_hunks) ~= "table") then
+    return refused("endpoint and review disagree on the model mirror")
+  end
+  local stale, drop = anchor_plan(state, ep)
+  -- Both helpers whenever any anchor moves: undoing a park needs a drop, and
+  -- compensating a drop needs a park.
+  if (next(stale) ~= nil or #drop > 0)
+    and (type(env.park_anchor) ~= "function" or type(env.drop_anchor) ~= "function") then
+    return refused("endpoint install must move decision anchors and lacks park_anchor/drop_anchor")
+  end
+  local position = position_error(state, ep, env)
+  if position then
+    return refused(position)
+  end
+  local start, start_err = M.capture_endpoint(state, { revision = env.revision, file = env.file })
+  if not start then
+    return refused("endpoint install cannot capture its start: " .. tostring(start_err))
+  end
+  local called, installed, why = pcall(ledger.install_ledger_endpoint, ledger, ep)
+  if called and not installed then
+    return refused(why)
+  end
+  local failure = not called and tostring(installed) or nil
+  local stuck = {}
+  if not failure then
+    local ok, err = pcall(install_review_half, state, ep, env)
+    if not ok and type(err) == "table" and err.leaked then
+      stuck[#stuck + 1] = "anchors: " .. err.leaked .. " parked anchor(s) not released"
+    end
+    failure = not ok and reason_of(err) or position_error(state, ep, env) or review_half_error(state, ep)
+  end
+  if not failure then
+    ledger:request_paint()
+    return { ok = true, changed = true, code = "installed", byte_location = "pre_call" }
+  end
+  -- Compensation: the captured start, through the same two halves, each verified
+  -- exact (the ledger half checks itself) before anyone reports unchanged.
+  local back_called, back_ok, back_why = pcall(ledger.install_ledger_endpoint, ledger, start)
+  if not (back_called and back_ok) then
+    stuck[#stuck + 1] = "ledger: " .. tostring(back_called and back_why or back_ok)
+  end
+  local review_ok, review_err = pcall(install_review_half, state, start, env)
+  local mismatch = review_ok and review_half_error(state, start) or nil
+  if not review_ok or mismatch then
+    stuck[#stuck + 1] = "review: " .. (mismatch or reason_of(review_err))
+  end
+  pcall(ledger.request_paint, ledger)
+  if #stuck == 0 then
+    return { ok = false, changed = false, code = "rolled_back", reason = failure, byte_location = "pre_call" }
+  end
+  return { ok = false, changed = true, code = "install_stuck", byte_location = "pre_call",
+    reason = failure .. "; compensation failed: " .. table.concat(stuck, "; "), stuck = stuck }
 end
 
 return M

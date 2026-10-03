@@ -97,13 +97,9 @@ local diary_session = diary_session_factory.new({
 	journal_path = journal_path,
 	fsync_dir = fsync_dir,
 	resolve_target = resolve_target,
-	hash_bytes = hash_bytes,
 	observe_state = observe_state,
-	mode_perm = mode_perm,
+	evidence_of = diary_state.evidence_of,
 	test_state = M._test,
-	empty_hash = function()
-		return M.empty_hash()
-	end,
 	intent = function(opts)
 		return M.intent(opts)
 	end,
@@ -141,6 +137,9 @@ end
 function M.restore_workspace_bytes(opts)
 	return diary_session.restore_workspace_bytes(opts)
 end
+
+-- End's journaled write takes its evidence from the file as it is now (CORE "Saving is Neovim's", N51).
+M.current_evidence = diary_state.current_evidence
 
 -- Every name below stays a local of this file under its original name so no call site
 -- changes.

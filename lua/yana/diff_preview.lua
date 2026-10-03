@@ -233,7 +233,7 @@ local function cleanup_preview()
   if state then
     -- Theme preview binds NO Turn (observe_open guarded on opts.preview).
     -- Plain scrub only: detach any listener group, clear paint, drop the
-    -- synthetic pool/active state. No End-turn dialog, no settle.
+    -- synthetic pool attachment. No End-turn dialog, no settle.
     if state.listener_group then
       pcall(require("yana.turn.turn_listeners").detach, state.listener_group)
     end
@@ -249,9 +249,7 @@ local function cleanup_preview()
     local ok_st, st = pcall(function()
       return inline._test.pool_for(preview_opts())
     end)
-    if ok_st and type(st) == "table" and st.active == state then
-      st.active = nil
-    end
+    if ok_st and type(st) == "table" then require("yana.review_context").detach(st, state) end
   end
   if preview.saved then
     config.options.diff_highlights = preview.saved

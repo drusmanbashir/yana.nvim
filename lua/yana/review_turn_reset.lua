@@ -95,8 +95,10 @@ function M.mark_turn_closed(turn)
       c._parked_review = nil
     end
   end
-  if st and st.active and st.active.change and (anchor == nil or same_turn(st.active.change, anchor)) then
-    st.active.decisions = {}
+  for change, state in pairs(st and st.open or {}) do
+    if not state.closed and (anchor == nil or same_turn(change, anchor)) then
+      state.decisions = {}
+    end
   end
 end
 
@@ -117,8 +119,10 @@ local function load_file_snapshot(file, review_state, saved)
   if not (file and file.ledger and saved) then
     return false, "turn-start overlay is unavailable"
   end
-  file.ledger:load_snapshot(saved.blocks)
-
+  if review_state and review_state.bufnr then
+    local ready, reason = require("yana.review_watch").finalize(review_state.bufnr, review_state)
+    if not ready then return false, reason end
+  end
   local bufnr = review_state and review_state.bufnr or vim.fn.bufnr(file.path, false)
   if saved.has_text and type(bufnr) == "number" and bufnr > 0
     and vim.api.nvim_buf_is_valid(bufnr) and vim.api.nvim_buf_is_loaded(bufnr)
@@ -138,6 +142,19 @@ local function load_file_snapshot(file, review_state, saved)
       end
       return false, tostring(err)
     end
+  end
+
+  -- Model first, then the join (the open path's order), then the blocks: the start
+  -- blocks were captured before the review stamped them, so they join the restored
+  -- model here; with no captured model they record `model_unavailable`.
+  if review_state then
+    local restored = saved.model ~= nil
+      and require("yana.review_hunk_split").restore_model_snapshot(review_state.model_hunks, saved.model)
+    if restored then review_state.model_source = saved.model_source end
+    require("yana.review_model").stamp_model_index(saved.blocks, restored and review_state.model_hunks or nil)
+  end
+  file.ledger:load_snapshot(saved.blocks)
+  if type(bufnr) == "number" and bufnr > 0 and vim.api.nvim_buf_is_valid(bufnr) then
     M._recompute_modified(bufnr, file.ledger:pending(), file.path)
   end
 
@@ -183,17 +200,22 @@ local function undo_rest_of_turn(state)
       local path = diff.abs_path(c.path)
       local file = turn and turn:file(path)
       local saved = overlay and overlay:get(path)
+      local open_state = st.open[c]
       local parked_state = c._parked_state
-      local ok, err = load_file_snapshot(file, parked_state, saved)
+      local ok, err = load_file_snapshot(file, open_state or parked_state, saved)
       if ok then
-        revive_change(st, c, opts)
-        local parked = overlay:get(path)
-        c._parked_review = {
-          staged_text = parked.text,
-          blocks = parked.blocks,
-          sealed_decisions = {},
-          undone_decisions = {},
-        }
+        if open_state then
+          c.status = "pending"
+        else
+          revive_change(st, c, opts)
+          local parked = overlay:get(path)
+          c._parked_review = {
+            staged_text = parked.text,
+            blocks = parked.blocks,
+            sealed_decisions = {},
+            undone_decisions = {},
+          }
+        end
         c._accept_regime = nil
         c._accept_bufnr = nil
         c._accept_composed_hash = nil

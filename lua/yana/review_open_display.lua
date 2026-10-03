@@ -39,8 +39,9 @@ function Factory.new(deps)
     -- Rung 1 over the render that staged this review. It observes only, so it
     -- runs after the open-path budget closes: the diagnostic must not spend the
     -- user's review-open tail. Its inputs are the just-rendered buffer, extmarks
-    -- and palette state captured above.
-    render_invariant({
+    -- and palette state captured above. A review closed before this tick (a
+    -- publication rollback withdrew it) has no render left to observe.
+    if require("yana.review_resources").is_current(state) then render_invariant({
       site = "open",
       bufnr = bufnr,
       blocks = blocks,
@@ -48,7 +49,7 @@ function Factory.new(deps)
       model_source = model_source,
       change = change,
       opts = opts,
-    })
+    }) end
     M._emit_review_settled(bufnr, change.turn_id or change.turn_gen, "open")
     -- The first-hunk landing does NOT happen here. This callback is queued (via
     -- vim.schedule) strictly before the one below that calls focus_buf / tabnew, and
@@ -66,7 +67,7 @@ function Factory.new(deps)
       -- tab onto the dead scratch buffer then resurrects a ghost the user
       -- cannot close. Only display a session that is still the live one.
       local st = pool_for_state(state)
-      if st.active ~= state then
+      if not require("yana.review_context").is_live_attachment(st, state) then
         return
       end
       vim.cmd("tabnew")
@@ -88,7 +89,11 @@ function Factory.new(deps)
       -- missing here: this closure fires a tick after the open, by which time
       -- the session can already be torn down.
       local st = pool_for_state(state)
-      if st.active ~= state then
+      if not require("yana.review_context").is_live_attachment(st, state) then
+        return
+      end
+      local focused_review = require("yana.review_context").state_for_buf(st, vim.api.nvim_get_current_buf())
+      if focused_review and focused_review ~= state then
         return
       end
       local focused = focus_buf(change.path, bufnr)
@@ -96,7 +101,7 @@ function Factory.new(deps)
         -- focus_buf could not put the review anywhere visible (e.g. E37 from
         -- a modified current buffer with 'hidden' off). File stays a parked
         -- member of the live Turn (ledger intact); undecided hunks revert at
-        -- end_turn. No cleanup / pool.active clear / queue advance (ADJUDICATED 9).
+        -- end_turn. No cleanup or queue advance (ADJUDICATED 9).
         notify_one_line(
           "yana: could not display review for `" .. (change.rel or change.path)
             .. "` — no window available; left pending",

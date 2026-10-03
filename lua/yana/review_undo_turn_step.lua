@@ -72,7 +72,8 @@ function Factory.new(env)
       if not st or type(insert) ~= "function" or type(entry.item) ~= "table" then
         return false
       end
-      if st.active and st.active.change == entry.change then
+      local attached = st.open and st.open[entry.change]
+      if attached and not attached.closed and entry.change._parked_state ~= attached then
         return false
       end
       insert(st, entry.item)
@@ -152,7 +153,7 @@ function Factory.new(env)
         #touched,
         table.concat(touched, ", ")
       )
-      log.write("WARN", summary)
+      log.write("INFO", summary)
       notify_one_line(summary, vim.log.levels.INFO)
       record_decision(state, "undo_accept_turn_step", { files_undone = #touched, files_refused = 0 })
       return true

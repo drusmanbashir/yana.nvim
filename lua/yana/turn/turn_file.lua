@@ -10,11 +10,9 @@
 -- from a unit row. Nothing here reads disk, a buffer, a window or the config;
 -- callers hand in what they verified and this module records it.
 --
--- Names are frozen by pod-lead adjudication F-TRL01-01/F-TRL01B-02: the Turn
--- reference is `turn`; change identity is `change.id` falling back to `op_id`;
--- cached settlement is `settled_at_exit`/`settlement_stamp`; `attach(state)`
--- reads `state.ledger`/`state.bufnr`; the permission record is
--- `mode_verdict = {proposal_key, policy, asked, verdict}`.
+-- Frozen names (F-TRL01-01/F-TRL01B-02): `turn`; change identity `change.id`, else
+-- `op_id`; `settled_at_exit`/`settlement_stamp`; `attach(state)` reads `state.ledger`/
+-- `state.bufnr`; `mode_verdict = {proposal_key, policy, asked, verdict}`.
 --
 -- THE CHANGE IS STORED VERBATIM. This module never renames, adds or interprets
 -- a mode key: the unit fixtures spell `change.before_mode`, 18 product modules
@@ -38,33 +36,21 @@ local function identity_of(change)
   if type(change) ~= "table" then
     return nil
   end
-  local id = change.id
-  if id == nil then
-    id = change.op_id
-  end
-  return id
+  if change.id == nil then return change.op_id end
+  return change.id
 end
 
 local function operation_of(change)
-  if type(change) ~= "table" then
-    return nil
-  end
-  return OPERATION_KINDS[change.kind] and change.kind or nil
+  return type(change) == "table" and OPERATION_KINDS[change.kind] and change.kind or nil
 end
 
 local function call(ledger, name)
-  if type(ledger) ~= "table" then
-    return nil
-  end
-  local fn = ledger[name]
+  local fn = type(ledger) == "table" and ledger[name] or nil
   if type(fn) ~= "function" then
     return nil
   end
   local ok, result = pcall(fn, ledger)
-  if not ok then
-    return nil
-  end
-  return result
+  return ok and result or nil
 end
 
 -- The RETAINED ledger, decided hunks included. A parked review keeps its
@@ -110,6 +96,8 @@ function M.new(entry, turn)
   -- lose the pending operation with it.
   self.change_id = identity_of(entry.change)
   self.operation = operation_of(entry.change)
+  -- The ORIGINAL operation (false: a known modify): `operation` is the selected version's.
+  if entry.change ~= nil then self.original_operation = self.operation or false end
   if self.operation ~= nil then
     self.operation_verdict = "pending"
   end
@@ -121,27 +109,23 @@ end
 --- A different path, Turn or change identity is a named refusal that mutates
 --- nothing. Returns `true`, or `false, reason`.
 function File:refresh(entry)
+  if self.turn and self.turn:is_frozen() then
+    return false, "turn is frozen for End"
+  end
   if type(entry) ~= "table" then
     return false, "turn_file.refresh: " .. self.path .. " needs a table entry, got " .. type(entry)
   end
 
   if entry.path ~= nil and entry.path ~= self.path then
-    return false,
-      "turn_file.refresh: a different path " .. tostring(entry.path) .. " cannot refresh " .. self.path
+    return false, "turn_file.refresh: a different path " .. tostring(entry.path) .. " cannot refresh " .. self.path
   end
   if entry.turn ~= nil and not rawequal(entry.turn, self.turn) then
     return false, "turn_file.refresh: a different turn cannot refresh " .. self.path
   end
   local offered = identity_of(entry.change)
   if entry.change ~= nil and self.change_id ~= nil and offered ~= self.change_id then
-    return false,
-      "turn_file.refresh: a different change "
-        .. tostring(offered)
-        .. " cannot refresh "
-        .. self.path
-        .. " (established change "
-        .. tostring(self.change_id)
-        .. ")"
+    return false, "turn_file.refresh: a different change " .. tostring(offered) .. " cannot refresh " .. self.path
+      .. " (established change " .. tostring(self.change_id) .. ")"
   end
 
   -- Past the identity gate nothing below can fail, so the record never lands
@@ -151,6 +135,7 @@ function File:refresh(entry)
     self.change = entry.change
     self.change_id = offered
     self.operation = operation_of(entry.change)
+    self.original_operation = self.operation or false
     if self.operation ~= nil and self.operation_verdict == nil then
       self.operation_verdict = "pending"
     end
@@ -158,7 +143,7 @@ function File:refresh(entry)
   -- An established change is NOT replaced: `change.before`, `base_hash` and
   -- `disk_at_open` are rebased applier evidence, and `record_projection` is
   -- their only writer. Swapping in a same-identity copy would quietly restore a
-  -- pre-save snapshot over bytes the human has already durably saved.
+  -- snapshot from before the write that record_projection already recorded.
 
   if entry.base_text ~= nil and self.base_text == nil then
     -- Original content, immutable ONCE KNOWN: the first explicit value wins and
@@ -190,6 +175,9 @@ end
 --- cached settlement is no longer about this attachment.
 --- Returns `true`, or `false, reason`.
 function File:attach(state)
+  if self.turn and self.turn:is_frozen() then
+    return false, "turn is frozen for End"
+  end
   if type(state) ~= "table" then
     return false, "turn_file.attach: " .. self.path .. " needs a review state, got " .. type(state)
   end
@@ -215,6 +203,14 @@ end
 --- older owner's teardown. Membership, ledger and original facts are retained.
 --- Returns `true`, or `false, reason`.
 function File:detach(expected_state)
+  if self.turn and self.turn:is_frozen() then
+    return false, "turn is frozen for End"
+  end
+  return self:retire_attachment(expected_state)
+end
+
+-- The Turn's planned terminal cleanup is the only frozen detach door.
+function File:retire_attachment(expected_state)
   if not rawequal(self.review_state, expected_state) then
     return false, "turn_file.detach: that review state is not the current one for " .. self.path
   end
@@ -222,11 +218,12 @@ function File:detach(expected_state)
   return true
 end
 
---- Canonical acceptance: accepted text in the retained ledger, or an accepted
---- textless operation. Permission approval alone is NEVER acceptance, and
+--- Canonical acceptance: accepted text in the retained ledger, an accepted
+--- textless operation, or accepted work an earlier cycle's version carried
+--- (F-ADDENDUM-CARRY). Permission approval alone is NEVER acceptance, and
 --- `change.status` is presentation, never a fallback.
 function File:accepted()
-  if self.operation_verdict == "accepted" then
+  if self.operation_verdict == "accepted" or self.carried == true then
     return true
   end
   local blocks = hunks(self)
@@ -264,16 +261,12 @@ end
 --- Record the create/delete decision. Returns `true`, or `false, reason`; a
 --- refused verdict changes nothing.
 function File:decide_operation(verdict)
-  if self.turn and self.turn.frozen then
+  if self.turn and self.turn:is_frozen() then
     return false, "turn is frozen for End"
   end
   if not OPERATION_VERDICTS[verdict] then
-    return false,
-      "turn_file.decide_operation: "
-        .. self.path
-        .. " got an unknown verdict "
-        .. tostring(verdict)
-        .. "; expected pending, accepted or rejected"
+    return false, "turn_file.decide_operation: " .. self.path .. " got an unknown verdict " .. tostring(verdict)
+      .. "; expected pending, accepted or rejected"
   end
   if self.operation == nil then
     return false, "turn_file.decide_operation: " .. self.path .. " has no create or delete operation to decide"
@@ -281,6 +274,71 @@ function File:decide_operation(verdict)
   self.operation_verdict = verdict
   return true
 end
+
+--- THE SELECTED VERSION (F-ADDENDUM-CARRY, -END): the proposed operation (`proposal` = {kind, after,
+--- after_mode}, nil = the change's own), the textless operation and verdict, accepted work End owes from
+--- earlier cycles (`carried`: it may write that text, never approve a deletion), the effective accepted mode
+--- (`accepted_mode`, nil = the original) and the text its hunks' original side indexes (`base`, nil = the
+--- original). The token is bound to this File (`owner`). Original facts, consent (`mode_verdict`, matched by
+--- proposal key) and receipts stay on the File.
+function File:version()
+  return { owner = self, proposal = self.proposal, operation = self.operation, operation_verdict =
+    self.operation_verdict, carried = self.carried == true, accepted_mode = self.accepted_mode,
+    base = self.version_base, installed = self.version_installed == true }
+end
+
+local function opt(v, kind) return v == nil or type(v) == kind end
+local TOKEN = { owner = 1, proposal = 1, operation = 1, operation_verdict = 1, carried = 1, accepted_mode = 1,
+  base = 1, installed = 1 }
+local NEXT = { change = 1, proposal = 1, operation = 1, operation_verdict = 1, base = 1, review_opts = 1 }
+-- Full shape before anything moves: known keys only, typed fields, and an operation paired with its verdict.
+local function shaped(v, keys)
+  for k in pairs(v) do if not keys[k] then return false end end
+  return opt(v.proposal, "table") and opt(v.base, "string") and opt(v.change, "table") and opt(v.review_opts, "table")
+    and (v.operation == nil or OPERATION_KINDS[v.operation] == true)
+    and (v.operation_verdict == nil or OPERATION_VERDICTS[v.operation_verdict] == true)
+    and (keys == NEXT or ((v.operation == nil) == (v.operation_verdict == nil) and type(v.carried) == "boolean"
+      and type(v.installed) == "boolean" and (opt(v.accepted_mode, "number") or type(v.accepted_mode) == "string")))
+end
+
+--- The explicit install/restore door. `install_version(next)`, called BEFORE the next cycle's members reach
+--- the ledger, carries what this version owes End (accepted work, the effective accepted mode); next =
+--- {change?, proposal?, operation?, operation_verdict?, base?, review_opts?}; another textless operation
+--- starts pending. `review_opts` is the publishing cycle's write door (its live pass): it replaces the File's,
+--- no restore brings an older one back, and alone it changes no version. `restore_version` reinstalls this
+--- File's own `version()` exactly. Both return the replaced version, or nil, reason, changing nothing.
+function File:install_version(next, exact)
+  if self.turn and self.turn:is_frozen() then return nil, "turn is frozen for End" end
+  local keys = exact and TOKEN or NEXT
+  if type(next) ~= "table" or not shaped(next, keys) or (exact and not rawequal(next.owner, self)) then
+    return nil, "turn_file: " .. self.path .. " needs " .. (exact and "its own captured version" or "a version table")
+  end
+  local prior, v = self:version(), next
+  if not exact then
+    if next.review_opts ~= nil then self.review_opts = next.review_opts end
+    local c = next.change
+    if c == nil and next.proposal == nil and next.operation == nil and next.operation_verdict == nil
+      and next.base == nil then return prior end
+    local proposal = next.proposal or (c and { kind = c.kind, after = c.after, after_mode = c.after_mode })
+      or prior.proposal
+    local op = next.operation
+    if op == nil and proposal ~= prior.proposal then op = operation_of(proposal) end
+    if op == nil and proposal == prior.proposal then op = prior.operation end
+    local verdict = next.operation_verdict
+    if verdict == nil and op ~= nil then verdict = op == prior.operation and prior.operation_verdict or "pending" end
+    -- The mode End owes so far: the outgoing proposal's when its exact proposal is allowed, else the carried one.
+    local mv = require("yana.turn.turn_settle").current_mode_verdict(self)
+    v = { proposal = proposal, operation = op, operation_verdict = verdict, carried = self:accepted(), base =
+      next.base, installed = true, accepted_mode = mv and mv.verdict == "allow" and (self.proposal or self.change
+      or {}).after_mode or self.accepted_mode }
+  end
+  self.proposal, self.operation, self.operation_verdict = v.proposal, v.operation, v.operation_verdict
+  self.carried, self.version_base, self.version_installed = v.carried, v.base, v.installed
+  self.accepted_mode = v.accepted_mode
+  return prior
+end
+
+function File:restore_version(version) return self:install_version(version, true) end
 
 --- True when two proposal keys name the same proposal BY CONTENT (Turn, path,
 --- proposed mode). Table keys compare field by field as stored; any other key
@@ -310,7 +368,7 @@ end
 --- late answer for a verdict that has since moved cannot overwrite it. The
 --- default verdict is "keep". Returns `true`, or `false, reason`.
 function File:decide_mode(decision)
-  if self.turn and self.turn.frozen then
+  if self.turn and self.turn:is_frozen() then
     return false, "turn is frozen for End"
   end
   if type(decision) ~= "table" then
@@ -320,32 +378,19 @@ function File:decide_mode(decision)
     return false, "turn_file.decide_mode: " .. self.path .. " needs the exact proposal_key"
   end
   local verdict = decision.verdict
-  if verdict == nil then
-    verdict = decision.next
-  end
-  if verdict == nil then
-    verdict = "keep"
-  end
+  if verdict == nil then verdict = decision.next end
+  if verdict == nil then verdict = "keep" end
   if not MODE_VERDICTS[verdict] then
-    return false,
-      "turn_file.decide_mode: "
-        .. self.path
-        .. " got an unknown mode verdict "
-        .. tostring(verdict)
-        .. "; expected allow or keep"
+    return false, "turn_file.decide_mode: " .. self.path .. " got an unknown mode verdict " .. tostring(verdict)
+      .. "; expected allow or keep"
   end
   -- The compare-and-set reads the verdict for THIS proposal: a record left by a
   -- since-revised proposal is Keep for it.
   local on_key = M.mode_verdict_for(self, decision.proposal_key)
   local current = (on_key and on_key.verdict) or "keep"
   if decision.previous ~= nil and decision.previous ~= current then
-    return false,
-      "turn_file.decide_mode: "
-        .. self.path
-        .. " expected the previous mode verdict "
-        .. tostring(decision.previous)
-        .. " but it is "
-        .. tostring(current)
+    return false, "turn_file.decide_mode: " .. self.path .. " expected the previous mode verdict "
+      .. tostring(decision.previous) .. " but it is " .. tostring(current)
   end
   self.mode_verdict = {
     proposal_key = decision.proposal_key,

@@ -1,11 +1,13 @@
 -- Reading the world for one Turn file: line ownership and the frozen
--- projection INPUT. The file on disk is not read here
+-- projection INPUT. The file on disk is not read here, beyond whether a
+-- creation's path exists
 -- (disk and buffer-write audit). Split out of `turn_settle.lua`, which had grown past
 -- 500 lines carrying two jobs -- deciding what is true, and acting on it. This
 -- half only decides what is true. It calculates no action, no target bytes and
 -- no mode, opens no write door and touches no buffer; `turn_settle` owns all of
 -- that and is this module's only caller.
 local creation_touch = require("yana.paths.creation_touch")
+local diff = require("yana.diff")
 
 local M = {}
 
@@ -20,8 +22,8 @@ end
 
 --- THE ONE PLACE A MODE IS NORMALISED. `uv.fs_lstat` reports the full `st_mode`
 --- (file type plus permissions) while a change carries permission bits alone
---- (`cli/turn.lua:166-171` bounds them to 0..4095), and `review_open_save` has
---- written the unmasked value into `base_mode`. The projection COMPARES mode
+--- (`cli/turn.lua:166-171` bounds them to 0..4095), and an unmasked value
+--- once reached `base_mode`. The projection COMPARES mode
 --- values and must never parse or format one (rule 7c), so the snapshot adapter
 --- owes it values that are comparable. Masking here, once, is that debt paid;
 --- the diary applies the same mask before it chmods
@@ -92,31 +94,43 @@ end
 --- answers, and it is about identity, not about what is on disk now.
 ---
 --- `creation_touch.is_creation` reads `change.before == nil`, which is the
---- creation marker until the first ordinary save: `review_open_save`'s rebase
---- block sets `change.before` to the bytes it read back, so after one `:w` a
---- created file stops answering to it. R6 requires the opposite -- "a created
---- file remains identified as turn-created after saves" -- so the immutable
---- record answers first: the File's own established `operation` (turn_file
---- derives it once, precisely so a refresh cannot turn a creation into a
---- modify) and then the change's own kind, which no save rewrites.
+--- creation marker until Yana's own End write records the bytes it wrote
+--- (`turn_file` `record_projection` sets `change.before`); the operator's `:w`
+--- never touches it. R6 requires a created file to remain identified as
+--- turn-created after saves, so the immutable record answers first: the File's ORIGINAL operation (turn_file fixes it
+--- once; `operation` is the selected version's, F-ADDENDUM-CARRY) and then the
+--- change's own kind, which no save rewrites.
 function M.creation(f, change)
-  return f.operation == "create"
+  local original = f.original_operation
+  if original == nil then original = f.operation end
+  return original == "create"
     or change.kind == "create"
     or creation_touch.is_creation(change)
 end
 
+--- The register this file's review rows go to and the Turn id they carry, resolved as the decision and
+--- watcher doors push them (`review_decisions`, `review_watch_register`). The Turn's completion releases it.
+function M.register_key(f)
+  local change = type(f) == "table" and type(f.change) == "table" and f.change or {}
+  local opts = type(f) == "table" and ((f.review_state or {}).opts or f.review_opts) or {}
+  return change.review_workspace or opts.workspace or vim.fn.getcwd(), change.turn_id or change.turn_gen
+end
+
 --- The projection INPUT for one file. Everything the calculation needs, read
 --- once, with no calculation of its own: original and proposal sides, the
---- resolved hunks, the two verdicts and the buffer when one is loaded.
+--- resolved hunks, the two verdicts and the buffer when one is loaded. The
+--- proposal side, verdicts, carried acceptance and hunk base are the File's
+--- SELECTED VERSION (`File:version`); the original side never is.
 function M.snapshot_of(f, purpose)
   local change = type(f.change) == "table" and f.change or {}
+  local proposed = type(f.proposal) == "table" and f.proposal or change
   local is_creation = M.creation(f, change)
 
   local buffer
   -- A delete's review buffer shows the proposal (absence), not the file's content:
   -- composing a kept delete from it adds a trailing blank record (kept.py gains
   -- "\n", an empty file becomes "\n"). A delete projects from original + verdicts.
-  if change.kind ~= "delete" then
+  if proposed.kind ~= "delete" then
     if purpose == "exit" and type(f.frozen_buffer) == "table" then
       buffer = f.frozen_buffer
     elseif M.valid_buffer(f.bufnr) then
@@ -125,6 +139,7 @@ function M.snapshot_of(f, purpose)
         changedtick = vim.api.nvim_buf_get_changedtick(f.bufnr),
         fileformat = vim.bo[f.bufnr].fileformat,
         endofline = vim.bo[f.bufnr].endofline,
+        bomb = vim.bo[f.bufnr].bomb,
       }
     end
   end
@@ -139,21 +154,69 @@ function M.snapshot_of(f, purpose)
       -- carries no original record.
       bytes = f.base_text or change.before or "",
       mode = M.mode_perm(change.base_mode),
+      -- A creation's path EXISTENCE now (one lstat, never content), and whether it
+      -- is still exactly the file its review buffer last wrote (stat identity):
+      -- only the operator's own save may be removed when a creation ends absent
+      -- (CORE "Saving is Neovim's", LEDGER N51).
+      present = is_creation and (vim.uv or vim.loop).fs_lstat(change.path or f.path) ~= nil or nil,
+      saved = is_creation and require("yana.turn.turn_save_record").matches(change.path or f.path) or nil,
     },
     proposal = {
-      exists = change.kind ~= "delete",
-      bytes = change.after,
-      mode = M.mode_perm(change.after_mode),
+      exists = proposed.kind ~= "delete",
+      bytes = proposed.after,
+      mode = M.mode_perm(proposed.after_mode),
     },
     hunks = M.hunks_of(f, buffer and buffer.lines or nil),
     operation_verdict = f.operation_verdict,
+    -- Accepted work and the effective accepted mode an earlier cycle's version
+    -- owes End, and the text a later version's hunks index (F-ADDENDUM-CARRY).
+    carried = f.carried == true,
+    accepted_mode = M.mode_perm(f.accepted_mode),
+    base = f.version_base,
+    versioned = f.version_installed == true,
     -- Rule 7a: the permission record lives on the File as `mode_verdict` and
     -- authorises a mode only for the proposal it records. Absent, or recorded
     -- for a since-revised proposal, the projection defaults to keep, which is
     -- the only safe default.
-    mode_verdict = (require("yana.turn.turn_settle").current_mode_verdict(f) or {}).verdict,
+    mode_verdict = f.mode_verdict ~= nil
+      and (require("yana.turn.turn_settle").current_mode_verdict(f) or {}).verdict or nil,
     buffer = buffer,
   }
+end
+
+--- The buffer lines `bytes` become in `bufnr`, by its 'fileformat'.
+function M.lines_of_bytes(bufnr, bytes)
+  local lines = vim.split(bytes, "\n", { plain = true })
+  if bytes:sub(-1) == "\n" then
+    table.remove(lines)
+  end
+  if vim.bo[bufnr].fileformat == "dos" then
+    for index, line in ipairs(lines) do
+      lines[index] = line:gsub("\r$", "")
+    end
+  end
+  if #lines == 0 then
+    lines = { "" }
+  end
+  return lines
+end
+
+--- A KEPT FILE'S FINAL BUFFER IS WHAT DISK ENDS AS. With nothing accepted, a
+--- file whose final buffer Neovim calls 'modified' is still saved through the
+--- buffer, so whatever the operator's `:w` put on disk during the review --
+--- pending agent lines included -- never outlives End (CORE "Saving is
+--- Neovim's", LEDGER N51). Never a disk read. A kept deletion projects from the
+--- original, not from its buffer, so its buffer owes the terminal text when it
+--- does not hold it. Absence (`plan.bytes == nil`) owes nothing.
+function M.buffer_owes_save(f, plan)
+  if plan.bytes == nil or not (M.valid_buffer(f.bufnr) and vim.api.nvim_buf_is_loaded(f.bufnr)) then
+    return false
+  end
+  if vim.bo[f.bufnr].modified then
+    return true
+  end
+  return plan.buffer_lines == nil
+    and not vim.deep_equal(vim.api.nvim_buf_get_lines(f.bufnr, 0, -1, false), M.lines_of_bytes(f.bufnr, plan.bytes))
 end
 
 -- ---------------------------------------------------------- SETTLEMENT EVIDENCE

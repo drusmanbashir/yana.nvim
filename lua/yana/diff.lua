@@ -54,7 +54,7 @@ function M.abs_path(path)
     end
   end
   -- Resolve symlinks so Mac /var/folders and /private/var/folders compare equal
-  -- (BufWriteCmd <amatch> vs bufname; selection_scope paths_match). Existing path
+  -- (selection_scope paths_match). Existing path
   -- components resolve; a missing final segment stays on the resolved parent.
   local resolved = vim.fn.resolve(norm)
   if resolved ~= "" then
@@ -536,21 +536,6 @@ function M.read_file_bytes(path)
   local data = f:read("*a")
   f:close()
   return data
-end
-
--- Check path's current disk bytes still equal snapshot_bytes.
-function M.disk_bytes_unchanged(path, snapshot_bytes)
-  if snapshot_bytes == nil then
-    return true
-  end
-  local disk, err = M.read_file_bytes(path)
-  if disk == nil then
-    return false, err or "could not read file from disk"
-  end
-  if disk ~= snapshot_bytes then
-    return false, "file on disk changed since review opened"
-  end
-  return true
 end
 
 -- Join bufnr's lines with "\n" (no fileformat/BOM handling).

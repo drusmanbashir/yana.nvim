@@ -42,6 +42,7 @@ function M.new(deps)
   local stop_spinner = deps.stop_spinner
   local buf_valid = deps.buf_valid
   local ui_M = deps.M
+  require("yana.panel.ui_followup").set_doors({ review_opts = inline_review_opts, flush = flush_review_batch })
 
 -- Row 69: the ONE stderr line that names the failure. Usually the vendor's last line.
 local function last_stderr_line(stderr)
@@ -310,7 +311,8 @@ local function on_done(p, gen, code, stderr, agent_outcome)
   if type(ui_M._test.force_turn_edits) == "number" then
     turn_edits = ui_M._test.force_turn_edits
   end
-  if not cancelled and not p.turn_errored and turn_edits == 0 and #p.queue == 0 then
+  -- A follow-up publishes into the open review (ui_turn_shadow): no new change record is no empty turn.
+  if not cancelled and not p.turn_errored and turn_edits == 0 and #p.queue == 0 and not (p.turn_followups or {})[gen] then
     if resolved_mode == "ask" then
       local completed_question = p.turn_questions and p.turn_questions[gen]
       local completed_answer = p.turn_answers and p.turn_answers[gen]

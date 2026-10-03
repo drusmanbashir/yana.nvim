@@ -26,16 +26,28 @@ function M.new(files)
 end
 
 -- Capture once. A later open/materialize refreshes the live ledger but MUST
--- NOT replace the start overlay with already-mutated state.
+-- NOT replace the start overlay with already-mutated state. Intake captures
+-- before the review exists; the file's first attached review then supplies
+-- the change model its start hunks join (`U` re-stamps them against it).
 function Overlay:add_file(file)
 	local path = file and file.path
-	if type(path) ~= "string" or self.by_path[path] ~= nil then
+	local saved = type(path) == "string" and self.by_path[path] or nil
+	if saved then
+		if saved.model == nil and file.review_state and file.review_state.model_hunks then
+			saved.model = require("yana.review_hunk_split").snapshot_model(file.review_state.model_hunks)
+			saved.model_source = file.review_state.model_source
+		end
+		return
+	end
+	if type(path) ~= "string" then
 		return
 	end
 	self.by_path[path] = {
 		text = file.overlay_text,
 		has_text = file.overlay_text ~= nil,
 		blocks = copy_blocks(file.ledger),
+		model = file.review_state and require("yana.review_hunk_split").snapshot_model(file.review_state.model_hunks),
+		model_source = file.review_state and file.review_state.model_source,
 	}
 end
 
@@ -52,6 +64,8 @@ function Overlay:get(path)
 		text = saved.text,
 		has_text = saved.has_text,
 		blocks = blocks,
+		model = vim.deepcopy(saved.model),
+		model_source = saved.model_source,
 	}
 end
 

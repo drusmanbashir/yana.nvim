@@ -591,6 +591,9 @@ check() {
 
 	"$clone/scripts/release/verify.sh" "$clone" || note_fail "verify.sh failed on the fresh clone"
 
+	# A rejected candidate needs no full-history audit. Keep that expensive scan
+	# for trees whose refs, tags and HEAD export have passed their own checks.
+	(( fail == 0 )) || return 1
 	audit_main_history "$clone" "$scratch"
 
 	(( fail == 0 )) || exit 1

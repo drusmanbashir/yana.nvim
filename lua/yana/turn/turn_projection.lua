@@ -108,8 +108,13 @@ local function compose_from_buffer(buffer, hunks)
 		out[#out + 1] = line
 		if index < #lines or buffer.endofline ~= false then out[#out + 1] = eol end
 	end
-	return lines, table.concat(out)
+	local bytes = table.concat(out)
+	if buffer.bomb == true then bytes = "\239\187\191" .. bytes end
+	return lines, bytes
 end
+-- The follow-up's comparison view `C` is this composition, reused as is
+-- (plan followup-addendum-turn.md "### Reuse and object rules"; turn/turn_cycle.lua).
+M.compose_from_buffer = compose_from_buffer
 
 -- Each hunk's PROPOSAL-side start, from stable original coordinates only: its
 -- original-side start shifted by the line-count deltas of every hunk ahead of it
@@ -164,8 +169,8 @@ end
 -- compute(input) -> {action, bytes, mode, buffer_lines} | nil, reason
 function M.compute(input)
 	if type(input) ~= "table" then return nil, "projection input is not a table" end
-	if input.purpose ~= "save" and input.purpose ~= "exit" then
-		return nil, "projection purpose must be save or exit, got " .. tostring(input.purpose)
+	if input.purpose ~= "exit" then
+		return nil, "projection purpose must be exit, got " .. tostring(input.purpose)
 	end
 	local original, proposal = input.original, input.proposal
 	if type(original) ~= "table" then return nil, "projection input has no original side" end
@@ -183,12 +188,17 @@ function M.compute(input)
 	end
 
 	local hunks = input.hunks or {}
-	-- :56 — accepted text or an accepted textless operation both keep content.
-	local content_accepted = input.operation_verdict == "accepted" or any_accepted(hunks)
+	-- :56 — accepted text or an accepted textless operation both keep content: the
+	-- selected version's OWN decisions. Accepted work an earlier cycle's version
+	-- carried keeps content too (F-ADDENDUM-CARRY: a missing fresh hunk does not
+	-- erase what End owes), but it can only write that text: it never approves
+	-- this version's deletion (CORE step 4, End applies accepted changes only).
+	local own_accepted = input.operation_verdict == "accepted" or any_accepted(hunks)
+	local content_accepted = own_accepted or input.carried == true
 
 	local target_exists
 	if proposal.exists == false then
-		target_exists = not content_accepted -- a pending deletion retains the file
+		target_exists = not own_accepted -- a pending or rejected deletion retains the file
 	elseif original.exists == false then
 		-- A created file has nothing on disk until its content is accepted
 			-- no empty file is written for a creation, so an unaccepted one stays absent.
@@ -198,10 +208,12 @@ function M.compute(input)
 	end
 
 	-- :58-60 — the verdict alone selects the mode; the proposed mode is never
-	-- read without it. A creation under keep has no original mode and takes the
-	-- host's creation permissions.
+	-- read without it. Under keep the mode is the effective accepted one an
+	-- earlier cycle carried, else the original; a creation under keep has no
+	-- original mode and takes the host's creation permissions.
 	local target_mode
-	if input.mode_verdict == "allow" then target_mode = proposal.mode else target_mode = original.mode end
+	if input.mode_verdict == "allow" then target_mode = proposal.mode
+	else target_mode = input.accepted_mode or original.mode end
 
 	local target_bytes, buffer_lines
 	if target_exists then
@@ -228,8 +240,13 @@ function M.compute(input)
 			end
 			buffer_lines, target_bytes = lines, bytes
 		else
+			-- A later cycle's hunks index that version's `base`, never the original.
+			local base = input.base
+			if base == nil and input.versioned then
+				return nil, "a later cycle's version has no base text; its hunks need the buffer"
+			end
 			local bytes, reason = compose_from_original(
-				split_records(original_bytes),
+				split_records(base or original_bytes),
 				split_records(type(proposal.bytes) == "string" and proposal.bytes or ""),
 				hunks)
 			if bytes == nil then return nil, reason end
@@ -239,14 +256,15 @@ function M.compute(input)
 		buffer_lines = {}
 	end
 
-	-- THE ACTION COMES FROM THE DECISIONS ALONE. The file on disk plays no part
-	-- End no longer reads the file's bytes, mode or inode to decide whether to write.
-	-- An End with nothing accepted writes nothing; an own-file save always
-	-- writes what the buffer shows.
+	-- THE ACTION COMES FROM THE DECISIONS. End reads no file bytes to decide
+	-- whether to write. The one disk fact is a creation's path, by stat: a creation
+	-- that ends absent removes the file only while it is still the operator's own
+	-- save of the review buffer (`original.saved`); any other file there is kept
+	-- (CORE "Saving is Neovim's", LEDGER N51).
 	local action
 	if not target_exists then
-		action = original.exists and "delete" or "none"
-	elseif content_accepted or target_mode ~= original.mode or input.purpose == "save" then
+		action = (original.exists or original.saved == true) and "delete" or "none"
+	elseif content_accepted or target_mode ~= original.mode then
 		action = "replace"
 	else
 		action = "none"

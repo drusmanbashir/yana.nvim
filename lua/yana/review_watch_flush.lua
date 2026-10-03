@@ -53,6 +53,8 @@ function M.new(env)
     local context = { state = state, deps = deps, reachable = reachable }
     local prepared = owner.prepare(context, order, state.watch_timeline)
     owner.commit(context, prepared, state.watch_timeline)
+    -- The commit filed one row per group; each row's event records its group's splices.
+    for _, group in ipairs(order) do push_buffer_edit(state, group.seq, group.changes) end
   end
   local function process_pending_watch()
     -- FIRST LINE, before anything is read off the state: a scheduled flush
@@ -180,7 +182,7 @@ function M.new(env)
       -- `BufferEditAction` by `kind == "buffer_edit"`. Skipping the push here
       -- is what left a full deletion with a `decision` row and no buffer
       -- action to reverse.
-      local buffer_action = push_buffer_edit(state, group.seq)
+      local buffer_action = push_buffer_edit(state, group.seq, group.changes)
       -- A record rides the sequence of the change that qualified it (the same
       -- key the groups were built on); a record whose change was never grouped
       -- rides the LAST group rather than being dropped -- an unrecorded

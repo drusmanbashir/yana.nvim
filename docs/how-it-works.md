@@ -1,11 +1,12 @@
 # How it works
 
-**Review model.** Every agent edit arrives as inline hunks in your real
-buffers. `]x`/`[x` move between hunks and, at a file's edge, park the file and
-move to the next one with pending hunks; `ca` accepts a hunk, `cr` rejects it,
-`cf` accepts the file, `cx` rejects the file's remaining hunks, `cA` accepts
-the whole turn — including parked hunks, since parking is navigation, never a
-decision. Undo walks the turn-global register with `u` / `<C-r>` (one door;
+**Review model.** Every affected file receives its inline hunks and review
+keys when a turn opens, including after a follow-up. `]x`/`[x` move between
+hunks and files without closing another file's review; `ca` accepts a hunk,
+`cr` rejects it, `cf` accepts the file, `cx` rejects the file's remaining
+hunks, and `cA` accepts the whole turn. Undo walks the turn-global register
+from the buffer of every file the turn has reviewed -- a parked member, or a
+file a follow-up's undo took back out -- with `u` / `<C-r>` (one door;
 no `:YanaUndo` / `:YanaRedo`); exhausting the register opens the End-turn
 dialog. Whole-turn reset is `U` (every file back to the state you were first
 shown). After End-turn, `u` / `<C-r>` are native Neovim. Nothing reaches disk

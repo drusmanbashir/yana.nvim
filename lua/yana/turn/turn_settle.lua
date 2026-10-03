@@ -1,19 +1,16 @@
--- Turn settlement: ONE projection calculation, two write doors.
+-- Turn settlement at End/abort: ONE projection calculation, two write doors.
 --
--- F-APPLY-JOURNAL, F-HUMAN-SAVE. Ordinary own-file `:w` and End/abort
--- both come here:
+-- F-APPLY-JOURNAL. The operator's `:w` never comes here: saving is Neovim's
+-- (CORE "Saving is Neovim's", LEDGER N51).
 --
 --   snapshot -> turn_projection.compute -> then either
---   End with accepted content: final text into the buffer -> Neovim's `:write`, or
---   `:w` during review, an accepted deletion, an accepted permission change:
+--   accepted content: final text into the buffer -> Neovim's `:write`, or
+--   an accepted deletion, an accepted permission change:
 --   acquire the existing file claim -> the diary-backed apply path
 --   -> File:record_projection, only after the write has actually succeeded.
 --
--- The composition bodies this module used to carry (its own line splitter,
--- renderer, disk differ, hunk sorter, `compose_disk` and `compose_buffer`) are
--- GONE: they were the second calculation of the final bytes, and
--- `yana.turn.turn_projection` is the only one now. Nothing here re-derives an
--- action, target bytes or a mode.
+-- `yana.turn.turn_projection` is the only calculation of the final bytes:
+-- nothing here re-derives an action, target bytes or a mode.
 local projection = require("yana.turn.turn_projection")
 local diff = require("yana.diff")
 local hash = require("yana.safety.hash")
@@ -21,7 +18,6 @@ local hash = require("yana.safety.hash")
 local M = {}
 
 local snapshot = require("yana.turn.turn_settle_snapshot")
-
 
 --- The `{turn, path, mode}` key named by the File's current change. This stays
 --- available after a successful write resets the base mode, so undo can still
@@ -33,16 +29,20 @@ function M.change_proposal_key(f)
   return {
     turn = turn == nil and "no-turn" or (turn.id or turn.turn_id or tostring(turn)),
     path = f.path or change.path or "?",
-    mode = tostring(change.after_mode),
+    mode = tostring((f.proposal or change).after_mode),
   }
 end
 
---- THE proposal key, `{turn, path, mode}`, of the File's CURRENT change, or nil
---- when the change proposes no mode of its own.
+--- THE proposal key, `{turn, path, mode}`, of the File's CURRENT change (its
+--- selected version's proposal), or nil when it proposes no mode of its own: none
+--- differing from the effective mode (the accepted mode an earlier cycle carried,
+--- else the original). A fresh mode change thus waits for its own decision.
 function M.mode_proposal_key(f)
   local change = type(f) == "table" and f.change or nil
-  local proposed = type(change) == "table" and change.after_mode or nil
-  if proposed == nil or proposed == (change.base_mode or change.before_mode) then
+  local proposed = type(change) == "table" and (f.proposal or change).after_mode or nil
+  local effective = type(f) == "table" and f.accepted_mode or nil
+  if effective == nil and proposed ~= nil then effective = change.base_mode or change.before_mode end
+  if proposed == nil or proposed == effective then
     return nil
   end
   return M.change_proposal_key(f)
@@ -73,7 +73,6 @@ end
 -- Turn deps table and every caller already use is unchanged.
 M.settled_current = snapshot.settled_current
 
-
 --- `File:record_projection` is the ONLY door that advances rebased applier
 --- evidence. A turn entry that is not yet a `turn_file` File has no such door;
 --- the write still committed, so the settlement still succeeded, and the caller
@@ -88,9 +87,10 @@ end
 --- The buffer End saves a file through: the Turn file's own buffer, else the
 --- buffer snapshotted at submit, else a buffer loaded for the path now. The
 --- second answer says whether this module loaded it, so it can be wiped after.
-local function save_buffer_for(f, change, path)
-  if snapshot.valid_buffer(f.bufnr) and vim.api.nvim_buf_is_loaded(f.bufnr) then
-    return f.bufnr, false
+local function save_buffer_for(f, change, path, fixed_bufnr)
+  local bufnr = fixed_bufnr or f.bufnr
+  if snapshot.valid_buffer(bufnr) and vim.api.nvim_buf_is_loaded(bufnr) then
+    return bufnr, false
   end
   local capture = type(change.buffer_capture) == "table" and change.buffer_capture or nil
   local captured = capture and capture.bufnr
@@ -106,32 +106,17 @@ local function save_buffer_for(f, change, path)
   return bufnr, true
 end
 
---- END SAVES THROUGH NEOVIM'S OWN WRITE: the final text goes into the buffer, then
---- `:write!` saves it. No disk read, no fingerprint check. The bang is what
---- keeps a file another program changed after submit from stopping End with
---- Neovim's changed-since-reading question. Yana's own write guard on a review
---- buffer (`review_open_save.lua`, BufWriteCmd) is skipped for this one write,
---- so Neovim writes the file itself; every other write event still fires.
---- The modified flag is Neovim's: the write clears it, Yana never touches it.
-local function write_through_buffer(f, change, path, plan)
-  local bufnr, loaded_here = save_buffer_for(f, change, path)
+--- End saves through Neovim's ordinary write. A declined changed-file question
+--- returns without throwing and can even fire BufWritePost; the modified flag
+--- must therefore remain set until Neovim actually saves the buffer.
+local function write_through_buffer(f, change, path, plan, fixed_bufnr)
+  local bufnr, loaded_here = save_buffer_for(f, change, path, fixed_bufnr)
   if not vim.bo[bufnr].modifiable then
     return false, "nomodifiable"
   end
   local lines = plan.buffer_lines
-  if lines == nil or bufnr ~= f.bufnr then
-    lines = vim.split(plan.bytes, "\n", { plain = true })
-    if plan.bytes:sub(-1) == "\n" then
-      table.remove(lines)
-    end
-    if vim.bo[bufnr].fileformat == "dos" then
-      for index, line in ipairs(lines) do
-        lines[index] = line:gsub("\r$", "")
-      end
-    end
-    if #lines == 0 then
-      lines = { "" }
-    end
+  if lines == nil or bufnr ~= (fixed_bufnr or f.bufnr) then
+    lines = snapshot.lines_of_bytes(bufnr, plan.bytes)
   end
   local wants_eol = plan.bytes:sub(-1) == "\n"
   local ok, err = pcall(function()
@@ -146,17 +131,20 @@ local function write_through_buffer(f, change, path, plan)
     if dir ~= "" then
       vim.fn.mkdir(dir, "p")
     end
-    local ignored = vim.o.eventignore
-    vim.o.eventignore = (ignored == "" and "" or ignored .. ",") .. "BufWriteCmd,FileWriteCmd,FileAppendCmd"
+    -- A proposal can be visible with 'modified' clear. Mark the terminal
+    -- projection unsaved so a declined write cannot masquerade as success.
+    vim.bo[bufnr].modified = true
     local wrote, write_err = pcall(vim.api.nvim_buf_call, bufnr, function()
-      vim.cmd("silent keepalt keepjumps write!")
+      vim.cmd("silent keepalt keepjumps write")
     end)
-    vim.o.eventignore = ignored
     if not wrote then
       error(write_err, 0)
     end
+    if vim.bo[bufnr].modified then
+      error("Neovim did not write the buffer", 0)
+    end
   end)
-  if loaded_here and vim.api.nvim_buf_is_valid(bufnr) then
+  if ok and loaded_here and vim.api.nvim_buf_is_valid(bufnr) then
     pcall(vim.api.nvim_buf_delete, bufnr, { force = true })
   end
   if not ok then
@@ -165,57 +153,29 @@ local function write_through_buffer(f, change, path, plan)
   return true
 end
 
---- Validate an ordinary own-file save request against the retained state.
---- `{bufnr, state, changedtick}`, and all three must match: another file's
---- buffer, a superseded review state or a buffer that has moved since the
---- request was raised are all refusals, not writes.
-local function own_file_request(f, request)
-  if type(request) ~= "table" then
-    return false, "turn_settle.save: " .. tostring(f.path) .. " needs a {bufnr, state, changedtick} request"
-  end
-  if request.bufnr ~= f.bufnr then
-    return false,
-      "turn_settle.save: buffer " .. tostring(request.bufnr) .. " is not the retained buffer for " .. tostring(f.path)
-  end
-  if not snapshot.valid_buffer(f.bufnr) then
-    return false, "turn_settle.save: " .. tostring(f.path) .. " has no live buffer to save"
-  end
-  local retained = f.review_state
-  if request.state ~= nil and retained ~= nil and not rawequal(request.state, retained) then
-    return false, "turn_settle.save: that review state is not the current one for " .. tostring(f.path)
-  end
-  local live = vim.api.nvim_buf_get_changedtick(f.bufnr)
-  if request.changedtick ~= nil and request.changedtick ~= live then
-    return false,
-      "turn_settle.save: "
-        .. tostring(f.path)
-        .. " moved since the request (changedtick "
-        .. tostring(request.changedtick)
-        .. " != "
-        .. tostring(live)
-        .. ")"
-  end
-  return true
-end
-
---- One settlement attempt, shared verbatim by `settle` and `save`.
+--- One settlement attempt for `settle`.
 ---
 --- `done(ok, reason, detail)` fires EXACTLY ONCE, including on synchronous
 --- completion, and `detail` carries `{phase, written, diary_dir, op_id}` --
 --- the commit receipt whenever the write committed, so a committed-but-
 --- readback/reconcile-failed attempt is never mistaken for no write at all.
 --- Returns `true`, `false, reason`, or `"pending"`.
-local function run(f, purpose, request, done)
+local function run(f, purpose, done, end_item, end_binding)
   local has_done = type(done) == "function"
   local finished, result_ok, result_err = false, nil, nil
   local function finish(ok, err, detail)
     if finished then return end
     finished, result_ok, result_err = true, ok == true, err
     if result_ok then
-      local stamped, stamp = pcall(snapshot.settlement_state, f)
-      -- The stamp is this module's verdict; the exit flag is the End's and is
-      -- handed straight back, so a direct save never speaks for an End.
-      f:record_settlement(stamped and stamp or nil, f.settled_at_exit)
+      if end_item then
+        -- Confirmed End has no retry walk. A live settlement_state read here
+        -- would re-read verdicts after an asynchronous claim despite the plan.
+        f:record_settlement({ plan_index = end_item.index, path = end_item.path },
+          f.settled_at_exit)
+      else
+        local stamped, stamp = pcall(snapshot.settlement_state, f)
+        f:record_settlement(stamped and stamp or nil, f.settled_at_exit)
+      end
     else
       f:record_settlement(nil, f.settled_at_exit)
     end
@@ -226,19 +186,18 @@ local function run(f, purpose, request, done)
     return "pending"
   end
 
-  if purpose == "save" then
-    local allowed, why = own_file_request(f, request)
-    if not allowed then
-      finish(false, why, { phase = "request", written = false })
-      return answer()
-    end
-  end
-
-  local change = type(f.change) == "table" and f.change or {}
-  local path = change.path or f.path
+  local change = end_item and vim.deepcopy(end_item.route.change)
+    or (type(f.change) == "table" and f.change or {})
+  local path = end_item and end_item.path or change.path or f.path
+  local bufnr = end_binding and end_binding.bufnr or f.bufnr
 
   -- SNAPSHOT, then CALCULATE. Both are pure; neither touches disk or the claim.
-  local snapshot_ok, input = pcall(snapshot.snapshot_of, f, purpose)
+  local snapshot_ok, input
+  if end_item then
+    snapshot_ok, input = true, vim.deepcopy(end_item.input)
+  else
+    snapshot_ok, input = pcall(snapshot.snapshot_of, f, purpose)
+  end
   if not snapshot_ok then
     finish(false, tostring(input), { phase = "snapshot", written = false })
     return answer()
@@ -249,8 +208,7 @@ local function run(f, purpose, request, done)
     return answer()
   end
 
-  -- End reconciles the buffer to the terminal projection; an ordinary save keeps
-  -- the displayed pending proposal, ledger and undo history exactly as they are.
+  -- End reconciles the buffer to the terminal projection.
   --
   -- ONLY A CONFIRMED OUTCOME MAY DO THIS, so it is a function called from the
   -- two places that have one -- a confirmed no-op and a committed write -- and
@@ -265,10 +223,10 @@ local function run(f, purpose, request, done)
   -- which is how a removed zero-accepted creation reappeared as a one-byte
   -- file. The buffer is left alone; the file goes.
   local function reconcile_buffer()
-    if purpose ~= "exit" or plan.action == "delete" or plan.buffer_lines == nil then return true end
-    if not snapshot.valid_buffer(f.bufnr) then return true end
-    if not vim.bo[f.bufnr].modifiable then return false, "nomodifiable" end
-    local current = vim.api.nvim_buf_get_lines(f.bufnr, 0, -1, false)
+    if plan.action == "delete" or plan.buffer_lines == nil then return true end
+    if not snapshot.valid_buffer(bufnr) then return true end
+    if not vim.bo[bufnr].modifiable then return false, "nomodifiable" end
+    local current = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
     if vim.deep_equal(current, plan.buffer_lines) then return true end
     -- THROUGH THE WATCHER'S OWN DOOR. This is Yana replacing the displayed
     -- proposal with the terminal text, and the review watcher has to know that:
@@ -277,8 +235,8 @@ local function run(f, purpose, request, done)
     -- the ledger still transports the geometry exactly once. Resolved at call
     -- time, not captured, so the door is whichever one is installed now.
     local set_ok, set_err = pcall(function()
-      return require("yana.review_watch").own_splice(f.bufnr, function()
-        vim.api.nvim_buf_set_lines(f.bufnr, 0, -1, false, plan.buffer_lines)
+      return require("yana.review_watch").own_splice(bufnr, function()
+        vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, plan.buffer_lines)
       end)
     end)
     if not set_ok then return false, tostring(set_err) end
@@ -300,6 +258,7 @@ local function run(f, purpose, request, done)
     and committed.bytes == plan.bytes
     and committed.mode == plan.mode
 
+  local save_kept = false
   if plan.action == "none" or committed_already then
     -- A confirmed no-op IS an outcome: nothing to write, so the terminal text
     -- is already decided and the buffer may be reconciled to it.
@@ -307,6 +266,23 @@ local function run(f, purpose, request, done)
     if not reconciled then
       finish(false, reconcile_err, { phase = "buffer", written = false })
       return answer()
+    end
+    if plan.action == "none" then
+      if end_item then
+        -- A plain :w clears 'modified' after saving the visible proposal.
+        -- End still owes a save if its frozen terminal bytes differ from that
+        -- frozen buffer, even when Neovim considered the proposal saved.
+        save_kept = plan.bytes ~= nil and (end_item.buffer_modified
+          or (end_item.buffer_bytes ~= nil and end_item.buffer_bytes ~= plan.bytes))
+      else
+        save_kept = snapshot.buffer_owes_save(f, plan)
+      end
+    end
+  end
+  if (plan.action == "none" or committed_already) and not save_kept then
+    if plan.action == "none" and input.original.present == true then
+      -- A creation that ends absent over a file its buffer did not write (N51).
+      require("yana.turn.turn_save_record").report_kept(change.rel or path)
     end
     local detail = {
       -- `write` when this settlement is spending a commit the earlier attempt
@@ -322,13 +298,13 @@ local function run(f, purpose, request, done)
     return answer()
   end
 
-  -- END SAVES ACCEPTED CONTENT THROUGH THE BUFFER. Only an accepted deletion
-  -- and an accepted permission change stay on the journaled writer below, as
-  -- does an own-file `:w` during review (purpose "save").
-  if purpose == "exit" and plan.action == "replace" and plan.mode == input.original.mode then
-    local wrote, write_err = write_through_buffer(f, change, path, plan)
+  -- END SAVES ACCEPTED CONTENT THROUGH THE BUFFER, and a kept file whose final
+  -- buffer owes a save (above). Only an accepted deletion and an accepted
+  -- permission change stay on the journaled writer below.
+  if save_kept or (plan.action == "replace" and plan.mode == input.original.mode) then
+    local wrote, write_err = write_through_buffer(f, change, path, plan, bufnr)
     if not wrote then
-      finish(false, write_err, { phase = "write", written = false })
+      finish(false, write_err, { phase = "write", written = false, via = "buffer" })
       return answer()
     end
     local detail = { phase = "write", written = true, via = "buffer" }
@@ -349,16 +325,17 @@ local function run(f, purpose, request, done)
   end
 
   local opts = f.review_opts or {}
-  local accept = opts.on_shadow_accept
-  if opts.shadow_apply ~= true or type(accept) ~= "function" then
+  local accept = end_binding and end_binding.accept or opts.on_shadow_accept
+  local shadow_apply = end_item ~= nil and end_item.route.shadow_apply or nil
+  if end_item == nil then shadow_apply = opts.shadow_apply end
+  if shadow_apply ~= true or type(accept) ~= "function" then
     finish(false, "no journaled write door for this file at turn " .. purpose, { phase = "door", written = false })
     return answer()
   end
 
   -- THE EXPLICIT WRITE DESCRIPTION. The apply routes consume this and derive
   -- nothing of their own: not the action from `change.kind`, not the mode from
-  -- `change.after_mode`. `preserve_review` withholds only the buffer reconcile
-  -- on an ordinary save, never a disk identity or content check.
+  -- `change.after_mode`.
   -- THE PINNED REVIEW BUFFER. At End the review buffer legitimately differs
   -- from BOTH fingerprints the applier's unsaved-edits guard knows: it is
   -- neither pre-turn disk nor the terminal bytes, because it still shows the
@@ -371,18 +348,19 @@ local function run(f, purpose, request, done)
   -- to this pin. That is one more EXACTLY KNOWN value, not a wildcard: a human
   -- edit in that window changes the hash and is refused exactly as before.
   local staged_proof
-  if snapshot.valid_buffer(f.bufnr) then
-    local staged_bytes = diff.buffer_bytes_snapshot(f.bufnr)
+  if snapshot.valid_buffer(bufnr) then
+    local staged_bytes = diff.buffer_bytes_snapshot(bufnr)
     if staged_bytes ~= nil then
       staged_proof = {
         hash = hash.hash_bytes(staged_bytes),
-        tick = vim.api.nvim_buf_get_changedtick(f.bufnr),
+        tick = vim.api.nvim_buf_get_changedtick(bufnr),
+        seq = vim.api.nvim_buf_call(bufnr, vim.fn.changenr),
       }
     end
   end
 
   local accept_opts = {
-    staged_bufnr = f.bufnr,
+    staged_bufnr = bufnr,
     -- The proof handed down to the guard; an argument only, like `own_splice`,
     -- never part of the write description below.
     staged_proof = staged_proof,
@@ -394,7 +372,6 @@ local function run(f, purpose, request, done)
       bytes = plan.bytes,
       mode = plan.mode,
       purpose = purpose,
-      preserve_review = purpose == "save",
     },
   }
   local composed = plan.action == "delete" and nil or plan.bytes
@@ -458,11 +435,11 @@ local function run(f, purpose, request, done)
 
   -- ACQUIRE THE EXISTING CLAIM, then take the existing diary-backed apply path.
   local apply_sessions = require("yana.shadow.apply_sessions")
-  local context = claim_context(f)
+  local context = end_item and vim.deepcopy(end_item.route.context) or claim_context(f)
   local token = {}
   -- The decisions this projection was built from; see `decision_stamp` and the
   -- re-ask inside the claim callback below.
-  local decisions_at_projection = snapshot.decision_stamp(f)
+  local decisions_at_projection = not end_item and snapshot.decision_stamp(f) or nil
 
   local started, start_err = apply_sessions.request_file_claim(context, change,
     function(ok, value, code, refusal, frozen)
@@ -471,7 +448,7 @@ local function run(f, purpose, request, done)
         finish(false, value, { phase = "claim", written = false })
         return
       end
-      local live = claim_context(f)
+      local live = end_item and vim.deepcopy(end_item.route.context) or claim_context(f)
       if apply_sessions.grant_file_claim(change, token, value, frozen or context, live) == false then
         finish(false, "the yanad file.claim answer does not name this settlement attempt",
           { phase = "claim", written = false })
@@ -482,12 +459,24 @@ local function run(f, purpose, request, done)
       -- moves the projection without touching a byte. Refusing leaves the Turn
       -- live, the review open and every decision intact, so a fresh End projects
       -- all of them; the grant must not stay installed.
-      if snapshot.decision_stamp(f) ~= decisions_at_projection then
+      if not end_item and snapshot.decision_stamp(f) ~= decisions_at_projection then
         apply_sessions.clear_file_claim_grant(change)
         finish(false,
           "a review decision changed while this End waited for the file claim; "
             .. "nothing was written -- end the turn again to apply every decision",
           { phase = "decision_drift", written = false })
+        return
+      end
+      -- THE LAST-INSTANT PROVENANCE RE-STAT, inside the claim: a creation's file
+      -- goes only while it is still its review buffer's own save; else it is kept.
+      if plan.action == "delete" and not input.original.exists
+        and not require("yana.turn.turn_save_record").matches(path) then
+        apply_sessions.clear_file_claim_grant(change)
+        -- Gone during the wait: nothing was kept, so nothing to say (critic N51 L2).
+        if require("yana.turn.turn_save_record").identity(path) ~= nil then
+          require("yana.turn.turn_save_record").report_kept(change.rel or path)
+        end
+        finish(true, nil, { phase = "kept", written = false })
         return
       end
       local called, a1, a2, a3 = pcall(accept, change, composed, accept_opts)
@@ -509,14 +498,14 @@ end
 --- then consumed immediately by the applier. `done` is called once; a pending
 --- return is not success.
 function M.settle(f, done)
-  return run(f, "exit", nil, done)
+  return run(f, "exit", done)
 end
 
---- Ordinary own-file `:w`. Same steps, same order and same single projection
---- calculation as `settle`, always through the journaled write door; End
---- saves accepted content through the buffer instead.
-function M.save(f, request, done)
-  return run(f, "save", request, done)
+-- Confirmed End consumes only the private plan's detached value item. The File
+-- binding is an output destination for receipt/rebased evidence, never a source
+-- for the projection, owner or claim route.
+function M.settle_plan(item, binding, done)
+  return run(binding.file, "exit", done, item, binding)
 end
 
 return M

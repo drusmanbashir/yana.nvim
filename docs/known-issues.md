@@ -1,6 +1,6 @@
 # Known issues
 
-None of these lose data on disk — `:w` always withholds pending agent lines:
+`:w` is a plain Neovim save of the visible buffer, including pending agent lines. The issues below are separate from that save behaviour:
 
 - **There is no trash store, so a proposed DELETE or CHMOD is not enabled
   yet.** A deletion should move a file to trash so the confirmation's undo is

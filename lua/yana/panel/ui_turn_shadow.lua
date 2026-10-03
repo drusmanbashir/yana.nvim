@@ -51,6 +51,24 @@ local function attach_snapshots(changes, snaps)
   end
 end
 
+-- yanad owns the durable review record; publish absolute paths and turn-start evidence together.
+local function set_review_bundle(turn, changes)
+  turn.review_files, turn.review_bundle = {}, {}
+  for _, change in ipairs(changes) do
+    turn.review_files[#turn.review_files + 1] = change.path
+    turn.review_bundle[#turn.review_bundle + 1] = {
+      id = change.id, path = change.path, rel = change.rel, root = change.root, root_index = change.root_index,
+      root_is_primary = change.root_is_primary, kind = change.kind, base_state = change.base_state,
+      base_hash = change.base_hash, base_mode = change.base_mode, base_hash_captured_ts = change.base_hash_captured_ts,
+      after_mode = change.after_mode, upper_path = change.upper_path,
+      -- Recovery cannot rebuild an unsaved buffer baseline from disk; keep it in the daemon-owned bundle.
+      home_buffer_only = change.home_buffer_capture ~= nil or nil,
+      -- B0 for every snapshotted file (INTERFACE.md section 1).
+      review_before = change.buf_org or (change.home_buffer_capture and change.review_before) or nil,
+    }
+  end
+end
+
 -- deps.state: shared S; this module assigns S.finalize_shadow_turn onto it. render_*/turn_ledger/with_render_gen: ui_render and ui_review facade locals.
 function M.new(deps)
   local S = deps.state
@@ -103,15 +121,26 @@ local function release_unsafe_turn(p, turn, classification)
   end)
 end
 
+-- A follow-up's refused launch and its recorded result belong to the follow-up route (ui_followup.lua).
+local followup_route = require("yana.panel.ui_followup")
+followup_route.set_doors({ render_error = render_error, render_tool_change = render_tool_change,
+  preview = preview_module, turn_ledger = turn_ledger, shadow_turn_gen = shadow_turn_gen,
+  set_review_bundle = set_review_bundle, drain = function(p) S.maybe_drain_queue(p) end })
+
 local function finalize_shadow_turn_body(p, turn)
-  if turn._review_finalized then
+  -- Run-once: the flag lives on this run's record (turn/turn_cycle.lua), not on an object that outlives the run.
+  if not require("yana.turn.turn_cycle").once(turn, "review_finalized") then
     return
   end
-  turn._review_finalized = true
   -- The launch answer binds layer_dir/upper_dir; it MUST precede the walk
   -- because on_exit_confirmed runs before on_done.
   local launch_answer = require("yana.shadow.jail").consume_answer(turn)
   local refusal = type(launch_answer) == "table" and launch_answer.refuse
+  local followup = require("yana.turn.turn_cycle").recording_run(turn)
+  if followup and (type(refusal) == "table" or not turn.upper_dir) then
+    return followup_route.launch_refused(p, followup, type(refusal) == "table" and refusal.code,
+      type(refusal) == "table" and refusal.reason or "the overlay did not establish a layer")
+  end
   if type(refusal) == "table" then
     local code = refusal.code
     local retried = code == "unknown_session"
@@ -187,6 +216,21 @@ local function finalize_shadow_turn_body(p, turn)
     local changes, cerr, typed, classification = ops.changes_from_session(turn, {
       tracked_evidence = p.turn_pass and p.turn_pass.tracked_evidence or nil,
     })
+    -- Result reading seam (plan "### Reconciliation" step 3): a follow-up run records its raw records BEFORE
+    -- drop_snapshot_copies, which would drop a member the agent left unchanged, and goes to publication.
+    if followup then
+      record_control_plane_refusals(turn, p, typed)
+      if p.turn_pass then
+        local _, berr = require("yana.turn.turn_lifecycle").publish_bundle(p.turn_pass, ops.classified_bundle_entries(typed))
+        if berr then log.write(log.levels.WARN, "yana: bundle publication failed: " .. tostring(berr)) end
+      end
+      if not changes then
+        render_error(p, "follow-up result unreadable: " .. tostring(cerr))
+        return followup.owner:set_state("reviewing")
+      end
+      followup.owner:record_result(followup, changes, { session = turn, stopped = p.cancelled == true }) -- A: read_run_view
+      return followup_route.publish_result(p, turn, followup)
+    end
     drop_snapshot_copies(changes, snaps)
     changes, typed, classification = require("yana.input.home_buffer_proposal")
       .classify_buffer_restore(turn, home_capture, changes, typed, classification)
@@ -295,31 +339,7 @@ local function finalize_shadow_turn_body(p, turn)
           table.insert(p.changes, change)
           render_tool_change(p, change)
         end
-        -- yanad owns the durable review record; publish absolute paths and turn-start evidence together.
-        turn.review_files = {}
-        turn.review_bundle = {}
-        for _, change in ipairs(changes) do
-          turn.review_files[#turn.review_files + 1] = change.path
-		  turn.review_bundle[#turn.review_bundle + 1] = {
-            id = change.id,
-            path = change.path,
-            rel = change.rel,
-            root = change.root,
-            root_index = change.root_index,
-            root_is_primary = change.root_is_primary,
-            kind = change.kind,
-            base_state = change.base_state,
-            base_hash = change.base_hash,
-            base_mode = change.base_mode,
-            base_hash_captured_ts = change.base_hash_captured_ts,
-            after_mode = change.after_mode,
-		    upper_path = change.upper_path,
-		    -- Recovery cannot rebuild an unsaved buffer baseline from disk; keep it in the daemon-owned bundle.
-		    home_buffer_only = change.home_buffer_capture ~= nil or nil,
-		    -- B0 for every snapshotted file (INTERFACE.md section 1).
-		    review_before = change.buf_org or (change.home_buffer_capture and change.review_before) or nil,
-		  }
-        end
+        set_review_bundle(turn, changes)
         preview_module().arm_review_open(turn, function(ok)
           if ok then
             ledger.mark(turn_ledger(p, turn_gen), "review_claim_open")

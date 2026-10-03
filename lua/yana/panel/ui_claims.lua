@@ -524,14 +524,11 @@ local function refresh_review_claim(p, change)
     local merged = change.merged_count or 1
     text = merged > 1 and string.format("_Review opens when the turn ends (%d edits merged)._", merged)
       or "_Review opens when the turn ends._"
-  elseif inline.active_change(ws_opts) == change then
+  elseif inline.is_change_open(change, ws_opts) then
     text = "_Hunks open in the source file — switch to that window._"
   else
-    -- Ask the engine for THIS change's position; pending_count()-1 gave every
-    -- queued change the same figure and counted items queued behind it.
-    local ahead = inline.queue_wait(change, ws_opts) or math.max(0, inline.pending_count(ws_opts) - 1)
-    text = ahead > 0 and string.format("_Queued behind %d review(s) — no hunks in this file yet._", ahead)
-      or "_Queued — no hunks in this file yet._"
+    -- This change is preparing; its source-file review is not attached yet.
+    text = "_Review is preparing in the source file._"
   end
   vim.bo[p.conv_buf].modifiable = true
   pcall(vim.api.nvim_buf_set_lines, p.conv_buf, change.conv_claim_line - 1, change.conv_claim_line, false, { text })

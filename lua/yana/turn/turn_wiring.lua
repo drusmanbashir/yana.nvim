@@ -66,9 +66,13 @@ end
 function M.tabs_callback(tabs)
 	return {
 		name = "tabs",
-		turn_end = function(_cb, _ctx)
+		turn_end = function(_cb, ctx)
 			if tabs and tabs.close_owned_tabs then
-				tabs.close_owned_tabs()
+				local keep_paths = {}
+				for _, failure in ipairs(ctx.refused or {}) do
+					if failure.via == "buffer" then keep_paths[failure.path] = true end
+				end
+				tabs.close_owned_tabs(keep_paths)
 			end
 		end,
 	}

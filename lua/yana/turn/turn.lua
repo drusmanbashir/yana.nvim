@@ -6,6 +6,7 @@
 local signals = require("yana.turn.turn_signals")
 local turn_file = require("yana.turn.turn_file")
 local end_result = require("yana.turn.turn_end_result")
+local end_plan = require("yana.turn.turn_end_plan")
 local log = require("yana.log")
 
 local M = {}
@@ -42,6 +43,9 @@ function M.new(files, deps)
 		state = "live",
 		started = false,
 		files = {},
+		-- Every path attached to this Turn, including a joined file later
+		-- withdrawn by publication undo. History keys stay Turn-owned there.
+		history_paths = {},
 		bus = signals.new(),
 		deps = deps,
 		-- R9 POLICY SNAPSHOT, RECONCILED (F-TRL09-02). The Turn OWNS the field;
@@ -64,9 +68,6 @@ function M.new(files, deps)
 		-- retires the ask, and no later membership change may take it back.
 		close_acked = false,
 		close_committed = false,
-		-- The paths the settlement walk actually settled. Cleanup may retire
-		-- these and nothing else.
-		settled_members = nil,
 		cleanup_error = nil,
 		-- The one edge memory for "is there a pending review hunk to work
 		-- on". Derived from the ledgers, never a second count: the field
@@ -92,12 +93,21 @@ function Turn:start()
 	self.bus:emit("turn_start", { turn = self })
 end
 
+-- The Turn holds its one cycle owner: runs, inputs, results, cycle state (turn/turn_cycle.lua; F-ADDENDUM-TURN).
+function Turn:cycles()
+	self.cycle_owner = self.cycle_owner or require("yana.turn.turn_cycle").new(self)
+	return self.cycle_owner
+end
+
 -- Files join the live Turn as their reviews open (W1: the pool grows the Turn).
 -- The member is the STABLE `turn_file` record and the returned value is that
 -- record, not the caller's entry: a path already present is REFRESHED in place,
 -- so a partial re-add can no longer drop the baseline, the ledger, the review
 -- options or the owner (R3). The old `self.files[i] = f` replacement is gone.
 function Turn:add_file(entry)
+	if self:is_frozen() then
+		return false, "turn is frozen for End"
+	end
 	if type(entry) ~= "table" then
 		name_failure("membership", "entry must be a table")
 		return nil
@@ -117,6 +127,22 @@ function Turn:add_file(entry)
 	end
 	self.files[#self.files + 1] = file
 	return file
+end
+
+function Turn:reviewed_paths()
+	local paths = {}
+	for path in pairs(self.history_paths) do paths[path] = true end
+	return paths
+end
+
+-- A first-time follow-up attachment was provisional until its publication
+-- committed. Rollback may forget it only after membership has been withdrawn.
+function Turn:forget_uncommitted_review(path)
+	if self:file(path) ~= nil then
+		return false, "turn.forget_uncommitted_review: " .. tostring(path) .. " is still a member"
+	end
+	self.history_paths[path] = nil
+	return true
 end
 
 -- Intake creates membership before the corresponding review buffer attaches.
@@ -154,19 +180,29 @@ end
 -- path. `detach_review` retires ONLY the attachment the caller still believes is
 -- current, so an older owner's teardown never retires a newer review (R4).
 function Turn:attach_review(path, state)
+	if self:is_frozen() then return false, "turn is frozen for End" end
 	local f = self:file(path)
 	if f == nil then
 		return false, "turn.attach_review: " .. tostring(path) .. " is not a member of this Turn"
 	end
-	return f:attach(state)
+	local ok, err = f:attach(state)
+	if ok then self.history_paths[f.path] = true end
+	return ok, err
 end
 
 function Turn:detach_review(path, expected_state)
+	if self:is_frozen() then return false, "turn is frozen for End" end
 	local f = self:file(path)
 	if f == nil then
 		return false, "turn.detach_review: " .. tostring(path) .. " is not a member of this Turn"
 	end
 	return f:detach(expected_state)
+end
+
+-- Terminal cleanup may retire only the attachment captured in the private plan.
+function Turn:retire_planned_review(item, binding, expected_state)
+	assert(self.frozen and binding.file == self:file(item.path), "End retirement is not a planned member")
+	return binding.file:retire_attachment(expected_state)
 end
 
 function Turn:file(path)
@@ -186,6 +222,56 @@ function Turn:is_live()
 	return self.state == "live"
 end
 
+function Turn:is_frozen()
+	return self.frozen == true or self.sealing == true
+end
+
+-- This is one synchronous local boundary. A drain failure is terminal for this
+-- confirmed End: the owning watcher remains closed to new input, with its
+-- captured evidence retained, and no external collaborator is entered.
+function Turn:freeze_for_end(cause)
+	if self.frozen then return true end
+	self.sealing = true
+	local watch = require("yana.review_watch")
+	local tokens = {}
+	for _, f in ipairs(self.files) do
+		local state = f.review_state
+		if state ~= nil then
+			local ok, token = watch.begin_end(f.bufnr, state)
+			if not ok then return false, token end
+			tokens[#tokens + 1] = token
+		end
+	end
+	for _, f in ipairs(self.files) do
+		if f.ledger and type(f.ledger.stamp_frozen) == "function" then
+			f.ledger:stamp_frozen()
+		end
+		local bufnr = f.bufnr
+		if type(bufnr) == "number" and bufnr > 0
+			and vim.api.nvim_buf_is_valid(bufnr)
+			and (type(f.change) ~= "table" or f.change.kind ~= "delete") then
+			f.frozen_buffer = {
+				lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false),
+				changedtick = vim.api.nvim_buf_get_changedtick(bufnr),
+				fileformat = vim.bo[bufnr].fileformat,
+				endofline = vim.bo[bufnr].endofline,
+				bomb = vim.bo[bufnr].bomb,
+			}
+		end
+	end
+	local candidate, reason = end_plan.prepare(self, cause)
+	if candidate == false then return false, reason end
+	end_plan.publish(self, candidate)
+	self.frozen = true
+	self.sealing = nil
+	if self.deps.on_sealed then self.deps.on_sealed(self) end
+	for _, token in ipairs(tokens) do
+		local retired, retire_reason = watch.retire_end(token)
+		if not retired then return false, retire_reason end
+	end
+	return true
+end
+
 -- Binding to the Turn's turn-scope count is an integration item.
 function Turn:pending_count()
 	local n = 0
@@ -197,7 +283,7 @@ end
 
 -- Review surfaces follow pending work independently of the Turn lifetime.
 function Turn:announce_review()
-	if self.state ~= "live" or self:pending_count() == 0 then
+	if self.state ~= "live" or self:is_frozen() or self:pending_count() == 0 then
 		return
 	end
 	self.review_alive = true
@@ -206,7 +292,7 @@ end
 
 -- Emit only when undo, redo or a decision crosses the pending-work edge.
 function Turn:refresh_review_liveness()
-	if self.state ~= "live" then
+	if self.state ~= "live" or self:is_frozen() then
 		return
 	end
 	local alive = self:pending_count() > 0
@@ -289,96 +375,13 @@ function Turn:run_required_cleanup()
 	return true
 end
 
---- Files that joined the Turn AFTER the settlement walk fixed its membership.
---- Settlement and close are asynchronous, so another panel can bind a file into
---- the singleton Turn while this End waits for a close ACK. Cleanup is the
---- terminal sweep: it would retire that file -- mark it rejected and drop it --
---- without it ever having been settled or its owner ever having been asked to
---- close. A Turn may only retire what it settled.
-function Turn:late_members()
-	local late = {}
-	if self.settled_members == nil then
-		return late
-	end
-	for _, f in ipairs(self.files) do
-		if self.settled_members[f.path] == nil then
-			late[#late + 1] = f.path
-		end
-	end
-	return late
-end
-
---- ONE COMPARABLE VALUE for the review decisions a File carries. `false` means
---- the question could not be asked in this context -- a stubbed settler, a File
---- with no ledger -- and a `false` is only ever compared against another
---- `false`, so an unanswerable question never invents drift and never hides it.
----
---- Deliberately the DECISION stamp and not `settled_current`. That one answers
---- "is every input and output of this settlement still exactly what it was",
---- which is the right question for a retry walk deciding whether to re-settle
---- and the WRONG one here: it is false whenever the evidence merely cannot be
---- reproduced, and cleanup would then refuse a Turn nothing had decided again.
---- `decision_stamp` answers only "did a review decision move", which is the
---- question this boundary is asking.
----
---- If `decision_stamp` is ever renamed away, this quietly answers `false` for
---- everything and the boundary stops detecting. `r_end_decision_during_close`
---- is what makes that loud; keep it.
-function Turn:decision_stamp(f)
-	local stamp = type(self.deps.settler.decision_stamp) == "function"
-		and self.deps.settler.decision_stamp or nil
-	if stamp == nil then
-		local loaded, snapshot = pcall(require, "yana.turn.turn_settle_snapshot")
-		if loaded and type(snapshot) == "table" and type(snapshot.decision_stamp) == "function" then
-			stamp = snapshot.decision_stamp
-		end
-	end
-	if stamp == nil then return false end
-	local asked, value = pcall(stamp, f)
-	if not asked or value == nil then return false end
-	return value
-end
-
---- Files a review decided AGAIN after their settlement. The membership check
---- above catches a file that joined; this catches the same window moving a file
---- that was already there. The close ACK is asynchronous and the review keys
---- stay answerable until it lands, so a `ca` in that window can accept an
---- operation this End had just removed -- without touching the path set.
---- Cleanup would then publish `completed` over a decision it never wrote.
-function Turn:drifted_members()
-	local drifted = {}
-	if self.settled_members == nil then
-		return drifted
-	end
-	for _, f in ipairs(self.files) do
-		local at_settle = self.settled_members[f.path]
-		if at_settle ~= nil and self:decision_stamp(f) ~= at_settle then
-			drifted[#drifted + 1] = f.path
-		end
-	end
-	return drifted
-end
-
 function Turn:run_cleanup(attempt, cause, refused)
 	if self.attempt ~= attempt or self.state ~= "live" then return end
-	-- THE POST-SETTLEMENT BOUNDARY, before anything terminal runs. Two ways the
-	-- Turn can no longer be the Turn that was settled: a file JOINED, or a
-	-- settled file MOVED. Either is refused honestly and left live; the close
-	-- ACK already banked stays banked (per owner, in `turn_bind`'s
-	-- `review_close_acks`) and required cleanup stays owed, so the retry settles
-	-- and closes only what is actually owed. `close_acked` goes back to false
-	-- because the close step is NOT finished for this Turn; `close_committed`
-	-- does not, because a close WAS acknowledged and the operator is not asked
-	-- a second time.
-	local late = self:late_members()
-	local drifted = #late == 0 and self:drifted_members() or {}
-	if #late > 0 or #drifted > 0 then
-		self.close_acked = false
-		local phase = #late > 0 and "membership" or "settlement_drift"
-		self.cleanup_error = name_failure(phase, #late > 0
-			and ("joined after settlement: " .. table.concat(late, ", "))
-			or ("decided again after settlement: " .. table.concat(drifted, ", ")))
-		self:deliver_end_result("partial", { phase = phase, reason = tostring(self.cleanup_error) })
+	-- The private plan is the only close/cleanup membership authority.
+	local members_ok, members_err = pcall(end_plan.bindings, self)
+	if not members_ok then
+		self.cleanup_error = name_failure("membership", members_err)
+		self:deliver_end_result("partial", { phase = "local", reason = tostring(self.cleanup_error) })
 		return
 	end
 	self.phase = "closed"
@@ -409,9 +412,18 @@ function Turn:run_cleanup(attempt, cause, refused)
 	-- Step 6 -- publish. Local finalisation and the queue drain hang off
 	-- `turn_end`/`on_gone`, so they follow every collaborator, never precede one.
 	self.state = "gone"
+	local first = end_plan.bindings(self)[1]
+	local ws, turn_id = require("yana.turn.turn_settle_snapshot").register_key(first and first.binding.file) -- drop its history (B7)
+	pcall(function() require("yana.turn.turn_register"):release_turn(ws, turn_id) end)
 	self.bus:emit("turn_end", { turn = self, cause = cause, refused = refused or {} })
 	if self.deps.on_gone then pcall(self.deps.on_gone, self) end
-	self:deliver_end_result("completed", { refused = refused or {} })
+	if refused and #refused > 0 then
+		self:deliver_end_result("partial", {
+			phase = "settle", reason = tostring(refused[1].err), refused = refused, review_ended = true,
+		})
+	else
+		self:deliver_end_result("completed", { refused = {} })
+	end
 end
 
 --- The End request record and its one answer live in `yana.turn.turn_end_result`.
@@ -457,61 +469,23 @@ function Turn:end_turn(cause, context)
 	-- called last. A committed End keeps the cause its first write used.
 	cause = self:end_request(cause)
 
-	-- RESUME. An acknowledged close is a one-way boundary: the question was
-	-- already answered and every file already settled, so a retry that only
-	-- failed at cleanup repeats cleanup and nothing else. Asking again, or
-	-- walking the files again, would re-question a decision the operator has
-	-- made and re-enter settlement the close already passed.
-	--
-	-- A LATE MEMBER is the one thing that reopens the walk: `close_acked` was
-	-- cleared because a file joined that no settlement covers. The walk skips
-	-- what is already settled and `close_review_owners` skips owners that have
-	-- already acknowledged, so the retry costs exactly the new member.
-	if self.close_acked then
-		self.attempt = self.attempt + 1
-		self:run_cleanup(self.attempt, cause, self.end_refused)
-		return true
-	end
-
-	-- Step 1 — the ask. An acknowledged close already carries the operator's
-	-- answer: a late member owes settlement, not a second question.
-	if not self.close_committed then
-		local ok_ask, answer = pcall(self.deps.ask, cause, { pending = self:pending_count() })
-		if not ok_ask or answer ~= "end" then
-			self.ending = false
-			self:deliver_end_result(ok_ask and "cancelled" or "refused",
-				ok_ask and nil or { reason = tostring(answer) })
-			return false
-		end
+	-- Step 1 — the ask. A confirmed End stays one-way, even on partial failure.
+	local ok_ask, answer = pcall(self.deps.ask, cause, { pending = self:pending_count() })
+	if not ok_ask or answer ~= "end" then
+		self.ending = false
+		self:deliver_end_result(ok_ask and "cancelled" or "refused",
+			ok_ask and nil or { reason = tostring(answer) })
+		return false
 	end
 
 	-- End confirmation barrier: freeze the Turn, stamp ledgers, capture buffer
 	-- snapshots. After this point the only terminal results are completed and
 	-- partial; the Turn never returns to interactive review.
-	local froze, freeze_err = pcall(function()
-		if self.frozen then return end
-		-- Set this before any fallible stamp or buffer read. A local failure is
-		-- one-way: it may publish partial, but cannot return to live review.
+	local called, froze, freeze_err = pcall(self.freeze_for_end, self, cause)
+	if not called or not froze then
 		self.frozen = true
-		for _, f in ipairs(self.files) do
-			if f.ledger and type(f.ledger.stamp_frozen) == "function" then
-				f.ledger:stamp_frozen()
-			end
-			local bufnr = f.bufnr
-			if type(bufnr) == "number" and bufnr > 0
-				and vim.api.nvim_buf_is_valid(bufnr)
-				and (type(f.change) ~= "table" or f.change.kind ~= "delete") then
-				f.frozen_buffer = {
-					lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false),
-					changedtick = vim.api.nvim_buf_get_changedtick(bufnr),
-					fileformat = vim.bo[bufnr].fileformat,
-					endofline = vim.bo[bufnr].endofline,
-				}
-			end
-		end
-	end)
-	if not froze then
-		self:deliver_end_result("partial", { phase = "local", reason = tostring(freeze_err) })
+		self.sealing = nil
+		self:deliver_end_result("partial", { phase = "local", reason = tostring(called and freeze_err or froze) })
 		return true
 	end
 
@@ -579,11 +553,24 @@ function Turn:end_turn(cause, context)
 
 	finish_settle = function()
 		if self.settle_walk ~= walk then return end
+		-- Validate while this attempt still owns the walk. A failed private-plan
+		-- identity check is a local invariant failure, not an unanswered End.
+		local members_ok, members = pcall(end_plan.bindings, self)
+		if not members_ok then
+			self.settle_walk = nil
+			self.settle_error = name_failure("membership", members)
+			self:deliver_end_result("partial", { phase = "local", reason = tostring(self.settle_error) })
+			return
+		end
 		self.settle_walk = nil
 		if #refused == 0 and cause == "abort"
 			and type(self.deps.settler.reverse_turn_creations) == "function"
 		then
-			local ok_rev, rev = pcall(self.deps.settler.reverse_turn_creations, self.files)
+			local planned = {}
+			for _, member in ipairs(members) do
+				planned[#planned + 1] = member.binding.file
+			end
+			local ok_rev, rev = pcall(self.deps.settler.reverse_turn_creations, planned)
 			if ok_rev then
 				for _, r in ipairs(rev or {}) do
 					refused[#refused + 1] = { path = r.path, err = r.err }
@@ -599,41 +586,28 @@ function Turn:end_turn(cause, context)
 		end
 		if #refused > 0 then
 			self.settle_error = refused[1].err
-			self:deliver_end_result("partial", { phase = "settle", reason = tostring(self.settle_error),
-				refused = refused })
-			return
+			for _, failure in ipairs(refused) do
+				if failure.via ~= "buffer" then
+					self:deliver_end_result("partial", { phase = "settle", reason = tostring(self.settle_error),
+						refused = refused })
+					return
+				end
+			end
+		else
+			self.settle_error = nil
 		end
-		self.settle_error = nil
 		self.phase = "settled"
-		-- The membership this walk settled AND the decisions each member carried
-		-- when it did -- one record, two questions. A path absent from it joined
-		-- late; a path whose stamp has moved was decided again.
-		local members = {}
-		for _, f in ipairs(self.files) do
-			members[f.path] = self:decision_stamp(f)
-		end
-		self.settled_members = members
-		-- Retained for a post-ACK resume, which has no walk of its own.
-		self.end_refused = refused
 		run_close()
 	end
 
 	step = function()
 		index = index + 1
-		local f = self.files[index]
-		if f == nil then
+		local item, binding = end_plan.item(self, index)
+		if item == nil then
 			finish_settle()
 			return
 		end
-		if f.settled_at_exit then
-			local current = type(self.deps.settler.settled_current) == "function"
-				and self.deps.settler.settled_current(f) == true
-			if current then
-				step()
-				return
-			end
-			f:invalidate_settlement()
-		end
+		local f = binding.file
 		local answered = false
 		-- `done(ok, reason, detail)` — the THIRD argument is the settler's
 		-- receipt for work it already committed (`{phase, written, diary_dir,
@@ -649,8 +623,21 @@ function Turn:end_turn(cause, context)
 				f:record_receipt(detail)
 			end
 			if not ok then
-				refused[#refused + 1] = { path = f.path, err = tostring(err or "?") }
-				finish_settle()
+				local buffer_write = type(detail) == "table" and detail.via == "buffer" and detail.phase == "write"
+				refused[#refused + 1] = { path = f.path, err = tostring(err or "?"), via = buffer_write and "buffer" or nil }
+				if not buffer_write then
+					finish_settle()
+					return
+				end
+				-- A failed Neovim write does not stop independent files or review teardown.
+				local continued, continue_err = pcall(step)
+				if not continued and self.settle_walk == walk then
+					refused[#refused + 1] = {
+						path = f.path,
+						err = "settle continuation failed: " .. tostring(continue_err),
+					}
+					finish_settle()
+				end
 				return
 			end
 			-- The End's own answer. The stamp is turn_settle's and travels back unchanged.
@@ -664,7 +651,13 @@ function Turn:end_turn(cause, context)
 				finish_settle()
 			end
 		end
-		local called, result, err = pcall(self.deps.settler.settle, f, on_settled)
+		local settle_fn = self.deps.settler.settle_plan or self.deps.settler.settle
+		local called, result, err
+		if self.deps.settler.settle_plan then
+			called, result, err = pcall(settle_fn, item, binding, on_settled)
+		else
+			called, result, err = pcall(settle_fn, f, on_settled)
+		end
 		if not called then
 			on_settled(false, result)
 		elseif result ~= "pending" then

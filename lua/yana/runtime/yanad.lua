@@ -292,6 +292,12 @@ function M.ensure(cb)
 end
 local function wrap(cmd)
 	return function(args, id, cb)
+		-- PANEL.md F-ADDENDUM-TURN: a frame naming its run generation gets a per-run id.
+		-- The journal replays an answered (owner, id), so a later run of the same
+		-- Turn must never reuse an earlier run's `<turn>:review.open`.
+		if args and args.generation ~= nil then
+			id = id .. ":g" .. tostring(args.generation)
+		end
 		M.ensure(function(ok, client)
 			-- THIRD ARGUMENT, ALWAYS. `client` here is the REASON ("no_daemon",
 			-- "version_mismatch", ...), which the operator never saw. Carry it in the table so

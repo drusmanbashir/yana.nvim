@@ -158,8 +158,7 @@ function M.prepare(env, groups, timeline)
       for _, change in ipairs(group.changes) do
         change_index = change_index + 1
         local s = change.splice
-        vim.api.nvim_buf_set_text(scratch, s.sr, s.sc, s.er, s.ec,
-          change._timeline_inserted)
+        require("yana.review_watch_timeline").replay_splice(scratch, s, change._timeline_inserted)
         dirty = splice.rows(s, dirty)
         local lo, hi = splice.touched(s)
         for row = lo or 1, hi or 0 do dirty[row] = true end

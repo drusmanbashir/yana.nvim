@@ -2,13 +2,18 @@
 -- Turn that owns this register.
 --
 -- Nothing here clears the stack on turn end; the boundary is the stamp, not a wipe.
+--
+-- `actions` and `cursor` are the Yana `u`/`<C-r>` reach; every row is also an
+-- event in `graph`, the review-event graph (turn_register_graph.lua). A push
+-- after an undo truncates the reach, never the graph (M1 redo semantics).
 local M = {}
+local graph = require("yana.turn.turn_register_graph")
 
 local Register = {}
 Register.__index = Register
 
 function M.new()
-	return setmetatable({ actions = {}, cursor = 0, owed = {} }, Register)
+	return setmetatable({ actions = {}, cursor = 0, owed = {}, graph = graph.new() }, Register)
 end
 
 -- The identity an OWED row is held under: one file, one turn. Two turns may
@@ -26,6 +31,7 @@ function M.for_workspace(workspace)
 	local reg = registers[key]
 	if not reg then
 		reg = M.new()
+		reg.workspace = key
 		registers[key] = reg
 	end
 	return reg
@@ -39,6 +45,11 @@ function M.push(_self, action)
 	assert(type(action) == "table" and type(action.rel) == "string",
 		"turn register push needs a table with a `rel` field")
 	return M.for_workspace(action.workspace):push(action)
+end
+
+-- Colon-callable route for an ended Turn's history (Turn:run_cleanup), to its workspace's register.
+function M.release_turn(_self, workspace, turn_id)
+	return M.for_workspace(workspace):release_turn(turn_id)
 end
 
 -- Colon-callable mirror of `M.push` for a row that is OWED rather than
@@ -76,6 +87,8 @@ end
 -- new branch, so stale redo actions cannot be replayed.
 local function push_into(target, action, emitted)
 	assert(type(action) == "table", "turn register action must be a table")
+	assert(action.participants or action.file_id or action.rel,
+		"turn register action needs `rel`, `file_id` or `participants`")
 	-- Flush this file's owed row FIRST, so it lands beneath the row that
 	-- triggered it. Cleared before the recursive push so an owed row can
 	-- never flush itself.
@@ -117,9 +130,21 @@ local function log_pushes(emitted)
 	end
 end
 
+-- The one cursor mover: walk_* and mark spend the row and cross its event. A row
+-- the router spends unreplayed carries `halted`; the graph records the halt.
+local function move_cursor(self, outcome)
+	local undo = outcome == "undone"
+	self.cursor = self.cursor + (undo and -1 or 1)
+	local row = self.actions[undo and self.cursor + 1 or self.cursor]
+	local event = self.graph.of_row[row]
+	if event then graph.cross(self.graph, event, outcome, row.halted) end
+	return row
+end
+
 function Register:push(action)
 	local emitted = {}
 	push_into(self, action, emitted)
+	for _, item in ipairs(emitted) do graph.add_event(self.graph, item.action) end
 	log_pushes(emitted)
 	return action
 end
@@ -142,13 +167,16 @@ function Register:commit_prepared(plan)
 		or self.owed ~= plan.before_owed then
 		return false, "register changed during native batch preparation"
 	end
+	plan.graph_mark = graph.checkpoint(self.graph)
 	self.actions, self.cursor, self.owed = plan.actions, plan.cursor, plan.owed
+	for _, item in ipairs(plan.emitted) do graph.add_event(self.graph, item.action, plan.graph_mark.arrival) end
 	return true
 end
 
 function Register:rollback_prepared(plan)
 	if self.actions == plan.actions and self.cursor == plan.cursor and self.owed == plan.owed then
 		self.actions, self.cursor, self.owed = plan.before_actions, plan.before_cursor, plan.before_owed
+		if plan.graph_mark then graph.rollback_to(self.graph, plan.graph_mark) end
 	end
 end
 
@@ -173,9 +201,7 @@ function Register:walk_back()
 	if self.cursor == 0 then
 		return nil
 	end
-	local action = self.actions[self.cursor]
-	self.cursor = self.cursor - 1
-	return action
+	return move_cursor(self, "undone")
 end
 
 -- Non-mutating look at the newest not-yet-redone action, or nil. Mirrors
@@ -195,8 +221,7 @@ function Register:walk_forward()
 	if self.cursor == #self.actions then
 		return nil
 	end
-	self.cursor = self.cursor + 1
-	return self.actions[self.cursor]
+	return move_cursor(self, "applied")
 end
 
 -- Callers never mutate it.
@@ -208,11 +233,17 @@ function Register:clear()
 	self.actions = {}
 	self.cursor = 0
 	self.owed = {}
+	self.graph = graph.new()
 end
 
 -- `U` hard-resets one live Turn. Remove both walked and redo-side rows for
 -- that Turn while preserving older/future Turn rows and the cursor relation.
-function Register:discard_turn(turn_id)
+-- The graph keeps the turn's events and gives each file a reset root mapped to
+-- the floor (`graph.retire`); optional `roots` = {[file_id] = NativePos}. A root
+-- for a file another Turn now holds refuses before anything changes.
+function Register:discard_turn(turn_id, roots)
+	local conflict = graph.reset_conflict(self.graph, turn_id, roots)
+	if conflict then return false, conflict end
 	local kept = {}
 	local cursor = 0
 	for i, action in ipairs(self.actions) do
@@ -230,6 +261,10 @@ function Register:discard_turn(turn_id)
 			self.owed[key] = nil
 		end
 	end
+	graph.retire(self.graph, turn_id, roots)
+	return true
 end
+
+graph.install(Register, { move_cursor = move_cursor })
 
 return M

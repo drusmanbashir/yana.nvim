@@ -191,6 +191,15 @@ function M.recover(session_id, deps, done)
 			done(false, msg)
 			return
 		end
+		-- Interim until F-ADDENDUM-RECOVERY (plan "Milestones"): a Turn that has had a
+		-- follow-up is declined in one line, before anything is written.
+		if recovery.cycles > 1 then
+			local msg = "yana: recovery declined: not restored after a follow-up"
+			settle("not restored after a follow-up")
+			if deps.notify then deps.notify(msg, vim.log.levels.WARN) end
+			done(false, msg)
+			return
+		end
 		local changes, err = build_changes(recovery)
 		if not changes then
 			local msg = "yana: recovery refused: " .. tostring(err)
@@ -208,6 +217,10 @@ function M.recover(session_id, deps, done)
 			workspace = result.workspace,
 			turn_id = recovery.turn_id,
 			turn_gen = recovery.turn_id,
+			-- The daemon's run identity for this review, and its review is open:
+			-- release closes it with review.close naming that run (F-ADDENDUM-TURN).
+			run_generation = recovery.generation,
+			review_open_requested = true,
 			turn_dir = recovery.turn_dir,
 			mounted_root = recovery.mounted_root,
 			roots = recovery.roots or {},

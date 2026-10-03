@@ -241,6 +241,16 @@ function I.recover_layer(session)
 	return primary_target, primary_err
 end
 
+-- PANEL.md F-ADDENDUM-TURN: publication and cleanup frames name their run, the
+-- (Turn ID, generation) pair the daemon checks; the runtime client keys their
+-- journal ids per run. A recovered review carries the daemon's own generation.
+local function run_args(session, args)
+	args.turn_id = tostring(session.turn_id)
+	args.generation = session.turn_pass and session.turn_pass.generation or session.run_generation
+	assert(args.generation ~= nil, "yanad frame for turn " .. args.turn_id .. " has no run generation")
+	return args
+end
+
 --- Publish the complete review only after process exit, turn settlement, and
 --- classification. The saved bundle is the evidence R-b recovery reuses.
 --- `on_marked` fires after the daemon accepts (or immediately on ask/no-session).
@@ -253,10 +263,9 @@ function I.arm_review_open(session, on_marked)
 	end
 	if session.mode == "ask" then
 		-- Ask turns take no claim; tell the daemon there is no review.
-		require("yana.runtime.yanad").review_none({
+		require("yana.runtime.yanad").review_none(run_args(session, {
 			session_id = session.yanad_session_id,
-			turn_id = tostring(session.turn_id),
-		}, tostring(session.turn_id) .. ":review.none", function()
+		}), tostring(session.turn_id) .. ":review.none", function()
 			if on_marked then
 				on_marked(true)
 			end
@@ -266,10 +275,9 @@ function I.arm_review_open(session, on_marked)
 	local files = session.review_files or {}
 	if type(files) ~= "table" or #files == 0 then
 		-- Walk found nothing: review.none releases the claim.
-		require("yana.runtime.yanad").review_none({
+		require("yana.runtime.yanad").review_none(run_args(session, {
 			session_id = session.yanad_session_id,
-			turn_id = tostring(session.turn_id),
-		}, tostring(session.turn_id) .. ":review.none", function(ok)
+		}), tostring(session.turn_id) .. ":review.none", function(ok)
 			session.review_open_marked = ok and true or false
 			if on_marked then
 				on_marked(ok)
@@ -287,13 +295,12 @@ function I.arm_review_open(session, on_marked)
 		end
 	end
 	session.review_open_requested = true
-	require("yana.runtime.yanad").review_open({
+	require("yana.runtime.yanad").review_open(run_args(session, {
 		session_id = session.yanad_session_id,
-		turn_id = tostring(session.turn_id),
 		files = abs,
 		tabs = session.review_tabs or {},
 		bundle = session.review_bundle or {},
-	}, tostring(session.turn_id) .. ":review.open", function(ok)
+	}), tostring(session.turn_id) .. ":review.open", function(ok)
 		session.review_open_marked = ok and true or false
 		if on_marked then
 			on_marked(ok)
@@ -378,17 +385,7 @@ function I.release(session, on_released)
 	local sender = session.review_open_requested
 		and require("yana.runtime.yanad").review_close
 		or require("yana.runtime.yanad").review_none
-	local args
-	if session.review_open_requested then
-		args = {
-			session_id = session.yanad_session_id,
-		}
-	else
-		args = {
-			session_id = session.yanad_session_id,
-			turn_id = tostring(session.turn_id),
-		}
-	end
+	local args = run_args(session, { session_id = session.yanad_session_id })
 	local sent, send_err = pcall(sender, args, attempt.id, complete)
 	if not sent then
 		if attempt.settled then

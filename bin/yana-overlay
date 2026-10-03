@@ -86,15 +86,14 @@ FORCE_REASON=""
 CURSOR_DIR=""
 OPERATOR_HOME=""
 
-
 source "$DIR/lib/yana-overlay/paths.sh"
 source "$DIR/lib/yana-overlay/capture_plan.sh"
 source "$DIR/lib/yana-overlay/fuse.sh"
 source "$DIR/lib/yana-overlay/open_capture.sh"
 source "$DIR/lib/yana-overlay/yanad.sh"
+source "$DIR/lib/yana-overlay/layer_edit.sh"
 source "$DIR/lib/yana-overlay/cgroup.sh"
 source "$DIR/lib/yana-overlay/mount.sh"
-
 
 # --unshare-pid is the read half of the boundary (the isolation contract,
 # "Read boundary"). Without it the `--proc /proc` mount still describes the host
@@ -453,6 +452,7 @@ parse_run_args() {
 				EXTRA_WORKS[$(( ${#EXTRA_ROOTS[@]} - 1 ))]=$2
 				shift 2
 				;;
+			--generation|--resume|--layer-*) cycle_flag "$@"; shift "$CYCLE_FLAG_SHIFT" ;;
 			--help|-h)
 				usage
 				exit 0

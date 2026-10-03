@@ -238,6 +238,30 @@ function M.wrap_cmd(argv, session)
 		vim.list_extend(out, { "--seed", seed.path .. "=" .. seed.from })
 	end
 
+	-- PANEL.md F-ADDENDUM-TURN: every run names its generation, the lifecycle
+	-- pass's (none is minted here). A follow-up resumes the Turn on its own layer
+	-- (daemon `turn.resume`), and its layer edits make unopened files match the
+	-- selected review view; the launcher records their inverse facts under private/.
+	local generation = session.turn_pass and session.turn_pass.generation
+	if generation ~= nil then
+		vim.list_extend(out, { "--generation", tostring(generation) })
+	end
+	if session.resume then
+		if generation == nil then
+			return nil, "yanad turn.resume needs the run generation of the lifecycle pass"
+		end
+		vim.list_extend(out, { "--resume", "--layer-inverse", private .. "/layer-inverse/g" .. tostring(generation) })
+		for _, edit in ipairs(session.layer_edits or {}) do
+			if edit.op == "put" then
+				vim.list_extend(out, { "--layer-put", edit.path .. "=" .. edit.from })
+			elseif edit.op == "remove" then
+				vim.list_extend(out, { "--layer-remove", edit.path })
+			else
+				return nil, "layer edit " .. tostring(edit.op) .. " is neither put nor remove"
+			end
+		end
+	end
+
 	--
 	-- Read from the session `preview.begin_turn` built out of filesystem position and
 	-- operator configuration; nothing in this process may widen it, and nothing a turn

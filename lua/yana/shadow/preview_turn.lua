@@ -71,11 +71,18 @@ function I.begin_turn(opts)
 	end
 	local turn_dir = deps.workspace.turn_dir(primary_workspace, stream, turn_id)
 	local private_dir = turn_dir .. "/private"
-	-- A panel-local turn id can be reused after an editor restart. Never let a
-	-- same-id durable refusal from that earlier process authenticate this turn.
-	pcall(vim.fn.delete, turn_dir .. "/refused", "rf")
+	-- PANEL.md F-ADDENDUM-TURN: `opts.resume` runs the next cycle of this open
+	-- Turn on its own layer; its refusal evidence stays and no first-run cleanup runs.
+	local resume = opts.resume == true
+	if not resume then
+		-- A panel-local turn id can be reused after an editor restart. Never let a
+		-- same-id durable refusal from that earlier process authenticate this turn.
+		pcall(vim.fn.delete, turn_dir .. "/refused", "rf")
+	end
 	vim.fn.mkdir(private_dir, "p")
-	deps.workspace.prune_refused_turns(vim.fn.fnamemodify(turn_dir, ":h"))
+	if not resume then
+		deps.workspace.prune_refused_turns(vim.fn.fnamemodify(turn_dir, ":h"))
+	end
 
 	local yanad_session_id = opts.yanad_session_id or opts.session_id
 	local roots = {
@@ -123,6 +130,10 @@ function I.begin_turn(opts)
 		roots = roots,
 		refused_bytes = 0,
 		refused_retained = {},
+		-- jail.wrap_cmd: `--resume` and the follow-up's layer edits
+		-- ({op = "put", path, from} | {op = "remove", path}).
+		resume = resume,
+		layer_edits = opts.layer_edits,
 	}
 	local lifecycle = require("yana.turn.turn_lifecycle")
 	session.turn_pass = lifecycle.begin_turn({

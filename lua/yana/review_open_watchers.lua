@@ -109,7 +109,7 @@ function Factory.new(deps)
           end)
         end
         local st = pool_for_state(state)
-        if st.active ~= state then
+        if not require("yana.review_context").is_live_attachment(st, state) then
           state.reload_restaging = false
           state.watch_suspended = false
           return
@@ -217,7 +217,7 @@ function Factory.new(deps)
       -- callback, so the re-highlight cannot be skipped by an early return.
       local ok_read, err_read = pcall(function()
       local st = pool_for_state(state)
-      if st.active ~= state or change.kind == "delete" then
+      if not require("yana.review_context").is_live_attachment(st, state) or change.kind == "delete" then
         return
       end
       local disk_now = diff.read_file_bytes(change.path)
@@ -226,7 +226,12 @@ function Factory.new(deps)
       -- INTERFACE.md section 1): its read is always swallowed and the review
       -- restored below; `disk_now` is used only if that restore fails.
       local captured = type(change.buffer_capture) == "table"
-      if (not captured and disk_now ~= base) or type(state.staged_text) ~= "string" then
+      -- Disk holding the review buffer's own text is the operator's `:w` of it,
+      -- not a change on disk: the review is restored as for unchanged disk
+      -- (CORE "Saving is Neovim's", LEDGER N51).
+      local expected = state.reload_unload_text or state.staged_text
+      local disk_moved = disk_now ~= base and disk_now ~= expected
+      if (not captured and disk_moved) or type(state.staged_text) ~= "string" then
         local disk_text = disk_now or ""
         vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, buffer_lines(disk_text))
         local has_eol = disk_text:match("\n$") ~= nil
@@ -238,7 +243,6 @@ function Factory.new(deps)
       local token = (state.reload_unload_token or 0) + 1
       state.reload_unload_token = token
       state.ignore_next_reload_unload = token
-      local expected = state.reload_unload_text or state.staged_text
       state.reload_unload_text = nil
       state.restoring_reload = true
       local restored = pcall(vim.api.nvim_buf_call, bufnr, function()
@@ -278,7 +282,7 @@ function Factory.new(deps)
       vim.bo[bufnr].modified = false
       vim.schedule(function()
         log.guard("yana.inline_diff direct reload", function()
-          if pool_for_state(state).active ~= state then
+          if not require("yana.review_context").is_live_attachment(pool_for_state(state), state) then
             return
           end
           if not vim.api.nvim_buf_is_valid(bufnr) then
@@ -319,7 +323,7 @@ function Factory.new(deps)
             return
           end
           local st = pool_for_state(state)
-          if st.active == state then
+          if require("yana.review_context").is_live_attachment(st, state) then
             local exiting = false
             pcall(function()
               local v = vim.v.exiting

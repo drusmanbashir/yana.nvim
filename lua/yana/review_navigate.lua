@@ -27,6 +27,7 @@ function M.new(deps)
   local open_or_abandon = deps.open_or_abandon
   local diff = deps.diff
   local M = facade
+  local state_for_buf = deps.state_for_buf
 
   require("yana.review_navigate_registry").new({
     facade = facade,
@@ -118,13 +119,14 @@ end
       return false, nil
     end
     -- NEVER OPEN DIRECTLY OVER A STALE QUEUE DUPLICATE. Opening it here (below) sets
-    -- `st.active` directly, bypassing `process_next_impl`'s own queue pop, so the old
+    -- an attachment directly, bypassing `process_next_impl`'s own queue pop, so the old
     -- queue entry survives pointing at the SAME change.
     queue_remove_change(st, target_change)
     local ok, err = open_or_abandon(target_change, target_item.opts)
-    if ok and st.active and st.active.change == target_change then
+    local target_state = st.open[target_change]
+    if ok and target_state and not target_state.closed then
       target_change._nav_refusal_announced = nil
-      st.active.queue_item = target_item
+      target_state.queue_item = target_item
       announce_state()
       -- Opening bound the target's review keys. Focus that buffer before this
       -- mapped handler returns; only cursor placement may wait for the next
@@ -136,13 +138,13 @@ end
         -- (review_open_actions.report_history_move) focuses this buffer after
         -- the move, still before the handler returns, so queued typeahead
         -- reaches its review maps.
-        st.active._focus_after_history_move = true
+        target_state._focus_after_history_move = true
         return true, nil
       end
-      land_on(target_change.path, st.active.bufnr, nil)
+      land_on(target_change.path, target_state.bufnr, nil)
       vim.schedule(function()
-        local active_state = st.active
-        if active_state and active_state.change == target_change then
+        local active_state = st.open[target_change]
+        if active_state == target_state and not active_state.closed then
           local want_first = (landing == "first")
             or (landing == nil and direction == "next")
           local live = active_state.hunk_ledger:pending()
@@ -169,6 +171,20 @@ local function park_and_open_state(state, direction, target_item, landing, allow
   local bufnr = state and state.bufnr
   if not (state and change and bufnr) then
     return false
+  end
+  local already_open = target_item and target_item.change
+    and pool_for(state.opts or {}).open[target_item.change]
+  if already_open and not already_open.closed
+    and target_item.change._parked_state ~= already_open then
+    local pending = already_open.hunk_ledger:pending()
+    if #pending == 0 and not allow_empty then return false end
+    if landing == "none" then
+      already_open._focus_after_history_move = true
+      return true
+    end
+    local block = (landing == "last" or (landing == nil and direction == "prev"))
+      and pending[#pending] or pending[1]
+    return land_on(target_item.change.path, already_open.bufnr, block) ~= false
   end
   break_undo_block(bufnr)
   local staged, snap_err = diff.buffer_bytes_snapshot(bufnr)
@@ -233,6 +249,7 @@ local function park_and_open_state(state, direction, target_item, landing, allow
   })
   require("yana.review_lifecycle").park_review(state)
   change._parked_state = state
+  require("yana.review_open_bind_keys").sync_queued()
   -- A park that CROSSES TO ANOTHER FILE keeps its own
   -- still-pending hunks PAINTED, so it asks the ledger to re-emit its one
   -- signal (the render lands at site `ledger_dirty`).
@@ -259,7 +276,6 @@ local function park_and_open_state(state, direction, target_item, landing, allow
       state.hunk_ledger:request_paint()
     end
   end
-  st.active = nil
   queue_insert_original(st, parked_item)
   announce_state()
 
@@ -286,8 +302,9 @@ local function park_and_open_state(state, direction, target_item, landing, allow
   end
   queue_remove_change(st, change)
   local reopen_ok, _reopen_err = open_or_abandon(change, parked_item.opts)
-  if reopen_ok and st.active and st.active.change == change then
-    st.active.queue_item = parked_item
+  local restored = st.open[change]
+  if reopen_ok and restored and not restored.closed then
+    restored.queue_item = parked_item
     announce_state()
     return false
   end
@@ -338,14 +355,18 @@ end
 M._navigate_or_park_state = navigate_or_park_state
 
 local function active_state_for_global_navigation()
-  local current = pool_for({}).active
+  local current_buf = vim.api.nvim_get_current_buf()
+  for _, st in pairs(pools) do
+    local state = state_for_buf(st, current_buf)
+    if state then return state end
+  end
+  local current = state_for_buf(pool_for({}))
   if current then
     return current
   end
   for _, st in pairs(pools) do
-    if st.active then
-      return st.active
-    end
+    local state = state_for_buf(st)
+    if state then return state end
   end
   return nil
 end

@@ -202,6 +202,7 @@ Runtime provenance inventory:
 - post-fork original: `bin/lib/yana-overlay/cgroup.sh`
 - post-fork original: `bin/lib/yana-overlay/capture_plan.sh`
 - post-fork original: `bin/lib/yana-overlay/fuse.sh`
+- post-fork original: `bin/lib/yana-overlay/layer_edit.sh`
 - post-fork original: `bin/lib/yana-overlay/open_capture.sh`
 - post-fork original: `bin/lib/yana-overlay/yanad.sh`
 - post-fork original: `lua/yana/configuration/config_mappings.lua`
@@ -223,7 +224,6 @@ Runtime provenance inventory:
 - post-fork original: `lua/yana/input/home_buffer_proposal.lua`
 - post-fork original: `lua/yana/agent/model_hierarchy.lua`
 - post-fork original: `lua/yana/runtime/persisted_state.lua`
-- post-fork original: `lua/yana/prompts/debugger.lua`
 - post-fork original: `lua/yana/runtime/recovery_entry.lua`
 - post-fork original: `lua/yana/render_check_extent.lua`
 - post-fork original: `lua/yana/review_bulk_disclosure.lua`
@@ -273,6 +273,17 @@ Runtime provenance inventory:
 - post-fork original: `lua/yana/turn/turn_plan.lua`
 - post-fork original: `lua/yana/turn/turn_projection.lua`
 - post-fork original: `lua/yana/turn/turn_wiring.lua`
+- post-fork original: `lua/yana/panel/ui_followup.lua`
+- post-fork original: `lua/yana/review_undo_dispatch.lua`
+- post-fork original: `lua/yana/review_restore.lua`
+- post-fork original: `lua/yana/turn/turn_cycle.lua`
+- post-fork original: `lua/yana/turn/turn_cycle_log.lua`
+- post-fork original: `lua/yana/turn/turn_cycle_reconcile.lua`
+- post-fork original: `lua/yana/turn/turn_cycle_view.lua`
+- post-fork original: `lua/yana/turn/turn_end_plan.lua`
+- post-fork original: `lua/yana/turn/turn_register_graph.lua`
+- post-fork original: `lua/yana/turn/turn_save_record.lua`
+- post-fork original: `lua/yana/undo_action_followup_cycle.lua`
 - post-fork original: `lua/yana/panel/ui_geometry.lua`
 - post-fork original: `lua/yana/panel/ui_grid.lua`
 - post-fork original: `lua/yana/panel/ui_model_hierarchy.lua`

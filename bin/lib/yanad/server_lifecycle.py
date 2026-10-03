@@ -179,7 +179,9 @@ class LifecycleMixin:
                     continue
                 kind = liveness.owner_kind(turn.get("owner"))
                 if kind == "live":
-                    self.watch_owner(sess["session_id"], turn["turn_id"], turn["owner"], "launcher")
+                    self.watch_owner(
+                        sess["session_id"], turn["turn_id"], turn["owner"], "launcher", store.run_generation(turn)
+                    )
                 elif kind == "dead":
                     self.owner_dead(sess["session_id"], turn["turn_id"], "launcher")
             editor_kind = liveness.owner_kind(sess.get("owner"))
@@ -188,22 +190,24 @@ class LifecycleMixin:
             elif editor_kind == "dead" and not sess.get("dead"):
                 self.owner_dead(sess["session_id"], None, "editor")
 
-    def watch_owner(self, sid, tid, owner, role):
+    # A launcher watcher carries its run generation (F-ADDENDUM-TURN): a death
+    # delivered for an older run of the Turn is stale and changes nothing.
+    def watch_owner(self, sid, tid, owner, role, generation=None):
         if not owner:
             return
         try:
             fd = liveness.pidfd_open(int(owner["pid"]))
         except OSError:
-            self.owner_dead(sid, tid, role)
+            self.owner_dead(sid, tid, role, generation)
             return
         key = (sid, tid, role)
         self.unwatch(*key)
         self.pidfds[key] = fd
-        self.register_pidfd_reader(fd, key, sid, tid, role)
+        self.register_pidfd_reader(fd, key, sid, tid, role, generation)
 
-    def register_pidfd_reader(self, fd, key, sid, tid, role):
+    def register_pidfd_reader(self, fd, key, sid, tid, role, generation=None):
         loop = asyncio.get_running_loop()
-        loop.add_reader(fd, self.owner_dead, sid, tid, role)
+        loop.add_reader(fd, self.owner_dead, sid, tid, role, generation)
 
     def unwatch(self, sid, tid, role):
         key = (sid, tid, role)
@@ -213,10 +217,12 @@ class LifecycleMixin:
             loop.remove_reader(fd)
             os.close(fd)
 
-    def owner_dead(self, sid, tid, role):
+    def owner_dead(self, sid, tid, role, generation=None):
         if role == "client":
             self.unwatch(sid, tid, role)
             self.maybe_exit(gone_pid=sid.split(":")[1])
+            return
+        if generation is not None and self.stale_death(sid, tid, generation):
             return
         self.unwatch(sid, tid, role)
         if role == "editor":
@@ -245,13 +251,18 @@ class LifecycleMixin:
                     state = "dead"
             except OSError:
                 pass
+            # F-ADDENDUM-TURN: a dead writer of a Turn whose review is open settles
+            # for recovery; its review, claims and layer are not reaped.
+            reviewing = self.open_review_turn(sid) == tid
+            if reviewing and state == "dead":
+                state = "settling"
             store.set_turn_state(
                 self.root, sid, tid, state, reason, log=self.log,
                 clear_workdirs=self.defer_workdir_cleanup,
             )
             for row in store.iter_claims(self.root):
                 if row["session_id"] == sid and row["turn_id"] == tid:
-                    if state == "dead_unsealed":
+                    if state == "dead_unsealed" or reviewing:
                         store.write_claim_row(self.root, row["key"], sid, tid, state)
                     else:
                         (self.root / "claims" / row["key"] / "row.json").unlink(missing_ok=True)
@@ -269,6 +280,136 @@ class LifecycleMixin:
                 continue
             if meta["state"] != "dead_unsealed":
                 (self.root / "claims" / row["key"] / "row.json").unlink(missing_ok=True)
+
+    def turn_meta(self, sid, tid):
+        return store.read_json(self.root / "sessions" / sid / "turns" / tid / "meta.json")
+
+    def open_review_turn(self, sid):
+        """The turn id the session's open review belongs to, or None."""
+        try:
+            return store.read_json(self.root / "sessions" / sid / "review" / "open").get("turn_id")
+        except (OSError, AttributeError, TypeError, ValueError):
+            return None
+
+    def stale_death(self, sid, tid, generation):
+        try:
+            current = store.run_generation(self.turn_meta(sid, tid))
+        except OSError:
+            return False
+        if current == generation:
+            return False
+        self.log.write("WARN", "stale launcher death session=%s turn=%s generation=%s current=%s"
+                       % (sid, tid, generation, current))
+        return True
+
+    # F-ADDENDUM-TURN: run identity is the pair (Turn ID, generation). Publication
+    # (review.open), completion (turn.end) and cleanup (review.none/close) must name
+    # the run they act on, refused by name otherwise. `tid` is the Turn the frame
+    # would change. Only the latest minted run is accepted, except that closing the
+    # open review (`review_run`) also accepts the run that published it -- after a
+    # failed resumed launch that is an older run, and no other older run is. The
+    # operator's session-wide review-abort names no run and skips this check.
+    def require_run(self, args, sid, tid, review_run=False):
+        missing = [field for field in ("turn_id", "generation") if field not in args]
+        if missing:
+            raise store.Refused("run_identity_missing", "frame names no %s" % " or ".join(missing))
+        if args["turn_id"] != tid:
+            raise store.Refused("stale_turn", "frame names turn %s; the run is turn %s" % (args["turn_id"], tid))
+        meta = self.turn_meta(sid, tid)
+        current = store.run_generation(meta)
+        allowed = {current, store.review_generation(meta)} if review_run else {current}
+        generation = int(args["generation"])
+        if generation in allowed:
+            return
+        if generation < current:
+            raise store.Refused("stale_generation", "turn %s generation %d is not its run %s"
+                                % (tid, generation, sorted(allowed)))
+        raise store.Refused("unknown_generation", "turn %s has no run %d (its run is %d)"
+                            % (tid, generation, current))
+
+    def settled_state(self, sid, tid, args, state):
+        """turn.end's next state. A resumed launch that failed before its agent ran
+        keeps the open review (published by an older run, see require_run) only when
+        its layer rollback was verified (launch_failed -> reviewing); an unverified
+        rollback halts it as recovery_required, claims and evidence kept, never
+        resumable. The failed run's generation stays consumed either way."""
+        launch = {"launch_failed": "reviewing", "launch_unrestored": "recovery_required"}
+        if state == "sealed" and args["outcome"] in launch and self.open_review_turn(sid) == tid:
+            return launch[args["outcome"]]
+        return "settling" if state == "sealed" else state
+
+    async def turn_resume(self, frame):
+        """F-ADDENDUM-TURN: the next run of a reviewing Turn on its own layer and claims.
+
+        Refused unless the Turn's review is open, it is reviewing (its writer has
+        stopped) and the generation is newer. Flips reviewing -> running without
+        touching review/open, recreates only the disposable work dirs, and never
+        runs the first-run cleanup (`reconcile_prior_turns`).
+        """
+        args = frame["args"]
+        sid, tid, generation = args["session_id"], args["turn_id"], int(args["generation"])
+        # The last move away from running queued a work-dir clear; it lands before
+        # this run's work dirs exist, never after. No await below this line.
+        pending = [task for task in self.workdir_cleanup_tasks if not task.done()]
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        store.load_session(self.root, sid)
+        owner = frame["owner"]
+        if not liveness.cgroup_matches(owner, args["cgroup"]):
+            self.log_refusal("turn.resume", "cgroup_mismatch", session=sid, turn=tid)
+            return protocol.refuse(frame["id"], "cgroup_mismatch")
+        if self.open_review_turn(sid) != tid:
+            raise store.Refused("resume_no_review", "turn %s has no open review" % tid)
+        meta = self.turn_meta(sid, tid)
+        if meta["state"] != "reviewing":
+            raise store.Refused("resume_not_reviewing", "turn %s is %s, not reviewing" % (tid, meta["state"]))
+        current = store.run_generation(meta)
+        if generation <= current:
+            raise store.Refused("stale_generation", "turn %s generation %d is not newer than its run %d"
+                                % (tid, generation, current))
+        launch = store.resume_turn(self.root, sid, tid, owner, args["cgroup"], generation, log=self.log)
+        for key in claims.claim_keys(args["files"]):
+            store.write_claim_row(self.root, key, sid, tid, "running")
+        self.watch_owner(sid, tid, owner, "launcher", generation)
+        return protocol.ok(frame["id"], {"launch": launch})
+
+    def reconcile_prior_turns(self, sid, requested_tid):
+        """Clear dead launch state before minting the next turn's layers.
+
+        A live or unclassifiable owner is never reclaimed. A dead turn with an
+        open review remains available for recovery; only an unreviewed dead
+        turn is disposable.
+        """
+        cleaned = []
+        review_tid = self.open_review_turn(sid)
+        for turn in store.iter_turns(self.root, sid):
+            tid = turn["turn_id"]
+            state = turn.get("state")
+            if state == "running":
+                kind = liveness.owner_kind(turn.get("owner"))
+                if kind == "live":
+                    return {"turn_id": tid, "reason": "turn is still live"}, cleaned
+                if kind != "dead":
+                    return {"turn_id": tid, "reason": "turn liveness is unconfirmed"}, cleaned
+                self.owner_dead(sid, tid, "launcher")
+                try:
+                    state = self.turn_meta(sid, tid).get("state")
+                except OSError:
+                    state = "dead"
+            # dead_unsealed preserves its residue refusal for
+            # session.delete, but never excludes another launch.
+            if state == "dead_unsealed":
+                continue
+            if state not in {"dead", "sealed"} or tid == review_tid:
+                continue
+            store.clear_claim_rows_for_turn(self.root, sid, tid)
+            store.remove_turn(self.root, sid, tid, log=self.log)
+            cleaned.append(tid)
+        return None, cleaned
+
+    def warn_dead_turn_cleanup(self, turn_ids, requested_tid):
+        names = ", ".join(turn_ids)
+        self.log.write("WARN", "self-healed dead turn %s before turn %s" % (names, requested_tid))
 
     async def exit0(self):
         if self.exiting:

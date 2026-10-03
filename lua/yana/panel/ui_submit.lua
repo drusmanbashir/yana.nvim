@@ -61,7 +61,6 @@ function M.new(deps)
     end
   end
   local focus = deps.focus
-  local finalize_shadow_turn = deps.finalize_shadow_turn
   local render_note = deps.render_note
   local steer_text = deps.steer_text
   local on_event = deps.on_event
@@ -313,20 +312,9 @@ function M.new(deps)
     return
   end
 
-  if p.shadow_turn then
-    if not p.shadow_turn._review_finalized then
-      finalize_shadow_turn(p, p.shadow_turn)
-    end
-    if p.shadow_turn then
-      table.insert(p.queue, 1, question)
-      notify_one_line(
-        "yana: review still open — queued until it closes",
-        vim.log.levels.INFO
-      )
-      update_winbar(p)
-      return
-    end
-  end
+  -- An open review of this conversation: the prompt is its follow-up (F-ADDENDUM-TRIGGER), held or refused.
+  local follow = p.shadow_turn and require("yana.panel.ui_followup").follow_up(p, question)
+  if follow and type(follow) ~= "table" then return end
 
   focus:set_last(p)
 
@@ -414,6 +402,7 @@ function M.new(deps)
     end
   end
 
+  if follow then built.prompt = follow.line .. "\n\n" .. built.prompt end -- F-ADDENDUM-MEMORY
   p.last_question = question
   if not p.title then
     p.title = sessions.title_from_prompt(question)
@@ -437,7 +426,7 @@ function M.new(deps)
   -- Allocate the one durable identity before confinement. Preview, recorder,
   -- lifecycle and recovery must name the same turn even across editor processes.
   local lifecycle = require("yana.turn.turn_lifecycle")
-  local turn_id = lifecycle.new_turn_id(p.id, gen)
+  local turn_id = follow and follow.turn_id or lifecycle.new_turn_id(p.id, gen)
   local L = ledger.begin_turn(p.id, gen, {
     panel_id = p.id,
     session_id = p.session_id,
@@ -468,7 +457,7 @@ function M.new(deps)
   -- Assign BEFORE the run call so a fast exit can correlate (I2): a job that
   -- dies before agent.run() even returns must still match on_exit_confirmed.
   p.job_spawn_gen = gen
-  p.shadow_pass = nil
+  if not follow then p.shadow_pass = nil end
   p.job_shadow_turn = nil
   if config.overlay_mode() then
     local preview = require("yana.shadow.preview")
@@ -477,7 +466,7 @@ function M.new(deps)
       selection = selection,
       origin = origin,
       launch_flags = consume_next_launch_flags(),
-      stream = p.session_id or ("panel-" .. tostring(p.conv_buf)),
+      stream = follow and follow.prior.stream or p.session_id or ("panel-" .. tostring(p.conv_buf)),
       session_id = p.session_id,
       turn_id = turn_id,
       turn_gen = gen,
@@ -485,6 +474,7 @@ function M.new(deps)
       mode = p.turn_modes[gen],
       yanad_session_id = p.yanad_session_id,
       read_only_workspace = selection and selection.home_buffer_capture ~= nil,
+      resume = follow and true or nil,
     })
     if not turn then
       log.buffer_event("launch_failed", { panel_id = p.id, generation = gen, turn_id = turn_id, reason = perr })
@@ -519,8 +509,9 @@ function M.new(deps)
     local seeds, seed_err = p.shadow_turn and snapshot.write_seeds(order, roots, private_dir)
     if p.shadow_turn and not seeds then
       snapshot.release_snapshots(p.turn_buffer_captures, gen)
-      preview_module().discard(p.shadow_turn)
-      p.shadow_turn, p.job_shadow_turn, p.busy = nil, nil, false
+      if follow then require("yana.panel.ui_followup").drop_launch(p, follow)
+      else preview_module().discard(p.shadow_turn) end
+      p.shadow_turn, p.job_shadow_turn, p.busy = follow and follow.prior or nil, nil, false
       stop_spinner(p)
       ledger.close_turn(L, { exit_code = nil, confinement_failed = seed_err })
       render_error(p, seed_err)
@@ -533,7 +524,7 @@ function M.new(deps)
   p.turn_pass = lifecycle.begin_turn({
     panel_id = p.id,
     generation = gen,
-    stream = p.session_id or ("panel-" .. tostring(p.conv_buf)),
+    stream = follow and follow.prior.stream or p.session_id or ("panel-" .. tostring(p.conv_buf)),
     session_id = p.session_id,
     workspace = p.shadow_turn and p.shadow_turn.workspace or p.cwd,
     state_dir = p.shadow_turn and p.shadow_turn.turn_dir or lifecycle.state_dir(),
@@ -542,6 +533,13 @@ function M.new(deps)
     ),
     turn_id = turn_id,
   })
+  if follow and not require("yana.panel.ui_followup").begin_follow_up(p, follow, gen) then
+    p.busy, p.job_spawn_gen, p.job_shadow_turn = false, nil, nil
+    stop_spinner(p)
+    ledger.close_turn(L, { exit_code = nil, confinement_failed = "follow-up input not captured" })
+    update_winbar(p)
+    return
+  end
   log.buffer_event("launch", { panel_id = p.id, generation = gen, turn_id = turn_id,
     cwd = p.cwd, bufnr = selection and selection.buf or (origin and origin.buf), selection = selection })
   p.job = agent.run({
@@ -587,7 +585,9 @@ function M.new(deps)
     p.job_spawn_gen = nil
     require("yana.input.home_buffer_proposal").release_snapshots(p.turn_buffer_captures, gen)
     -- The overlay never ran, so it never took a claim; nothing to release.
-    if p.shadow_turn then
+    if follow then
+      require("yana.panel.ui_followup").drop_launch(p, follow)
+    elseif p.shadow_turn then
       preview_module().discard(p.shadow_turn)
       p.shadow_turn = nil
     end

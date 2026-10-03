@@ -301,6 +301,135 @@ function M.install(Ledger, env)
 		end
 		self.buffer_history:rewind(snapshot and snapshot.seq or nil)
 	end
+
+	-- THE LEDGER HALF OF ONE REVIEW ENDPOINT (follow-up endpoint plan,
+	-- S1 record schema `EndpointState`; composed by review_park_snapshot.capture_endpoint).
+	-- Members and history are RETAINED REFERENCES, never copies: older actions,
+	-- frames and decision entries name these block tables, and the history is
+	-- the buffer's one record keyed by native sequence, carried the way a park
+	-- carries it. Only the frames are copies (`capture_buffer_snapshot`).
+	-- `revision` is the endpoint revision the caller is sealing; the ledger
+	-- stores it and mints nothing. Origins, prior rejections and split
+	-- allocations are read here because only the ledger reads hunk fields.
+	local ORIGIN_KIND = { pending = "pending", accepted = "accepted", rejected = "operator" }
+
+	function Ledger:capture_ledger_endpoint(revision)
+		local snapshot = self:capture_buffer_snapshot()
+		local frames = {}
+		for _, value in ipairs(snapshot.frames) do
+			frames[value.block] = value
+		end
+		local origins, prior_rejection, split_alloc = {}, {}, {}
+		for _, block in ipairs(self.hunks) do
+			if block.lineage_id ~= nil then
+				origins[block.lineage_id] = { kind = ORIGIN_KIND[block.verdict], block = block,
+					rows = { block.new_start_line, block.new_end_line } }
+			end
+			if block.verdict == "rejected" then
+				-- The proposal the operator turned down; no lines means it was a removal.
+				prior_rejection[block] = { bytes = table.concat(block.new_lines or {}, "\n"),
+					existence = #(block.new_lines or {}) > 0 }
+			end
+			if block.split_parent_lineage_id ~= nil and block.old_start_line ~= nil then
+				split_alloc[block] = { first = block.old_start_line, last = block.old_end_line }
+			end
+		end
+		return {
+			members = self:members(),
+			frames = frames,
+			origins = origins,
+			prior_rejection = prior_rejection,
+			split_alloc = split_alloc,
+			ledger_history = { ref = self.buffer_history, seq = snapshot.seq, revision = revision },
+		}
+	end
+
+	-- Exact equality of two frame field tables. Frames copy one level, so a nested
+	-- value compares by reference; owner entries are copied and compare by value.
+	local function same_fields(a, b)
+		for key, value in pairs(a) do
+			local other = b[key]
+			if key == "owned_rows" and type(value) == "table" and type(other) == "table" then
+				if #value ~= #other then return false end
+				for i, owner in ipairs(value) do
+					local o = other[i]
+					if o.row ~= owner.row or o.source ~= owner.source or o.provisional ~= owner.provisional then
+						return false
+					end
+				end
+			elseif type(value) == "table" and type(other) == "table" then
+				for k, v in pairs(value) do if other[k] ~= v then return false end end
+				for k in pairs(other) do if value[k] == nil then return false end end
+			elseif value ~= other then
+				return false
+			end
+		end
+		for key in pairs(b) do
+			if a[key] == nil then return false end
+		end
+		return true
+	end
+
+	-- The inverse, in the schema's order: history (`adopt_buffer_history`),
+	-- membership (`publish_prepared_members`), frames (`restore_buffer_snapshot`,
+	-- which also rewinds the observed sequence). Everything that can refuse is
+	-- asked first and answers `false, reason` with nothing written. Past that
+	-- only a writer or the landing check can raise, and the caller compensates.
+	-- Frames go in as copies, so the endpoint never shares a value with a live hunk.
+	--
+	-- EXACT, which the replay's frame restore is not: it writes the captured
+	-- values and leaves a field the hunk gained since (a `group_id` decides hunks
+	-- together). A complete endpoint also restores captured ABSENCE. A live frame
+	-- names exactly the fields a frame may carry, so the handles frames exclude
+	-- (extmark ids, timeline marks) stay. Geometry-only replay keeps its own,
+	-- narrower write.
+	function Ledger:install_ledger_endpoint(ep)
+		assert_open(self, "install_ledger_endpoint")
+		local history = type(ep) == "table" and ep.ledger_history or nil
+		if type(history) ~= "table" or type(history.ref) ~= "table"
+			or type(history.ref.transition) ~= "function" then
+			return false, "endpoint carries no retained ledger history"
+		end
+		if self.frozen_for_end then
+			return false, "turn is frozen for End"
+		end
+		local members, frames = {}, {}
+		for i, block in ipairs(ep.members or {}) do
+			local value = type(ep.frames) == "table" and ep.frames[block] or nil
+			if type(value) ~= "table" or type(value.fields) ~= "table" or value.geometry_only then
+				return false, "endpoint member " .. i .. " has no complete frame"
+			end
+			members[i] = block
+			frames[i] = copied(value)
+		end
+		if count_keys(ep.frames or {}) ~= #members then
+			return false, "endpoint frames name a hunk outside its membership"
+		end
+		self:adopt_buffer_history(history.ref)
+		self:publish_prepared_members(members, {})
+		self:restore_buffer_snapshot({ seq = history.seq, frames = frames })
+		for i, block in ipairs(members) do
+			for key in pairs(frame.snapshot_ref(block).fields) do
+				if frames[i].fields[key] == nil then
+					block[key] = nil
+				end
+			end
+		end
+		-- The landing, checked before anyone reports ok or unchanged: exactly these
+		-- members in this order, each frame's fields exactly, on the retained
+		-- history and sequence.
+		local landed = #self.hunks == #members and self.buffer_history == history.ref
+			and self.buffer_history.current_seq == history.seq
+		for i, block in ipairs(members) do
+			if self.hunks[i] ~= block or not same_fields(frame.snapshot_ref(block).fields, frames[i].fields) then
+				landed = false
+			end
+		end
+		if not landed then
+			error("hunk_ledger: endpoint install did not land exactly on its members, fields and history", 0)
+		end
+		return true
+	end
 end
 
 return M

@@ -42,7 +42,7 @@ local function new_chat()
   local review_opts = inline_review_opts(p)
 
   -- ORDER, and it is the whole fix. The review's End is asked FIRST; the claim
-  -- is released only once that End completed; the conversation is reset only
+  -- is released only once End has closed its review; the conversation is reset only
   -- once the release succeeded. Releasing first tore the claim out from under
   -- a review that was still ending, and resetting on a merely STARTED End
   -- bumped the epoch out from under the live review's own owner.
@@ -88,7 +88,7 @@ local function new_chat()
       return
     end
     local status = type(result) == "table" and result.status or nil
-    if status ~= "completed" then
+    if status ~= "completed" and not (status == "partial" and result.review_ended == true) then
       finished = true
       p._new_chat_pending = nil
       notify_one_line(

@@ -79,7 +79,7 @@ function M._emit_review_settled(bufnr, turn, reason)
   })
 end
 
--- M.open installs real, buffer-visible side effects -- augroup, BufWriteCmd guard,
+-- M.open installs real, buffer-visible side effects -- augroup,
 -- keymaps, extmarks, winhl -- and keeps going. false").
 local reactivate_parked_state = require("yana.review_park_snapshot").reactivate_factory(pool_for, announce_state)
 M._reactivate_parked_state = reactivate_parked_state
@@ -114,9 +114,8 @@ local function open_or_abandon(change, opts)
   local pcall_ok, a, b = pcall(M.open, change, opts)
   if not pcall_ok then
     local st = pool_for(opts or {})
-    if st.active and st.active.change == change then
-      pcall(M.cleanup, st.active)
-      st.active = nil
+    if st.open[change] then
+      pcall(M.cleanup, st.open[change])
     end
     -- STAMP BEFORE ANNOUNCE. The claim renderer reads review_error first; if the
     -- announce runs while it is still nil the row falls through to the queued branch
@@ -166,11 +165,8 @@ function M._announce_open_failure(change, text, level)
   notify_one_line(line, level)
 end
 
--- The guarded entry for callers outside the queue (the diff-theme preview).
--- M.open must never be called raw: a throw after `active = state` leaves the
--- singleton set forever, which stalls process_next and makes every later
--- review refuse with "close active inline review first" -- a ghost review
--- nobody can close.
+-- The guarded entry for the diff-theme preview. A failed attachment must
+-- release its buffer resources before another review can claim that buffer.
 function M.open_guarded(change, opts)
   local ok, err = open_or_abandon(change, opts)
   if not ok then
@@ -178,11 +174,11 @@ function M.open_guarded(change, opts)
     M._announce_open_failure(change, "inline review failed: " .. notify.error_headline(err), vim.log.levels.ERROR)
     return false, nil
   end
-  -- M.open sets `active` on the pool synchronously, before it can still
+  -- M.open attaches this change to the pool synchronously, before it can still
   -- throw (see the comment above M.cleanup) -- open_or_abandon's own (ok,
   -- err) collapsed the state out of its return, but it is still right there.
   local st = pool_for(opts or {})
-  local state = (st.active and st.active.change == change) and st.active or nil
+  local state = st.open[change]
   return true, state
 end
 
@@ -196,7 +192,7 @@ local process_next_for
 local rewind_schedule
 
 local function process_next_impl(st)
-  if st.active or #st.queue == 0 then
+  if require("yana.review_context").state_for_buf(st) or #st.queue == 0 then
     return nil
   end
   local item = table.remove(st.queue, 1)
@@ -389,8 +385,17 @@ local function remember_batch_item(st, item)
   if not change._review_order then
     st.order_seq = (st.order_seq or 0) + 1
     change._review_order = st.order_seq
-    st.order[#st.order + 1] = change
   end
+  -- Re-admission (a publication undo withdrew the change from st.order but kept its identity): restore the
+  -- ORIGINAL entry at its `_review_order` slot; never mint a second order identity.
+  for _, c in ipairs(st.order) do
+    if c == change then return end
+  end
+  local pos = #st.order + 1
+  for i, c in ipairs(st.order) do
+    if (c._review_order or math.huge) > change._review_order then pos = i break end
+  end
+  table.insert(st.order, pos, change)
 end
 
 local function queue_remove_change(st, change)

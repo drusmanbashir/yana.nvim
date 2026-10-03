@@ -3,12 +3,14 @@
 -- answer, and it is the question every discard caller got wrong.
 --
 -- THE RULE. `Turn:end_turn` answers STARTED, not finished. A truthy answer was
--- never permission to clear a queue; only a delivered `completed` result is.
+-- never permission to clear a queue; the result must say cleanup finished.
 -- Zero visible hunks is not a close receipt either -- a Turn with no hunks
 -- still owes End and cleanup -- so a `hunks > 0` guard skips the request and
 -- drops exactly the work it looks like it protects (F-END-DISCARD).
 --
--- THE CONTINUATION. The result can arrive later. One request therefore carries
+-- A declined Neovim write reports `partial` with `review_ended=true`: the
+-- retained modified buffer is the operator's manual save path, and the review
+-- has already closed. THE CONTINUATION can arrive later. One request therefore carries
 -- its own cleanup into the callback and runs it exactly once, whenever the
 -- answer comes; the caller is never asked to discard a second time.
 local M = {}
@@ -33,18 +35,16 @@ function M.new(deps)
     return true
   end
 
-  --- THE END IS THE ACTIVE REVIEW'S. `turn_bind.get(pool)` answers with the
-  --- pool's ONE Turn whoever owns it, so asking it on a named discard ended a
-  --- DIFFERENT owner's live work whenever the named owner held only queue
-  --- items. End is owed only by the owner of the active review.
+  --- End is owed only by an owner with an attached review in this pool. A
+  --- named discard of queue-only work cannot end another owner's live Turn.
   local function owns_active(st, owner)
-    if st.active == nil then
-      return false
+    for _, state in pairs(st.open or {}) do
+      if owners_match(state.opts and state.opts.review_owner, owner) then return true end
     end
-    return owners_match(st.active.opts and st.active.opts.review_owner, owner) and true or false
+    return false
   end
 
-  --- Request the Turn's End, then run `continue` once, on `completed` only --
+  --- Request the Turn's End, then run `continue` once after review cleanup --
   --- synchronously if the Turn answers at once, otherwise from the callback.
   --- `notify` is the caller's own observer and hears every terminal status,
   --- so a panel can tell "kept editing" from "completed".
@@ -60,7 +60,9 @@ function M.new(deps)
       on_result = function(result)
         answer = result
         if ran then return end
-        if type(result) == "table" and result.status == "completed" then
+        if type(result) == "table" and (result.status == "completed"
+          or (result.status == "partial" and result.review_ended == true))
+        then
           ran = true
           continue()
         end
@@ -88,9 +90,10 @@ function M.new(deps)
       -- Re-asked, not remembered: an async End answers later, and the active
       -- review may have been replaced by then.
       local cleared_active = owns_active(st, owner)
-      if cleared_active then
-        pcall(facade.cleanup, st.active)
-        st.active = nil
+      for _, state in pairs(st.open or {}) do
+        if owners_match(state.opts and state.opts.review_owner, owner) then
+          pcall(facade.cleanup, state)
+        end
       end
       local kept = {}
       for _, item in ipairs(st.queue) do
@@ -123,10 +126,7 @@ function M.new(deps)
       if tabs_path then
         pcall(vim.fn.delete, tabs_path)
       end
-      if st.active then
-        pcall(facade.cleanup, st.active)
-        st.active = nil
-      end
+      for _, state in pairs(st.open or {}) do pcall(facade.cleanup, state) end
       st.queue = {}
       st.batched = {}
       st.order = {}

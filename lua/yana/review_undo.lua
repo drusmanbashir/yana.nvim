@@ -129,9 +129,11 @@ function Factory.new(deps)
         pcall(log.write, "WARN", "yana: jump to " .. tostring(rel) .. " threw: " .. tostring(jump_err))
         return nil, "could not reach that file"
       end
-      _ht_trace("JUMP ok rel=" .. tostring(rel) .. " active=" .. tostring(pool.active and pool.active.change and (pool.active.change.rel or pool.active.change.path)))
-      local target_state = pool.active
-      if not target_state or not target_state.change
+      local finder = deps.facade and deps.facade._state_for_rel
+      local target_state = type(finder) == "function" and finder(pool, rel) or nil
+      _ht_trace("JUMP ok rel=" .. tostring(rel) .. " attached=" .. tostring(target_state and target_state.change and (target_state.change.rel or target_state.change.path)))
+      if not target_state or target_state.closed or not target_state.change
+        or target_state.change._parked_state == target_state
         or (target_state.change.rel or target_state.change.path) ~= rel
       then
         return nil, "reopen landed elsewhere"
@@ -151,9 +153,10 @@ function Factory.new(deps)
         return state
       end
       local pool = pool_for_walk()
-      local active = pool and pool.active
-      if active and active.change and (active.change.rel or active.change.path) == rel then
-        return active
+      local attached = pool and type(deps.facade._state_for_rel) == "function"
+        and deps.facade._state_for_rel(pool, rel)
+      if attached and not attached.closed and attached.change._parked_state ~= attached then
+        return attached
       end
       return jump_to_rel(rel)
     end
@@ -419,253 +422,17 @@ function Factory.new(deps)
     local undo_accept_turn_step = turn_step.reverse
     local redo_accept_turn_step = turn_step.forward
 
-    --- The pair that must be exact inverses is the file's EXISTENCE ON DISK, so it
- --- lives in its own class beside the `cA` giant step.
-    ---
-    --- The class does the disk op, parks/revives ITS OWN review and announces.
-    ---
-    --- The old `walk_file_touch` returned `true` unconditionally AND was consumed
-    --- before it ran, so a refused removal still moved the row.
-    ---
-    --- ROUTER-OWNED ON PURPOSE. Every hop is pcall'd and any missing plumbing is a
-    --- quiet no-op -- the disk op already happened and was announced.
-    local function land_after_removal(rel, next_rel)
-      local pool = pool_for_walk()
-      if not pool or pool.active ~= nil then
-        return
-      end
-      local facade = deps.facade
-      -- `file_creation.reverse` has already parked this file -- correctly, BEFORE
-      -- blanking its buffer, so `change._parked_review.staged_text` holds the
-      -- pre-removal screen. Calling the full `_park_and_open_state` here parked it a
-      -- SECOND time, over the now-blank buffer, and `<C-r>` restored that blank
-      -- verbatim (`r_v2r24_redo_after_removal_retouches`: want 7 lines, got 1). The
-      -- open half alone lands the walk and leaves the snapshot alone.
-      local open_fn = facade and facade._open_target_item
-      if type(open_fn) ~= "function" then
-        return
-      end
-      local removed_change = nil
-      for _, item in ipairs(pool.queue or {}) do
-        local c = item.change
-        if c and (c.rel or c.path) == rel then
-          removed_change = c
-          break
-        end
-      end
-      -- The walk continues into the file it was reviewing BEFORE the creation:
-      -- the parked change immediately before the removed one in review order. It
-      -- is all-accepted -- ZERO pending -- BY DEFINITION, which is the only
-      -- reason it had register rows to walk back at all. The ordinary target
-      -- finder (`_ordered_target_for_state`) skips a settled file, emitting
-      -- "settled -- skipping", and MUST keep doing so for `]x`/`[x` (A-7); so it
-      -- can never return this one. Parked all-accepted files stay in `pool.queue`
-      -- (review_queue.lua), so take the predecessor straight off it instead.
-      -- THE REGISTER IS THE TRUTH ABOUT "PREVIOUS", NOT `_review_order`.
-      -- `_review_order` is the order the turn ENQUEUED its files; the walk runs
-      -- back over the order the operator DECIDED them, and the two part company
-      -- the moment the operator reviews out of queue order. MEASURED: with the
-      -- created file enqueued first, the queue reads `n.py:1 | p.py:2` while the
-      -- file the walk owes next is p.py, so "the entry before order 1" is nothing
-      -- at all and the walk landed nowhere
-      -- (`r_v2r24_third_press_walks_to_previous_file`, got active=nil).
-      -- So the landing is the file named by the row the NEXT press will spend;
-      -- the review-order predecessor stays as the fallback for a register with
-      -- nothing left behind this row (`u_walk_after_removal_lands_on_settled_file`
-      -- pushes the `file_touch` row alone).
-      local target_item = nil
-      if next_rel and next_rel ~= rel then
-        for _, item in ipairs(pool.queue or {}) do
-          local c = item.change
-          if c and (c.rel or c.path) == next_rel then
-            target_item = item
-            break
-          end
-        end
-      end
-      if not target_item then
-        local removed_order = (removed_change and removed_change._review_order) or math.huge
-        local target_order = nil
-        for _, item in ipairs(pool.queue or {}) do
-          local c = item.change
-          local o = c and c._review_order
-          if c and o and o < removed_order and (target_order == nil or o > target_order) then
-            target_item, target_order = item, o
-          end
-        end
-      end
-      if not target_item then
-        return
-      end
-      pcall(open_fn, pool, target_item, "first", "walk")
-    end
-
-    local decision = require("yana.undo_action_decision").new({})
-
-    local file_creation = require("yana.undo_action_file_creation").new({
-      facade = M,
-      state = state,
-      change = change,
-      log = log,
-      notify_one_line = notify_one_line,
-      resolve_target = resolve_target,
-      undo_refuse = undo_refuse,
+    --- Yana's `u` and `<C-r>`: the per-kind dispatch over the turn register, its own module
+    --- (review_undo_dispatch.lua, the owner-preserving split of this file).
+    local dispatch = require("yana.review_undo_dispatch").new({
+      deps = deps, facade = M, state = state, change = change, bufnr = bufnr, log = log,
+      notify_one_line = notify_one_line, turn_register = turn_register, buf_undo_seq = buf_undo_seq,
+      undo_refuse = undo_refuse, rerender_after_history_move = rerender_after_history_move,
+      resolve_target = resolve_target, pool_for_walk = pool_for_walk, spend_buffer_edit = spend_buffer_edit,
+      undo_accept_turn_step = undo_accept_turn_step, redo_accept_turn_step = redo_accept_turn_step,
+      native_redo = native_redo, pop_decision = pop_decision,
     })
-
-    --- `<C-r>` inside an open review.
-    local function redo_key()
-      local ready, reason = require("yana.review_watch").finalize(bufnr, state)
-      if not ready then undo_refuse("could not finish pending edit: " .. tostring(reason)); return false end
-      -- LIFO: `U`'s last act was the turn sweep, so redo owes its removals first.
-      if M._redo_staged_restores(state) then
-        return
-      end
-      local before = buf_undo_seq(bufnr)
-      if state.reload_redo_guard and before == state.reload_restore_seq then
-        undo_refuse("redo cannot reapply the transient buffer state used by reload")
-        rerender_after_history_move("native_redo")
-        return
-      end
-      if before ~= state.reload_restore_seq then
-        state.reload_redo_guard = nil
-        state.reload_restore_seq = nil
-      end
-      local workspace = change.review_workspace or (state.opts and state.opts.workspace) or vim.fn.getcwd()
-      local register = turn_register.for_workspace(workspace)
-      local live_turn = change.turn_id or change.turn_gen
-      local peeked = register:peek_forward()
-      if peeked ~= nil and peeked.turn_id == live_turn and peeked.kind == "buffer_edit" then
-        return spend_buffer_edit(register, peeked, "redo")
-      end
-      if peeked ~= nil and peeked.turn_id == live_turn and peeked.kind == "accept_turn_step" then
-        -- The row is CONSUMED BY THE OUTCOME, never by the press. So: redo first,
-        -- consume only on a FULL reapply (partial counts as refusal -- see
-        -- `redo_accept_turn_step`).
-        --
-        -- The identity re-check is not belt-and-braces: the redo re-enters
-        -- the review (paint, watchers, queue), and any register `push` from
-        -- in there truncates the forward side, which would leave this
-        -- `walk_forward` landing on a DIFFERENT row than the one just
-        -- redone. Consume the row that was actually replayed, or nothing.
-        --
-        -- The claims this step needs are fetched from the daemon WITHOUT
-        -- blocking the editor, so the outcome may only be known after the
-        -- press returns. `"pending"` means exactly that: the same identity
-        -- re-check then runs from the completion callback instead, and a
-        -- late callback from an abandoned attempt is dropped by the
-        -- per-attempt token in `review_undo_turn_step.lua` before it can
-        -- reach here. Either way the row is consumed once, and only on a
-        -- full reapply.
-        local function consume_on_full_reapply(applied)
-          if applied == true and register:peek_forward() == peeked then
-            register:walk_forward()
-          end
-        end
-        local outcome = redo_accept_turn_step(peeked, { on_complete = consume_on_full_reapply })
-        if outcome ~= "pending" then
-          consume_on_full_reapply(outcome)
-        end
-        return
-      end
-      if peeked ~= nil and peeked.turn_id == live_turn and peeked.kind == "file_touch" then
-        -- CONSUME ONLY ON SUCCESS. A refused re-touch (the path is occupied)
-        -- leaves the row exactly where it stands, so a later press can retry.
-        -- The identity re-check mirrors `accept_turn_step` above: the action
-        -- re-enters the review, and any `push` from in there truncates the
-        -- forward side, which would land this `walk_forward` on a DIFFERENT
-        -- row than the one just replayed.
-        if file_creation.forward(peeked) == true and register:peek_forward() == peeked then
-          register:walk_forward()
-        end
-        return
-      end
-      if peeked ~= nil and peeked.turn_id == live_turn then
-        local target_state = resolve_target(peeked.rel)
-        if target_state then
-          local ok
-          if peeked.kind == "decision" then
-            ok = decision.forward(peeked, target_state)
-          else
-            undo_refuse("unknown undo action kind: " .. tostring(peeked.kind))
-            return false
-          end
-          if ok == true and register:peek_forward() == peeked then register:walk_forward() end
-          return ok
-        end
-      end
-
-      -- Nothing of Yana's cross-file register to redo: the editor's own
-      -- redo, unsilenced so its own "Already at newest change" shows.
-      --
-      -- The outcome is STRUCTURED and a refusal the user cannot see is a silent
-      -- failure -- this press reported nothing at all where the undo side says
-      -- why (`spend_buffer_edit`). Neovim prints its own message for a history
-      -- that simply had nowhere to go, so that one no-op is left to it; every
-      -- other refusal, including a move that could not be put back, is named.
-      local outcome = native_redo()
-      if type(outcome) == "table"
-        and outcome.ok ~= true
-        and outcome.code ~= "no_move"
-      then
-        undo_refuse("could not redo -- " .. tostring(outcome.reason))
-      end
-    end
-
-    --- Take one decision back. Ask the turn-global register for the newest
-    --- not-yet-walked action, turn-wide, not just this file's own `state.decisions`.
-    --- Exhaustion is NOT bare `walk_back()==nil` (ADJUDICATED 28/correction 1-2): a row
-    --- belonging to a FOREIGN turn is nothing for THIS turn too, since its payload died
-    --- with the state object that pushed it.
-    local function undo_key()
-      local ready, reason = require("yana.review_watch").finalize(bufnr, state)
-      if not ready then undo_refuse("could not finish pending edit: " .. tostring(reason)); return false end
-      local workspace = change.review_workspace or (state.opts and state.opts.workspace) or vim.fn.getcwd()
-      local register = turn_register.for_workspace(workspace)
-      local live_turn = change.turn_id or change.turn_gen
-      local peeked = register:peek_back()
-      -- Every buffer edit is a `buffer_edit` register row (F-UNDO-REGISTER), so
-      -- the register alone decides which press owns the next native undo.
-      local exhausted = peeked == nil or peeked.turn_id ~= live_turn
-      if exhausted then
-        return pop_decision()
-      end
-      if peeked.kind == "accept_turn_step" then
-        register:walk_back()
-        return undo_accept_turn_step(peeked)
-      end
-      if peeked.kind == "file_touch" then
-        -- CONSUME ONLY ON SUCCESS (contract law 1).
-        if file_creation.reverse(peeked) ~= true then
-          return false
-        end
-        register:walk_back()
-        -- The action parked its own review and left NO active one, so without this
-        -- there is no live `u` keymap and the walk dies on the very press the ruling
-        -- says continues it. THIS IS THE ROUTER'S JOB, NOT THE ACTION'S: an action that
-        -- navigates for itself reaches into another file's state, which is D-26.
-        local next_row = register:peek_back()
-        land_after_removal(peeked.rel,
-          (next_row and next_row.turn_id == live_turn) and next_row.rel or nil)
-        return true
-      end
-      if peeked.kind == "buffer_edit" then
-        return spend_buffer_edit(register, peeked, "undo")
-      end
-      local target_state, err = resolve_target(peeked.rel)
-      if not target_state then
-        undo_refuse("could not reach " .. tostring(peeked.rel) .. " to undo -- " .. tostring(err))
-        return false
-      end
-      local ok
-      if peeked.kind == "decision" then
-        ok = decision.reverse(peeked, target_state)
-      else
-        undo_refuse("unknown undo action kind: " .. tostring(peeked.kind))
-        return false
-      end
-      if ok == true and register:peek_back() == peeked then register:walk_back() end
-      return ok
-    end
+    local undo_key, redo_key = dispatch.undo_key, dispatch.redo_key
 
     --- `U` -- the turn-wide history operation, NOT an undo action
  ---. It replays nothing:
@@ -685,6 +452,9 @@ function Factory.new(deps)
     }).undo_turn
 
     state._pop_decision = pop_decision
+    -- This review's decision-anchor pair, for an endpoint install another file's press drives (a publication's
+    -- reverse/forward, undo_action_followup_cycle.lua).
+    state._anchor_pair = { park = park_anchor, drop = drop_anchor }
     state._redo_local = redo_local
     state._native_undo = native_undo
     state._native_redo = native_redo

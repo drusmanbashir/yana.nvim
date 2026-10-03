@@ -203,6 +203,10 @@ local function reject_change(change)
   if not change or change.status ~= "pending" then
     return false
   end
+  -- The panel's reject-all door (F-ADDENDUM-END); `cx` reaches the same reject_all and stays a decision.
+  if require("yana.turn.turn_bind").closing_refused("reject-all") then
+    return false
+  end
   do
     local inline = require("yana.inline_diff")
     if inline.resolve_change(change, "reject") then

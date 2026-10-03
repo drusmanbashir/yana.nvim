@@ -23,6 +23,25 @@ local Factory = {}
 local review_open_bind_factory = require("yana.review_open_bind")
 local review_permissions = require("yana.review_permissions")
 
+-- THE FIRST-RUN FALLBACK, one named function taking a base text: the hunk blocks
+-- of `target` over `base_text` (buffer review: B0 against the revision). Each
+-- block keeps the base rows it was built on, so a reload during the review can
+-- fall back to the base without comparing texts (review_open_watchers.lua).
+-- F-ADDENDUM-FALLBACK calls it with the follow-up base (turn/turn_cycle.lua).
+-- `differ` defaults to the one text-to-coordinates owner; `stamp` maps the diff
+-- before the base rows are recorded (the open path stamps model indices).
+function Factory.fallback_blocks(base_text, target, differ, stamp)
+  differ = differ or require("yana.review_line_space").build_diff_blocks
+  local blocks = differ(base_text or "", target or "")
+  if stamp then
+    blocks = stamp(blocks)
+  end
+  for _, block in ipairs(blocks) do
+    block.b0_span = { start_line = block.start_line, end_line = block.end_line }
+  end
+  return blocks
+end
+
 
 function Factory.new(deps)
   local env = setmetatable({}, {
@@ -53,6 +72,10 @@ function Factory.new(deps)
     announce_state()
     schedule_queue_advance(state)
     return false, "invalid change: missing path"
+  end
+  local active_turn = require("yana.turn.turn_bind").get()
+  if active_turn and active_turn:is_frozen() then
+    return false, "turn is frozen for End"
   end
   opts = opts or {}
   change._last_review_opts = M.carryable_review_opts(opts)
@@ -196,12 +219,9 @@ function Factory.new(deps)
   -- nothing to do with it.
   local parked_already_staged = change._parked_already_staged
   change._parked_already_staged = nil
-  local blocks = stamp_model_index(M.build_diff_blocks(review_before or "", target), model)
-  -- The B0 rows each edit was built on, kept so a reload during the review can
-  -- fall back to B0 without comparing texts (review_open_watchers.lua).
-  for _, block in ipairs(blocks) do
-    block.b0_span = { start_line = block.start_line, end_line = block.end_line }
-  end
+  local blocks = Factory.fallback_blocks(review_before, target, M.build_diff_blocks, function(diffed)
+    return stamp_model_index(diffed, model)
+  end)
   -- Buffer drift stage 1 (INTERFACE.md sections 3 and 4): the hunk record is
   -- stamped above on B0; now each edit is placed on B1 by the submit extmarks.
   -- When they cannot be used the file falls back to B0: the B0 blocks stay and B0
@@ -266,7 +286,7 @@ function Factory.new(deps)
   if #blocks == 0 and change.before ~= nil and not carries_decision then
     log.buffer_event("review_staged", { change = change, bufnr = bufnr, outcome = "no_hunks", engine = engine_facts })
     -- Neovim owns the modified flag of a captured buffer (INTERFACE.md section 5).
-    if snap == nil then
+    if snap == nil and not change._dirty_kept then
       vim.bo[bufnr].modified = false
     end
     change.status = "accepted"
@@ -301,13 +321,15 @@ function Factory.new(deps)
       if parked and type(parked.staged_text) == "string" then
         vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, buffer_lines(parked.staged_text))
       end
-      if change.before == nil and not on_b1 then
+      -- An EMPTY buffer's forced blank line is no row of an empty base either (BLOCKERS F-T1-1): left below the
+      -- staged rows it became a real line the next cycle's input carries (PANEL.md F-ADDENDUM-B0).
+      if (change.before == nil and not on_b1) or (review_before == "" and vim.deep_equal(pre_stage_lines, { "" })) then
         local n = vim.api.nvim_buf_line_count(bufnr)
         if n > 1 and (vim.api.nvim_buf_get_lines(bufnr, n - 1, n, false)[1] or "") == "" then
           vim.api.nvim_buf_set_lines(bufnr, n - 1, n, false, {})
         end
       end
-      if snap == nil then
+      if snap == nil and not change._dirty_kept then
         vim.bo[bufnr].modified = false
       end
     end
@@ -315,7 +337,7 @@ function Factory.new(deps)
   if not stage_ok then
     break_undo_block(bufnr)
     pcall(vim.api.nvim_buf_set_lines, bufnr, 0, -1, false, pre_stage_lines)
-    if snap == nil then
+    if snap == nil and not change._dirty_kept then
       vim.bo[bufnr].modified = false
     end
     change.review_error = tostring(stage_err)
@@ -354,7 +376,7 @@ function Factory.new(deps)
     if restored ~= parked.staged_text or got_sig ~= parked.pending_signature then
       break_undo_block(bufnr)
       pcall(vim.api.nvim_buf_set_lines, bufnr, 0, -1, false, pre_stage_lines)
-      vim.bo[bufnr].modified = false
+      if not change._dirty_kept then vim.bo[bufnr].modified = false end
       change.review_error = "parked review restore mismatch"
       log.buffer_event("review_staged", { change = change, bufnr = bufnr, outcome = "restore_mismatch", engine = engine_facts })
       ledger.record_decision(change_ledger(change, opts), {

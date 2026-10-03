@@ -23,6 +23,12 @@ def read_json(path):
     return base._read_json(path)
 
 
+def run_generation(record):
+    """A Turn's run generation (PANEL.md F-ADDENDUM-TURN): the lifecycle pass's,
+    never minted here. A meta.json written before generations existed reads as 0."""
+    return int(record.get("generation", 0))
+
+
 def load_session(root, session_id):
     path = Path(root) / "sessions" / session_id / "session.json"
     if not path.exists():
@@ -60,6 +66,8 @@ def load_recovery(root, session_id):
         root_layers = {path.name: str(path) for path in sorted(roots_dir.iterdir()) if path.is_dir()}
     return {
         "turn_id": turn_id,
+        "generation": run_generation(meta),
+        "cycles": cycle_count(meta),
         "turn_dir": str(turn_dir),
         "mounted_root": meta.get("mounted_root"),
         "roots": meta.get("roots", []),
@@ -121,6 +129,66 @@ def set_turn_state(root, session_id, turn_id, state, reason=None, log=None, clea
         )
     if state != "running":
         (clear_workdirs or clear_turn_workdirs)(str(turn_dir), log)
+
+
+def resume_turn(root, session_id, turn_id, owner, cgroup, generation, log=None):
+    """PANEL.md F-ADDENDUM-TURN: run `generation` of a reviewing Turn on its own layers.
+
+    Recreates only the disposable overlay work dirs; every upper (the Turn's
+    change set), private/ and review/open stay. meta.json names the new writer.
+    """
+    turn_dir = Path(root) / "sessions" / session_id / "turns" / turn_id
+    layers = [turn_dir / "layer"]
+    roots_dir = turn_dir / "roots"
+    if roots_dir.is_dir():
+        layers.extend(sorted(path for path in roots_dir.iterdir() if path.is_dir()))
+    for layer in layers:
+        if os.path.lexists(layer / "work"):
+            base._force_rmtree(str(layer / "work"), log=log)
+        base._bare_layer(str(layer))
+    meta = read_json(turn_dir / "meta.json")
+    old = meta["state"]
+    meta.update({"state": "running", "owner": owner, "cgroup": cgroup, "generation": generation,
+                 "cycles": cycle_count(meta) + 1})
+    meta.pop("reason", None)
+    atomic_json(turn_dir / "meta.json", meta)
+    if log is not None:
+        log.write("DEBUG", "turn state session=%s turn=%s from=%s to=running trigger=turn.resume generation=%d"
+                  % (session_id, turn_id, old, generation))
+    return {
+        "turn_dir": str(turn_dir),
+        "layers": {"workspace": str(turn_dir / "layer"),
+                   "roots": {path.name: str(path) for path in layers[1:]}},
+    }
+
+
+def cycle_count(meta):
+    """Runs of the Turn that got past launch (turn.request's run is 1; each admitted
+    turn.resume adds one, a verified launch rollback takes it back). Read by the
+    interim recovery decline (plan "Milestones")."""
+    return int(meta["cycles"]) if "cycles" in meta else 1
+
+
+def uncount_cycle(root, session_id, turn_id):
+    path = Path(root) / "sessions" / session_id / "turns" / turn_id / "meta.json"
+    meta = read_json(path)
+    meta["cycles"] = cycle_count(meta) - 1
+    atomic_json(path, meta)
+
+
+def review_generation(meta):
+    """The run whose publication is the open review (review.open records it). It
+    stays put when a later resumed launch fails, while `generation` -- every run
+    minted so far, monotonic -- never moves back. A meta.json from before the
+    field reads as its execution generation."""
+    return int(meta["review_generation"]) if "review_generation" in meta else run_generation(meta)
+
+
+def publish_run(root, session_id, turn_id, generation):
+    path = Path(root) / "sessions" / session_id / "turns" / turn_id / "meta.json"
+    meta = read_json(path)
+    meta["review_generation"] = generation
+    atomic_json(path, meta)
 
 
 def write_claim_row(root, claim_key, session_id, turn_id, state):

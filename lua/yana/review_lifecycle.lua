@@ -27,7 +27,9 @@ function Factory.cleanup(state)
   if not state then
     return
   end
-  return require("yana.review_resources").close(state)
+  local ok, err = require("yana.review_resources").close(state)
+  if ok then require("yana.review_context").detach(state._pool, state) end
+  return ok, err
 end
 
 --- Park: navigation away from this review while it stays alive (R7).
@@ -195,7 +197,7 @@ function Factory.new(deps)
               break_undo_block(bufnr)
             end
             local pre_seq = buf_undo_seq(bufnr)
-            local replaced = (end_line >= start_line) and (end_line - start_line + 1) or 0
+            local last, delta = require("yana.review_restore").span(bufnr, change, start_line, end_line, restored)
             -- THROUGH THE WATCHER'S OWN DOOR. This restoration is Yana putting
             -- the original side back, and a bare `set_lines` reaches the watch
             -- timeline as an unexplained change: the InsertLeave seal then finds
@@ -204,7 +206,7 @@ function Factory.new(deps)
             -- only -- the ledger still transports this geometry exactly once.
             local restore_ok, restore_err = pcall(function()
               return review_watch.own_splice(bufnr, function()
-                vim.api.nvim_buf_set_lines(bufnr, start_line - 1, end_line, false, restored)
+                vim.api.nvim_buf_set_lines(bufnr, start_line - 1, last, false, restored)
               end)
             end)
             if not bulk then
@@ -214,7 +216,6 @@ function Factory.new(deps)
               ok = false
               err = tostring(restore_err)
             else
-              local delta = #restored - replaced
               local anchor = park_decision_anchor(
                 bufnr,
                 start_line,
@@ -311,8 +312,7 @@ function Factory.new(deps)
         -- advances or ends this review and owns its teardown -- the same division
         -- of labour the per-hunk `reject_block_at` door already keeps, restoring
         -- and recording itself and leaving the close to the Turn's leave edge. A
-        -- second teardown here would blank `st.active` out from under the file the
-        -- Turn just advanced to.
+        -- second teardown here would close the file the Turn just advanced to.
         return ok == true
       end
       if state.opts.on_close then
@@ -321,8 +321,6 @@ function Factory.new(deps)
         end, change, "on_close")
       end
       M.cleanup(state)
-      local st = pool_for_state(state)
-      st.active = nil
       if accepted and ok and applied and applied.reconcile_error then
         -- shadow/apply.lua has already brought this buffer back in step with the
         -- file it wrote, or named why it would not. Surface the refusal; do NOT
@@ -359,8 +357,6 @@ function Factory.new(deps)
         end, change, "on_close")
       end
       M.cleanup(state)
-      local st = pool_for_state(state)
-      st.active = nil
       announce_state()
       M._emit_review_settled(bufnr, change.turn_id or change.turn_gen, "reject_file")
       schedule_queue_advance(state)
@@ -377,8 +373,6 @@ function Factory.new(deps)
       vim.log.levels.ERROR
     )
     M.cleanup(state)
-    local st = pool_for_state(state)
-    st.active = nil
     announce_state()
     schedule_queue_advance(state)
     return false
@@ -407,7 +401,9 @@ function Factory.new(deps)
   end
 
   local function claim_owner_is_current(state, token, owner)
-    if state._yanad_claim_pending ~= token or owner.pool.active ~= state or state.change ~= owner.change then
+    if state._yanad_claim_pending ~= token
+      or not require("yana.review_context").is_live_attachment(owner.pool, state)
+      or state.change ~= owner.change then
       return false
     end
     local now = claim_owner_snapshot(state)

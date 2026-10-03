@@ -32,8 +32,8 @@ function M.new(deps)
     for _, item in ipairs(st.order or {}) do
       mark_if_pending(item and item.change)
     end
-    if st.active then
-      mark_if_pending(st.active.change)
+    for change, state in pairs(st.open or {}) do
+      if not state.closed then mark_if_pending(change) end
     end
     return pending
   end
@@ -142,6 +142,9 @@ function M.new(deps)
         local still_live_owned_handle = type(live_entry) == "table" and live_entry.tab_id == tab
         if not still_live_owned_handle and not tab_shows_path(tab, abs) then
           -- Drop silently: neither live ownership nor the recorded path survives.
+        elseif (opts.keep_paths or {})[abs] then
+          refused[rel] = true
+          notify_one_line("yana: keeping unsaved file open for manual write: " .. rel, vim.log.levels.WARN)
         elseif pending[abs] then
           refused[rel] = true
           notify_one_line("yana: keeping tab open for pending hunks in " .. rel, vim.log.levels.WARN)

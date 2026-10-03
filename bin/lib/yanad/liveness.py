@@ -2,6 +2,7 @@ import ctypes
 import errno
 import os
 import socket
+import time
 from pathlib import Path
 
 
@@ -120,6 +121,18 @@ def cgroup_matches(owner, cgroup):
     return any(line == f"0::{relative}" for line in lines)
 
 
+def wait_unpopulated(path, timeout=1.0):
+    """cgroup.kill only sends SIGKILL; members exit asynchronously and rmdir of a
+    populated cgroup fails. A writer killed by `stop`, or left behind by a dead
+    launcher, is confirmed gone only once cgroup.events says so (bounded wait)."""
+    events = path / "cgroup.events"
+    if not events.exists():
+        return
+    deadline = time.monotonic() + timeout
+    while "populated 0" not in events.read_text().splitlines() and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+
 def seal_cgroup(cgroup):
     if not cgroup:
         return "dead_unsealed", "no liveness cgroup was provided"
@@ -132,6 +145,7 @@ def seal_cgroup(cgroup):
     try:
         if (path / "cgroup.kill").exists():
             (path / "cgroup.kill").write_text("1\n")
+            wait_unpopulated(path)
         path.rmdir()
         return "sealed", None
     except OSError:

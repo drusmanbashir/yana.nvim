@@ -10,11 +10,10 @@ import time
 import uuid
 
 
-
 # Turn states (running -> settling -> reviewing
 # -> closed; running -> dead -> sealed | dead_unsealed).
 TURN_STATES = frozenset({
-    "running", "settling", "reviewing", "closed", "dead", "sealed", "dead_unsealed",
+    "running", "settling", "reviewing", "closed", "dead", "sealed", "dead_unsealed", "recovery_required",
 })
 
 
@@ -206,7 +205,7 @@ def create_session(root, workspace, backend, kind, owner, daemon_owner=None, ver
     return session_id
 
 
-def turn_dir(root, session_id, turn_id, cgroup, owner, mounted_root, roots, mode=None, plan=None):
+def turn_dir(root, session_id, turn_id, cgroup, owner, mounted_root, roots, mode=None, plan=None, generation=0):
     """Create turn layer dirs and return daemon launch paths.
 
     `mode` is the per-turn yana mode (ask/inline/agentic/…). Persisted into
@@ -240,6 +239,7 @@ def turn_dir(root, session_id, turn_id, cgroup, owner, mounted_root, roots, mode
         "mounted_root": _real(mounted_root),
         "roots": [_real(item) for item in roots],
         "mode": mode,
+        "generation": generation,
     }
     write_json_atomic(os.path.join(base, "meta.json"), meta)
     return {"turn_dir": base, "layers": {"workspace": workspace_layer, "roots": root_layers}}

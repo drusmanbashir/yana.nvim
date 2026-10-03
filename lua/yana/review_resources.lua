@@ -202,9 +202,12 @@ function M.is_current(state)
 end
 
 --- Park: navigation away while the review stays alive. Retains owner entry,
---- augroup (save handlers), ledger, marks, winhl. Releases the watcher
---- attachment (and its queued work), buffer-local keys and preview tab.
---- Never sets `state.closed`, deletes the augroup or gives up ownership.
+--- augroup (save handlers), ledger, marks, winhl and the watcher attachment, so an
+--- edit in a parked buffer is still one `buffer_edit` row, in time order, without
+--- resuming the review (F-ADDENDUM-EDIT-HISTORY; integrator ruling 2026-10-02).
+--- Releases buffer-local keys and the preview tab: decisions and the strip stay
+--- with the active review. Never sets `state.closed`, deletes the augroup or gives
+--- up ownership.
 function M.park(state)
   if type(state) ~= "table" then
     return false, "park refused: a review state is required"
@@ -217,10 +220,6 @@ function M.park(state)
     local watch = require("yana.review_watch")
     local finalized, reason = watch.finalize(state.bufnr, state)
     if not finalized then return false, "park refused: " .. tostring(reason) end
-    local invalidated, invalidate_reason = watch.invalidate(state.bufnr, state)
-    if invalidated == false and invalidate_reason then
-      return false, "park refused: " .. tostring(invalidate_reason)
-    end
   end
   refresh_button_strip()
   release_preview(state)
@@ -228,6 +227,8 @@ function M.park(state)
   if owner ~= nil then
     unbind_keys(state.bufnr, owner.hooks.keys)
   end
+  -- Parked-member key guard (review_open_bind_keys, reason=parked); runs after the park settles.
+  vim.schedule(require("yana.review_open_bind_keys").sync_queued)
   return true
 end
 

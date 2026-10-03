@@ -24,12 +24,17 @@ you review and accept them before they reach disk.
 
 Yana requires Neovim 0.11.2+.
 
-Use the optional prerequisite installer script or follow the manual steps
-below. Run it as your normal user, not with `sudo`: it checks Neovim and your
-agent, then shows each system command and asks before running it with `sudo`.
+Use the [optional prerequisite installer](scripts/install-deps.sh) or follow
+the manual steps below. Run it as your normal user, not with `sudo`: it checks
+Neovim and your agent, then asks before each system change. When needed, it
+requests `sudo` to install Bubblewrap and its capability package, which Yana
+uses in Linux `ask` and `inline` modes to confine agent file writes until
+review, or to add Ubuntu's AppArmor permission. It refuses to add a second
+profile. Read the script before running it:
 
 ```sh
 curl -fsSLO https://raw.githubusercontent.com/drusmanbashir/yana.nvim/main/scripts/install-deps.sh
+less install-deps.sh
 bash install-deps.sh
 ```
 
@@ -53,12 +58,16 @@ a private workspace until you accept them. Install it and its capability tool:
 sudo apt-get install bubblewrap libcap2-bin
 ```
 
-#### 3. Allow Bubblewrap on Ubuntu
+#### 3. Allow Bubblewrap on Ubuntu 24.04+
 
 AppArmor is [Ubuntu's application security system](https://documentation.ubuntu.com/security/security-features/privilege-restriction/apparmor/).
 
-On Ubuntu 24.04 and newer with AppArmor's user-namespace restriction, add this
-one-time permission for Bubblewrap. First check for an existing profile:
+Bubblewrap builds the sandbox from a Linux user namespace, and Ubuntu 24.04 and
+newer block those by default through AppArmor. This one-time step lets
+`/usr/bin/bwrap`, and only it, create one; AppArmor stays on and the rule still
+applies to every other program. Other distributions can skip it.
+
+First check for an existing profile:
 
 ```sh
 grep -rl /usr/bin/bwrap /etc/apparmor.d/
@@ -80,9 +89,10 @@ EOF
 sudo apparmor_parser -r /etc/apparmor.d/yana-bwrap
 ```
 
-This allows Bubblewrap to create its private environment (a user namespace)
-while retaining the restriction for other programs. macOS supports `agentic`
-mode only. See the [full requirements and troubleshooting guide](docs/installation.md).
+To undo it, run
+`sudo apparmor_parser -R /etc/apparmor.d/yana-bwrap`, then delete that file.
+macOS supports `agentic` mode only. See the
+[full requirements and troubleshooting guide](docs/installation.md).
 
 ### Neovim setup
 

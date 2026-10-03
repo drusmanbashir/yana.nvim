@@ -39,42 +39,6 @@ local function reject_restoration(bufnr, block, start_line, end_line)
   return old_lines, nil
 end
 
-local function resolve_disk_unchanged(change)
-  -- Since E9 the file is still there for the whole review -- the deletion happens at
-  -- accept -- so the honest question is the same one every other kind asks: are the
-  -- bytes captured at open still the bytes on disk?
-  if change.before == nil and change.kind ~= "delete" then
-    -- The `disk_absent_at_open` branch this replaces refused ANY appearance at the
-    -- path, and yana's own proposal-time touch is exactly that appearance -- unamended,
-    -- this guard would rule every created-file review stale the moment the touch and
-    -- the open raced, in either order.
-    local creation_touch = require("yana.paths.creation_touch")
-    local ours, why = creation_touch.disk_is_ours(change.path)
-    if ours then
-      return true
-    end
-    if change._accept_composed_hash ~= nil and deps.base_fingerprint ~= nil then
-      local disk = diff.read_file_bytes(change.path)
-      if disk ~= nil and deps.base_fingerprint(disk) == change._accept_composed_hash then
-        return true
-      end
-    end
-    return false, why or "file appeared on disk since review opened"
-  end
-  if change.disk_at_open == nil then
-    if change.kind == "delete" and vim.fn.filereadable(change.path) == 1 then
-      -- Absent when the review opened, present now: someone else created it.
-      return false, "file on disk changed since review opened"
-    end
-    return true
-  end
-  local ok, err = diff.disk_bytes_unchanged(change.path, change.disk_at_open)
-  if not ok then
-    return false, err
-  end
-  return true
-end
-
 -- Sensor: has the review buffer diverged from what this engine last staged?
 --
 -- It is NOT a blanket accept guard, and wiring it as one is wrong. Refusing there would
@@ -261,7 +225,6 @@ end
 
   return {
     reject_restoration = reject_restoration,
-    resolve_disk_unchanged = resolve_disk_unchanged,
     staged_snapshot_unchanged = staged_snapshot_unchanged,
     apply_review_blocks_to_reloaded_disk = apply_review_blocks_to_reloaded_disk,
     absorb_review_blocks_over_drift = absorb_review_blocks_over_drift,

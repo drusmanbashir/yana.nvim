@@ -87,6 +87,10 @@ function Factory.new(deps)
   end
   env.child_deps = child_deps
   local function bind()
+  local active_turn = require("yana.turn.turn_bind").get()
+  if active_turn and active_turn:is_frozen() then
+    return false, "turn is frozen for End"
+  end
   local maps = config.options.mappings
   local keys = {
     maps.reject_hunk,
@@ -357,7 +361,7 @@ function Factory.new(deps)
   -- no `record_buffer_change`, no absorb, no history record and no
   -- `buffer_edit` row for `u`. An open that cannot watch its buffer is not an
   -- open: unwind here, BEFORE the review becomes reachable (no keymaps, no
-  -- display, no `st.active`, no Turn announcement, no
+  -- display, no pool attachment, no Turn announcement, no
   -- `review_profile_buffer_watched` mark), and answer the ordinary
   -- `false, reason` refusal `review_open` already speaks.
   if attach_buffer_watch(state) ~= true then
@@ -398,20 +402,18 @@ function Factory.new(deps)
     panel_id = state_owner.panel_id,
     epoch = state_owner.epoch,
   } or nil
-  local review_tabs = M._review_tabs_init_for_turn(st, change, opts or {})
-  -- The button strip uses the ownership record's tab handle, not the
-  -- currently focused tab. Existing operator tabs stay panel-owned; only a
-  -- tab opened by Yana receives its own bottom strip.
-  if review_tabs and review_tabs.owned and change.path then
-    local abs = diff.abs_path(change.path)
-    local owned = review_tabs.owned[abs]
-    state.review_tab = owned and owned.tab_id or nil
+  active_turn = require("yana.turn.turn_bind").get()
+  if active_turn and active_turn:is_frozen() then
+    local closed, close_err = review_resources.close(state)
+    return false, "turn is frozen for End"
+      .. (closed and "" or ("; prepared review cleanup failed: " .. tostring(close_err)))
   end
-  st.active = state
+  review_context.attach(st, state)
+  state._pool = st
   -- The pool's ONE Turn learns of this file and its exact review attachment.
   -- First sight binds the Turn, registers teardown callbacks and fires
   -- turn_start; later files just join.
-  require("yana.turn.turn_bind").observe_open(st, {
+  local admitted, admission_err = require("yana.turn.turn_bind").observe_open(st, {
     path = diff.abs_path(change.path),
     ledger = state.hunk_ledger,
     -- End starts from B1, the buffer as it was when the agent finished, when
@@ -450,11 +452,26 @@ function Factory.new(deps)
     queue_remove_change = queue_remove_change,
     queue_pool_for = pool_for_turn_file,
     tabs = {
-      close_owned_tabs = function()
-        pcall(M.close_owned_tabs, opts)
+      close_owned_tabs = function(keep_paths)
+        local close_opts = vim.tbl_extend("force", opts or {}, { keep_paths = keep_paths or {} })
+        pcall(M.close_owned_tabs, close_opts)
       end,
     },
   })
+  if not admitted then
+    review_context.detach(st, state)
+    state._pool = nil
+    local closed, close_err = review_resources.close(state)
+    return false, tostring(admission_err or "turn refused the prepared review")
+      .. (closed and "" or ("; prepared review cleanup failed: " .. tostring(close_err)))
+  end
+  local review_tabs = M._review_tabs_init_for_turn(st, change, opts or {})
+  -- The strip uses this ownership record's tab, never the currently focused tab.
+  if review_tabs and review_tabs.owned and change.path then
+    local abs = diff.abs_path(change.path)
+    local owned = review_tabs.owned[abs]
+    state.review_tab = owned and owned.tab_id or nil
+  end
   -- R9 WIRING. The Turn is now bound and holds this file, so the question can
   -- be asked against the exact Turn member -- and asked BEFORE the first hunk,
   -- because nothing below has painted or bound a decision key yet.
@@ -630,9 +647,7 @@ function Factory.new(deps)
     -- ownership entry, and nothing has to re-derive which of them landed.
     review_resources.close(state)
     state._key_defs = {}
-    if st.active == state then
-      st.active = nil
-    end
+    review_context.detach(st, state)
     log.lifecycle_info("review.open.bind_refusal", {
       rel = change.rel or change.path,
       turn_id = change.turn_id or change.turn_gen,

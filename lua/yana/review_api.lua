@@ -1,4 +1,4 @@
--- Public queue, status, render, and close API for inline review.
+-- Public multi-file review, status, render, and close API.
 local Factory = {}
 
 function Factory.new(deps)
@@ -14,6 +14,7 @@ function Factory.new(deps)
   local review_tabs = deps.review_tabs
   local announce_state = deps.announce_state
   local pools = deps.pools
+  local state_for_buf = require("yana.review_context").state_for_buf
   local open_or_abandon = deps.open_or_abandon
   local notify = deps.notify
   local find_active_for_change = deps.find_active_for_change
@@ -49,7 +50,7 @@ function Factory.new(deps)
     require("yana.log").buffer_event("enqueue", { change = change, preview = opts.preview })
     stamp_proposed_creation(change, opts)
     local st = pool_for(opts)
-    if st.active and st.active.change == change then
+    if st.open[change] and not st.open[change].closed then
       return false
     end
     for _, item in ipairs(st.queue) do
@@ -66,15 +67,16 @@ function Factory.new(deps)
       owner = freeze_review_owner(opts),
     }
     remember_batch_item(st, item)
-    table.insert(st.queue, item)
-    local attempted = process_next_for(opts)
-    if attempted == change then
-      return "opened"
+    local ok, err = open_or_abandon(change, opts)
+    if not ok then
+      M._announce_open_failure(change, "inline review failed: " .. notify.error_headline(err), vim.log.levels.ERROR)
+      return false
     end
-    return "inserted"
+    announce_state()
+    return "opened"
   end
 
-  -- Drop active and queued reviews owned by one panel/stream epoch inside a workspace
+  -- Drop the owner's review attachments and any parked queue entries inside a workspace
   -- pool. Other owners' work in the same pool survives (H4). No live Turn, or zero
   -- hunks -> silent today.
   -- The two discard doors live in `yana.review_discard`: one question -- may
@@ -92,22 +94,16 @@ function Factory.new(deps)
   M.discard_for_owner = discard.discard_for_owner
   M.discard_pool = discard.discard_pool
 
-  -- M.open sets the `active` singleton with no guard, so reviewing change B while
-  -- change A was open silently overwrote it: A's keymaps, BufWriteCmd guard and
-  -- extmarks stayed live with nothing owning them, and A's eventual finish_session
-  -- cleared `active` out from under B. Queueing instead makes that state unreachable —
-  -- one review is open at a time by construction, which is the same invariant
-  -- process_next already assumes. The queue is checked as well as `active`: between
+  -- Each changed file owns its attachment and review keys in its own buffer.
   function M.review(change, opts)
     opts = opts or {}
     stamp_proposed_creation(change, opts)
     local st = pool_for(opts)
-    if st.active or #st.queue > 0 then
-      M.enqueue(change, opts)
-      return true
+    if not opts.preview then
+      local result = M.enqueue(change, opts)
+      return result == "opened" or result == false and st.open[change] ~= nil
     end
-    -- Same orphan contract as the queue path: a throw here must not leave the write
-    -- guard and keymaps armed. Fail like the queue path does: stamped (in
+    -- A throw here must not leave the write guard and keymaps armed. It is stamped (in
     -- open_or_abandon), announced, reported in one line, and falsy to the caller.
     local ok, err = open_or_abandon(change, opts)
     if not ok then
@@ -117,15 +113,19 @@ function Factory.new(deps)
     return true
   end
 
-  -- Returns queued-plus-active review count for opts' pool, or all pools.
+  -- Returns live review members plus any parked queue entries.
   function M.pending_count(opts)
     if opts then
       local st = pool_for(opts)
-      return #st.queue + (st.active and 1 or 0)
+      local count = 0
+      for _, item in ipairs(st.queue) do if not st.open[item.change] then count = count + 1 end end
+      for _, state in pairs(st.open) do if not state.closed then count = count + 1 end end
+      return count
     end
     local n = 0
     for _, st in pairs(pools) do
-      n = n + #st.queue + (st.active and 1 or 0)
+      for _, item in ipairs(st.queue) do if not st.open[item.change] then n = n + 1 end end
+      for _, state in pairs(st.open) do if not state.closed then n = n + 1 end end
     end
     return n
   end
@@ -134,51 +134,27 @@ function Factory.new(deps)
   function M.active_change(opts)
     if opts then
       local st = pool_for(opts)
-      return st.active and st.active.change or nil
+      local current = state_for_buf(st)
+      return current and current.change or nil
     end
     for _, st in pairs(pools) do
-      if st.active then
-        return st.active.change
-      end
+      local current = state_for_buf(st, vim.api.nvim_get_current_buf())
+      if current then return current.change end
+    end
+    for _, st in pairs(pools) do
+      local current = state_for_buf(st)
+      if current then return current.change end
     end
     return nil
   end
 
-  -- How many reviews a queued change actually waits on: everything ahead of it
-  -- in the queue, plus the open one. Callers used `pending_count() - 1`, which
-  -- is position-blind -- it reports the same number for every queued change, so
-  -- items queued BEHIND one inflated its own "behind N". Returns nil when the
-  -- change is not queued (open, resolved, or unknown to the engine).
-  function M.queue_wait(change, opts)
-    local st
-    if opts then
-      st = pool_for(opts)
-    else
-      st = find_active_for_change(change)
-      if not st then
-        for _, candidate in pairs(pools) do
-          for _, item in ipairs(candidate.queue) do
-            if item.change == change then
-              st = candidate
-              break
-            end
-          end
-          if st then break end
-        end
-      end
-    end
-    if not st then
-      return nil
-    end
-    for i, item in ipairs(st.queue) do
-      if item.change == change then
-        return (i - 1) + (st.active and 1 or 0)
-      end
-    end
-    return nil
+  function M.is_change_open(change, opts)
+    local st = opts and pool_for(opts) or find_active_for_change(change)
+    local state = st and st.open[change]
+    return state ~= nil and not state.closed
   end
 
-  -- Is `bufnr` under active or queued review? Consumed by the user's autosave
+  -- Is `bufnr` a review member? Consumed by the user's autosave
   -- config to suppress writes while a review is pending. Cheap and
   -- side-effect free: bufnr(path, false) never creates a buffer.
   function M.is_reviewing(bufnr)
@@ -186,8 +162,8 @@ function Factory.new(deps)
       return false
     end
     for _, st in pairs(pools) do
-      if st.active and st.active.bufnr == bufnr then
-        return true
+      for _, state in pairs(st.open) do
+        if state.bufnr == bufnr and not state.closed then return true end
       end
       for _, item in ipairs(st.queue) do
         if vim.fn.bufnr(diff.abs_path(item.change.path), false) == bufnr then
@@ -206,10 +182,10 @@ function Factory.new(deps)
   --- Panel-level accept/reject while inline review is open for this change.
   function M.resolve_change(change, action)
     local st = find_active_for_change(change)
-    if not st or not st.active or not change or st.active.change.id ~= change.id then
+    local active = st and (st.open or {})[change]
+    if not active then
       return false
     end
-    local active = st.active
     if action == "accept" then
       -- So this door CALLS `cf`'s own function (`accept_all`, review_decisions.lua:342)
       -- instead of keeping a second copy of its body beside it.
@@ -250,11 +226,12 @@ function Factory.new(deps)
   -- Focuses the active review's buffer/window for opts' pool.
   function M.focus_active(opts)
     local st = pool_for(opts or {})
-    if not st.active then
+    local active = state_for_buf(st)
+    if not active then
       return false
     end
-    if not land_on(st.active.change.path, st.active.bufnr, nil) then
-      focus_buf(st.active.change.path, st.active.bufnr)
+    if not land_on(active.change.path, active.bufnr, nil) then
+      focus_buf(active.change.path, active.bufnr)
     end
     return true
   end
@@ -262,12 +239,16 @@ function Factory.new(deps)
   -- Returns the active review state for opts' pool, or any pool's.
   function M.active_state(opts)
     if opts then
-      return pool_for(opts).active
+      local st = pool_for(opts)
+      return state_for_buf(st)
     end
     for _, st in pairs(pools) do
-      if st.active then
-        return st.active
-      end
+      local current = state_for_buf(st, vim.api.nvim_get_current_buf())
+      if current then return current end
+    end
+    for _, st in pairs(pools) do
+      local state = state_for_buf(st)
+      if state then return state end
     end
     return nil
   end
@@ -282,10 +263,11 @@ function Factory.new(deps)
   function M.reset_active_review()
     local current = vim.api.nvim_get_current_buf()
     for _, st in pairs(pools) do
-      local active = st.active
-      if active and active.bufnr == current and active._ops and type(active._ops.undo_turn) == "function" then
-        active._ops.undo_turn()
-        return true
+      for _, active in pairs(st.open) do
+        if active.bufnr == current and active._ops and type(active._ops.undo_turn) == "function" then
+          active._ops.undo_turn()
+          return true
+        end
       end
     end
     return false, "no_open_review_here"
@@ -313,13 +295,13 @@ function Factory.new(deps)
     local states = {}
     if opts and (opts.workspace or opts.review_owner) then
       local st = pool_for(opts)
-      if st.active then
-        states[#states + 1] = st.active
+      for _, state in pairs(st.open) do
+        if not state.closed then states[#states + 1] = state end
       end
     else
       for _, st in pairs(pools) do
-        if st.active then
-          states[#states + 1] = st.active
+        for _, state in pairs(st.open) do
+          if not state.closed then states[#states + 1] = state end
         end
       end
     end
@@ -350,8 +332,19 @@ function Factory.new(deps)
         queued = #st.queue,
         batched = {},
         queue = {},
+        open = {},
         active = nil,
       }
+      for change, state in pairs(st.open) do
+        if not state.closed then
+          pool.open[#pool.open + 1] = {
+            rel = change.rel or change.path,
+            bufnr = state.bufnr,
+            pending_hunks = #state.hunk_ledger:pending(),
+          }
+        end
+      end
+      table.sort(pool.open, function(a, b) return tostring(a.rel) < tostring(b.rel) end)
       for path in pairs(st.batched) do
         pool.batched[#pool.batched + 1] = path
       end
@@ -363,8 +356,8 @@ function Factory.new(deps)
           review_error = item.change and item.change.review_error or nil,
         }
       end
-      if st.active then
-        local state = st.active
+      local state = state_for_buf(st)
+      if state then
         local blocks = {}
         for i, b in ipairs(state.hunk_ledger:pending()) do
           blocks[i] = {
@@ -412,10 +405,11 @@ function Factory.new(deps)
   -- did. The answer says a decision was made, not that the session is closed.
   function M.close_active(opts)
     local st = pool_for(opts or {})
-    if not st.active then
+    local state = state_for_buf(st)
+    if not state then
       return false
     end
-    local reject_all = st.active._ops and st.active._ops.reject_all
+    local reject_all = state._ops and state._ops.reject_all
     if type(reject_all) ~= "function" then
       return false
     end

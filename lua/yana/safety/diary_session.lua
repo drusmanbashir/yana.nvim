@@ -12,18 +12,16 @@ function M.new(deps)
 	local journal_path = deps.journal_path
 	local fsync_dir = deps.fsync_dir
 	local resolve_target = deps.resolve_target
-	local hash_bytes = deps.hash_bytes
 	-- diary_state layer
 	local observe_state = deps.observe_state
-	local mode_perm = deps.mode_perm
+	local evidence_of = deps.evidence_of
 	-- Live reference (not a copy): a test that mutates
 	-- `diary._test.force_diary_root` at runtime is still seen here.
 	local test_state = deps.test_state
-	-- Late-bound: `M.empty_hash`/`M.intent`/`M.apply_pending` are defined
+	-- Late-bound: `M.intent`/`M.apply_pending` are defined
 	-- later in diary.lua (the public apply/readers groups), so these
 	-- forward through the parent's `M` table rather than capturing a value
 	-- before it exists.
-	local empty_hash = deps.empty_hash
 	local intent = deps.intent
 	local apply_pending = deps.apply_pending
 
@@ -203,21 +201,11 @@ function M.new(deps)
 		local base_hash_captured_ts = opts.base_hash_captured_ts
 		if base_hash == nil then
 			base_hash_captured_ts = base_hash_captured_ts or os.time()
-			if state.kind == "absent" then
-				base_hash = empty_hash()
-				base_state = base_state or "absent"
-			elseif state.kind == "file" then
-				base_hash = state.hash
-				base_state = base_state or "file"
-				base_mode = base_mode or mode_perm(state.mode)
-			elseif state.kind == "link" then
-				base_hash = hash_bytes(state.target or "")
-				base_state = base_state or "link"
-				base_mode = base_mode or mode_perm(state.mode)
-				base_link_target = base_link_target or state.target
-			else
-				return false, "cannot derive base_hash for checkpoint restore at " .. tostring(path)
-			end
+			local ev = evidence_of(state)
+			base_hash = ev.base_hash
+			base_state = base_state or ev.base_state
+			base_mode = base_mode or ev.base_mode
+			base_link_target = base_link_target or ev.base_link_target
 		end
 		local ok, err = intent({
 			session = session,

@@ -17,6 +17,7 @@ assets/yana-review.gif
 bin/lib/yana-overlay/capture_plan.sh
 bin/lib/yana-overlay/cgroup.sh
 bin/lib/yana-overlay/fuse.sh
+bin/lib/yana-overlay/layer_edit.sh
 bin/lib/yana-overlay/mount.sh
 bin/lib/yana-overlay/open_capture.sh
 bin/lib/yana-overlay/paths.sh
@@ -116,6 +117,7 @@ lua/yana/panel/ui_changes.lua
 lua/yana/panel/ui_claims.lua
 lua/yana/panel/ui_commands.lua
 lua/yana/panel/ui_events.lua
+lua/yana/panel/ui_followup.lua
 lua/yana/panel/ui_geometry.lua
 lua/yana/panel/ui_grid.lua
 lua/yana/panel/ui_input.lua
@@ -149,7 +151,6 @@ lua/yana/paths/ignore.lua
 lua/yana/paths/manifest.lua
 lua/yana/paths/path_key.lua
 lua/yana/paths/repo_root.lua
-lua/yana/prompts/debugger.lua
 lua/yana/record.lua
 lua/yana/render_check.lua
 lua/yana/render_check_extent.lua
@@ -184,7 +185,6 @@ lua/yana/review_open_bind_resume.lua
 lua/yana/review_open_display.lua
 lua/yana/review_open_hints.lua
 lua/yana/review_open_prompt.lua
-lua/yana/review_open_save.lua
 lua/yana/review_open_watchers.lua
 lua/yana/review_ownership.lua
 lua/yana/review_paint.lua
@@ -195,12 +195,14 @@ lua/yana/review_queue.lua
 lua/yana/review_queued_hunks.lua
 lua/yana/review_reread_highlight.lua
 lua/yana/review_resources.lua
+lua/yana/review_restore.lua
 lua/yana/review_tabs.lua
 lua/yana/review_tabs_close.lua
 lua/yana/review_tabs_record.lua
 lua/yana/review_turn.lua
 lua/yana/review_turn_reset.lua
 lua/yana/review_undo.lua
+lua/yana/review_undo_dispatch.lua
 lua/yana/review_undo_replay.lua
 lua/yana/review_undo_trace.lua
 lua/yana/review_undo_turn_all.lua
@@ -254,6 +256,11 @@ lua/yana/shadow/preview_turn.lua
 lua/yana/shadow/preview_workspace.lua
 lua/yana/turn/turn.lua
 lua/yana/turn/turn_bind.lua
+lua/yana/turn/turn_cycle.lua
+lua/yana/turn/turn_cycle_log.lua
+lua/yana/turn/turn_cycle_reconcile.lua
+lua/yana/turn/turn_cycle_view.lua
+lua/yana/turn/turn_end_plan.lua
 lua/yana/turn/turn_end_result.lua
 lua/yana/turn/turn_file.lua
 lua/yana/turn/turn_lifecycle.lua
@@ -262,6 +269,8 @@ lua/yana/turn/turn_overlay.lua
 lua/yana/turn/turn_plan.lua
 lua/yana/turn/turn_projection.lua
 lua/yana/turn/turn_register.lua
+lua/yana/turn/turn_register_graph.lua
+lua/yana/turn/turn_save_record.lua
 lua/yana/turn/turn_settle.lua
 lua/yana/turn/turn_settle_snapshot.lua
 lua/yana/turn/turn_signals.lua
@@ -270,6 +279,7 @@ lua/yana/ui.lua
 lua/yana/undo_action_buffer_edit.lua
 lua/yana/undo_action_decision.lua
 lua/yana/undo_action_file_creation.lua
+lua/yana/undo_action_followup_cycle.lua
 lua/yana/undo_action_merge.lua
 lua/yana/undo_action_native.lua
 lua/yana/undo_action_split.lua
