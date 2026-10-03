@@ -36,8 +36,19 @@ cmp "$work/a/yana.nvim-"*.tar.gz "$work/b/yana.nvim-"*.tar.gz
 "$work/export/tests/release/yana_ui_dependency_gate.sh" "$work/export" "$(command -v nvim)"
 DEV_CHECKOUT="$root" "$work/export/tests/release/confined_turn_gate.sh" "$work/export" "$(command -v nvim)"
 # Not in scripts/release/manifest.txt, so $root, never the export tree; the exceptions gate reaches the public remote.
-"$root/tests/release/candidate_check_gate.sh"
-"$root/tests/release/candidate_history_exceptions_gate.sh"
+"$root/tests/release/candidate_check_gate.sh" >"$work/candidate-check.log" 2>&1 &
+candidate_pid=$!
+"$root/tests/release/candidate_history_exceptions_gate.sh" >"$work/history-exceptions.log" 2>&1 &
+history_pid=$!
+candidate_rc=0
+history_rc=0
+wait "$candidate_pid" || candidate_rc=$?
+wait "$history_pid" || history_rc=$?
+cat "$work/candidate-check.log" "$work/history-exceptions.log"
+if (( candidate_rc != 0 || history_rc != 0 )); then
+	echo "RELEASE GATE FAIL: candidate gate=$candidate_rc, history exceptions gate=$history_rc" >&2
+	exit 1
+fi
 "$root/tests/release/yana_release_preflight_gate.sh"
 "$(command -v nvim)" --clean --headless -u NONE -i NONE --cmd "set rtp^=$root" -l "$root/tests/release/install_remedy_smoke.lua"
 "$(command -v nvim)" --clean --headless -u NONE -i NONE --cmd "set rtp^=$root" -l "$root/tests/release/health_yana_ui_smoke.lua"
