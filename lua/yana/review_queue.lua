@@ -25,6 +25,7 @@ function M.carryable_review_opts(opts)
     on_reject = opts.on_reject,
     on_kept_unreviewed = opts.on_kept_unreviewed,
     on_system_refused = opts.on_system_refused,
+    on_turn_joined = opts.on_turn_joined,
   }
 end
 

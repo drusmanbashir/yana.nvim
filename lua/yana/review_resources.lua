@@ -14,6 +14,30 @@
 -- `vim.fn.bufnr(file.path)` (a path resolves to whatever buffer holds the name).
 
 local M = {}
+local change_observers = {}
+
+function M.on_change(fn)
+  assert(type(fn) == "function", "on_change needs a function")
+  change_observers[#change_observers + 1] = fn
+  return function()
+    for i, observer in ipairs(change_observers) do
+      if observer == fn then table.remove(change_observers, i); break end
+    end
+  end
+end
+
+local function notify_change(state)
+  local observers = {}
+  for i, fn in ipairs(change_observers) do observers[i] = fn end
+  for _, fn in ipairs(observers) do
+    local ok, err = pcall(fn, state)
+    if not ok then
+      pcall(function()
+        require("yana.log").write("ERROR", "review resource observer failed: " .. tostring(err))
+      end)
+    end
+  end
+end
 
 --- Buffer-owner table: `owners[bufnr] = { state, hooks, augroup, name }`.
 --- Not `review_watch`'s table: park drops the watcher's entry while this review
@@ -111,13 +135,6 @@ local function release_preview(state)
   if state.opts and state.opts.preview and buf_valid(state.bufnr) then
     pcall(vim.api.nvim_buf_delete, state.bufnr, { force = true })
   end
-end
-
---- The strip is the SIDEBAR's; park and close only re-render it.
-local function refresh_button_strip()
-  pcall(function()
-    require("yana.panel.ui_review_buttons").refresh()
-  end)
 end
 
 --- Windows this state put highlighting on (`state.winhl_restore`) that are still
@@ -221,7 +238,7 @@ function M.park(state)
     local finalized, reason = watch.finalize(state.bufnr, state)
     if not finalized then return false, "park refused: " .. tostring(reason) end
   end
-  refresh_button_strip()
+  notify_change(state)
   release_preview(state)
   -- Only the owner unbinds keys: a newer review's maps share the same lhs.
   if owner ~= nil then
@@ -290,7 +307,7 @@ function M.close(state)
     local ok, err = release_once(state, name, fn)
     if not ok then unreleased[#unreleased + 1] = name .. ": " .. tostring(err) end
   end
-  refresh_button_strip()
+  notify_change(state)
   release_preview(state)
 
   -- ONLY the required releases run before the answer. Everything that gives the

@@ -1,4 +1,5 @@
 -- yana: configuration defaults table (facade: yana.config).
+local prompts = require("yana.prompts")
 
 local defaults = {
   -- WHERE cursor-agent IS RESOLVED FROM. Nothing below bakes in a username or absolute
@@ -201,19 +202,6 @@ local defaults = {
   -- leaves the standout colour to the mode chip.
   model_highlight = { link = "Identifier" },
 
-  -- Prepended to inline-mode prompts. Read from prompt.txt at the plugin root;
-  -- empty (and therefore disabled) when that file is missing.
-  agent_instructions = (function()
-    local root = vim.fn.fnamemodify(debug.getinfo(1, "S").source:sub(2), ":h:h:h:h")
-    local f = io.open(root .. "/prompt.txt", "r")
-    if not f then
-      return ""
-    end
-    local text = f:read("*a")
-    f:close()
-    return text
-  end)(),
-
   selection_scope = {
     -- "reject" hard-blocks out-of-zone edits; "warn" keeps them reviewable with a note; "off" disables.
     enforce = "reject",
@@ -240,7 +228,7 @@ local defaults = {
     -- redirect is aborted (text returned to the prompt) — never two processes.
     kill_grace_ms = 1500,
     -- One-line prefix telling the model the previous turn was cut.
-    marker = "[redirect — previous turn interrupted]",
+    marker = prompts.render("redirect_marker"),
   },
 
   context = {

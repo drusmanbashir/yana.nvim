@@ -102,6 +102,8 @@ Runtime provenance inventory:
 - post-fork original: `lua/yana/render_check.lua`
 - post-fork original: `lua/yana/agent/renewal.lua`
 - post-fork original: `lua/yana/paths/repo_root.lua`
+- post-fork original: `lua/yana/prompts/init.lua`
+- post-fork original: `lua/yana/prompts/templates.lua`
 - post-fork original: `lua/yana/safety/checkpoint.lua`
 - post-fork original: `lua/yana/safety/control_plane.lua`
 - post-fork original: `lua/yana/safety/diary.lua`

@@ -169,6 +169,7 @@ function M.new(deps)
   local append = deps.append
   local commit_stream = deps.commit_stream
   local update_winbar = deps.update_winbar
+  local render_review_status = deps.render_review_status
   local buf_valid = deps.buf_valid
   local start_spinner = deps.start_spinner
   local stop_spinner = deps.stop_spinner
@@ -215,6 +216,9 @@ local function begin_accept_indication(p)
   end)
 end
 local function change_footer_text(change, _k)
+  if change.review_withdrawn then
+    return "_Withdrawn — undo removed this file from the review._"
+  end
   if change.status == "pending" then
     local maps = config.options.mappings
     return string.format(
@@ -228,6 +232,9 @@ local function change_footer_text(change, _k)
   end
   if change.status == "accepted" then
     return "Accepted · agent edit kept"
+  end
+  if change.status == "superseded" then
+    return "Merged · reviewed with this file's earlier change"
   end
   if change.status == "kept_unreviewed" then
     return "_kept unreviewed — agent edit kept, no consent recorded_"
@@ -249,6 +256,9 @@ local function conv_base_line(p)
 end
 
 local function change_header_text(change, counts)
+  if change.review_withdrawn then
+    return "**Withdrawn `" .. notify.flatten(change.rel) .. "`** — undo removed this file from the review."
+  end
   local badge = change.undeclared and " · undeclared" or ""
   return "**"
     .. diff.status_icon(change)
@@ -462,6 +472,7 @@ local function render_scope_rejection(p, change, reason)
     notify_one_line("yana: " .. tostring(rerr), vim.log.levels.WARN)
   end
   change.status = "rejected"
+  render_review_status(p)
   append(p, {
     "",
     "**✗ rejected `" .. label .. "`** (outside selection scope)",
@@ -501,7 +512,9 @@ local function refresh_review_claim(p, change)
   local ws_opts = change.review_workspace and { workspace = change.review_workspace }
     or { workspace = panel_claimed_workspace(p) }
   local text
-  if change.review_error then
+  if change.review_withdrawn then
+    text = "_Withdrawn — undo removed this file from the review._"
+  elseif change.review_error then
     -- FLATTENED, and this is not cosmetic. review_error routinely carries a multi-line
     -- value: a failed save stamps the full nvim_exec2 error including its stack
     -- traceback. nvim_buf_set_lines REJECTS any item containing a newline, so the raw

@@ -7,6 +7,7 @@
 --
 -- `deps` carries the parent's product-policy caps (constants, not options —
 -- see renewal.lua) so this module closes over no upvalue it was not handed.
+local prompts = require("yana.prompts")
 local M = {}
 
 function M.new(deps)
@@ -101,7 +102,7 @@ local function decision_sets(p)
 				if c._accept_regime == "transfer" then
 					local b = vim.fn.bufnr(c.path, false)
 					if b > 0 and vim.api.nvim_buf_is_loaded(b) and vim.bo[b].modified then
-						name = tostring(name) .. " (accepted, unsaved — not yet on disk)"
+						name = prompts.render("brief_unsaved_accepted", { file = tostring(name) })
 					end
 				end
 				push_unique(accepted, seen_a, name, { rel = name, hash = hash })
@@ -159,15 +160,15 @@ local function outcome_of(p)
 		return nil
 	end
 	if o.cancelled then
-		return "cancelled"
+		return prompts.render("outcome_cancelled")
 	end
 	if o.turn_errored or (o.exit_code ~= nil and o.exit_code ~= 0) then
-		return string.format("ended with an error (exit %s)", tostring(o.exit_code))
+		return prompts.render("outcome_error", { code = tostring(o.exit_code) })
 	end
 	if o.got_result then
-		return "completed"
+		return prompts.render("outcome_completed")
 	end
-	return "ended without a result"
+	return prompts.render("outcome_no_result")
 end
 
 --- Compose the brief for a renewal from `from_mode` to `to_mode`.
@@ -222,7 +223,7 @@ local function name_list(rows, cap)
 	local names = {}
 	for i, row in ipairs(rows) do
 		if i > cap then
-			names[#names + 1] = string.format("… and %d more", #rows - cap)
+			names[#names + 1] = prompts.render("brief_more_files", { count = #rows - cap })
 			break
 		end
 		if row.hash and row.hash ~= "" then
@@ -238,7 +239,7 @@ local function refused_list(rows, cap)
 	local out = {}
 	for i, row in ipairs(rows) do
 		if i > cap then
-			out[#out + 1] = string.format("… and %d more", #rows - cap)
+			out[#out + 1] = prompts.render("brief_more_files", { count = #rows - cap })
 			break
 		end
 		if row.reason and row.reason ~= "" then
@@ -255,16 +256,16 @@ render_decision_note = function(accepted, rejected, refused)
 		return nil
 	end
 	local lines = {
-		"Yana record from the previous turn; operator decisions are authoritative, not agent claims:",
+		prompts.render("decision_note_header"),
 	}
 	if #accepted > 0 then
-		lines[#lines + 1] = "Accepted: " .. name_list(accepted, deps.file_list_cap)
+		lines[#lines + 1] = prompts.render("decision_accepted", { files = name_list(accepted, deps.file_list_cap) })
 	end
 	if #rejected > 0 then
-		lines[#lines + 1] = "Rejected: " .. name_list(rejected, deps.file_list_cap)
+		lines[#lines + 1] = prompts.render("decision_rejected", { files = name_list(rejected, deps.file_list_cap) })
 	end
 	if #refused > 0 then
-		lines[#lines + 1] = "Refused: " .. refused_list(refused, deps.file_list_cap)
+		lines[#lines + 1] = prompts.render("refused_files", { files = refused_list(refused, deps.file_list_cap) })
 	end
 	return table.concat(lines, "\n")
 end
@@ -272,30 +273,30 @@ end
 --- The five-line head every rendering shares.
 local function head_lines(b)
 	local lines = {
-		"Continuing an existing conversation in a new mode.",
-		string.format("Workspace: %s", b.workspace),
-		string.format("Mode: %s (was %s)", b.to_mode, b.from_mode),
+		prompts.render("brief_opening"),
+		prompts.render("brief_workspace", { path = tostring(b.workspace) }),
+		prompts.render("brief_mode", { to = tostring(b.to_mode), from = tostring(b.from_mode) }),
 	}
 	if b.instruction then
 		local q = clip(b.instruction, deps.instruction_cap_bytes)
 		if #b.instruction > deps.instruction_cap_bytes then
 			q = q .. "…"
 		end
-		lines[#lines + 1] = "Previous instruction: " .. q
+		lines[#lines + 1] = prompts.render("brief_previous_instruction", { text = q })
 	end
 	if b.outcome then
-		lines[#lines + 1] = "Previous outcome: " .. b.outcome
+		lines[#lines + 1] = prompts.render("brief_previous_outcome", { outcome = b.outcome })
 	end
 	if #b.accepted > 0 then
-		lines[#lines + 1] = "Accepted last turn: " .. name_list(b.accepted, deps.file_list_cap)
+		lines[#lines + 1] = prompts.render("brief_accepted_last_turn", { files = name_list(b.accepted, deps.file_list_cap) })
 	end
 	if #b.rejected > 0 then
-		lines[#lines + 1] = "Rejected last turn: " .. name_list(b.rejected, deps.file_list_cap)
+		lines[#lines + 1] = prompts.render("brief_rejected_last_turn", { files = name_list(b.rejected, deps.file_list_cap) })
 	end
 	-- A refusal is part of the story: a control-plane refusal in particular is
 	-- something the next session must not be told happened cleanly.
 	if #b.system_refused > 0 then
-		lines[#lines + 1] = "Refused: " .. refused_list(b.system_refused, deps.file_list_cap)
+		lines[#lines + 1] = prompts.render("refused_files", { files = refused_list(b.system_refused, deps.file_list_cap) })
 	end
 	return lines
 end
@@ -309,8 +310,8 @@ local function carry_text(b)
 	if b.artifact and b.artifact ~= "" then
 		local body, truncated = clip(b.artifact, deps.carry_cap_bytes)
 		lines[#lines + 1] = (b.artifact_kind == "code_blocks")
-				and "Artifact from the previous answer (its code blocks, verbatim):"
-			or "The previous answer, carried in full:"
+				and prompts.render("brief_artifact_code_blocks")
+			or prompts.render("brief_artifact_full_answer")
 		lines[#lines + 1] = body .. (truncated and "\n…" or "")
 	end
 	return table.concat(lines, "\n")

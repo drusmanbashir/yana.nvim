@@ -1,7 +1,7 @@
 -- Per-tab review controls. The strip is SIDEBAR CHROME: it belongs to the
 -- panel, is split between that panel's conversation and prompt, and its
--- existence has exactly ONE condition -- a live Turn for the panel's pool
--- (`turn_start` attaches, `turn_end` removes). Sidebar toggle, resize, tab
+-- existence has exactly ONE condition -- a live, unsealed Turn for the panel's pool
+-- (`turn_start` attaches, `turn_sealed`/`turn_end` remove). Sidebar toggle, resize, tab
 -- mirroring, park/resume, review close and a zero pending count never remove
 -- it; no pending work only DIMS buttons (F-BUTTON-STRIP).
 --
@@ -829,7 +829,7 @@ function M.open(pool)
   return any
 end
 
--- turn_end: the one event that removes the strip.
+-- A confirmed End removes the strip at turn_sealed; turn_end also removes it.
 function M.remove(pool)
   for _, e in ipairs(all_entries()) do
     if pool == nil or e.pool == pool then close_entry(e, "turn_end") end

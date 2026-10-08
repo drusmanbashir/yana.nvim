@@ -12,13 +12,12 @@ local ledger = require("yana.ledger")
 local M = {}
 
 -- deps.current_panel: parent-local panel bookkeeping (module-level, not reassigned).
--- deps.update_winbar: yana.ui_winbar facade local. deps.turn_ledger: yana.ui_render
--- facade local.
+-- deps.render_review_status: the panel's review-status view (yana.panel.ui_review).
+-- deps.turn_ledger: yana.ui_render facade local.
 function M.new(deps)
   local current_panel = deps.current_panel
-  local update_winbar = deps.update_winbar
+  local render_review_status = deps.render_review_status
   local turn_ledger = deps.turn_ledger
-  local refresh_change_block = deps.refresh_change_block
   local panel_claimed_workspace = deps.panel_claimed_workspace
   local inline_review_opts = deps.inline_review_opts
   local MAX_REVIEW_RETRY = deps.MAX_REVIEW_RETRY
@@ -164,8 +163,7 @@ local function accept_change(change)
     if inline.resolve_change(change, "accept") then
       local p = current_panel()
       if p then
-        refresh_change_block(p, change)
-        update_winbar(p)
+        render_review_status(p)
       end
       return true
     end
@@ -212,8 +210,7 @@ local function reject_change(change)
     if inline.resolve_change(change, "reject") then
       local p = current_panel()
       if p then
-        refresh_change_block(p, change)
-        update_winbar(p)
+        render_review_status(p)
       end
       return true
     end

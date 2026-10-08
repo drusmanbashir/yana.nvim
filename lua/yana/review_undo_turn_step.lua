@@ -93,6 +93,7 @@ function Factory.new(env)
 
     local function undo_accept_turn_step(row)
       local touched = {}
+      local status_changed = false
       if row.active and row.active.rel then
         local operation_ok, operation_err = move_operation(row.active, false)
         if not operation_ok then
@@ -123,6 +124,7 @@ function Factory.new(env)
       for _, entry in ipairs(row.files or {}) do
         local operation_ok, operation_err = move_operation(entry, false)
         if not operation_ok then
+          if status_changed then deps.announce_state() end
           undo_refuse(tostring(operation_err))
           return false
         end
@@ -132,6 +134,7 @@ function Factory.new(env)
           end
         end
         if type(entry.change) == "table" then
+          status_changed = status_changed or entry.change.status ~= "pending"
           entry.change.status = "pending"
           entry.change.review_error = nil
         end
@@ -156,6 +159,7 @@ function Factory.new(env)
       log.write("INFO", summary)
       notify_one_line(summary, vim.log.levels.INFO)
       record_decision(state, "undo_accept_turn_step", { files_undone = #touched, files_refused = 0 })
+      if status_changed then deps.announce_state() end
       return true
     end
 
@@ -165,6 +169,7 @@ function Factory.new(env)
     local function apply_row(row)
       local touched = {}
       local refused = {}
+      local status_changed = false
       if row.active and row.active.rel then
         local operation_ok, operation_err = move_operation(row.active, true)
         if not operation_ok then
@@ -195,6 +200,7 @@ function Factory.new(env)
             end
           end
           if type(entry.change) == "table" then
+            status_changed = status_changed or entry.change.status ~= "accepted"
             entry.change.status = "accepted"
           end
           dequeue_redone(entry)
@@ -234,6 +240,7 @@ function Factory.new(env)
           vim.log.levels.WARN
         )
       end
+      if status_changed then deps.announce_state() end
       return #refused == 0
     end
 

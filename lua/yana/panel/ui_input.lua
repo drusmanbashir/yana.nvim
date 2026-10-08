@@ -1,5 +1,6 @@
 -- Prompt paste + panel stop-on-key (split from yana.ui).
 local config = require("yana.config")
+local prompts = require("yana.prompts")
 local clipboard = require("yana.input.clipboard")
 local log = require("yana.log")
 local notify = require("yana.notify")
@@ -68,7 +69,7 @@ function M.new(deps)
       local token = "[Image#" .. tostring(attachment.id) .. "]"
       local start = text:find(token, 1, true)
       if start then
-        local replacement = token .. " (attached image: " .. attachment.path .. ")"
+        local replacement = prompts.render("attached_image", { token = token, path = attachment.path })
         if not opts or opts.expand_paths ~= false then
           text = text:sub(1, start - 1) .. replacement .. text:sub(start + #token)
         end

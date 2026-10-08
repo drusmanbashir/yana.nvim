@@ -426,10 +426,9 @@ function Factory.new(deps)
     -- each panel owner once when one session-wide Turn spans several panels.
     review_owner = turn_file_owner,
     review_state = state,
-    -- Turn-end status flip: the Turn's own End settles bytes and tears down WITHOUT the
-    -- v1 finish_session_now write that retires change.status -- _poll_leave_edge reports
-    -- "stay" on that branch, so review_lifecycle.lua's flip is unreachable and nothing
-    -- in the Turn path writes change.status.
+    -- The Turn's own End settles bytes and tears down WITHOUT review_lifecycle's
+    -- finish_session status write; turn_bind's terminal cleanup writes change.status
+    -- instead, and only the Turn's `turn_end` signal follows it.
     change = change,
   }, {
     opts_fn = function()
@@ -464,6 +463,14 @@ function Factory.new(deps)
     local closed, close_err = review_resources.close(state)
     return false, tostring(admission_err or "turn refused the prepared review")
       .. (closed and "" or ("; prepared review cleanup failed: " .. tostring(close_err)))
+  end
+  -- The review's owner subscribes its view to the Turn that now holds this file.
+  local on_turn_joined = state.opts and state.opts.on_turn_joined
+  if type(on_turn_joined) == "function" then
+    local joined, join_err = pcall(on_turn_joined, admitted)
+    if not joined then
+      require("yana.log").write("WARN", "yana: review owner on_turn_joined failed: " .. tostring(join_err))
+    end
   end
   local review_tabs = M._review_tabs_init_for_turn(st, change, opts or {})
   -- The strip uses this ownership record's tab, never the currently focused tab.

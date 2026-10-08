@@ -4,6 +4,7 @@
 -- history"). ui_submit asks `follow_up`, then `begin_follow_up` / `drop_launch`; ui_turn_shadow hands a refused
 -- launch to `launch_refused` and a recorded result to `publish_result`.
 local say = require("yana.notify").one_line
+local prompts = require("yana.prompts")
 local clog = require("yana.turn.turn_cycle_log")
 
 local M = {}
@@ -29,10 +30,9 @@ end
 
 function M.prompt_line(turn)
   local rejected = M.rejected_paths(turn)
-  local names = #rejected == 0 and "none" or table.concat(vim.list_slice(rejected, 1, 8), ", ")
-    .. (#rejected > 8 and string.format(" and %d more", #rejected - 8) or "")
-  return "[Yana] This prompt continues the open review of your previous changes in this conversation; the operator "
-    .. "rejected hunks in: " .. names .. ". The user may keep editing while you work."
+  local names = #rejected == 0 and prompts.render("followup_no_files") or table.concat(vim.list_slice(rejected, 1, 8), ", ")
+    .. (#rejected > 8 and prompts.render("followup_more_files", { count = #rejected - 8 }) or "")
+  return prompts.render("followup_open_review", { files = names })
 end
 
 -- F-ADDENDUM-TRIGGER, -NO-RESUME, F-PROMPT-HANDOVER (panel rules; prompt-delivery plan steps 3-4): the
@@ -169,6 +169,7 @@ local function join_new_file(p, live, f)
   local change = f.change
   local path = require("yana.diff").abs_path(change.path)
   -- A redo of the publication re-admits the change its undo withdrew (kept_unreviewed) as pending again.
+  change.review_withdrawn = nil
   change.status = "pending"
   table.insert(p.changes, change)
   doors.render_tool_change(p, change)
@@ -195,9 +196,12 @@ local function withdraw_new_file(p, path, change, forget_uncommitted_history)
     end
   end
   change.status = "kept_unreviewed"
+  change.review_withdrawn = true
+  doors.render_review_status(p)
   for i = #(p.changes or {}), 1, -1 do
     if p.changes[i] == change then table.remove(p.changes, i) end
   end
+  doors.render_review_status(p)
   local abs = require("yana.diff").abs_path(path)
   if require("yana.turn.turn_bind").withdraw_unopened(abs) ~= true then return false end
   if forget_uncommitted_history then

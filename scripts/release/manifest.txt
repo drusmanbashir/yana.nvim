@@ -151,6 +151,8 @@ lua/yana/paths/ignore.lua
 lua/yana/paths/manifest.lua
 lua/yana/paths/path_key.lua
 lua/yana/paths/repo_root.lua
+lua/yana/prompts/init.lua
+lua/yana/prompts/templates.lua
 lua/yana/record.lua
 lua/yana/render_check.lua
 lua/yana/render_check_extent.lua

@@ -2,6 +2,7 @@
 -- Every turn and event callback arrives by name, so who answers a turn is decided where
 -- this service is built.
 local config = require("yana.config")
+local prompts = require("yana.prompts")
 local notify = require("yana.notify")
 local notify_one_line = notify.one_line
 local sessions = require("yana.runtime.sessions")
@@ -379,7 +380,7 @@ function M.new(deps)
   -- Mode switch ended the upstream session: carry context so the agent does not silently forget.
   local carried, carried_brief, carried_state = renewal.consume(p)
   if carried then
-    built.prompt = "[Context carried from the earlier part of this conversation, which ran in a different mode]\n"
+    built.prompt = prompts.render("carried_context_header") .. "\n"
       .. carried
       .. "\n\n"
       .. built.prompt

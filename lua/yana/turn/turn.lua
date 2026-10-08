@@ -231,6 +231,9 @@ end
 -- captured evidence retained, and no external collaborator is entered.
 function Turn:freeze_for_end(cause)
 	if self.frozen then return true end
+	if self.bus.draining then
+		return false, "freeze_for_end inside a Turn signal drain"
+	end
 	self.sealing = true
 	local watch = require("yana.review_watch")
 	local tokens = {}
@@ -264,7 +267,7 @@ function Turn:freeze_for_end(cause)
 	end_plan.publish(self, candidate)
 	self.frozen = true
 	self.sealing = nil
-	if self.deps.on_sealed then self.deps.on_sealed(self) end
+	self.bus:emit("turn_sealed", { turn = self })
 	for _, token in ipairs(tokens) do
 		local retired, retire_reason = watch.retire_end(token)
 		if not retired then return false, retire_reason end
@@ -485,6 +488,7 @@ function Turn:end_turn(cause, context)
 	if not called or not froze then
 		self.frozen = true
 		self.sealing = nil
+		self.bus:emit("turn_sealed", { turn = self })
 		self:deliver_end_result("partial", { phase = "local", reason = tostring(called and freeze_err or froze) })
 		return true
 	end

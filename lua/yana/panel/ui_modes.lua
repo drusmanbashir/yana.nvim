@@ -10,6 +10,7 @@ local notify = require("yana.notify")
 local notify_one_line = notify.one_line
 --- Switch itself never renews; renewal.blocked gates review-open / in-flight.
 local renewal = require("yana.agent.renewal")
+local prompts = require("yana.prompts")
 local conversation = require("yana.panel.conversation")
 
 local M = {}
@@ -68,12 +69,7 @@ function M.new(deps)
     if artifact == nil or artifact == "" then
       return question
     end
-    return table.concat({
-      "Apply exactly what we agreed in the previous ask answer.",
-      "Treat this artifact as the source of truth for the edits.",
-      "",
-      artifact,
-    }, "\n")
+    return prompts.render("apply_ask_answer", { artifact = artifact })
   end
 
   --- The brief AS THE OPERATOR SEES IT at switch time, not the raw transcript.
@@ -94,13 +90,13 @@ function M.new(deps)
     if not ((p.last_question and p.last_question ~= "") or (p.last_answer_text and p.last_answer_text ~= "")) then
       return nil
     end
-    local lines = { "[Context from the other seat on this panel]" }
+    local lines = { prompts.render("other_seat_header") }
     if p.last_question and p.last_question ~= "" then
-      lines[#lines + 1] = "Previous request:"
+      lines[#lines + 1] = prompts.render("other_seat_request")
       lines[#lines + 1] = p.last_question
     end
     if p.last_answer_text and p.last_answer_text ~= "" then
-      lines[#lines + 1] = "Previous answer:"
+      lines[#lines + 1] = prompts.render("other_seat_answer")
       lines[#lines + 1] = p.last_answer_text
     end
     return table.concat(lines, "\n")

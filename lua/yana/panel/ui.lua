@@ -333,11 +333,13 @@ local trunc_display = ui_winbar.trunc_display
 
 -- Instantiated early so later clusters read these as plain in-scope locals (same placement as ui_render).
 local ui_claims_factory = require("yana.panel.ui_claims")
+local render_review_status
 local ui_claims = ui_claims_factory.new({
   state = S,
   append = append,
   commit_stream = commit_stream,
   update_winbar = update_winbar,
+  render_review_status = function(p) return render_review_status(p) end,
   buf_valid = buf_valid,
   start_spinner = start_spinner,
   stop_spinner = stop_spinner,
@@ -381,7 +383,8 @@ local ui_review = ui_review_factory.new({
   stamp_undeclared_badge = stamp_undeclared_badge,
   bump_review_rejection = bump_review_rejection,
 })
-local refresh_all_review_claims = ui_review.refresh_all_review_claims
+render_review_status = ui_review.render_review_status
+require("yana.panel.ui_followup").set_doors({ render_review_status = render_review_status })
 local MAX_REVIEW_RETRY = ui_review.MAX_REVIEW_RETRY
 local REVIEW_RETRY_EXHAUSTED = ui_review.REVIEW_RETRY_EXHAUSTED
 local inline_review_opts = ui_review.inline_review_opts
@@ -393,9 +396,8 @@ local render_tool_change = ui_review.render_tool_change
 local ui_changes_factory = require("yana.panel.ui_changes")
 local ui_changes = ui_changes_factory.new({
   current_panel = current_panel,
-  update_winbar = update_winbar,
+  render_review_status = render_review_status,
   turn_ledger = turn_ledger,
-  refresh_change_block = refresh_change_block,
   panel_claimed_workspace = panel_claimed_workspace,
   inline_review_opts = inline_review_opts,
   MAX_REVIEW_RETRY = MAX_REVIEW_RETRY,
@@ -640,7 +642,7 @@ local ui_panel = ui_panel_factory.new({
   paste_into_panel = ui_input.paste_into_panel,
   update_winbar = update_winbar,
   prompt_winbar_text = prompt_winbar_text,
-  refresh_all_review_claims = refresh_all_review_claims,
+  render_review_status = render_review_status,
   stop_spinner = stop_spinner,
 })
 local apply_panel_keymaps = ui_panel.apply_panel_keymaps
@@ -804,5 +806,6 @@ end
 
 -- The configured side-panel observer reads this key without requiring it.
 package.loaded["yana.ui"] = M
+require("yana.panel.ui_review_buttons_signals").install()
 
 return M

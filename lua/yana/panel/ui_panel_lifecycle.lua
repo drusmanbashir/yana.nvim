@@ -65,7 +65,7 @@ function M.new(deps)
   local prune_panels = deps.prune_panels
   local destroy_panel = deps.destroy_panel
   local install_stop_on_key = deps.install_stop_on_key
-  local refresh_all_review_claims = deps.refresh_all_review_claims
+  local render_review_status = deps.render_review_status
   local stop_spinner = deps.stop_spinner
   local apply_panel_keymaps = deps.apply_panel_keymaps
   local setup_panel_autocmds = deps.setup_panel_autocmds
@@ -130,9 +130,9 @@ function M.new(deps)
     install_stop_on_key()
     local p = new_panel_state()
     p.mode = config.panel_mode(nil)
-    -- Repaint claims on EVERY engine transition, not only this panel's own edges.
+    -- Repaint review status on EVERY engine transition, not only this panel's own edges.
     p.unsubscribe_review = require("yana.inline_diff").on_state_change(function()
-      refresh_all_review_claims(p)
+      render_review_status(p)
     end)
 
     -- Door for (re)issuing the daemon session, installed on EVERY panel. Create is the default;
@@ -265,10 +265,10 @@ function M.new(deps)
           ensure_prompt_win(q, tab)
           if not q.unsubscribe_review then
             q.unsubscribe_review = require("yana.inline_diff").on_state_change(function()
-              refresh_all_review_claims(q)
+              render_review_status(q)
             end)
           end
-          refresh_all_review_claims(q)
+          render_review_status(q)
         end
       else
         if not panel_open_in(target, tab) then
@@ -276,10 +276,10 @@ function M.new(deps)
         end
         if not target.unsubscribe_review then
           target.unsubscribe_review = require("yana.inline_diff").on_state_change(function()
-            refresh_all_review_claims(target)
+            render_review_status(target)
           end)
         end
-        refresh_all_review_claims(target)
+        render_review_status(target)
       end
       if target.yanad_session_id and not target.yanad_session_pending then
         local root = current_state_root()

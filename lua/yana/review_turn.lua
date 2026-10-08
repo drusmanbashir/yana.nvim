@@ -290,8 +290,8 @@ function M._record_shadow_accept_refusal(state, err)
   if not state.hunk_ledger then
     error("review_turn: _record_shadow_accept_refusal needs a state with a hunk_ledger", 2)
   end
+  announce_state()
   if state.hunk_ledger:count() > 0 then
-    announce_state()
     schedule_queue_advance(state)
     return true
   end

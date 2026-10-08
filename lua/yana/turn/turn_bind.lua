@@ -12,6 +12,31 @@ local current = nil
 local current_overlay = nil
 -- The pool the live Turn was bound to; the one record sidebar chrome asks.
 local current_pool = nil
+local wired_observers = {}
+
+local function notify_wired(fn, turn, pool)
+	local ok, err = pcall(fn, turn, pool)
+	if not ok then
+		pcall(function()
+			require("yana.log").write("ERROR", "turn wired observer failed: " .. tostring(err))
+		end)
+	end
+end
+
+-- Panel views can attach after a Turn starts. Replay the live wired Turn once
+-- so a late subscriber sees the same model as an early one.
+function M.on_turn_wired(fn)
+	assert(type(fn) == "function", "on_turn_wired needs a function")
+	wired_observers[#wired_observers + 1] = fn
+	if current and current:is_live() and current._wired then
+		notify_wired(fn, current, current_pool)
+	end
+	return function()
+		for i, observer in ipairs(wired_observers) do
+			if observer == fn then table.remove(wired_observers, i); break end
+		end
+	end
+end
 
 -- Advance hook invoked when a file reaches zero pending mid-turn. Not a Turn method
 -- or Bus signal (Turn never drives UI). Wired once in observe_open, dropped with the Turn.
@@ -187,12 +212,6 @@ function M.bind(pool, files, hooks)
 	current = Turn.new(files, {
 		ask = wiring.make_ask(hooks.opts_fn),
 		settler = settle,
-		on_sealed = function()
-			-- A strip can only exist after its module was loaded. Direct Turn tests
-			-- and headless owners have no panel chrome to remove.
-			local buttons = package.loaded["yana.panel.ui_review_buttons"]
-			if type(buttons) == "table" then buttons.remove() end
-		end,
 		close = function(turn, cause, _refused, done)
 			return close_review_owners(turn, cause, done)
 		end,
@@ -259,24 +278,9 @@ function M.observe_open(pool, file_entry, hooks)
 			})
 		end
 		t:register(wiring.tabs_callback(hooks.tabs))
-			-- Namespaces and keys are released by `review_resources.close` through the owner
-			-- table. The button strip's only existence condition is a live Turn; the
-			-- focused live attachment decides dimming at render time.
-		t:register({
-			name = "buttons",
-			turn_start = function(_cb, _ctx)
-				pcall(require("yana.panel.ui_review_buttons").open, pool)
-			end,
-			review_alive = function(_cb, _ctx)
-				pcall(require("yana.panel.ui_review_buttons").open, pool)
-			end,
-			review_finished = function(_cb, _ctx)
-				pcall(require("yana.panel.ui_review_buttons").refresh)
-			end,
-			turn_end = function(_cb, _ctx)
-				pcall(require("yana.panel.ui_review_buttons").remove, pool)
-			end,
-		})
+		local observers = {}
+		for i, fn in ipairs(wired_observers) do observers[i] = fn end
+		for _, fn in ipairs(observers) do notify_wired(fn, t, current_pool) end
 			-- No `turn_end` teardown listener: `deps.cleanup` (mandatory, fallible) sweeps active AND parked reviews.
 		t:start()
 	end

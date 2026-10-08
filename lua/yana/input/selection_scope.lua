@@ -1,6 +1,7 @@
 -- yana: structural edit zone for a visual selection + diff validation.
 local diff = require("yana.diff")
 local config = require("yana.config")
+local prompts = require("yana.prompts")
 
 local M = {}
 
@@ -403,22 +404,12 @@ function M.describe(scope)
   local label = node_label(scope.node_kind, scope.node_name)
   local mode = M.enforcement_for(scope)
   if mode == "reject" then
-    return string.format(
-      "Edit zone: %s, lines L%d–L%d. Plugin rejects edits outside this range.",
-      label,
-      scope.zone_l1,
-      scope.zone_l2
-    )
+    return prompts.render("edit_zone_enforced", { block = label, first = scope.zone_l1, last = scope.zone_l2 })
   end
   if mode == "warn" then
-    return string.format(
-      "Advisory edit zone: %s, lines L%d–L%d. Out-of-zone edits are flagged but still reviewable.",
-      label,
-      scope.zone_l1,
-      scope.zone_l2
-    )
+    return prompts.render("edit_zone_advisory", { block = label, first = scope.zone_l1, last = scope.zone_l2 })
   end
-  return string.format("Context: %s, lines L%d–L%d.", label, scope.zone_l1, scope.zone_l2)
+  return prompts.render("edit_zone_context", { block = label, first = scope.zone_l1, last = scope.zone_l2 })
 end
 
 -- Diff before/after text into changed line regions (insert/delete/modify).

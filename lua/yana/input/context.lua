@@ -2,6 +2,7 @@
 -- to attach to a prompt.
 local config = require("yana.config")
 local selection_scope = require("yana.input.selection_scope")
+local prompts = require("yana.prompts")
 local diff = require("yana.diff")
 
 local M = {}
@@ -113,14 +114,13 @@ local function diagnostics_block(origin)
   if #diags == 0 then
     return nil
   end
-  local lines = { "Diagnostics in `" .. (origin.name or "current buffer") .. "`:" }
+  local lines = { prompts.render("diagnostics_header", { file = origin.name or "current buffer" }) }
   for _, d in ipairs(diags) do
-    lines[#lines + 1] = string.format(
-      "- L%d: [%s] %s",
-      (d.lnum or 0) + 1,
-      SEVERITY_NAME[d.severity] or "INFO",
-      (d.message or ""):gsub("\n", " ")
-    )
+    lines[#lines + 1] = prompts.render("diagnostics_line", {
+      line = (d.lnum or 0) + 1,
+      severity = SEVERITY_NAME[d.severity] or "INFO",
+      message = ((d.message or ""):gsub("\n", " ")),
+    })
   end
   return table.concat(lines, "\n")
 end
@@ -148,16 +148,9 @@ function M.build(question, origin, selection, opts)
     end
   end
 
-  -- Ordinary inline review/scope template only; HOME buffer-only skips it so
-  -- it cannot contradict the request-only no-file JSON constraint.
-  if mode == "inline" and not home_buffer and o.agent_instructions and o.agent_instructions ~= "" then
-    table.insert(parts, "For this request only: " .. o.agent_instructions)
-    table.insert(parts, "")
-  end
-
   local at_path = at_path_from_question(question)
   if at_path then
-    table.insert(parts, "Edit file: `" .. at_path .. "` (only this file unless the user names others).")
+    table.insert(parts, prompts.render("edit_named_file", { path = at_path }))
     table.insert(parts, "")
   end
 
@@ -170,30 +163,29 @@ function M.build(question, origin, selection, opts)
     if mode == "inline" and selection.scope then
       local describe = selection_scope.describe(selection.scope)
       if describe then
-        table.insert(parts, "For this request only: " .. describe)
+        table.insert(parts, prompts.render("this_request_only", { text = describe }))
         table.insert(parts, "")
       end
     end
 
-    table.insert(parts, "Selected code (line numbers are absolute file lines):")
+    table.insert(parts, prompts.render("selected_code_header"))
     table.insert(parts, "```" .. fence)
     vim.list_extend(parts, M.numbered_lines(selection))
     table.insert(parts, "```")
     if selection.truncated then
-      table.insert(parts, "(selection truncated)")
+      table.insert(parts, prompts.render("selection_truncated"))
     end
     table.insert(parts, "")
   elseif o.context.include_file and origin and origin.name then
     label = origin.name
-    table.insert(parts, string.format(
-      "The user is editing `%s` (filetype: %s, cursor on line %d). Open it if you need its contents.",
-      origin.name, origin.filetype ~= "" and origin.filetype or "none", origin.cursor or 1
-    ))
+    table.insert(parts, prompts.render("editing_file_hint", {
+      file = origin.name, filetype = origin.filetype ~= "" and origin.filetype or "none", line = origin.cursor or 1,
+    }))
     table.insert(parts, "")
   end
 
   if home_buffer then
-    table.insert(parts, "This is a buffer-only HOME edit for this request only. Do not write any file. Your entire final response must be one JSON object with exactly one field, replacement_text, containing the complete proposed file text. Do not include a path, markdown fence, explanation, or trailing text.")
+    table.insert(parts, prompts.render("home_buffer_json_only"))
     table.insert(parts, "")
   end
 

@@ -104,6 +104,7 @@ function Factory.new(deps)
     pool_for = pool_for,
     queue_insert_original = queue_insert_original,
     queue_remove_change = queue_remove_change,
+    announce_state = announce_state,
   })
   local undo_refuse = review_undo.undo_refuse
   local rerender_after_history_move = review_undo.rerender_after_history_move

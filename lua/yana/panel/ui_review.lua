@@ -31,13 +31,40 @@ function M.new(deps)
   local stamp_undeclared_badge = deps.stamp_undeclared_badge
   local bump_review_rejection = deps.bump_review_rejection
 
--- Queue advances when a review resolves; sweep header glyph, claim line and footer together, since a transition
--- the panel did not drive (retrace reopen) fires no decision callback.
-local function refresh_all_review_claims(p)
+-- THE panel review-status view (F-PANEL-REVIEW-STATUS): every change block's header glyph and footer, every
+-- claim line and the winbar's pending count, each read from the changes at paint time. Every status transition
+-- repaints through here, never through a per-mutation subset of these painters.
+local function render_review_status(p)
   for _, c in ipairs(p.changes or {}) do
     refresh_change_block(p, c)
     refresh_review_claim(p, c)
   end
+  update_winbar(p)
+end
+
+-- One subscription per (panel, Turn). The Turn writes the final `change.status` in terminal cleanup and only then
+-- emits `turn_end`; no review-engine callback follows that write. The bus is per Turn, so a signal names this
+-- Turn by construction, and the closure paints this panel only.
+local observed_turns = setmetatable({}, { __mode = "k" })
+local function observe_turn(p, turn)
+  if type(turn) ~= "table" or type(turn.register) ~= "function" then
+    return
+  end
+  local panels = observed_turns[turn] or setmetatable({}, { __mode = "k" })
+  observed_turns[turn] = panels
+  if panels[p] then
+    return
+  end
+  panels[p] = true
+  local function render()
+    render_review_status(p)
+  end
+  turn:register({
+    name = "panel_review_status",
+    review_alive = render,
+    review_finished = render,
+    turn_end = render,
+  })
 end
 
 local MAX_REVIEW_RETRY = 5
@@ -109,15 +136,15 @@ local function inline_review_opts(p, change)
       return shadow_apply.revert_to_bytes(panel, c, content)
     end or nil,
     on_accept = function(c)
-      refresh_change_block(p, c)
-      refresh_all_review_claims(p)
-      update_winbar(p)
+      render_review_status(p)
       notify_one_line("yana: accepted " .. c.rel, vim.log.levels.INFO)
     end,
-    on_kept_unreviewed = function(c)
-      refresh_change_block(p, c)
-      refresh_all_review_claims(p)
-      update_winbar(p)
+    on_kept_unreviewed = function()
+      render_review_status(p)
+    end,
+    -- The review's file joined `turn`; the panel subscribes to that Turn's signals.
+    on_turn_joined = function(turn)
+      observe_turn(p, turn)
     end,
     on_system_refused = function(c)
       if c.shadow_apply and p.shadow_turn then
@@ -128,14 +155,10 @@ local function inline_review_opts(p, change)
           retention_error = c.retention_error,
         })
       end
-      refresh_change_block(p, c)
-      refresh_all_review_claims(p)
-      update_winbar(p)
+      render_review_status(p)
     end,
     on_reject = function(c)
-      refresh_change_block(p, c)
-      refresh_all_review_claims(p)
-      update_winbar(p)
+      render_review_status(p)
       notify_one_line("yana: rejected " .. c.rel .. " (reverted)", vim.log.levels.INFO)
       bump_review_rejection(p, c)
     end,
@@ -179,21 +202,22 @@ local function inline_review_opts(p, change)
         -- has already finished. The old code registered a `turn_end` listener
         -- here, one line too late to ever fire, and a listener has no answer
         -- the Turn reads anyway.
+        local turn_owned = false
         if ok and receipt ~= nil then
           local bound = require("yana.turn.turn_bind").get(p)
           if bound ~= nil then
             -- Keyed per receipt, so several file owners are each tracked and
             -- each finalised exactly once. The refusal is REAL: it keeps the
-            -- Turn live with this release still owed.
-            bound:require_cleanup(receipt, function()
+            -- Turn live with this release still owed. No repaint here: the
+            -- statuses change after this, and the Turn's `turn_end` repaints.
+            turn_owned = bound:require_cleanup(receipt, function()
               local finalized, reason = receipt.finalize(receipt)
               if finalized == false then
                 return false, reason or "panel receipt finalization refused"
               end
-              refresh_all_review_claims(p)
               drain()
               return true
-            end)
+            end) == true
           end
         end
         if on_closed then on_closed(ok, err) end
@@ -206,11 +230,11 @@ local function inline_review_opts(p, change)
           drain()
           return
         end
-        -- A Turn took the receipt as required cleanup above. Without one, the
-        -- non-Turn path finalises here exactly as it always has.
-        if require("yana.turn.turn_bind").get(p) == nil then
+        -- Decided BEFORE `on_closed`: that call can run the Turn to `gone`, so asking turn_bind again here would
+        -- send a Turn-owned receipt down the non-Turn path a second time.
+        if not turn_owned then
           receipt.finalize(receipt)
-          refresh_all_review_claims(p)
+          render_review_status(p)
           drain()
         end
       end, { defer_local_release = true })
@@ -287,7 +311,9 @@ local function flush_review_batch(p)
     end
     if #intake_files > 0 then
       -- `pool` (first arg) is ignored by turn_bind (one singleton Turn per session); nil matches observe_open.
-      turn_bind.bind(nil, intake_files, {
+      -- The panel subscribes here as well as on review attach: a member whose review never opens still has its
+      -- status written when another file's review ends the Turn.
+      local bound = turn_bind.bind(nil, intake_files, {
         opts_fn = function()
           return config.options
         end,
@@ -297,6 +323,7 @@ local function flush_review_batch(p)
           return inline._pool_for(inline_review_opts(p, file and file.change))
         end,
       })
+      observe_turn(p, bound)
     end
   end
 
@@ -317,10 +344,8 @@ local function flush_review_batch(p)
       end
     end
     ::continue_flush::
-    refresh_review_claim(p, owner)
-    refresh_change_block(p, owner)
   end
-  update_winbar(p)
+  render_review_status(p)
   return n
 end
 
@@ -339,6 +364,7 @@ local function drop_review_batch(p)
   end
   p.review_batch = {}
   p.review_batch_by_path = {}
+  render_review_status(p)
 end
 
 local function render_tool_change(p, change)
@@ -399,18 +425,14 @@ local function render_tool_change(p, change)
     end
     vim.schedule(function()
       log.guard("yana.ui review batch refresh", function()
-        refresh_review_claim(p, change)
-        if owner then
-          refresh_review_claim(p, owner)
-          refresh_change_block(p, owner)
-        end
+        render_review_status(p)
       end)
     end)
   end
 end
 
   return {
-    refresh_all_review_claims = refresh_all_review_claims,
+    render_review_status = render_review_status,
     MAX_REVIEW_RETRY = MAX_REVIEW_RETRY,
     REVIEW_RETRY_EXHAUSTED = REVIEW_RETRY_EXHAUSTED,
     inline_review_opts = inline_review_opts,

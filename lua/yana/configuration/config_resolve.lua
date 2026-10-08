@@ -1,4 +1,5 @@
 -- yana: mode dial + cmd resolution (facade: yana.config).
+local prompts = require("yana.prompts")
 local M = {}
 
 function M.new(deps)
@@ -16,12 +17,8 @@ function M.new(deps)
 
   local MODES = { ask = true, inline = true, agentic = true }
 
-  --- One stable instruction sentence per canonical mode (shared by HOME/normal inline).
-  local MODE_INSTRUCTIONS = {
-    ask = "Yana ask mode: answer without changing files, replacing earlier Yana mode instructions.",
-    inline = "Yana inline mode: propose edits for review without tests or writing live files, replacing earlier Yana mode instructions.",
-    agentic = "Yana agentic mode: make requested file changes directly and validate as needed, replacing earlier Yana mode instructions.",
-  }
+  --- Prompt key of each canonical mode's sentence (shared by HOME/normal inline).
+  local MODE_PROMPT_KEYS = { ask = "mode_ask", inline = "mode_inline", agentic = "mode_agentic" }
 
   --- Highlight group names for the winbar mode chip (one per named mode).
   local mode_hl_groups = {
@@ -159,7 +156,7 @@ function M.new(deps)
   --- Instruction sentence for the resolved mode, or nil when unknown.
   local function mode_instruction(mode)
     local m = resolve_mode(mode)
-    return MODE_INSTRUCTIONS[m]
+    return MODE_PROMPT_KEYS[m] and prompts.render(MODE_PROMPT_KEYS[m])
   end
 
   -- True when resolved mode is ask/inline (agent runs under the overlay).
