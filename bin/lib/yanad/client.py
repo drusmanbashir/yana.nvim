@@ -1,6 +1,7 @@
 """One-shot yanad client for launcher and CLI processes (U4)."""
 
 import argparse
+import fcntl
 import hashlib
 import json
 import os
@@ -17,7 +18,7 @@ import time
 # the entry is already there and the insert changes nothing.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from yanad import tree_version
+from yanad import protocol, tree_version
 
 
 EXIT_USAGE = 64
@@ -135,6 +136,33 @@ def start_daemon(root):
         pass
 
 
+def unreachable_lock_refusal(root, path, frame_id):
+    """Diagnose a failed socket dial without stealing or deleting its owner's lock."""
+    try:
+        lock = (root / "yanad.lock").open("r+")
+    except FileNotFoundError:
+        return None
+    with lock:
+        try:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            # Startup acquires the lock before it records its PID/readiness.
+            try:
+                pid = (root / "yanad.pid").read_text(encoding="utf-8").strip()
+            except FileNotFoundError:
+                pid = "not yet recorded"
+            message = (
+                f"state root {root} is locked; recorded lock holder pid={pid}; "
+                f"socket={path} is unreachable. Another editor/host owns this state root; "
+                "return to that owner, close it there, or use a separate YANA_STATE_ROOT"
+            )
+            answer = protocol.refuse(frame_id, "state_root_owned", {
+                "owner_pid": pid, "socket_path": path, "state_root": str(root), "message": message,
+            })
+            return answer
+    return None
+
+
 def request(args):
     root = Path(args.root).resolve()
     root.mkdir(parents=True, exist_ok=True)
@@ -165,6 +193,9 @@ def request(args):
         return exchange(path, hello, frame)
     except (ConnectionError, FileNotFoundError, OSError, socket.timeout) as error:
         last_error = str(error)
+        if args.no_start:
+            request.last_error = "root=%s; last socket error=%s" % (root, last_error)
+            return unreachable_lock_refusal(root, path, args.id)
         start_daemon(root)
 
     for _ in range(10):
@@ -176,7 +207,7 @@ def request(args):
             last_error = str(error)
             continue
     request.last_error = "root=%s; last socket error=%s" % (root, last_error)
-    return None
+    return unreachable_lock_refusal(root, path, args.id)
 
 
 def main(args):
@@ -203,6 +234,7 @@ if __name__ == "__main__":
     parser.add_argument("--id", required=True)
     parser.add_argument("--kind", choices=("launcher", "cli"), default="launcher")
     parser.add_argument("--servername")
+    parser.add_argument("--no-start", action="store_true", help="probe the socket/owner without autostart")
     parser.add_argument("command")
     parser.add_argument("--json", default="{}")
     args = parser.parse_known_args()[0]

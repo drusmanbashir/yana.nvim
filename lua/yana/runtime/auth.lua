@@ -5,6 +5,71 @@ local dependencies = require("yana.runtime.dependencies")
 local M = {}
 local active
 local login_generation = 0
+local login_buffers = {}
+local paste_installed = false
+local login_hint = "terminal mode — paste the code and press Enter; q closes (normal mode)"
+
+local function live(session)
+  return session.running and vim.api.nvim_buf_is_valid(session.buf)
+    and vim.fn.jobwait({ session.job }, 0)[1] == -1
+end
+
+local function enter_login(session)
+  vim.schedule(function()
+    if live(session) and vim.api.nvim_get_current_buf() == session.buf then vim.cmd("startinsert") end
+  end)
+end
+
+local function send_login(session, text)
+  if not live(session) then
+    vim.notify("yana: login process has exited — run :YanaLogin to retry", vim.log.levels.WARN)
+    return
+  end
+  vim.api.nvim_chan_send(session.job, text)
+  enter_login(session)
+end
+
+local function retire_login(session)
+  session.running = false
+  login_buffers[session.buf] = nil
+  if session.group then vim.api.nvim_del_augroup_by_id(session.group); session.group = nil end
+end
+
+local function bind_login_input(session)
+  local buf = session.buf
+  session.running, login_buffers[buf] = true, session
+  vim.wo[session.win].winbar = login_hint
+  if not paste_installed then
+    local previous = vim.paste
+    vim.paste = function(lines, phase)
+      local target = login_buffers[vim.api.nvim_get_current_buf()]
+      if target and live(target) then
+        send_login(target, table.concat(lines, "\n"))
+        return true
+      end
+      return previous(lines, phase)
+    end
+    paste_installed = true
+  end
+  vim.keymap.set("n", "<CR>", function() send_login(session, "\r") end,
+    { buffer = buf, silent = true, desc = "Send Enter to agent sign-in" })
+  for _, key in ipairs({ "p", "P" }) do
+    vim.keymap.set("n", key, function() send_login(session, vim.fn.getreg(vim.v.register)) end,
+      { buffer = buf, silent = true, desc = "Paste into agent sign-in" })
+  end
+  session.group = vim.api.nvim_create_augroup("yana_login_" .. buf, { clear = true })
+  vim.api.nvim_create_autocmd({ "WinEnter", "BufEnter" }, {
+    group = session.group, buffer = buf, callback = function() enter_login(session) end,
+  })
+  vim.api.nvim_create_autocmd("ModeChanged", {
+    group = session.group, pattern = { "*:n", "*:nt" }, callback = function()
+      if vim.api.nvim_get_current_buf() == buf then enter_login(session) end
+    end,
+  })
+  vim.api.nvim_create_autocmd("BufWipeout", {
+    group = session.group, buffer = buf, once = true, callback = function() retire_login(session) end,
+  })
+end
 
 function M.classify(entry, result)
   if not result or result.code == 124 or (result.signal or 0) ~= 0 then return "unknown" end
@@ -104,6 +169,7 @@ function M.login()
     and vim.api.nvim_buf_is_valid(active.buf) and vim.fn.jobwait({ active.job }, 0)[1] == -1 then
     if vim.api.nvim_win_is_valid(active.win) then vim.api.nvim_set_current_win(active.win)
     else vim.cmd("botright 12split"); vim.api.nvim_win_set_buf(0, active.buf); active.win = vim.api.nvim_get_current_win() end
+    vim.wo[active.win].winbar = login_hint
     vim.cmd("startinsert")
     return active.job, active.buf
   end
@@ -116,9 +182,15 @@ function M.login()
   local ok, job = pcall(vim.fn.jobstart, argv, { term = true, on_exit = function(_, code)
     vim.schedule(function()
       if active == session then active = nil end
+      retire_login(session)
       if not vim.api.nvim_buf_is_valid(buf) then return end
+      if vim.api.nvim_get_current_buf() == buf then vim.cmd("stopinsert") end
+      if vim.api.nvim_win_is_valid(session.win) then
+        vim.wo[session.win].winbar = "login exited " .. code .. " — output kept; q closes"
+      end
       vim.notify(code == 0 and "yana: login command completed — submit your prompt again"
-        or "yana: login did not complete — run :YanaLogin to retry", code == 0 and vim.log.levels.INFO or vim.log.levels.WARN)
+        or ("yana: login command exited " .. code .. " — output kept visible; run :YanaLogin to retry"),
+        code == 0 and vim.log.levels.INFO or vim.log.levels.WARN)
     end)
   end })
   if not ok or job <= 0 then
@@ -127,6 +199,7 @@ function M.login()
     return nil
   end
   session.job, active = job, session
+  bind_login_input(session)
   vim.keymap.set("n", "q", function() vim.api.nvim_buf_delete(buf, { force = true }) end,
     { buffer = buf, silent = true, desc = "Close or cancel agent sign-in" })
   vim.cmd("startinsert")

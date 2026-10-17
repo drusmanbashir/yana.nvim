@@ -252,7 +252,14 @@ local function drop_seed_copies(session, upper, typed)
 	if next(seeds) == nil then
 		return typed
 	end
-	local kept = {}
+	local kept, seed_dirs = {}, {}
+	local function mark_parents(rel, into)
+		local parent = rel:match("^(.*)/[^/]+$")
+		while parent do
+			into[parent] = true
+			parent = parent:match("^(.*)/[^/]+$")
+		end
+	end
 	for _, op in ipairs(typed) do
 		local from = seeds[op.path]
 		local copy = from ~= nil
@@ -265,9 +272,24 @@ local function drop_seed_copies(session, upper, typed)
 		end
 		if not copy then
 			kept[#kept + 1] = op
+		else
+			mark_parents(op.rel, seed_dirs)
 		end
 	end
-	return kept
+	-- Seeding an unsaved buffer also creates absent parents. Remove those
+	-- scaffold records unless a genuine remaining operation needs them.
+	local needed, result = {}, {}
+	for _, op in ipairs(kept) do
+		if not (op.kind == "create" and op.detail == "dir" and seed_dirs[op.rel]) then
+			mark_parents(op.rel, needed)
+		end
+	end
+	for _, op in ipairs(kept) do
+		if not (op.kind == "create" and op.detail == "dir" and seed_dirs[op.rel] and not needed[op.rel]) then
+			result[#result + 1] = op
+		end
+	end
+	return result
 end
 
 --- Build inline review change objects for one turn, across every root it wrote.

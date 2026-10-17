@@ -129,7 +129,9 @@ function M.new(deps)
       -- Name the cause: no_daemon/version_mismatch/identity_mismatch are not transient (ERROR + instruction);
       -- anything else (timeout under load) is INFO.
       local err = tostring(p.yanad_session_err or "session.create failed")
-      if FINAL_SESSION_REFUSALS[err] then
+      if err == "state_root_owned" then
+        notify_one_line("yana: daemon session refused — " .. p.yanad_session_detail.message .. "; turn queued", vim.log.levels.ERROR)
+      elseif FINAL_SESSION_REFUSALS[err] then
         notify_one_line(
           "yana: daemon session refused (" .. err .. ") — " .. FINAL_SESSION_REFUSALS[err] .. "; turn queued",
           vim.log.levels.ERROR

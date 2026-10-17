@@ -466,9 +466,10 @@ local function record_artifact_refusals(p, turn, classification)
     ledger.bump(L, "ops_system_refused")
     p.system_refusals[#p.system_refusals + 1] = op
     S.render_note(p, string.format(
-      "⛔ %s %s system-refused; inspectable at %s/%s until this turn settles",
+      "⛔ %s %s system-refused: %s; inspectable at %s/%s until this turn settles",
       tostring(op.kind),
       tostring(op.rel),
+      tostring(op.refusal_reason),
       tostring(turn.upper_dir),
       tostring(op.rel)
     ))

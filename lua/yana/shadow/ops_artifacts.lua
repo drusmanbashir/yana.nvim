@@ -419,18 +419,15 @@ function I.classify_artifacts(typed, changes, _base_evidence, tracked)
 		end
 	end
 
-	-- WHAT SURVIVED, and therefore which new directories carry something. A path survives
-	-- when it is still offered for review, OR when the ignore list will write it through
-	-- -- both reach the real tree, so both need the directory to exist and neither wants a
-	-- refusal note about it. Ancestor directories of a survivor are themselves survivors,
-	-- so nested new directories (`pkg/.agent/idx/` under `pkg/.agent/`) all resolve on the
-	-- one leaf.
+	-- A parent is structural even when its child has its own refusal. Only an
+	-- empty directory needs a separate explanation; a child decision never
+	-- grants an independent mkdir on the real tree.
 	local survivors = {}
 	for _, change in ipairs(reviewable_changes) do
 		survivors[#survivors + 1] = change.rel
 	end
 	for _, op in ipairs(typed or {}) do
-		if op.ignored then
+		if op.ignored or (op.detail ~= "dir" and op.kind ~= "delete") then
 			survivors[#survivors + 1] = op.rel
 		end
 	end
@@ -447,11 +444,7 @@ function I.classify_artifacts(typed, changes, _base_evidence, tracked)
 		if carries_something(op.rel) then
 			op.structural = true
 		else
-			-- Nothing under it is offered, so accepting nothing would create it and
-			-- the directory would be lost in silence. Disclose it exactly as
-			-- before; the text is unchanged so an operator who has seen this note
-			-- reads the same sentence it always meant.
-			op.refusal_reason = "inline review cannot represent this operation"
+			op.refusal_reason = "F-INLINE-DIRECTORY: empty directories have no file hunk; ask the agent to create a file inside, or create the directory yourself"
 			op.status = "system_refused"
 			op.retention_strength = "momentary"
 			individual[#individual + 1] = op

@@ -106,14 +106,16 @@ function M.new(deps)
       backend = backend,
       kind = "nvim",
       owner = nvim_owner_identity(),
-    }, rid, function(ok, res)
+    }, rid, function(ok, res, failure)
       p.yanad_session_pending = false
       if ok and type(res) == "table" and res.session_id then
         p.yanad_session_id = res.session_id
         p.yanad_session_err = nil
+        p.yanad_session_detail = nil
         fire_parked_turn(p)
       else
         p.yanad_session_err = tostring(res)
+        p.yanad_session_detail = failure and failure.detail
         -- Leave p.yanad_submit_queue SET: the turns were requested and the next submit re-fires
         -- session.create; clearing would drop them silently. fire_parked_turn already emptied it.
       end

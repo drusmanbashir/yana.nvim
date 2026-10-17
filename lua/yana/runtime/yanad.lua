@@ -283,7 +283,20 @@ function M.ensure(cb)
 			-- keep dialling on the retry cadence until autostart_timeout_ms, and only
 			-- then call it missing.
 			if n >= M.retries and uv.now() - started_at >= M.autostart_timeout_ms then
-				return cb(false, "no_daemon")
+				-- A foreign runtime namespace can hold our flock while its socket
+				-- is unreachable here. Probe through the Python client's real flock
+				-- check; never infer ownership from a stale PID file alone.
+				return vim.system({ "python3", repo_root() .. "/bin/lib/yanad/client.py",
+					"--root", state_root(), "--id", "lock-probe", "--kind", "cli", "--no-start", "status" },
+					{ text = true }, function(result)
+						vim.schedule(function()
+							local decoded, answer = pcall(vim.json.decode, result.stdout)
+							if decoded and answer.code == "state_root_owned" then
+								return cb(false, answer.code, answer.result)
+							end
+							cb(false, "no_daemon")
+						end)
+					end)
 			end
 			vim.defer_fn(function() attempt(n + 1) end, M.retry_ms)
 		end)
@@ -298,11 +311,11 @@ local function wrap(cmd)
 		if args and args.generation ~= nil then
 			id = id .. ":g" .. tostring(args.generation)
 		end
-		M.ensure(function(ok, client)
+		M.ensure(function(ok, client, detail)
 			-- THIRD ARGUMENT, ALWAYS. `client` here is the REASON ("no_daemon",
 			-- "version_mismatch", ...), which the operator never saw. Carry it in the table so
 			-- the refusal can name what actually happened.
-			if not ok then return cb(false, client, { reason_code = client, unreachable = true }) end
+			if not ok then return cb(false, client, { reason_code = client, unreachable = true, detail = detail }) end
 			client:request(cmd, args or {}, id, cb)
 		end)
 	end

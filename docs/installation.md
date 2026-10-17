@@ -29,8 +29,11 @@ key is required.
 If your agent is installed but not signed in, run `:YanaLogin` after configuring
 Yana. It opens the selected agent's official interactive login in a Neovim
 terminal. Follow its browser or terminal instructions, then submit your prompt
-again. In normal mode, `q` closes the login terminal; use `<C-\\><C-n>` to
-leave terminal input mode first. Yana does not store login tokens, log this
+again. Clicking or returning to the login window restores terminal input mode.
+Enter and paste also reach the login process from normal mode; `p`/`P` paste
+the selected register, and normal-mode `q` closes the window. The window shows
+an input hint. If login exits unsuccessfully, its output stays visible and the
+notice names the exit status. Yana does not store login tokens, log this
 terminal or replay a turn. The agent owns its credentials; existing API-key
 authentication is preserved.
 
