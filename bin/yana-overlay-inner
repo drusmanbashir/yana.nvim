@@ -228,6 +228,12 @@ source "$INNER_DIR/lib/yana-overlay/mount.sh"
 source "$INNER_DIR/lib/yana-overlay/fuse.sh"
 
 inner_run_agent_without_caps() {
+	if [[ "$OPEN_CAPTURE_BACKEND" == fuse-compat ]]; then
+		# FUSE reaches this door after mounting its view, before the ordinary
+		# overlay branch below can install the writable host exceptions.
+		mount_cursor_exception
+		mount_state_dirs
+	fi
 	mount_user_manager_endpoints
 	local capsh_path cap_now
 	local -a cmd=( "$@" )

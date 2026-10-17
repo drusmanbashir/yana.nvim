@@ -28,7 +28,8 @@ refusal always names the exact boundary that would allow it.
 **Modes.** One dial, three results: `ask` (reads and answers, no edits),
 `inline` (edits become hunks), `agentic` (direct, unconfined). `modes` picks
 which of the three are available: the first entry is the starting mode,
-`<M-t>` cycles in that order, and a mode not listed cannot be entered.
+`:YanaMode` cycles in that order, and a mode not listed cannot be entered.
+Yana assigns no cycle shortcut; bind the command in your own keymap configuration.
 Switching mid-chat hands the next session a short brief of what you asked,
 what landed, and what was refused, once.
 
@@ -57,7 +58,7 @@ rather than a flag, a positional resume id, its own JSON stream token):
 
 ```lua
 opts = {
-  sandbox = { inline = "vendor-default", agentic = "full" },
+  sandbox = { inline = "full", agentic = "full" },
   backends = {
     codex = {
       cmd = "codex",
@@ -84,11 +85,11 @@ opts = {
 
 `sandbox` uses Yana's four vendor-neutral levels: `full`, `workspace`,
 `read-only`, and `vendor-default` (append no sandbox flag). Ask always uses
-`read-only`; inline and agentic default to `vendor-default` and `full`. Each
-shipped backend translates the selected level into its own measured CLI
-spelling. Inline's default appends no vendor sandbox token because Yana's
-overlay is the write boundary. A system-wide vendor config may narrow a
-declared root; `:checkhealth yana` warns when inline inherits it.
+`read-only`; inline and agentic default to `full`. Each shipped backend translates
+the selected level into its own CLI spelling. Inline grants headless edit
+permission while Yana's overlay and review enforce its write boundary. An explicit
+`vendor-default` inherits vendor settings and can require permission that a
+headless turn cannot obtain.
 Custom backends must declare all four `sandbox_args` entries. A token-bearing
 map also needs dated vendor-version stamps; missing levels refuse at setup
 instead of silently tightening a turn.

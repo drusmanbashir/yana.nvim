@@ -43,6 +43,10 @@ forbidden_bytes_allowed_path() {
 		| scripts/release/README.md | scripts/release/hpc-smoke-remote.sh \
 		| scripts/release/manifest_policy.py | scripts/release/paths.conf \
 		| scripts/release/to-release.sh \
+		| scripts/release/hooks/* | scripts/release/lib/proof.sh \
+		| scripts/release/vendors.txt | tests/release/vendor_live_gate.sh | tests/release/vendor_live_controls.sh \
+		| tests/release/vendor_live/* | tests/release/stranger/* \
+		| tests/release/yana_release_sync_gate.sh \
 		| tests/release/candidate_check_gate.sh \
 		| tests/release/candidate_history_exceptions_gate.sh \
 		| tests/release/health_yana_ui_smoke.lua \

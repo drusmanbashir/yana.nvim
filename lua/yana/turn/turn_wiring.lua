@@ -61,7 +61,7 @@ end
 -- PRUNED (manifest): `paint_callback`, `keymap_callback` and `listener_callback`
 -- are gone. Namespaces and keys are now released by `review_resources.close`
 -- through the owner table that recorded them, and the listener callback had no
--- caller at all (`yana.turn.turn_listeners` stays live for `diff_preview`).
+-- caller at all.
 
 function M.tabs_callback(tabs)
 	return {

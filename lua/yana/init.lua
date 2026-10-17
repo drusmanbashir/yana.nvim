@@ -261,11 +261,6 @@ function M.pick_vendor_then_model()
   ui().pick_vendor_then_model()
 end
 
--- Show this session's file changes as a side-by-side diff.
-function M.show_changes()
-  ui().show_changes()
-end
-
 -- Pick a pending change and open its inline review.
 function M.review_changes()
   ui().review_changes()
@@ -311,11 +306,6 @@ end
 function M.login()
   if not require_setup() then return end
   return require("yana.runtime.auth").login()
-end
-
--- Open the live playground for inline diff-highlight themes.
-function M.diff_themes()
-  require("yana.diff_preview").open()
 end
 
 -- Ask about a line range; buf 0 = current, question may be nil.

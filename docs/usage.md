@@ -35,7 +35,6 @@ stable: `ask` appears as **Ask**, `inline` as **Inline**, and `agentic` as
 |---|---|
 | `<C-s>` | Submit the prompt (normal and insert mode) |
 | `<C-n>` | Start a new chat |
-| `<M-t>` | Cycle through `modes`, in list order |
 | `<M-r>` | Resend the last prompt |
 | `<C-g>` | Pick the agent CLI, then its model |
 | `<C-y>` | Open review for a pending change |
@@ -51,11 +50,13 @@ stable: `ask` appears as **Ask**, `inline` as **Inline**, and `agentic` as
 
 ### Global — `<C-a>` toggles the sidebar by default
 
-| Setting (`mappings`) | Example | Action |
+| Setting (`mappings`) | Default | Action |
 |---|---|---|
 | `toggle` | `<C-a>` | Open/close the panel from any normal-mode buffer, including the panel |
-| `ask` | `<leader>ca` | Ask about the current line/selection (normal + visual; unset by default) |
-| `inline_edit` | `<C-k>` | Inline edit the visual selection (unset by default) |
+| `ask` | `false` | Optional shortcut to ask about the current line/selection (normal + visual) |
+| `inline_edit` | `false` | Optional shortcut to inline-edit the visual selection |
+
+With those optional shortcuts disabled, use `:YanaAsk` and `:YanaEdit`.
 
 ## Commands
 
@@ -73,7 +74,6 @@ stable: `ask` appears as **Ask**, `inline` as **Inline**, and `agentic` as
 | `:YanaMode` | Cycle the agent mode |
 | `:YanaModel` | Pick the model (layer 2: within the active backend) |
 | `:YanaBackend` | Pick the backend (layer 1: which binary/account/bill) |
-| `:YanaDiff` | View agent file changes as a diff (read-only) |
 | `:YanaRefusals` | List system-refused operations and recovery paths |
 | `:YanaIgnore` | List the review ignore list; `:YanaIgnore <pattern>` adds one (gitignore syntax, effective immediately) |
 | `:YanaReview` | Open a pending inline review |
@@ -86,7 +86,7 @@ stable: `ask` appears as **Ask**, `inline` as **Inline**, and `agentic` as
 | `:YanaDump` | Write a diagnostic dump of the current turn and review state, for bug reports |
 | `:YanaFlowReport[!]` | Write the per-turn flow report (`!` also opens it) |
 | `:YanaRenderCheck` | Reconcile every open review's display against its actual state |
-| `:YanaDiffThemes` | Live-preview Yana's inline diff color themes |
+| `:YanaReviewTheme [native\|dark\|light]` | Select the review-button theme; omit the name to cycle |
 
 ## Highlight Groups
 

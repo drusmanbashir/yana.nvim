@@ -44,19 +44,6 @@ function M.new(deps)
   local ui_M = deps.M
   require("yana.panel.ui_followup").set_doors({ review_opts = inline_review_opts, flush = flush_review_batch })
 
--- Row 69: the ONE stderr line that names the failure. Usually the vendor's last line.
-local function last_stderr_line(stderr)
-  if not stderr or stderr == "" then
-    return nil
-  end
-  local ls = vim.split(stderr, "\n", { plain = true, trimempty = true })
-  for _, l in ipairs(ls) do
-    if l:match("^%s*[Ee]rror:%s*%S") then
-      return l
-    end
-  end
-  return ls[#ls]
-end
 ----------------------------------------------------------------------
 -- session persistence
 ----------------------------------------------------------------------
@@ -144,16 +131,20 @@ local function on_done(p, gen, code, stderr, agent_outcome)
   local completed_turn = p.job_shadow_turn or p.shadow_turn
   -- jobstop() → exit 143 (SIGTERM). Intentional cancel already noted in the panel.
   local job_failed = (code ~= 0)
-  if job_failed and not p.got_result and not cancelled then
+  local process_failure = agent_outcome and agent_outcome.failure
+  if not cancelled and (process_failure or job_failed or not p.got_result) then
     -- A real exit code is never -1 (jobstop() -> 143, a real vendor failure -> its own
     -- nonzero code), so this split changes nothing about a real process's rendered
     -- error.
     local msg
-    if code == -1 and stderr and stderr ~= "" then
+    if process_failure then
+      msg = process_failure
+    elseif code == -1 and stderr and stderr ~= "" then
       msg = stderr
     else
-      local last_line = last_stderr_line(stderr)
-      msg = last_line or (backend_label() .. " process exited with no output")
+      local lines = vim.split(stderr or "", "\n", { plain = true, trimempty = true })
+      msg = #lines > 0 and table.concat(lines, "\n", math.max(1, #lines - 9))
+        or (backend_label() .. " process exited without a result")
     end
     render_error(p, msg, {
       exit_code = code,
@@ -424,7 +415,6 @@ local function set_model_actual(p, gen, model)
 end
 
   return {
-    last_stderr_line = last_stderr_line,
     persist_session = persist_session,
     on_done = on_done,
     on_exit_confirmed = on_exit_confirmed,

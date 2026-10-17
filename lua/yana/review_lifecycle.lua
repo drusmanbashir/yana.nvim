@@ -555,8 +555,8 @@ function Factory.new(deps)
 
   -- One implementation, one name. Every existing caller reaches the close
   -- through the facade table (`review_queue`'s abandon path, `review_api`'s two
-  -- discard doors, `review_open_bind`'s failure door, `diff_preview`'s preview
-  -- teardown and `finish_session_now`'s three tails below), so the facade field
+  -- discard doors, `review_open_bind`'s failure door and
+  -- `finish_session_now`'s three tails below), so the facade field
   -- is pointed at the module function rather than given a body of its own.
   M.cleanup = Factory.cleanup
   M.park_review = Factory.park_review

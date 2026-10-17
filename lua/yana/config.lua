@@ -205,6 +205,9 @@ function M.setup(opts)
   next_options.mappings = _mappings.resolve(M.defaults.mappings, opts)
   -- Every validator runs against the candidate. Any of them may raise; none of
   -- them can leave a half-installed configuration behind.
+  local timeout = next_options.vendor_timeout_ms
+  assert(type(timeout) == "number" and timeout >= 1 and timeout <= 2147483647 and timeout == math.floor(timeout),
+    "yana: vendor_timeout_ms must be a positive integer <= 2147483647")
   next_options.selection_scope = M.normalize_selection_scope(next_options.selection_scope)
   next_options.image_paste = M.normalize_image_paste(next_options.image_paste)
   next_options.redirect = M.normalize_redirect(next_options.redirect)
@@ -230,8 +233,10 @@ function M.setup(opts)
   next_options.debug_modules = M.normalize_debug_modules(next_options.debug_modules, next_options.profile)
   next_options.ui = next_options.ui or {}
   next_options.ui.multi_panel_layout = M.normalize_multi_panel_layout(next_options.ui.multi_panel_layout)
+  require("yana.panel.ui_review_button_theme").check(next_options.ui.review_buttons.theme)
   -- Only now does anything become effective.
   M.options = next_options
+  require("yana.panel.ui_review_button_theme").apply()
   M._setup_done = true
   M.apply_mode_highlights()
   -- The ignore matcher compiles `review.ignore` once and caches it. A setup()

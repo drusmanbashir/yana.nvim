@@ -84,7 +84,6 @@ Runtime provenance inventory:
 - post-fork original: `lua/yana/runtime/dependencies.lua`
 - post-fork original: `lua/yana/runtime/auth.lua`
 - upstream-derived: `lua/yana/diff.lua`
-- post-fork original: `lua/yana/diff_preview.lua`
 - post-fork original: `lua/yana/dump.lua`
 - post-fork original: `lua/yana/flow_report.lua`
 - post-fork original: `lua/yana/forensics.lua`
@@ -262,6 +261,7 @@ Runtime provenance inventory:
 - post-fork original: `lua/yana/roots/model.lua`
 - post-fork original: `lua/yana/roots/view.lua`
 - post-fork original: `lua/yana/agent/steer_channel.lua`
+- post-fork original: `lua/yana/agent/agent_outcome.lua`
 - post-fork original: `lua/yana/turn/turn.lua`
 - post-fork original: `lua/yana/turn/turn_bind.lua`
 - post-fork original: `lua/yana/turn/turn_file.lua`
@@ -301,7 +301,9 @@ Runtime provenance inventory:
 - post-fork original: `lua/yana/panel/ui_panel_views.lua`
 - post-fork original: `lua/yana/panel/panel_focus.lua`
 - post-fork original: `lua/yana/panel/layout_depth.lua`
+- post-fork original: `lua/yana/panel/ui_review_button_theme.lua`
 - post-fork original: `lua/yana/panel/ui_review_buttons.lua`
+- post-fork original: `lua/yana/panel/ui_review_buttons_signals.lua`
 - post-fork original: `lua/yana/panel/ui_roots.lua`
 - post-fork original: `lua/yana/undo_action_buffer_edit.lua`
 - post-fork original: `lua/yana/undo_action_decision.lua`

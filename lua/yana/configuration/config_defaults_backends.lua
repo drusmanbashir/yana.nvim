@@ -41,7 +41,7 @@
 -- stream_protocol OPTIONAL string, default "cursor".
 local function sandbox_stamps(vendor_version)
   local function stamp()
-    return { measured_on = "2026-08-31", vendor_version = vendor_version }
+    return { measured_on = "2026-10-17", vendor_version = vendor_version }
   end
   return {
     full = stamp(),
@@ -65,7 +65,7 @@ local backends = {
       ["read-only"] = { "--mode", "ask" },
       ["vendor-default"] = {},
     },
-    sandbox_args_stamps = sandbox_stamps("2026.08.25-3e8eec8"),
+    sandbox_args_stamps = sandbox_stamps("2026.10.16-e3cb207"),
     allow_edits_args = {},
     select_model_flag = "--model",
     resume_flag = "--resume",
@@ -111,7 +111,7 @@ local backends = {
       ["read-only"] = { "--permission-mode", "plan" },
       ["vendor-default"] = {},
     },
-    sandbox_args_stamps = sandbox_stamps("2.1.251 (Claude Code)"),
+    sandbox_args_stamps = sandbox_stamps("2.1.302 (Claude Code)"),
     allow_edits_args = {},
     select_model_flag = "--model",
     -- Hierarchy mode tokens: Claude Code 2.1.251 `claude --help` prints
@@ -190,7 +190,7 @@ local backends = {
       ["read-only"] = { "-c", 'sandbox_mode="read-only"' },
       ["vendor-default"] = {},
     },
-    sandbox_args_stamps = sandbox_stamps("codex-cli 0.151.0"),
+    sandbox_args_stamps = sandbox_stamps("codex-cli 0.163.0"),
     allow_edits_args = { "--skip-git-repo-check" },
     select_model_flag = "--model",
     mode_tokens = {

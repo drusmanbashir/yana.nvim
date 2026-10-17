@@ -10,6 +10,8 @@ set -euo pipefail
 
 root=$(git -C "$(dirname "$0")/../.." rev-parse --show-toplevel)
 commit=${1:-HEAD}
+[[ $# == 0 ]] || shift
+live_args=("$@")
 tmp=${TMPDIR:-/tmp}
 work=$(mktemp -d "$tmp/yana-release-gate.XXXXXX")
 trap 'rm -rf "$work"' EXIT
@@ -49,7 +51,7 @@ if (( candidate_rc != 0 || history_rc != 0 )); then
 	echo "RELEASE GATE FAIL: candidate gate=$candidate_rc, history exceptions gate=$history_rc" >&2
 	exit 1
 fi
-"$root/tests/release/yana_release_preflight_gate.sh"
+"$root/tests/release/yana_release_preflight_gate.sh" "${live_args[@]}"
 "$(command -v nvim)" --clean --headless -u NONE -i NONE --cmd "set rtp^=$root" -l "$root/tests/release/install_remedy_smoke.lua"
 "$(command -v nvim)" --clean --headless -u NONE -i NONE --cmd "set rtp^=$root" -l "$root/tests/release/health_yana_ui_smoke.lua"
 
@@ -69,4 +71,5 @@ else
 	[[ $smoke_rc == 0 ]] || exit "$smoke_rc"
 fi
 
+"$root/tests/release/vendor_live_gate.sh" --commit "$commit" --local="$work/export" "${live_args[@]}"
 echo "RELEASE GATE PASS"

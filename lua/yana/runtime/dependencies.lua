@@ -336,12 +336,14 @@ local function agent_version_row()
     -- version-probe.
     return nil
   end
+  local binary = vim.fn.fnamemodify(resolved, ":t")
+  local id = "exec:" .. binary .. "-version"
   local ok_probe, result, probe_err = probe({ resolved, "--version" }, 1500)
   if not ok_probe then
     return row(
-      "exec:cursor-agent-version",
+      id,
       "warn",
-      "could not determine cursor-agent version: " .. probe_err,
+      "could not determine " .. binary .. " version: " .. probe_err,
       "run '" .. resolved .. " --version' manually to confirm the binary works"
     )
   end
@@ -349,22 +351,22 @@ local function agent_version_row()
   if result.code ~= 0 then
     local detail = (result.stderr or ""):gsub("%s+$", "")
     return row(
-      "exec:cursor-agent-version",
+      id,
       "warn",
-      "cursor-agent --version exited " .. result.code .. (detail ~= "" and (": " .. detail) or ""),
+      binary .. " --version exited " .. result.code .. (detail ~= "" and (": " .. detail) or ""),
       "run '" .. resolved .. " --version' manually to confirm the binary works"
     ), wrapper_row
   end
   local version = vim.trim((result.stdout or ""):match("^[^\n]*") or "")
   if version == "" then
     return row(
-      "exec:cursor-agent-version",
+      id,
       "warn",
-      "cursor-agent --version produced no output",
+      binary .. " --version produced no output",
       "run '" .. resolved .. " --version' manually to confirm the binary works"
     ), wrapper_row
   end
-  return row("exec:cursor-agent-version", "ok", "cursor-agent version: " .. version), wrapper_row
+  return row(id, "ok", binary .. " version: " .. version), wrapper_row
 end
 
 local function neovim_version()
@@ -426,6 +428,14 @@ function M.check(mode, opts)
         .. "AppImage / neovim-ppa/unstable install path (Neovim's own install docs: "
         .. "https://neovim.io/doc/install/)"
     )
+    rows[#rows + 1] = row(
+      "nvim:probes-skipped",
+      "warn",
+      "runtime probes skipped: Neovim " .. M.minimum_neovim .. "+ is required",
+      "upgrade Neovim, then run :checkhealth yana again"
+    )
+    -- Feature probes use APIs guaranteed only by the supported Neovim floor.
+    return rows
   end
 
   rows[#rows + 1] = configured_agent_row()

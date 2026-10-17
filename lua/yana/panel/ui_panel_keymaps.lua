@@ -5,7 +5,7 @@ local log = require("yana.log")
 local M = {}
 
 -- deps.state: parent shared state `S` (submit_panel, cancel_inflight, render_note).
--- deps.M: parent module table (steer, new_chat, toggle_mode, resend, pick_*).
+-- deps.M: parent module table (steer, new_chat, resend, pick_*).
 -- deps.paste_into_panel: yana.ui_input facade local.
 -- deps.close_panel / deps.open_new_panel / deps.focus_prompt: yana.ui_panel
 -- lifecycle locals (late-bound through the factory).
@@ -113,9 +113,6 @@ function M.new(deps)
       map(buf, modes, k.new_chat, function()
         ui_M.new_chat()
       end, "yana: new chat")
-      map(buf, modes, k.toggle_mode, function()
-        ui_M.toggle_mode()
-      end, "yana: toggle mode")
       -- Resend is a PREFIX, not a single key: the useful question after "resend"
       -- is always "where", and a chat's mode is locked once it has run a turn, so
       -- "in agent mode" necessarily means "in a new chat". which-key renders the

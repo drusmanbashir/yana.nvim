@@ -154,12 +154,6 @@ cmd("YanaBackend", function()
   end)
 end, { desc = "Pick the yana backend (layer 1: which binary/account/bill)" })
 
-cmd("YanaDiff", function()
-  log.guard("YanaDiff", function()
-    yana().show_changes()
-  end)
-end, { desc = "View agent file changes as a diff (read-only)" })
-
 cmd("YanaRefusals", function()
   log.guard("YanaRefusals", function()
     require("yana.panel.ui").show_refusals()
@@ -296,11 +290,11 @@ cmd("YanaRenderCheck", function()
   end)
 end, { desc = "Reconcile every open inline review's decoration against its change model" })
 
-cmd("YanaDiffThemes", function()
-  log.guard("YanaDiffThemes", function()
-    require("yana.diff_preview").open()
-  end)
-end, { desc = "Live preview yana inline diff color themes" })
+raw_cmd("YanaReviewTheme", function(opts)
+  local theme = require("yana.panel.ui_review_button_theme").set(opts.args)
+  vim.notify("Yana review theme: " .. theme)
+end, { nargs = "?", desc = "Select or cycle the review-button theme",
+  complete = function() return require("yana.panel.ui_review_button_theme").names() end })
 
 -- Logging surface (LSP-shaped: same names/verbs as :LspLog / vim.lsp.log).
 -- WARN by default, same as vim.lsp.log -- these three commands are the

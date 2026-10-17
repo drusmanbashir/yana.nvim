@@ -9,7 +9,7 @@ M.CONTEXTS = {
   review = { "accept_hunk", "reject_hunk", "accept_file", "reject_file", "accept_all", "next_hunk", "prev_hunk" },
   prompt = { "submit", "stop" },
   panel = {
-    "model", "new_chat", "toggle_mode", "resend", "review", "reject", "focus_prompt", "close",
+    "model", "new_chat", "resend", "review", "reject", "focus_prompt", "close",
     "next_panel", "prev_panel", "completion_menu", "new_panel", "queue", "steer",
   },
   float = { "history_prev", "history_next" },

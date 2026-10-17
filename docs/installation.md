@@ -39,7 +39,7 @@ authentication is preserved.
 For a normal Ubuntu installation, add the tools used by Yana's sandbox:
 
 ```sh
-sudo apt-get install bubblewrap libcap2-bin
+sudo apt-get install git curl bubblewrap libcap2-bin
 ```
 
 These provide `bwrap` and `capsh`. The full system-tool list below covers minimal
@@ -83,17 +83,17 @@ Then install the system packages:
 
 **Debian / Ubuntu**
 ```sh
-sudo apt-get install -y bubblewrap libcap2-bin python3 util-linux findutils gawk libc-bin hostname
+sudo apt-get install -y git curl bubblewrap libcap2-bin python3 util-linux findutils gawk libc-bin hostname
 ```
 
 **Fedora / RHEL**
 ```sh
-sudo dnf install -y bubblewrap libcap python3 util-linux findutils gawk glibc-common hostname
+sudo dnf install -y git curl bubblewrap libcap python3 util-linux findutils gawk glibc-common hostname
 ```
 
 **Arch**
 ```sh
-sudo pacman -S --needed bubblewrap libcap python3 util-linux findutils gawk glibc inetutils
+sudo pacman -S --needed git curl bubblewrap libcap python3 util-linux findutils gawk glibc inetutils
 ```
 
 `overlayfs-fast` does not require FUSE. For `fuse-compat`, also install
@@ -150,6 +150,7 @@ is selectable with `backend = "cursor" | "claude" | "codex"`.
 - **`codex`** (OpenAI Codex CLI) — **experimental**. Install line from
   OpenAI's own package
   ([npmjs.com/package/@openai/codex](https://www.npmjs.com/package/@openai/codex)):
+  install Node.js and npm first if they are not already available.
   ```sh
   npm install -g @openai/codex
   ```

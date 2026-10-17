@@ -61,6 +61,7 @@ lua/yana/agent/agent.lua
 lua/yana/agent/agent_cpu_sampler.lua
 lua/yana/agent/agent_liveness.lua
 lua/yana/agent/agent_models.lua
+lua/yana/agent/agent_outcome.lua
 lua/yana/agent/model_hierarchy.lua
 lua/yana/agent/renewal.lua
 lua/yana/agent/renewal_brief.lua
@@ -79,7 +80,6 @@ lua/yana/configuration/config_normalize.lua
 lua/yana/configuration/config_resolve.lua
 lua/yana/debug_keys.lua
 lua/yana/diff.lua
-lua/yana/diff_preview.lua
 lua/yana/dump.lua
 lua/yana/flow_report.lua
 lua/yana/forensics.lua
@@ -139,7 +139,9 @@ lua/yana/panel/ui_pickers.lua
 lua/yana/panel/ui_queue.lua
 lua/yana/panel/ui_render.lua
 lua/yana/panel/ui_review.lua
+lua/yana/panel/ui_review_button_theme.lua
 lua/yana/panel/ui_review_buttons.lua
+lua/yana/panel/ui_review_buttons_signals.lua
 lua/yana/panel/ui_roots.lua
 lua/yana/panel/ui_sessions.lua
 lua/yana/panel/ui_submit.lua

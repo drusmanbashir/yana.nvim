@@ -248,7 +248,7 @@ The default mode is `inline`, the first entry of `modes`. Important options: >lu
     require("yana").setup({
       -- cmd / cmd_env: see |yana-machine-config|.
       model = nil,
-      modes = { "inline", "agentic", "ask" }, -- first starts; <M-t> cycles in order
+      modes = { "inline", "agentic", "ask" }, -- first starts; :YanaMode cycles in order
       approve_mcps = false,
       -- Extra artifact-grouping names/globs; never a destructive-safety rule.
       artifact_dir_prefixes = {},
@@ -450,12 +450,12 @@ authoritative change bundle.
 Direct `agentic` mode does not use the overlay, review, or diary. With the
 default `sandbox.agentic = "full"`, the selected agent CLI gets the same user
 permissions it gets in a terminal, including paths outside the opened
-workspace. Agentic is in the default `modes` and reached with `<M-t>`; leave it
+workspace. Agentic is in the default `modes` and reached with `:YanaMode`; leave it
 out of the list to make it unreachable, or list it first to start in it: >lua
 
     require("yana").setup({
       modes = { "agentic", "inline", "ask" },
-      sandbox = { inline = "vendor-default", agentic = "full" },
+      sandbox = { inline = "full", agentic = "full" },
     })
 <
 
@@ -463,10 +463,10 @@ out of the list to make it unreachable, or list it first to start in it: >lua
 `workspace`, `read-only`, and `vendor-default`; the last appends no vendor
 sandbox flag. Ask always uses `read-only`. Each backend translates the selected
 level into its own CLI spelling; a backend missing a level refuses at setup.
-Inline defaults to `vendor-default`: Yana's overlay is the write boundary, so
-no second vendor sandbox token is added. A system-wide vendor config may still
-narrow a declared `write_roots` entry; |yana-health| warns when this inheritance
-is active.
+Inline defaults to `full` so vendor edits need no interactive approval.
+Yana's overlay and review enforce its write boundary. An explicit
+`vendor-default` inherits vendor settings and can deny headless edits;
+|yana-health| warns when this inheritance is active.
 
 Nothing the agent prints can enable direct mode.
 

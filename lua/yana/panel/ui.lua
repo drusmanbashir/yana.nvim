@@ -403,7 +403,6 @@ local ui_changes = ui_changes_factory.new({
   MAX_REVIEW_RETRY = MAX_REVIEW_RETRY,
   REVIEW_RETRY_EXHAUSTED = REVIEW_RETRY_EXHAUSTED,
 })
-M.show_changes = ui_changes.show_changes
 M.accept_change = ui_changes.accept_change
 M.reject_change = ui_changes.reject_change
 M.accept_changes = ui_changes.accept_changes
@@ -493,7 +492,6 @@ local ui_turn_end = ui_turn_end_factory.new({
   buf_valid = buf_valid,
   M = M,
 })
-local last_stderr_line = ui_turn_end.last_stderr_line
 local on_done = ui_turn_end.on_done
 local on_exit_confirmed = ui_turn_end.on_exit_confirmed
 local set_model_actual = ui_turn_end.set_model_actual
@@ -795,7 +793,6 @@ M._test.fit_winbar = fit_winbar
 M._test.trunc_display = trunc_display
 M._test.backend_label = backend_label
 M._test.turn_evidence_dir = turn_evidence_dir
-M._test.last_stderr_line = last_stderr_line
 -- Liveness seams: the threshold is policy with no operator option; tests move the one number from here. `liveness`
 -- exposes per-turn state so a row can assert the pairing, not only its text.
 M._test.set_stall_threshold_ms = ui_liveness.set_stall_threshold_override

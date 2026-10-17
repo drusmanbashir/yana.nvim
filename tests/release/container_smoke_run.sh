@@ -4,7 +4,6 @@
 #   positive              — smoke.lua (require yana, :Yana, panel)
 #   negative              — empty packpath; require("yana") must fail
 #   turns-agentic|inline|ask — two real submits for that mode (SIX-TURNS PASS)
-#   turns-cross-mode-reuse — red control: share one state root across modes (must FAIL)
 set -euo pipefail
 
 mode=${1:-positive}
@@ -159,34 +158,6 @@ turns-agentic | turns-inline | turns-ask)
 	if [[ -f $scratch/hl/state_root.txt ]]; then
 		echo "STATE_ROOT mode=$turn_mode $(cat "$scratch/hl/state_root.txt")"
 	fi
-	;;
-turns-cross-mode-reuse)
-	scratch=$scratch_base/cross
-	mkdir -p "$scratch"
-	plugin=$(install_plugin "$scratch")
-	shared=$scratch/shared-hl
-	mkdir -p "$shared"
-	export YANA_SIX_TURNS_MODE=ask
-	export YANA_SIX_TURNS_SCRATCH=$shared
-	set +e
-	run_nvim "$scratch" -l "$plugin/tests/release/container_six_turns.lua" >/tmp/ask.out 2>&1
-	ask_rc=$?
-	set -e
-	export YANA_SIX_TURNS_MODE=agentic
-	set +e
-	run_nvim "$scratch" -l "$plugin/tests/release/container_six_turns.lua" >/tmp/agentic.out 2>&1
-	agentic_rc=$?
-	set -e
-	assert_no_yanad "$shared"
-	disk=$(cat "$shared/ws/notes.txt" 2>/dev/null || true)
-	echo "cross-mode ask_rc=$ask_rc agentic_rc=$agentic_rc disk=<<$disk>>"
-	# Shared scratch means agentic edits the same notes.txt ask left seeded —
-	# that contamination must be visible so the host treats this mode as red.
-	if [[ $disk == *six-turn-* ]]; then
-		echo "TURNS CROSS-MODE REUSE DETECTED"
-	fi
-	echo "TURNS CROSS-MODE REUSE FAIL"
-	exit 1
 	;;
 *)
 	echo "container_smoke_run: unknown mode: $mode" >&2

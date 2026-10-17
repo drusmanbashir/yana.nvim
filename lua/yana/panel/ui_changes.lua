@@ -1,9 +1,4 @@
--- Accept/reject/show commands for pending changes -- split out of yana.ui (cluster 5,
--- the third of three files this cluster needed; see yana.ui_review's header for why).
--- `M.show_changes`, `M.accept_change`, `M.reject_change`, `M.accept_changes`,
--- `M.reject_changes`, `M.review_changes` moved here verbatim (as plain locals,
--- re-exported by ui.lua under their original `M.*` names so no call site changes);
--- `M.accept_changes`/`M.reject_changes`'s internal calls to
+-- Accept/reject/review commands for pending changes.
 local diff = require("yana.diff")
 local notify = require("yana.notify")
 local notify_one_line = notify.one_line
@@ -22,29 +17,6 @@ function M.new(deps)
   local inline_review_opts = deps.inline_review_opts
   local MAX_REVIEW_RETRY = deps.MAX_REVIEW_RETRY
   local REVIEW_RETRY_EXHAUSTED = deps.REVIEW_RETRY_EXHAUSTED
-
--- View the file changes the agent made this session as a side-by-side diff.
-local function show_changes()
-  local p = current_panel()
-  if not p or #p.changes == 0 then
-    notify_one_line("yana: no file changes this session", vim.log.levels.INFO)
-    return
-  end
-  if #p.changes == 1 then
-    diff.show(p.changes[1])
-    return
-  end
-  vim.ui.select(p.changes, {
-    prompt = "yana: view change",
-    format_item = function(c)
-      return string.format("%s %s  (+%s −%s)", diff.status_icon(c), c.rel, c.added or "?", c.removed or "?")
-    end,
-  }, function(choice)
-    if choice then
-      diff.show(choice)
-    end
-  end)
-end
 
 local function pick_pending(prompt, cb)
   local p = current_panel()
@@ -283,7 +255,6 @@ local function review_changes()
 end
 
   return {
-    show_changes = show_changes,
     pick_pending = pick_pending,
     retry_refused_review = retry_refused_review,
     accept_change = accept_change,

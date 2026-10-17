@@ -119,7 +119,8 @@ open_capture_userns_start() {
 }
 
 run_open_capture_fuse() {
-	local real_uid real_gid state_idx state_dir state_base rc marker marker_dir
+	prepare_neovim_state
+	local real_uid real_gid state_idx state_dir rc marker marker_dir
 	local -A marker_dirs=()
 	real_uid=$(id -u)
 	real_gid=$(id -g)
@@ -154,12 +155,11 @@ run_open_capture_fuse() {
 	for state_dir in ${STATE_DIRS[@]+"${STATE_DIRS[@]}"}; do
 		state_idx=$(( state_idx + 1 ))
 		if [[ ! -e "$state_dir" ]]; then
-			state_base=${state_dir##*/}
-			if [[ "${state_base#.}" == *.* ]]; then
+			if state_path_is_directory "$state_dir"; then
+				mkdir -p "$state_dir" 2>/dev/null || true
+			else
 				mkdir -p "${state_dir%/*}" 2>/dev/null || true
 				: >"$state_dir" 2>/dev/null || true
-			else
-				mkdir -p "$state_dir" 2>/dev/null || true
 			fi
 		fi
 		[[ -e "$state_dir" ]] && bwrap_args+=(--bind "$state_dir" "$NEUTRAL_STATE/$state_idx")

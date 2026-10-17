@@ -4,6 +4,115 @@
 # Sourced by the launcher and inner helper. No shebang exec; do not run directly.
 # Must not call `set` or install traps: it shares the parent's set -eu.
 
+NEOVIM_STATE_DIRS=()
+NEOVIM_STATE_FILES=()
+
+# Existing --state-dir convention: a missing basename with an extension names
+# a file. Every preparation route and seed classification uses this one rule.
+state_path_is_directory() {
+	local path=$1 basename
+	[[ ! -d "$path" ]] || return 0
+	[[ ! -e "$path" ]] || return 1
+	basename=${path##*/}
+	[[ "${basename#.}" != *.* ]]
+}
+
+# CORE "Neovim background-process files": use the same host-backed mounts as
+# backend state, not an ignore rule that copies stale bytes back at turn end.
+collect_neovim_state() {
+	local app=${NVIM_APPNAME:-nvim} home=${HOME:-} path log existing covered
+	[[ -n "$home" && -n "$WORKSPACE" ]] || return 0
+	case "/$app/" in
+		//*|*/../*) die_usage "NVIM_APPNAME must name a relative Neovim application directory" ;;
+	esac
+	NEOVIM_STATE_DIRS=()
+	NEOVIM_STATE_FILES=()
+	for path in "${XDG_STATE_HOME:-$home/.local/state}/$app" "${XDG_CACHE_HOME:-$home/.cache}/$app"; do
+		[[ "$path" == /* ]] || die_usage "Neovim state and cache paths must be absolute"
+		path=$(realpath_safe "$path")
+		NEOVIM_STATE_DIRS+=("$path")
+		STATE_DIRS+=("$path")
+	done
+	log=${NVIM_LOG_FILE:-}
+	if [[ -n "$log" && "$log" != /* ]]; then log="$WORKSPACE/$log"; fi
+	for path in "$WORKSPACE/nvim.log" "$log"; do
+		[[ -n "$path" ]] || continue
+		# /dev is already writable. Resolve neither character devices nor the
+		# standard stream links: their /proc/self/fd targets belong to the child.
+		if [[ "$path" == /dev/* ]] && { [[ -c "$path" ]] \
+			|| { [[ -e "$path" ]] && [[ "$path" == /dev/stdin || "$path" == /dev/stdout || "$path" == /dev/stderr ]]; }; }; then
+			continue
+		fi
+		path=$(realpath_safe "$path")
+		[[ "$path" != /dev/* || ! -c "$path" ]] || continue
+		case "/${path#/}/" in
+			*/.git/*|*/.hg/*|*/.svn/*) refuse "Neovim background path '$path' is a control-plane path" ;;
+		esac
+		covered=0
+		for existing in ${STATE_DIRS[@]+"${STATE_DIRS[@]}"}; do
+			if [[ "$path" == "$existing" ]] || { state_path_is_directory "$existing" && path_is_prefix "$existing" "$path"; }; then
+				covered=1
+				break
+			fi
+		done
+		for existing in "${NEOVIM_STATE_DIRS[@]}"; do
+			path_is_prefix "$existing" "$path" && covered=1
+		done
+		(( covered == 0 )) || continue
+		NEOVIM_STATE_FILES+=("$path")
+		STATE_DIRS+=("$path")
+	done
+}
+
+prepare_neovim_state() {
+	local path protected root
+	for path in "${NEOVIM_STATE_DIRS[@]}" "${NEOVIM_STATE_FILES[@]}"; do
+		case "/${path#/}/" in
+			*/.git/*|*/.hg/*|*/.svn/*) refuse "Neovim background path '$path' is a control-plane path" ;;
+		esac
+		for protected in "$STATE_ROOT" "$LAYER_ROOT" ${EXTRA_LAYER_ROOTS[@]+"${EXTRA_LAYER_ROOTS[@]}"}; do
+			[[ -n "$protected" ]] || continue
+			protected=$(realpath_safe "$protected")
+			if path_is_prefix "$protected" "$path" || path_is_prefix "$path" "$protected"; then
+				refuse "Neovim background path '$path' overlaps private Yana state '$protected'"
+			fi
+		done
+	done
+	for path in "${NEOVIM_STATE_DIRS[@]}"; do
+		for root in "$WORKSPACE" ${EXTRA_ROOTS[@]+"${EXTRA_ROOTS[@]}"}; do
+			path_is_prefix "$path" "$root" && refuse "Neovim state directory '$path' would make a capture root writable"
+		done
+		mkdir -p -- "$path" || refuse "cannot create Neovim state directory '$path'"
+	done
+	for path in "${NEOVIM_STATE_FILES[@]}"; do
+		mkdir -p -- "${path%/*}" || refuse "cannot create Neovim log parent '${path%/*}'"
+		if [[ ! -e "$path" ]]; then
+			# A file bind needs an existing host inode. This one empty placeholder
+			# is necessary for an absent workspace nvim.log; never truncate a log.
+			(set -o noclobber; : >"$path") 2>/dev/null || [[ -f "$path" ]] \
+				|| refuse "cannot create Neovim background file '$path'"
+		fi
+		[[ -f "$path" ]] || refuse "Neovim background path '$path' is not a regular file"
+	done
+}
+
+# Seeds must not manufacture upper-layer copies of host-backed exceptions.
+writable_exception_contains() {
+	local path=$1 exception
+	for exception in "$CURSOR_DIR" ${STATE_DIRS[@]+"${STATE_DIRS[@]}"}; do
+		[[ -n "$exception" ]] || continue
+		exception=$(realpath_safe "$exception")
+		[[ "$path" != "$exception" ]] || return 0
+		if [[ "$exception" == "$CURSOR_DIR" ]] || state_path_is_directory "$exception"; then
+			path_is_prefix "$exception" "$path" && return 0
+		fi
+	done
+	for exception in "${NEOVIM_STATE_DIRS[@]}"; do
+		path_is_prefix "$exception" "$path" && return 0
+	done
+	return 1
+}
+
 # These sockets can ask the host user manager to execute outside the jail.
 # Hide only those endpoints, preserving other runtime sockets such as SSH agents.
 user_manager_endpoints() {

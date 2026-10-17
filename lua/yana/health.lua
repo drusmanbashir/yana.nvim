@@ -368,7 +368,9 @@ function M.check()
 
   yana_ui_row()
 
+  local below_floor = false
   for _, item in ipairs(dependencies.check(config.options.mode)) do
+    below_floor = below_floor or (item.id == "nvim:min" and item.level == "error")
     local body = item.message
     if item.id == "exec:sqlite3" and item.level == "warn" then
       body = tostring(item.message) .. " — external Cursor session titles unavailable"
@@ -383,6 +385,13 @@ function M.check()
     end
   end
 
+  if below_floor then return end
+  local backend = config.options.backend
+  local failure = require("yana.agent.agent_outcome").last_failure(backend)
+  if failure then
+    err("[vendor:last-failure:" .. backend .. "] exit code: " .. tostring(failure.exit_code) .. "\n" .. failure.message,
+      { "Correct the reported vendor permission, model/account or network error and retry; run Neovim without root/sudo for a root refusal." })
+  end
   backend_auth_rows()
   birth_time_row()
   keymap_collision_row()
@@ -395,7 +404,7 @@ function M.check()
   elseif mode == "inline" and config.agent_needs_permission_flag() then
     warn(
       "mode = 'inline': the agent runs confined in the overlay and every change is reviewed before it reaches disk, "
-        .. "but its argv carries the vendor permission-bypass flag. "
+        .. "and sandbox.inline selects vendor permission level '" .. tostring(config.options.sandbox.inline) .. "' for headless editing. "
         .. "Your protection is Yana's host-enforced overlay plus review, not the vendor's prompts. See :help yana-security."
     )
   else

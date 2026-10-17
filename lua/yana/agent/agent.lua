@@ -296,6 +296,7 @@ function M.run(req)
   local model_mismatch_checked = false
   local got_result = false
   local result_failed = false
+  local process_outcome = require("yana.agent.agent_outcome").new(resolution.backend, config.options.vendor_timeout_ms)
 
   -- Opt-in raw tee (config.debug_record, default off); nil when off, so the default
   -- path performs no I/O.
@@ -379,6 +380,7 @@ function M.run(req)
         st.last_event_hr = uv.hrtime()
       end
       for _, ev in ipairs(vendor_stream.normalize(vstate, obj)) do
+        process_outcome.event(ev)
         -- Track the normalized event too, so the exit warning agrees with the decode path.
         if ev.type == "result" then
           got_result = true
@@ -453,6 +455,7 @@ function M.run(req)
           local key = jid or job_id
           local stop_reason = key and stop_reasons[key] or nil
           local stopped_by_yana = stop_reason ~= nil
+          local failure = process_outcome.finish(code, table.concat(stderr_acc, "\n"), got_result, stopped_by_yana)
           if key then
             stop_reasons[key] = nil
             stop_cpu_sampler(key)
@@ -564,6 +567,7 @@ function M.run(req)
               argv0 = resolved_cmd,
               elapsed_ms = elapsed_ms,
               got_result = got_result,
+              failure = failure,
             })
           end
         end)
@@ -578,6 +582,7 @@ function M.run(req)
   local ok_start, job = pcall(vim.fn.jobstart, cmd, jobstart_opts)
 
   if not ok_start or type(job) ~= "number" or job <= 0 then
+    process_outcome.finish(-1, tostring(job), false, false)
     if L then
       ledger.record_spawn(L, {
         argv = cmd,
@@ -600,6 +605,7 @@ function M.run(req)
   end
 
   job_id = job
+  process_outcome.start(job, M.stop)
   start_cpu_sampler(job, M.pid(job))
   if L then
     spawn = ledger.record_spawn(L, {

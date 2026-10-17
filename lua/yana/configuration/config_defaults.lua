@@ -19,6 +19,8 @@ local defaults = {
 
   -- Model to use. nil/"" => let cursor-agent pick (Auto). e.g. "claude-opus-5".
   model = nil,
+  -- Absolute process deadline, including vendor retry loops; positive milliseconds.
+  vendor_timeout_ms = 300000,
 
   -- Closed set error|warn|info|debug maps onto vim.log.levels. A record writes iff its
   -- severity >= this floor (debug shows everything; error only errors). Lifecycle rows
@@ -74,10 +76,9 @@ local defaults = {
 
   -- Vendor sandbox levels: Yana owns this
   -- vocabulary; each backend descriptor owns its argv translation.
-  -- Inline's host boundary is Yana's overlay. The vendor therefore inherits
-  -- its system-wide sandbox configuration instead of receiving a second,
-  -- narrower workspace boundary that cannot see declared write_roots.
-  sandbox = { inline = "vendor-default", agentic = "full" },
+  -- Inline grants vendor edit permission without a prompt; the overlay and
+  -- review enforce its write boundary independently of vendor permissions.
+  sandbox = { inline = "full", agentic = "full" },
 
   -- Pass --trust so the workspace is trusted in headless mode (no prompt).
   trust = true,
@@ -232,9 +233,8 @@ local defaults = {
   },
 
   context = {
-    -- When no visual selection is given, tell the agent which file/line the
-    -- cursor is on so it can open the file itself.
-    include_file = true,
+    -- File/cursor hints are opt-in; ordinary typed prompts attach no code.
+    include_file = false,
     -- Hard cap on selection lines embedded into the prompt.
     max_selection_lines = 600,
   },
@@ -247,6 +247,7 @@ local defaults = {
     prompt_height = 6,
     -- Review button strip (between conversation and prompt while a turn is live).
     review_buttons = {
+      theme = "native", -- native (editor colours), dark, light; :YanaReviewTheme cycles.
       -- Cap on strip height in rows (8 = one row per button when the column is narrow).
       max_height = 8,
       min_height = 1,
@@ -291,7 +292,6 @@ local defaults = {
     -- Panel.
     model = "<C-g>", -- one picker: the agent CLI, then its model
     new_chat = "<C-n>",
-    toggle_mode = "<M-t>", -- Alt+t: cycle `modes` (avoid <C-t> -- Vim tag pop / E73)
     resend = "<M-r>", -- prefix: then r (here), n (new chat), a (new agent chat)
     review = "<C-y>",
     reject = "<C-x>",

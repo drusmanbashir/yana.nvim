@@ -35,9 +35,10 @@ local grid = require("yana.panel.ui_grid")
 local views = require("yana.panel.ui_panel_views")
 local M = {}
 local MIN_CONV, FLASH_MS = 3, 38
-local HL = { live = "YanaReviewBtn", dim = "YanaReviewBtnDim", hover = "YanaReviewBtnHover", flash = "YanaReviewBtnFlash", marked = "YanaReviewBtnMarked", key = "YanaReviewBtnKey" }
+local theme = require("yana.panel.ui_review_button_theme")
+local HL = theme.hl_groups()
+theme.apply()
 local STRIP_MAP_DESC = { ["<LeftMouse>"] = "yana: review button press", ["<LeftRelease>"] = "yana: review button release", ["<MouseMove>"] = "yana: review button hover" }
-for name, spec in pairs({ YanaReviewBtn = { default = true, link = "Pmenu" }, YanaReviewBtnDim = { default = true, link = "Comment" }, YanaReviewBtnHover = { default = true, link = "PmenuSel" }, YanaReviewBtnFlash = { default = true, link = "IncSearch" }, YanaReviewBtnMarked = { default = true, underline = true, sp = "Orange" }, YanaReviewBtnKey = { default = true, link = "Special" } }) do pcall(vim.api.nvim_set_hl, 0, name, spec) end
 
 -- ONE strip per (pool, tab). The strip is the sidebar's chrome for a live
 -- Turn, and a Turn belongs to a POOL (keyed by workspace), not to a panel, so
@@ -602,7 +603,7 @@ end
 function M.refresh(tab) for _, e in ipairs(tab and entries_in_tab(tab) or all_entries()) do refresh_entry(e) end end
 
 local function close_entry(e, reason)
-  if not e then return end; forget(e); stop_timer(e); if e.augroup then pcall(vim.api.nvim_del_augroup_by_id, e.augroup) end
+  if not e or e.closed then return end; e.closed = true; forget(e); stop_timer(e); if e.augroup then pcall(vim.api.nvim_del_augroup_by_id, e.augroup) end
   if e.bufgroup then pcall(vim.api.nvim_del_augroup_by_id, e.bufgroup); e.bufgroup = nil end
   log.lifecycle_later("review.strip_close", { tab = e.tab, panel_id = e.panel and e.panel.id or nil, reason = reason or "unspecified" })
   local prev_ea = vim.o.equalalways; vim.o.equalalways = false; if e.grid then e.grid:close(false) end; if valid_win(e.win) then pcall(vim.api.nvim_win_close, e.win, true) end; if valid_buf(e.buf) then pcall(vim.api.nvim_buf_delete, e.buf, { force = true }) end
@@ -685,6 +686,8 @@ local function open_impl(panel, pool, tab)
   e.grid:attach(e.buf, e.win)
   -- Resize NEVER closes the strip: it re-lays out and re-renders.
   e.augroup = vim.api.nvim_create_augroup("YanaReviewButtons" .. tostring(e.win), { clear = true }); vim.api.nvim_create_autocmd({ "WinResized", "VimResized" }, { group = e.augroup, callback = function() refresh_entry(e) end }); vim.api.nvim_create_autocmd("User", { group = e.augroup, pattern = "YanaReviewSettled", callback = function() refresh_entry(e) end })
+  vim.api.nvim_create_autocmd("WinClosed", { group = e.augroup, pattern = tostring(e.win),
+    callback = function() close_entry(e, "window_closed") end })
   vim.api.nvim_create_autocmd({ "BufEnter", "WinEnter" }, { group = e.augroup, callback = function()
     if vim.api.nvim_get_current_tabpage() == e.tab then refresh_entry(e) end
   end })

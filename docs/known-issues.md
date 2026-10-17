@@ -1,5 +1,17 @@
 # Known issues
 
+Blocked user namespaces produce `:checkhealth yana` ERROR `[bwrap:userns]`
+with the AppArmor remedy, and refuse confined turns.
+Unavailable cgroup delegation produces ERROR `[cgroup:delegation]` with the
+required setup, and refuses confined turns.
+An unsupported Neovim produces ERROR `[nvim:min]` naming the minimum version.
+A vendor permission refusal or unavailable model appears verbatim in the
+panel and, after that run, under health ERROR `[vendor:last-failure:<backend>]`.
+A nonzero vendor exit or missing result shows the exit code and last ten
+stderr lines instead of “no reviewable changes.”
+A stalled network/proxy run stops at `vendor_timeout_ms` (default five
+minutes) with `vendor deadline exceeded after N ms` plus the vendor's stderr.
+
 `:w` is a plain Neovim save of the visible buffer, including pending agent lines. The issues below are separate from that save behaviour:
 
 - **There is no trash store, so a proposed DELETE or CHMOD is not enabled
@@ -27,12 +39,11 @@
   is mounted before the agent process exists and cannot be widened while it
   runs. This is deliberate: the boundary is what makes the review the only route
   from agent bytes to your files.
-- **A vendor's system-wide sandbox can silently narrow an inline root.** Inline
-  defaults to `sandbox.inline = "vendor-default"`, so Yana adds no second
-  vendor sandbox over its own host-enforced overlay. This keeps every declared
-  `write_roots` mount writable while everything outside the mounts stays
-  read-only. A stricter vendor config can still refuse a declared root;
-  `:checkhealth yana` warns and names the active backend and configuration key.
+- **Explicit `sandbox.inline = "vendor-default"` can deny headless edits.**
+  It inherits vendor permission settings; a headless turn cannot answer an
+  approval prompt. The default `full` permits edits inside Yana's overlay,
+  with review controlling which changes reach disk. A stricter explicit
+  vendor level may narrow a declared root; `:checkhealth yana` reports it.
 - **A vendor can hide a kernel refusal inside its JSON stream.** Yana records
   `system_refused` when the real vendor process exposes EROFS on stderr. Codex
   0.151.0 can instead put the child error inside JSON stdout, narrate the

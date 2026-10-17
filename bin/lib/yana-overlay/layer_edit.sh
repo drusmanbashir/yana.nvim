@@ -93,6 +93,7 @@ layer_target() {
 		LAYER_EDIT_REASON="'$path' is outside the turn's roots"
 		return 1
 	fi
+	writable_exception_contains "$path" && return 0
 	dest="$SEED_UPPER/${path#"$SEED_ROOT"/}"
 	# An upper can hold symlinks an agent made; never follow one out of it.
 	parent=$(realpath_safe "${dest%/*}")

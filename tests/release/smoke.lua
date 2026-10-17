@@ -22,6 +22,13 @@ local legacy_name = "neo" .. "cursor"
 check(not pcall(require, legacy_name), "old Lua namespace is absent")
 check(vim.fn.exists(":Yana") == 2, "panel command exists")
 check(vim.fn.exists(":YanaEdit") == 2, "inline-edit command exists")
+check(vim.fn.exists(":YanaReviewTheme") == 2, "review theme command exists")
+check(options.ui.review_buttons.theme == "native", "review theme defaults to native")
+vim.cmd("YanaReviewTheme light")
+check(options.ui.review_buttons.theme == "light"
+  and vim.api.nvim_get_hl(0, { name = "YanaReviewBtn", link = false }).bg == 0xe5e7eb,
+  "installed review theme changes to light")
+vim.cmd("YanaReviewTheme native")
 check(vim.fn.exists(":" .. legacy_name:gsub("^%l", string.upper)) == 0, "old command is absent")
 
 local ok_open, open_err = pcall(vim.cmd, "YanaOpen")

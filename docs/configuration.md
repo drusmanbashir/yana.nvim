@@ -14,15 +14,16 @@ opts = {
   backend = "cursor", -- choose "cursor", "claude" or "codex" for your installed CLI
   modes = { "inline", "agentic", "ask" },
   mappings = {
-    toggle = "<leader>cc",
-    ask = "<leader>ca",
-    inline_edit = "<C-k>",
+    toggle = "<C-a>",
+    ask = false,
+    inline_edit = false,
   },
 }
 ```
 
-That's enough to open the panel, ask a question, and select text and
-Ctrl-K it. Everything past this point is optional tuning. See
+That's enough to open the panel and send prompts. For an inline-edit float,
+select text and run `:YanaEdit`; no shortcut is assigned by default.
+Everything past this point is optional tuning. See
 [Installation](installation.md) for environment variables and per-machine
 paths, and [How it works](how-it-works.md) for what `mode` and the backend
 picker actually do at runtime.
@@ -49,6 +50,10 @@ opts = {
   another variable your shell already exports, or set it to `false` to skip it.
 - **`model`** (default `nil`) — model id passed to the backend. `nil` lets
   the backend choose (shown as "auto").
+- **`vendor_timeout_ms`** (default `300000`, five minutes) — absolute process
+  deadline, including vendor retries; a positive integer up to `2147483647`.
+  Expiry stops the vendor and shows the deadline and stderr in the panel;
+  increase it explicitly for longer tasks.
 - **`backend`** (default `"cursor"`) — which entry of `backends` is active:
   which binary runs, which account is billed. Switching backend always
   resets `model`, because a model id from one vendor means nothing to
@@ -128,7 +133,7 @@ field).
 ```lua
 opts = {
   modes = { "inline", "agentic", "ask" },
-  sandbox = { inline = "vendor-default", agentic = "full" },
+  sandbox = { inline = "full", agentic = "full" },
   inline_exec_allowlist = nil,
   single_file = { enabled = false, max_entries = 0 }, -- legacy; ignored with one warning
 }
@@ -138,17 +143,21 @@ opts = {
   may enter. `"ask"` reads and answers, proposing no edits; `"inline"` turns
   edits into reviewable hunks in your real buffers; `"agentic"` lets the agent
   write your real files directly, with no review. The first entry is the
-  starting mode, `<M-t>` (`mappings.toggle_mode`) cycles the list in order,
+  starting mode, `:YanaMode` cycles the list in order,
   and a mode missing from the list cannot be entered. `"ask"` always runs at
   the `read-only` sandbox level regardless of the `sandbox` setting below.
   The old keys still work: `mode = X` moves X to the front of the default
   list, `enable_agentic` set to anything but `true` removes `"agentic"`, and
   `modes` wins when both old and new keys are given.
-- **`sandbox`** (default `{ inline = "vendor-default", agentic = "full" }`)
+- **`sandbox`** (default `{ inline = "full", agentic = "full" }`)
   — which of the four vendor-neutral sandbox levels (`full`, `workspace`,
   `read-only`, `vendor-default`) `inline` and `agentic` turns ask the
   backend for. `inline`'s own write boundary is Yana's overlay, so its
-  default asks the vendor for nothing extra.
+  default permits headless edits without an interactive vendor permission prompt.
+  Proposed file edits stay in the overlay until review accepts them; the backend's
+  declared `state_dirs` remain writable on the real filesystem and network access
+  remains open (Claude: `~/.claude`, `~/.claude.json`; Cursor: `~/.cursor`,
+  `~/.config/cursor`; Codex: `~/.codex`).
 - **`inline_exec_allowlist`** (default `nil`, alpha) — a list of executable
   basenames/paths; when set, it narrows which executables `inline` mode may
   launch. `nil` keeps historical (unrestricted) behavior. `ask` and
@@ -240,7 +249,7 @@ opts = {
     show_usage = true,
     show_thinking = false,
     spinner = { "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" },
-    review_buttons = { max_height = 8, min_height = 1, steal_ratio = nil },
+    review_buttons = { theme = "native", max_height = 8, min_height = 1, steal_ratio = nil },
   },
   diff_highlights = {
     incoming = { link = "DiffAdd" },
@@ -277,6 +286,12 @@ opts = {
   `8`) caps its height in rows; `min_height` (default `1`) is its floor;
   `steal_ratio` (default `nil`, meaning equal shares) sets relative
   weights across the sidebar's horizontal splits at open.
+  `theme` defaults to `"native"`, following your editor colourscheme; choose
+  `"dark"` or `"light"` for fixed button colours. `:YanaReviewTheme` cycles
+  these three while review is open, or use `:YanaReviewTheme light` (Tab
+  completes names). Runtime switching lasts until setup/restart; edit this
+  setting to keep your choice. Switching affects no review decisions,
+  windows, editor colours or inline diff highlights.
 - **`diff_highlights`** — highlight groups for inline hunks: `incoming`
   (added text, default links to `DiffAdd`), `deleted` (default
   `DiffDelete`), `hint` (default `Comment`).
@@ -301,7 +316,7 @@ opts = {
     -- Prompt: the panel prompt and the inline-edit float
     submit = "<C-s>", stop = "<C-c>",
     -- Panel
-    model = "<C-g>", new_chat = "<C-n>", toggle_mode = "<M-t>", resend = "<M-r>",
+    model = "<C-g>", new_chat = "<C-n>", resend = "<M-r>",
     review = "<C-y>", reject = "<C-x>", focus_prompt = "i",
     close = "q", next_panel = "<M-.>", prev_panel = "<M-,>", completion_menu = "<C-Space>",
     -- Advanced
@@ -311,6 +326,12 @@ opts = {
     toggle = "<C-a>", ask = false, inline_edit = false,
   },
 }
+```
+
+Mode cycling has no plugin-owned key. Bind the command in your own keymap file:
+
+```lua
+vim.keymap.set({ "n", "i" }, "<M-t>", "<Cmd>YanaMode<CR>", { desc = "Yana: cycle mode" })
 ```
 
 - **Review keys** bind buffer-local in each reviewed buffer, normal and visual
@@ -378,7 +399,7 @@ opts = {
     rejection_cap = 3,
   },
   context = {
-    include_file = true,
+    include_file = false,
     max_selection_lines = 600,
   },
 }
@@ -402,7 +423,7 @@ opts = {
     structured.
   - `rejection_cap` (default `3`) — out-of-zone rejections allowed per path
     in one turn before the turn is cancelled outright.
-- **`context.include_file`** (default `true`) — when there's no visual
+- **`context.include_file`** (default `false`) — when explicitly enabled and there's no visual
   selection, tell the agent which file/line the cursor is on so it can open
   the file itself.
 - **`context.max_selection_lines`** (default `600`) — hard cap on how many
@@ -500,7 +521,7 @@ opts = {
   cmd_env = "YANA_AGENT_BIN", -- the NAME of a variable whose value is the cursor program's path; false skips this step
   model = nil, -- model id passed to the active backend's CLI as --model <id>; nil, "" or "auto" lets that CLI choose
   backends = {}, -- per-backend overrides deep-merged onto the shipped descriptors; see Backend descriptors above
-  sandbox = { inline = "vendor-default", agentic = "full" }, -- sandbox level per mode: "full", "workspace", "read-only" or "vendor-default"
+  sandbox = { inline = "full", agentic = "full" }, -- sandbox level per mode: "full", "workspace", "read-only" or "vendor-default"
   approve_mcps = false, -- cursor only: true passes --approve-mcps, auto-approving MCP servers (:checkhealth warns)
 
   -- Where turns write (absolute paths; a leading "~" is expanded)
@@ -522,7 +543,7 @@ opts = {
     rejection_cap = 3, -- out-of-zone rejections per file in one turn before the turn is cancelled (>= 1)
   },
   context = {
-    include_file = true, -- with no selection, tell the agent the current file and cursor line
+    include_file = false, -- plain prompts attach no file/cursor hint
     max_selection_lines = 600, -- a longer selection is cut to this many lines in the prompt
   },
   queue = {
@@ -536,6 +557,7 @@ opts = {
 
   ui = {
     review_buttons = { -- button strip between conversation and prompt while a turn is live
+      theme = "native", -- default; alternatives: "dark", "light"; :YanaReviewTheme cycles
       max_height = 8, -- tallest strip, in rows
       min_height = 1, -- shortest strip, in rows (values below 1 act as 1)
       steal_ratio = nil, -- nil = equal shares; a list of weights, one per sidebar pane top to bottom
@@ -557,9 +579,9 @@ opts = {
     steer = "<C-CR>", -- interrupt and resend the prompt as a new turn; many terminals cannot tell <C-CR> from <CR>
     history_prev = "<C-p>", -- previous instruction (inline-edit float, normal and insert)
     history_next = "<C-n>", -- next instruction (inline-edit float, normal and insert)
-    toggle = "<C-a>", -- global, normal mode: open or close the panel; override, e.g. "<leader>cc"
-    ask = false, -- global: open the panel (normal) or ask about the selection (visual), e.g. "<leader>ca"
-    inline_edit = false, -- global, visual mode: inline-edit the selection, e.g. "<C-k>"
+    toggle = "<C-a>", -- global, normal mode: open or close the panel
+    ask = false, -- optional global shortcut for asking about code
+    inline_edit = false, -- optional global, visual-mode shortcut for inline edit
   },
   inline_edit = { -- small float that rewrites exactly the selected lines
     enable = true, -- false turns the feature off

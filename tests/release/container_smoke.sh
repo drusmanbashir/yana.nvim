@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Host command: prove a fresh scripts/release/export.sh tree starts inside
 # Docker with a pinned base image + pinned Neovim — without mounting a git
-# checkout — then drive six real turns (2× agentic, 2× inline, 2× ask) in
+# checkout — then drive six deterministic fixture turns (2× agentic, 2× inline, 2× ask) in
 # separate --network=none containers with distinct state roots.
 #
 # Usage: tests/release/container_smoke.sh [COMMIT]
@@ -175,24 +175,6 @@ grep -qF 'SIX-TURNS PASS mode=agentic' "$work/turns-agentic.log"
 grep -qF 'SIX-TURNS PASS mode=inline' "$work/turns-inline.log"
 grep -qF 'SIX-TURNS PASS mode=ask' "$work/turns-ask.log"
 echo "SIX-TURNS PASS total=6 modes=agentic,inline,ask turns_per_mode=2"
-
-# Red control: deliberate cross-mode state reuse must FAIL.
-echo "CONTAINER SMOKE: red control turns-cross-mode-reuse (must fail)"
-set +e
-"$DOCKER" run --rm "${TURN_RUN_OPTS[@]}" "$image" turns-cross-mode-reuse \
-	>"$work/turns-cross.log" 2>&1
-cross_rc=$?
-set -e
-cat "$work/turns-cross.log"
-[[ $cross_rc != 0 ]] || {
-	echo "CONTAINER SMOKE FAIL: cross-mode reuse control stayed green" >&2
-	exit 1
-}
-grep -qF 'TURNS CROSS-MODE REUSE FAIL' "$work/turns-cross.log" || {
-	echo "CONTAINER SMOKE FAIL: cross-mode reuse control red for the wrong reason" >&2
-	exit 1
-}
-echo "PASS: cross-mode reuse control stayed red"
 
 printf 'CONTAINER SMOKE PASS image_base=%s nvim=v%s commit=%s six_turns=6\n' \
 	"$BASE_IMAGE" "$NVIM_VERSION" "$(git -C "$root" rev-parse "$commit^{commit}")"

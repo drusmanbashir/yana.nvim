@@ -620,39 +620,6 @@ function M.reload_file(path, opts)
   return true
 end
 
--- Open a side-by-side diff tab comparing change.before vs after.
-function M.show(change)
-  if not change then
-    return
-  end
-
-  vim.cmd("tabnew")
-  if change.path and vim.fn.filereadable(change.path) == 1 then
-    vim.cmd("edit " .. vim.fn.fnameescape(change.path))
-  else
-    local after = vim.split(change.after or "", "\n", { plain = true })
-    local b = vim.api.nvim_get_current_buf()
-    vim.api.nvim_buf_set_lines(b, 0, -1, false, after)
-    vim.bo[b].buftype = "nofile"
-    pcall(vim.api.nvim_buf_set_name, b, "yana://after/" .. (change.rel or "file"))
-  end
-  vim.cmd("diffthis")
-  local ft = vim.bo.filetype
-
-  vim.cmd("leftabove vnew")
-  local b = vim.api.nvim_get_current_buf()
-  vim.bo[b].buftype = "nofile"
-  vim.bo[b].bufhidden = "wipe"
-  vim.bo[b].swapfile = false
-  vim.api.nvim_buf_set_lines(b, 0, -1, false, vim.split(change.before or "", "\n", { plain = true }))
-  vim.bo[b].modifiable = false
-  if ft and ft ~= "" then
-    vim.bo[b].filetype = ft
-  end
-  pcall(vim.api.nvim_buf_set_name, b, "yana://before/" .. (change.rel or "file"))
-  vim.cmd("diffthis")
-end
-
 -- Review a pending change: hunks open inline in the source buffer.
 -- opts: { on_accept(change), on_reject(change), on_close() }
 function M.review(change, opts)

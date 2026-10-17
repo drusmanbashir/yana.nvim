@@ -106,17 +106,17 @@ source "$DIR/lib/yana-overlay/mount.sh"
 # reaper. Handing PID 1 to a Node process that performs no init duties would
 # leave them as zombies.
 run_overlay() {
+	prepare_neovim_state
 	if (( READ_ONLY_WORKSPACE == 1 )); then
 		local -a ro_args=(
 			--die-with-parent --new-session --ro-bind / / --tmpfs /tmp
 		)
-		local runtime runtime_base
+		local runtime
 		for runtime in "$CURSOR_DIR" ${STATE_DIRS[@]+"${STATE_DIRS[@]}"}; do
 			[[ -n "$runtime" ]] || continue
 			if [[ ! -e "$runtime" ]]; then
-				runtime_base=${runtime##*/}
-				if [[ "${runtime_base#.}" == *.* ]]; then mkdir -p "${runtime%/*}"; : >"$runtime"
-				else mkdir -p "$runtime"; fi
+				if state_path_is_directory "$runtime"; then mkdir -p "$runtime"
+				else mkdir -p "${runtime%/*}"; : >"$runtime"; fi
 			fi
 			ro_args+=(--bind "$runtime" "$runtime")
 		done
@@ -177,22 +177,19 @@ run_overlay() {
 		# at a path under a mounted root is invisible the instant the overlay covers that root
 		# -- the same trap the ~/.cursor exception was moved inside for. Index i must match
 		# the order the --state-dir arguments are passed in.
-		local state_idx=0 state_dir state_base
+		local state_idx=0 state_dir
 		for state_dir in ${STATE_DIRS[@]+"${STATE_DIRS[@]}"}; do
 			state_idx=$(( state_idx + 1 ))
 			# Created here, on the HOST, as the invoking user -- before any
 			# namespace exists. A vendor's first run has no state directory yet,
 			# and bwrap refuses to bind a source that is not there.
 			#
-			# Strip one leading dot from the basename; a dot in what remains means an extension,
-			# so a file.
 			if [[ ! -e "$state_dir" ]]; then
-				state_base=${state_dir##*/}
-				if [[ "${state_base#.}" == *.* ]]; then
+				if state_path_is_directory "$state_dir"; then
+					mkdir -p "$state_dir" 2>/dev/null || true
+				else
 					mkdir -p "${state_dir%/*}" 2>/dev/null || true
 					: >"$state_dir" 2>/dev/null || true
-				else
-					mkdir -p "$state_dir" 2>/dev/null || true
 				fi
 			fi
 			[[ -e "$state_dir" ]] || continue
@@ -280,7 +277,7 @@ run_overlay() {
 	# path under a mounted root is invisible the instant the overlay covers that root --
 	# the same trap the ~/.cursor exception was moved inside for. Index i must match the
 	# order the --state-dir arguments are passed in.
-	local state_idx=0 state_dir state_base
+	local state_idx=0 state_dir
 	for state_dir in ${STATE_DIRS[@]+"${STATE_DIRS[@]}"}; do
 		state_idx=$(( state_idx + 1 ))
 		# Created here, on the HOST, as the invoking user -- before any
@@ -290,12 +287,11 @@ run_overlay() {
 		# Strip one leading dot from the basename; a dot in what remains means an extension,
 		# so a file.
 		if [[ ! -e "$state_dir" ]]; then
-			state_base=${state_dir##*/}
-			if [[ "${state_base#.}" == *.* ]]; then
+			if state_path_is_directory "$state_dir"; then
+				mkdir -p "$state_dir" 2>/dev/null || true
+			else
 				mkdir -p "${state_dir%/*}" 2>/dev/null || true
 				: >"$state_dir" 2>/dev/null || true
-			else
-				mkdir -p "$state_dir" 2>/dev/null || true
 			fi
 		fi
 		[[ -e "$state_dir" ]] || continue
@@ -475,6 +471,7 @@ parse_run_args() {
 cmd_run() {
 	local -a launch_args=("$@")
 	parse_run_args "$@"
+	collect_neovim_state
 	if [[ -n "$UPPER" && -n "$WORK" ]]; then
 		if [[ -n "$CAPTURE_PLAN" || -n "${YANA_OPEN_CAPTURE_MODE:-}" ]]; then
 			cmd_run_direct_open_capture

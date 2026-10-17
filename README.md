@@ -22,21 +22,18 @@ you review and accept them before they reach disk.
 
 ### Prerequisites
 
-Yana requires Neovim 0.11.2+.
-
-Use the [optional prerequisite installer](scripts/install-deps.sh) or follow
-the manual steps below. Run it as your normal user, not with `sudo`: it checks
-Neovim and your agent, then asks before each system change. When needed, it
-requests `sudo` to install Bubblewrap and its capability package, which Yana
-uses in Linux `ask` and `inline` modes to confine agent file writes until
-review, or to add Ubuntu's AppArmor permission. It refuses to add a second
-profile. Read the script before running it:
+Install `git` for lazy.nvim to clone plugins and `curl` to download installers.
+Yana needs Neovim 0.11.2+, an agent CLI and, on Linux, Bubblewrap. Follow
+steps 1–3 below, or run the [script](scripts/install-deps.sh) that checks these
+and installs what is missing. Read it first if you like; it asks before every
+`sudo` command.
 
 ```sh
 curl -fsSLO https://raw.githubusercontent.com/drusmanbashir/yana.nvim/main/scripts/install-deps.sh
-less install-deps.sh
 bash install-deps.sh
 ```
+
+If not using the installer, you can follow steps below for the prerequisites:
 
 #### 1. Install an agent
 
@@ -55,7 +52,7 @@ In Linux `ask` and `inline` modes, Bubblewrap, also used by
 a private workspace until you accept them. Install it and its capability tool:
 
 ```sh
-sudo apt-get install bubblewrap libcap2-bin
+sudo apt-get install git curl bubblewrap libcap2-bin
 ```
 
 #### 3. Allow Bubblewrap on Ubuntu 24.04+
@@ -98,28 +95,76 @@ macOS supports `agentic` mode only. See the
 
 Add this plugin declaration to your lazy.nvim configuration. The example
 starts with Claude; change `backend` to `"codex"` or `"cursor"` for another CLI.
+The table shows the public plugin's configurable mapping defaults. Change
+their values during setup; omitted entries keep their defaults.
 
 ```lua
 {
   "drusmanbashir/yana.nvim",
   dependencies = { "drusmanbashir/yana-ui.nvim" },
   event = "VeryLazy",
-  opts = { backend = "claude" },
+  opts = {
+    backend = "claude",
+    mappings = {
+      -- Global: available from any buffer
+      toggle = "<C-a>", -- open or close the panel
+      ask = false, -- optional shortcut for asking about code
+      inline_edit = false, -- optional visual shortcut for the instruction float
+
+      -- Reviewed buffers: normal and visual modes
+      accept_hunk = "ca", -- accept the change under the cursor
+      reject_hunk = "cr", -- reject the change under the cursor
+      accept_file = "cf", -- accept all changes in the current file
+      reject_file = "cx", -- reject all changes in the current file
+      accept_all = "cA", -- accept all changes in the turn
+      next_hunk = "]x", -- next change
+      prev_hunk = "[x", -- previous change
+
+      -- Panel prompt and inline-edit float: normal and insert modes
+      submit = "<C-s>", -- send the prompt
+      stop = "<C-c>", -- stop the response; close the float in insert mode
+
+      -- Panel
+      model = "<C-g>", -- choose an agent and model
+      new_chat = "<C-n>", -- start a new chat
+      resend = "<M-r>", -- then r: here, n: new chat, a: new agent chat
+      review = "<C-y>", -- review pending changes
+      reject = "<C-x>", -- reject pending changes
+      focus_prompt = "i", -- focus the prompt from the conversation
+      close = "q", -- close the panel or float (normal mode)
+      next_panel = "<M-.>", -- next panel, from the prompt
+      prev_panel = "<M-,>", -- previous panel, from the prompt
+      completion_menu = "<C-Space>", -- prompt completion (insert mode)
+      new_panel = "<M-n>", -- open another panel
+      queue = "<M-q>", -- open the prompt queue
+      steer = "<C-CR>", -- send instructions to the running agent
+
+      -- Inline-edit float: normal and insert modes
+      history_prev = "<C-p>", -- previous instruction
+      history_next = "<C-n>", -- next instruction
+    },
+  },
 }
 ```
+
+Set an optional mapping to `false` to disable it. The seven review mappings
+cannot be disabled: `false` or `""` restores their defaults. Review keys `cR`,
+`cU`, `u`, `U` and `<C-r>` are fixed. If your terminal treats `<C-CR>` as Enter,
+change `steer` to another key, such as `"<M-CR>"`.
 
 lazy.nvim installs the required `yana-ui.nvim` dependency. If you omit
 `backend`, Yana starts with Cursor; it does not guess from installed CLIs.
 
-Restart Neovim in your project, run `:checkhealth yana`, then `:Yana`. The
-opened project is included automatically. Use `:YanaRoots` only to add other
-folders; no model or project-path setting is needed for normal use.
+Restart Neovim in your project, run `:checkhealth yana`, then press
+`<C-a>`. The opened project is included automatically. Use `:YanaRoots`
+only to add other folders; no model or project-path setting is needed for
+normal use.
 
 ## Use
 
-Run `:Yana`, enter a prompt and press `<C-s>`. Or select lines and run
-`:YanaEdit`. Review the proposed hunks with `ca` / `cr`, accept the whole turn
-with `cA`, and undo or redo a decision with `u` / `<C-r>`.
+Press `<C-a>`, enter a prompt and press `<C-s>`. Or select lines and run
+`:YanaEdit` to open the instruction float. Review hunks with `ca` / `cr`, accept the
+whole turn with `cA`, and undo or redo a decision with `u` / `<C-r>`.
 
 See [all commands and keys](docs/usage.md),
 [configuration and optional overrides](docs/configuration.md),
