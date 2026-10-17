@@ -310,6 +310,8 @@ tests/release/agent_path_smoke.lua
 tests/release/blink_gate.sh
 tests/release/blink_smoke.lua
 tests/release/buffer_snapshot_exclusion_gate.sh
+tests/release/config_reference.lua
+tests/release/config_reference_gate.sh
 tests/release/confined_turn_gate.sh
 tests/release/confined_turn_smoke.lua
 tests/release/container_six_turns.lua

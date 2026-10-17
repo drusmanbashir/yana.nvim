@@ -34,6 +34,7 @@ epoch=$(git -C "$root" show -s --format=%ct "$commit")
 sleep 1
 (umask 077; TZ=Pacific/Auckland SOURCE_DATE_EPOCH=$epoch "$work/export/scripts/release/archive.sh" "$work/export" "$work/b")
 cmp "$work/a/yana.nvim-"*.tar.gz "$work/b/yana.nvim-"*.tar.gz
+"$work/export/tests/release/config_reference_gate.sh" "$work/export" "$(command -v nvim)"
 "$work/export/tests/release/fresh_install.sh" "$work/export" "$(command -v nvim)"
 "$work/export/tests/release/yana_ui_dependency_gate.sh" "$work/export" "$(command -v nvim)"
 DEV_CHECKOUT="$root" "$work/export/tests/release/confined_turn_gate.sh" "$work/export" "$(command -v nvim)"

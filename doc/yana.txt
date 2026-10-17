@@ -287,6 +287,417 @@ Diagnostic environment variables are disabled by default:
 Both modes write extra diagnostic state. Do not enable them when a clean
 default run with no diagnostic writes is required.
 
+Open capture~
+`open_capture` chooses how confined turns collect proposed file changes.
+Defaults: { mode = "auto", on_unavailable = "refuse" }.
+`open_capture.mode`: "auto" chooses kernel OverlayFS when the mount layout
+permits, otherwise FUSE; "overlayfs-fast" requires the kernel route;
+"fuse-compat" requires FUSE; "off" uses the existing confined overlay route.
+Keep "auto" normally. Select a route to diagnose host compatibility, or "off"
+to disable optional open capture. `open_capture.on_unavailable` accepts only
+"refuse": an unavailable route stops the turn, never runs it unconfined.
+
+Option paths and shipped defaults~
+
+Backend descriptors~
+`backends` overrides named vendor descriptors. cmd/cmd_env choose the program;
+noninteractive_flag/subcommand select noninteractive execution. stream_protocol
+is cursor (default), claude or codex; stream_json_args requests that parser's
+format. allow_edits_args and ask_args are vendor argument lists. sandbox_args
+maps full/workspace/read-only/vendor-default to argv lists; sandbox_args_stamps
+records measured_on (YYYY-MM-DD) and vendor_version for each verified mapping.
+mode_switch is per_turn or two_seat; the latter requires seats.ask={"ask"} and
+seats.edit={"inline","agentic"}, while per_turn forbids seats.
+select_model_flag selects a model; resume_flag/resume_subcommand resume it.
+mode_tokens describes effort/reasoning/speed controls: kind=flag uses flag,
+kind=config uses key, and optional values restricts choices. models is a static
+list of {id,label}; label defaults to id. list_models_args requests a live list
+(false disables it); list_models_format is lines (default) or json_models.
+whoami_args probes auth; auth_json_field or auth_output_patterns.signed_in and
+signed_out interpret its output. auth_login_hint/install_hint are user remedies;
+login_args runs interactive sign-in (false disables); auth_env lists credential
+variable names. state_dirs lists writable vendor state under HOME. image_flag
+supplies the image argument; close_stdin closes input at launch; steer_channel
+can declare stream-json steering. Override only tokens your CLI supports.
+
+Highlight tables accept nvim_set_hl() attributes; this index enumerates their
+shipped link fields, not Neovim's separate API schema. See docs/configuration.md
+for explanations and examples of the remaining option groups.
+
+Use dot paths below inside setup tables: ui.width means ui = { width = ... }.
+<name> is the selected backend name; [] denotes each list entry. Scalar list
+items are values, not separate options. {...} points to the child rows. Nil
+means unset, with runtime fallbacks described above. Backend nil means that
+capability is not declared by that vendor; its normalizer may supply a fallback.
+These are shipped defaults, not a recommended table to paste into setup().
+
+`approve_mcps`
+    false
+`artifact_dir_prefixes`
+    {}
+`backend`
+    "cursor"
+`backends`
+    {...}; see child paths
+`backends.<name>`
+    cursor: {...}; see child paths; claude: {...}; see child paths; codex: {...}; see child paths
+`backends.<name>.allow_edits_args`
+    cursor: {}; claude: {}; codex: { "--skip-git-repo-check" }
+`backends.<name>.ask_args`
+    cursor: {}; claude: {}; codex: { "--skip-git-repo-check" }
+`backends.<name>.auth_env`
+    cursor: { "CURSOR_API_KEY" }; claude: { "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY" }; codex: { "OPENAI_API_KEY", "CODEX_API_KEY", "CODEX_ACCESS_TOKEN" }
+`backends.<name>.auth_json_field`
+    cursor: nil; claude: "loggedIn"; codex: nil
+`backends.<name>.auth_login_hint`
+    cursor: "cursor-agent login"; claude: "claude auth login"; codex: "codex login"
+`backends.<name>.auth_output_patterns`
+    cursor: {...}; see child paths; claude: nil; codex: {...}; see child paths
+`backends.<name>.auth_output_patterns.signed_in`
+    cursor: "Logged in as"; claude: nil; codex: "Logged in using"
+`backends.<name>.auth_output_patterns.signed_out`
+    cursor: "Not logged in"; claude: nil; codex: "^%s*Not logged in%s*$"
+`backends.<name>.close_stdin`
+    cursor: nil; claude: true; codex: true
+`backends.<name>.cmd`
+    cursor: nil; claude: "claude"; codex: "codex"
+`backends.<name>.cmd_env`
+    cursor: "YANA_CURSOR_BIN"; claude: "YANA_CLAUDE_BIN"; codex: "YANA_CODEX_BIN"
+`backends.<name>.image_flag`
+    cursor: nil; claude: nil; codex: "-i"
+`backends.<name>.install_hint`
+    cursor: "curl https://cursor.com/install -fsS | bash"; claude: "curl -fsSL https://claude.ai/install.sh | bash"; codex: "npm install -g @openai/codex"
+`backends.<name>.list_models_args`
+    cursor: { "--list-models" }; claude: false; codex: { "debug", "models" }
+`backends.<name>.list_models_format`
+    cursor: nil; claude: nil; codex: "json_models"
+`backends.<name>.login_args`
+    cursor: { "login" }; claude: { "auth", "login" }; codex: { "login" }
+`backends.<name>.mode_switch`
+    cursor: "two_seat"; claude: "per_turn"; codex: "per_turn"
+`backends.<name>.mode_tokens`
+    cursor: nil; claude: {...}; see child paths; codex: {...}; see child paths
+`backends.<name>.mode_tokens.effort`
+    cursor: nil; claude: {...}; see child paths; codex: nil
+`backends.<name>.mode_tokens.effort.flag`
+    cursor: nil; claude: "--effort"; codex: nil
+`backends.<name>.mode_tokens.effort.kind`
+    cursor: nil; claude: "flag"; codex: nil
+`backends.<name>.mode_tokens.effort.values`
+    cursor: nil; claude: { "low", "medium", "high", "xhigh", "max" }; codex: nil
+`backends.<name>.mode_tokens.reasoning`
+    cursor: nil; claude: nil; codex: {...}; see child paths
+`backends.<name>.mode_tokens.reasoning.key`
+    cursor: nil; claude: nil; codex: "model_reasoning_effort"
+`backends.<name>.mode_tokens.reasoning.kind`
+    cursor: nil; claude: nil; codex: "config"
+`backends.<name>.mode_tokens.speed`
+    cursor: nil; claude: nil; codex: {...}; see child paths
+`backends.<name>.mode_tokens.speed.key`
+    cursor: nil; claude: nil; codex: "service_tier"
+`backends.<name>.mode_tokens.speed.kind`
+    cursor: nil; claude: nil; codex: "config"
+`backends.<name>.models`
+    cursor: nil; claude: list of tables; see [] fields; codex: nil
+`backends.<name>.models[]`
+    cursor: nil; claude: {...}; see child paths; codex: nil
+`backends.<name>.models[].id`
+    cursor: nil; claude: "auto", "fable", "opus", "sonnet", "haiku"; codex: nil
+`backends.<name>.models[].label`
+    cursor: nil; claude: "let claude choose", "fable", "opus", "sonnet", "haiku"; codex: nil
+`backends.<name>.noninteractive_flag`
+    cursor: "-p"; claude: "-p"; codex: false
+`backends.<name>.resume_flag`
+    cursor: "--resume"; claude: "--resume"; codex: nil
+`backends.<name>.resume_subcommand`
+    cursor: nil; claude: nil; codex: { "resume" }
+`backends.<name>.sandbox_args`
+    cursor: {...}; see child paths; claude: {...}; see child paths; codex: {...}; see child paths
+`backends.<name>.sandbox_args.full`
+    cursor: { "--force" }; claude: { "--permission-mode", "bypassPermissions" }; codex: { "-c", 'sandbox_mode="danger-full-access"' }
+`backends.<name>.sandbox_args.read-only`
+    cursor: { "--mode", "ask" }; claude: { "--permission-mode", "plan" }; codex: { "-c", 'sandbox_mode="read-only"' }
+`backends.<name>.sandbox_args.vendor-default`
+    cursor: {}; claude: {}; codex: {}
+`backends.<name>.sandbox_args.workspace`
+    cursor: { "--force" }; claude: { "--permission-mode", "acceptEdits" }; codex: { "-c", 'sandbox_mode="workspace-write"' }
+`backends.<name>.sandbox_args_stamps`
+    cursor: {...}; see child paths; claude: {...}; see child paths; codex: {...}; see child paths
+`backends.<name>.sandbox_args_stamps.full`
+    cursor: {...}; see child paths; claude: {...}; see child paths; codex: {...}; see child paths
+`backends.<name>.sandbox_args_stamps.full.measured_on`
+    cursor: "2026-10-17"; claude: "2026-10-17"; codex: "2026-10-17"
+`backends.<name>.sandbox_args_stamps.full.vendor_version`
+    cursor: "2026.10.16-e3cb207"; claude: "2.1.302 (Claude Code)"; codex: "codex-cli 0.163.0"
+`backends.<name>.sandbox_args_stamps.read-only`
+    cursor: {...}; see child paths; claude: {...}; see child paths; codex: {...}; see child paths
+`backends.<name>.sandbox_args_stamps.read-only.measured_on`
+    cursor: "2026-10-17"; claude: "2026-10-17"; codex: "2026-10-17"
+`backends.<name>.sandbox_args_stamps.read-only.vendor_version`
+    cursor: "2026.10.16-e3cb207"; claude: "2.1.302 (Claude Code)"; codex: "codex-cli 0.163.0"
+`backends.<name>.sandbox_args_stamps.vendor-default`
+    cursor: {...}; see child paths; claude: {...}; see child paths; codex: {...}; see child paths
+`backends.<name>.sandbox_args_stamps.vendor-default.measured_on`
+    cursor: "2026-10-17"; claude: "2026-10-17"; codex: "2026-10-17"
+`backends.<name>.sandbox_args_stamps.vendor-default.vendor_version`
+    cursor: "2026.10.16-e3cb207"; claude: "2.1.302 (Claude Code)"; codex: "codex-cli 0.163.0"
+`backends.<name>.sandbox_args_stamps.workspace`
+    cursor: {...}; see child paths; claude: {...}; see child paths; codex: {...}; see child paths
+`backends.<name>.sandbox_args_stamps.workspace.measured_on`
+    cursor: "2026-10-17"; claude: "2026-10-17"; codex: "2026-10-17"
+`backends.<name>.sandbox_args_stamps.workspace.vendor_version`
+    cursor: "2026.10.16-e3cb207"; claude: "2.1.302 (Claude Code)"; codex: "codex-cli 0.163.0"
+`backends.<name>.seats`
+    cursor: {...}; see child paths; claude: nil; codex: nil
+`backends.<name>.seats.ask`
+    cursor: { "ask" }; claude: nil; codex: nil
+`backends.<name>.seats.edit`
+    cursor: { "inline", "agentic" }; claude: nil; codex: nil
+`backends.<name>.select_model_flag`
+    cursor: "--model"; claude: "--model"; codex: "--model"
+`backends.<name>.state_dirs`
+    cursor: { "~/.cursor", "~/.config/cursor" }; claude: { "~/.claude", "~/.claude.json" }; codex: { "~/.codex" }
+`backends.<name>.steer_channel`
+    cursor: nil; claude: "stream-json"; codex: nil
+`backends.<name>.stream_json_args`
+    cursor: { "--output-format", "stream-json", "--stream-partial-output" }; claude: { "--output-format", "stream-json", "--verbose" }; codex: { "--json" }
+`backends.<name>.stream_protocol`
+    cursor: nil; claude: "claude"; codex: "codex"
+`backends.<name>.subcommand`
+    cursor: nil; claude: nil; codex: { "exec" }
+`backends.<name>.whoami_args`
+    cursor: { "status" }; claude: { "auth", "status" }; codex: { "login", "status" }
+`capture_root`
+    nil
+`capture_root_candidates`
+    {}
+`cmd`
+    nil
+`cmd_env`
+    "YANA_AGENT_BIN"
+`context`
+    {...}; see child paths
+`context.include_file`
+    false
+`context.max_selection_lines`
+    600
+`debug_modules`
+    {}
+`debug_record`
+    false
+`diff_highlights`
+    {...}; see child paths
+`diff_highlights.deleted`
+    {...}; see child paths
+`diff_highlights.deleted.link`
+    "DiffDelete"
+`diff_highlights.hint`
+    {...}; see child paths
+`diff_highlights.hint.link`
+    "Comment"
+`diff_highlights.incoming`
+    {...}; see child paths
+`diff_highlights.incoming.link`
+    "DiffAdd"
+`image_paste`
+    {...}; see child paths
+`image_paste.enable`
+    true
+`image_paste.keep`
+    20
+`image_paste.key`
+    { "<C-v>", "<C-V>" }
+`inline_edit`
+    {...}; see child paths
+`inline_edit.enable`
+    true
+`inline_edit.history`
+    20
+`inline_edit.max_height`
+    6
+`inline_edit.width`
+    0.5
+`inline_exec_allowlist`
+    nil
+`log_level`
+    "info"
+`mappings`
+    {...}; see child paths
+`mappings.accept_all`
+    "cA"
+`mappings.accept_file`
+    "cf"
+`mappings.accept_hunk`
+    "ca"
+`mappings.ask`
+    false
+`mappings.close`
+    "q"
+`mappings.completion_menu`
+    "<C-Space>"
+`mappings.focus_prompt`
+    "i"
+`mappings.history_next`
+    "<C-n>"
+`mappings.history_prev`
+    "<C-p>"
+`mappings.inline_edit`
+    false
+`mappings.model`
+    "<C-g>"
+`mappings.new_chat`
+    "<C-n>"
+`mappings.new_panel`
+    "<M-n>"
+`mappings.next_hunk`
+    "]x"
+`mappings.next_panel`
+    "<M-.>"
+`mappings.prev_hunk`
+    "[x"
+`mappings.prev_panel`
+    "<M-,>"
+`mappings.queue`
+    "<M-q>"
+`mappings.reject`
+    "<C-x>"
+`mappings.reject_file`
+    "cx"
+`mappings.reject_hunk`
+    "cr"
+`mappings.resend`
+    "<M-r>"
+`mappings.review`
+    "<C-y>"
+`mappings.steer`
+    "<C-CR>"
+`mappings.stop`
+    "<C-c>"
+`mappings.submit`
+    "<C-s>"
+`mappings.toggle`
+    "<C-a>"
+`mode_highlights`
+    {...}; see child paths
+`mode_highlights.agentic`
+    {...}; see child paths
+`mode_highlights.agentic.link`
+    "WarningMsg"
+`mode_highlights.ask`
+    {...}; see child paths
+`mode_highlights.ask.link`
+    "Special"
+`mode_highlights.inline`
+    {...}; see child paths
+`mode_highlights.inline.link`
+    "Special"
+`model`
+    nil
+`model_highlight`
+    {...}; see child paths
+`model_highlight.link`
+    "Identifier"
+`modes`
+    { "inline", "agentic", "ask" }
+`open_capture`
+    {...}; see child paths
+`open_capture.mode`
+    "auto"
+`open_capture.on_unavailable`
+    "refuse"
+`profile`
+    "factory"
+`queue`
+    {...}; see child paths
+`queue.pause_on_error`
+    false
+`redirect`
+    {...}; see child paths
+`redirect.confirm_exit_timeout_ms`
+    3000
+`redirect.kill_grace_ms`
+    1500
+`redirect.marker`
+    "[redirect — previous turn interrupted]"
+`review`
+    {...}; see child paths
+`review.ignore`
+    {}
+`review.permissions`
+    "ask"
+`review.tabs`
+    true
+`sandbox`
+    {...}; see child paths
+`sandbox.agentic`
+    "full"
+`sandbox.inline`
+    "full"
+`selection_scope`
+    {...}; see child paths
+`selection_scope.cell_markers`
+    { "# %%", "#%%" }
+`selection_scope.enforce`
+    "reject"
+`selection_scope.min_zone_lines`
+    1
+`selection_scope.rejection_cap`
+    3
+`selection_scope.unstructured`
+    "warn"
+`sessions`
+    {...}; see child paths
+`sessions.chats_dir`
+    "~/.cursor/chats"
+`sessions.dir`
+    nil
+`sessions.max`
+    50
+`single_file`
+    {...}; see child paths
+`single_file.enabled`
+    false
+`single_file.max_entries`
+    0
+`skill_dirs`
+    { "~/.cursor/skills", "~/.cursor/skills-cursor", "~/.claude/skills" }
+`trust`
+    true
+`ui`
+    {...}; see child paths
+`ui.multi_panel_layout`
+    "split"
+`ui.position`
+    "right"
+`ui.prompt_height`
+    6
+`ui.review_buttons`
+    {...}; see child paths
+`ui.review_buttons.max_height`
+    8
+`ui.review_buttons.min_height`
+    1
+`ui.review_buttons.steal_ratio`
+    nil
+`ui.review_buttons.theme`
+    "native"
+`ui.show_thinking`
+    false
+`ui.show_usage`
+    true
+`ui.spinner`
+    { "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" }
+`ui.width`
+    0.4
+`ui.wrap`
+    true
+`vendor_timeout_ms`
+    300000
+`workspace_roots`
+    {}
+`write_roots`
+    {}
+
 ==============================================================================
 6. Machine-specific configuration                       *yana-machine-config*
 

@@ -34,6 +34,15 @@ usage() {
 fail=0
 note_fail() { echo "CANDIDATE FAIL: $*" >&2; fail=1; }
 
+# Current candidate gates; historical exception inventories below are not gates.
+readonly CANDIDATE_GATES=(tests/release/config_reference_gate.sh)
+check_candidate_gates() {
+	local tree=$1 gate
+	for gate in "${CANDIDATE_GATES[@]}"; do
+		"$tree/$gate" "$tree" || return $?
+	done
+}
+
 build() {
 	local tree bare version
 	tree=$(realpath "$1")
@@ -44,6 +53,7 @@ build() {
 	[[ ! -e "$bare" ]] || { echo "candidate build: output already exists: $bare" >&2; exit 1; }
 	version=$(tr -d '\r\n' <"$tree/VERSION")
 	"$tree/scripts/release/verify.sh" "$tree" >/dev/null
+	check_candidate_gates "$tree"
 	git init -q -b main "$tree"
 	git -C "$tree" -c user.name="Yana Release" -c user.email="release@invalid" add -A
 	git -C "$tree" -c user.name="Yana Release" -c user.email="release@invalid" \
@@ -602,6 +612,7 @@ check() {
 	fi
 
 	"$clone/scripts/release/verify.sh" "$clone" || note_fail "verify.sh failed on the fresh clone"
+	check_candidate_gates "$clone" || note_fail "candidate reference gates failed on the fresh clone"
 
 	audit_main_history "$clone" "$scratch"
 

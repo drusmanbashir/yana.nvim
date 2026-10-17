@@ -123,6 +123,27 @@ Fields that matter when reading or overriding an entry:
   startup (its own config/session state); everything else under `$HOME`
   stays read-only inside the sandbox.
 
+Other descriptor fields used by the shipped backends:
+
+- `stream_protocol` selects the implemented `cursor`, `claude` or `codex`
+  event parser (`cursor` if omitted); `stream_json_args` requests its output
+  format. `allow_edits_args` supplies additional vendor argument tokens.
+- `mode_switch` is `per_turn` or `two_seat`. The latter requires `seats.ask`
+  to list `ask` and `seats.edit` to list `inline`, `agentic`; `per_turn`
+  forbids `seats`.
+- `sandbox_args_stamps` records `measured_on` (YYYY-MM-DD) and
+  `vendor_version` for each sandbox level. These record verified CLI behavior;
+  changing a stamp alone does not make new arguments compatible.
+- `mode_tokens` describes model controls: `effort`, `reasoning` and `speed`.
+  Each `kind` is `flag` with a `flag`, or `config` with a `key`;
+  optional `values` restricts the offered choices.
+- `models` is a static list of `{ id, label }` entries; omitted `label` uses
+  `id`. `list_models_format` chooses `lines` (default) or `json_models` for
+  live model-list output.
+- `image_flag` supplies the CLI's image argument; `close_stdin` closes its
+  input pipe at launch. `steer_channel = "stream-json"` enables streaming
+  steering for a backend that supports that protocol.
+
 Yana ships `cursor`, `claude`, and `codex`. See
 [How it works](how-it-works.md) for a full custom-backend example (modeled
 on the `codex` entry, which differs from the other two in nearly every
@@ -172,6 +193,16 @@ like `~/.ssh` is the one exception, done explicitly per backend via
 `state_dirs`/vendor mount rules, not a general read boundary.
 
 ## Where turns write
+
+**`open_capture`** selects how confined turns collect proposed file changes.
+The default is `{ mode = "auto", on_unavailable = "refuse" }`.
+`open_capture.mode` accepts `"auto"` (choose kernel OverlayFS when the mount
+layout permits, otherwise FUSE), `"overlayfs-fast"` (require the kernel route),
+`"fuse-compat"` (require the FUSE route), or `"off"` (use the existing confined
+overlay route instead of optional open capture). Keep `"auto"` normally;
+select a route to diagnose host compatibility or use `"off"` to opt out of
+the optional route. `open_capture.on_unavailable` accepts only `"refuse"`:
+an unavailable route stops the turn; it never permits direct agent writes.
 
 ```lua
 opts = {
@@ -390,7 +421,6 @@ Two more keyed settings live outside `mappings`:
 
 ```lua
 opts = {
-  agent_instructions = "…(see defaults; edits become reviewable hunks)…",
   selection_scope = {
     enforce = "reject",
     unstructured = "warn",
@@ -405,11 +435,6 @@ opts = {
 }
 ```
 
-- **`agent_instructions`** (default: a paragraph of edit-behavior guidance)
-  — text prepended to the prompt. Set to `nil` to disable it entirely. It's
-  only added in **`inline` mode** — `agentic` turns never receive it, since
-  the shipped text specifically tells the agent to expect hunk-by-hunk
-  review, which doesn't apply there.
 - **`selection_scope`** — how strictly an edit is held to the
   function/class/cell/selection you actually asked about:
   - `enforce` (default `"reject"`) — `"reject"` hard-blocks out-of-zone
@@ -468,7 +493,7 @@ opts = {
 }
 ```
 
-- **`sessions`** (default `{}`) — session registry and transcript storage.
+- **`sessions`** (default `{ chats_dir = "~/.cursor/chats", max = 50 }`) — session registry and transcript storage.
   Leaving it `{}` means: `dir` falls back to `stdpath("data") .. "/yana"`,
   `chats_dir` falls back to `~/.cursor/chats` (used to discover sessions
   created outside Neovim), and `max` falls back to `50` (registry entries
@@ -598,12 +623,7 @@ opts = {
   profile = "factory", -- "factory" (normal) or "debugger" (also loads debug_modules); other values are refused
   debug_modules = {}, -- with profile = "debugger" only: names loaded as yana.debug_<name>; ships "keys" (logs keypresses)
   debug_record = false, -- true saves each turn's raw agent output and a meta.json for replay (disk I/O per event)
-  -- Text put before every inline-mode prompt; false or "" disables it.
-  agent_instructions = [[
-You are a Neovim inline editor working LIVE during an active editing session. The user may keep editing while you work. Selected excerpts and their line numbers are context captured earlier; current buffer and disk contents may differ. Never save the user's live source buffer.
 
-When the user asks to populate, add, change, or give an example in a file, make the requested change immediately using the file-editing capability exposed by the current backend, writing the proposal into Yana's private layer — do not require a particular tool name, only reply in chat, or ask whether to paste. If no file-editing capability is exposed, say so clearly and provide the proposed patch in chat without claiming the file was edited. Use minimal diffs at the referenced line numbers. When a visual selection is attached, prefer edits inside the stated edit zone; out-of-zone edits may be rejected or flagged before review. The user reviews each edit as inline hunks in the open file (cr/ca/cf) before it is final. Propose edits only — never run compilers, test suites, or import/smoke checks; the user's hunk-by-hunk review is the validation step here, not a shell command. If validation like that is actually needed, say so and let the user switch to agentic mode, where it belongs.
-]],
 }
 ```
 
@@ -616,3 +636,202 @@ resolution and security details), run:
 ```vim
 :help yana-configuration
 ```
+
+## Option paths and shipped defaults
+
+This index names every table and nested key, including the backend descriptor
+fields above. Highlight tables also accept Neovim's `nvim_set_hl()` attributes;
+the index lists the shipped `link` fields, not Neovim's separate API schema.
+
+Use dot paths below inside setup tables: ui.width means ui = { width = ... }.
+`<name>` is the selected backend name; `[]` denotes each list entry. Scalar list
+items are values, not separate options. {...} points to the child rows. Nil
+means unset, with runtime fallbacks described above. Backend nil means that
+capability is not declared by that vendor; its normalizer may supply a fallback.
+These are shipped defaults, not a recommended table to paste into setup().
+
+| Option path | Default |
+|---|---|
+| `approve_mcps` | `false` |
+| `artifact_dir_prefixes` | `{}` |
+| `backend` | `"cursor"` |
+| `backends` | `{...}; see child paths` |
+| `backends.<name>` | `cursor: {...}; see child paths; claude: {...}; see child paths; codex: {...}; see child paths` |
+| `backends.<name>.allow_edits_args` | `cursor: {}; claude: {}; codex: { "--skip-git-repo-check" }` |
+| `backends.<name>.ask_args` | `cursor: {}; claude: {}; codex: { "--skip-git-repo-check" }` |
+| `backends.<name>.auth_env` | `cursor: { "CURSOR_API_KEY" }; claude: { "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY" }; codex: { "OPENAI_API_KEY", "CODEX_API_KEY", "CODEX_ACCESS_TOKEN" }` |
+| `backends.<name>.auth_json_field` | `cursor: nil; claude: "loggedIn"; codex: nil` |
+| `backends.<name>.auth_login_hint` | `cursor: "cursor-agent login"; claude: "claude auth login"; codex: "codex login"` |
+| `backends.<name>.auth_output_patterns` | `cursor: {...}; see child paths; claude: nil; codex: {...}; see child paths` |
+| `backends.<name>.auth_output_patterns.signed_in` | `cursor: "Logged in as"; claude: nil; codex: "Logged in using"` |
+| `backends.<name>.auth_output_patterns.signed_out` | `cursor: "Not logged in"; claude: nil; codex: "^%s*Not logged in%s*$"` |
+| `backends.<name>.close_stdin` | `cursor: nil; claude: true; codex: true` |
+| `backends.<name>.cmd` | `cursor: nil; claude: "claude"; codex: "codex"` |
+| `backends.<name>.cmd_env` | `cursor: "YANA_CURSOR_BIN"; claude: "YANA_CLAUDE_BIN"; codex: "YANA_CODEX_BIN"` |
+| `backends.<name>.image_flag` | `cursor: nil; claude: nil; codex: "-i"` |
+| `backends.<name>.install_hint` | `cursor: "curl https://cursor.com/install -fsS \| bash"; claude: "curl -fsSL https://claude.ai/install.sh \| bash"; codex: "npm install -g @openai/codex"` |
+| `backends.<name>.list_models_args` | `cursor: { "--list-models" }; claude: false; codex: { "debug", "models" }` |
+| `backends.<name>.list_models_format` | `cursor: nil; claude: nil; codex: "json_models"` |
+| `backends.<name>.login_args` | `cursor: { "login" }; claude: { "auth", "login" }; codex: { "login" }` |
+| `backends.<name>.mode_switch` | `cursor: "two_seat"; claude: "per_turn"; codex: "per_turn"` |
+| `backends.<name>.mode_tokens` | `cursor: nil; claude: {...}; see child paths; codex: {...}; see child paths` |
+| `backends.<name>.mode_tokens.effort` | `cursor: nil; claude: {...}; see child paths; codex: nil` |
+| `backends.<name>.mode_tokens.effort.flag` | `cursor: nil; claude: "--effort"; codex: nil` |
+| `backends.<name>.mode_tokens.effort.kind` | `cursor: nil; claude: "flag"; codex: nil` |
+| `backends.<name>.mode_tokens.effort.values` | `cursor: nil; claude: { "low", "medium", "high", "xhigh", "max" }; codex: nil` |
+| `backends.<name>.mode_tokens.reasoning` | `cursor: nil; claude: nil; codex: {...}; see child paths` |
+| `backends.<name>.mode_tokens.reasoning.key` | `cursor: nil; claude: nil; codex: "model_reasoning_effort"` |
+| `backends.<name>.mode_tokens.reasoning.kind` | `cursor: nil; claude: nil; codex: "config"` |
+| `backends.<name>.mode_tokens.speed` | `cursor: nil; claude: nil; codex: {...}; see child paths` |
+| `backends.<name>.mode_tokens.speed.key` | `cursor: nil; claude: nil; codex: "service_tier"` |
+| `backends.<name>.mode_tokens.speed.kind` | `cursor: nil; claude: nil; codex: "config"` |
+| `backends.<name>.models` | `cursor: nil; claude: list of tables; see [] fields; codex: nil` |
+| `backends.<name>.models[]` | `cursor: nil; claude: {...}; see child paths; codex: nil` |
+| `backends.<name>.models[].id` | `cursor: nil; claude: "auto", "fable", "opus", "sonnet", "haiku"; codex: nil` |
+| `backends.<name>.models[].label` | `cursor: nil; claude: "let claude choose", "fable", "opus", "sonnet", "haiku"; codex: nil` |
+| `backends.<name>.noninteractive_flag` | `cursor: "-p"; claude: "-p"; codex: false` |
+| `backends.<name>.resume_flag` | `cursor: "--resume"; claude: "--resume"; codex: nil` |
+| `backends.<name>.resume_subcommand` | `cursor: nil; claude: nil; codex: { "resume" }` |
+| `backends.<name>.sandbox_args` | `cursor: {...}; see child paths; claude: {...}; see child paths; codex: {...}; see child paths` |
+| `backends.<name>.sandbox_args.full` | `cursor: { "--force" }; claude: { "--permission-mode", "bypassPermissions" }; codex: { "-c", 'sandbox_mode="danger-full-access"' }` |
+| `backends.<name>.sandbox_args.read-only` | `cursor: { "--mode", "ask" }; claude: { "--permission-mode", "plan" }; codex: { "-c", 'sandbox_mode="read-only"' }` |
+| `backends.<name>.sandbox_args.vendor-default` | `cursor: {}; claude: {}; codex: {}` |
+| `backends.<name>.sandbox_args.workspace` | `cursor: { "--force" }; claude: { "--permission-mode", "acceptEdits" }; codex: { "-c", 'sandbox_mode="workspace-write"' }` |
+| `backends.<name>.sandbox_args_stamps` | `cursor: {...}; see child paths; claude: {...}; see child paths; codex: {...}; see child paths` |
+| `backends.<name>.sandbox_args_stamps.full` | `cursor: {...}; see child paths; claude: {...}; see child paths; codex: {...}; see child paths` |
+| `backends.<name>.sandbox_args_stamps.full.measured_on` | `cursor: "2026-10-17"; claude: "2026-10-17"; codex: "2026-10-17"` |
+| `backends.<name>.sandbox_args_stamps.full.vendor_version` | `cursor: "2026.10.16-e3cb207"; claude: "2.1.302 (Claude Code)"; codex: "codex-cli 0.163.0"` |
+| `backends.<name>.sandbox_args_stamps.read-only` | `cursor: {...}; see child paths; claude: {...}; see child paths; codex: {...}; see child paths` |
+| `backends.<name>.sandbox_args_stamps.read-only.measured_on` | `cursor: "2026-10-17"; claude: "2026-10-17"; codex: "2026-10-17"` |
+| `backends.<name>.sandbox_args_stamps.read-only.vendor_version` | `cursor: "2026.10.16-e3cb207"; claude: "2.1.302 (Claude Code)"; codex: "codex-cli 0.163.0"` |
+| `backends.<name>.sandbox_args_stamps.vendor-default` | `cursor: {...}; see child paths; claude: {...}; see child paths; codex: {...}; see child paths` |
+| `backends.<name>.sandbox_args_stamps.vendor-default.measured_on` | `cursor: "2026-10-17"; claude: "2026-10-17"; codex: "2026-10-17"` |
+| `backends.<name>.sandbox_args_stamps.vendor-default.vendor_version` | `cursor: "2026.10.16-e3cb207"; claude: "2.1.302 (Claude Code)"; codex: "codex-cli 0.163.0"` |
+| `backends.<name>.sandbox_args_stamps.workspace` | `cursor: {...}; see child paths; claude: {...}; see child paths; codex: {...}; see child paths` |
+| `backends.<name>.sandbox_args_stamps.workspace.measured_on` | `cursor: "2026-10-17"; claude: "2026-10-17"; codex: "2026-10-17"` |
+| `backends.<name>.sandbox_args_stamps.workspace.vendor_version` | `cursor: "2026.10.16-e3cb207"; claude: "2.1.302 (Claude Code)"; codex: "codex-cli 0.163.0"` |
+| `backends.<name>.seats` | `cursor: {...}; see child paths; claude: nil; codex: nil` |
+| `backends.<name>.seats.ask` | `cursor: { "ask" }; claude: nil; codex: nil` |
+| `backends.<name>.seats.edit` | `cursor: { "inline", "agentic" }; claude: nil; codex: nil` |
+| `backends.<name>.select_model_flag` | `cursor: "--model"; claude: "--model"; codex: "--model"` |
+| `backends.<name>.state_dirs` | `cursor: { "~/.cursor", "~/.config/cursor" }; claude: { "~/.claude", "~/.claude.json" }; codex: { "~/.codex" }` |
+| `backends.<name>.steer_channel` | `cursor: nil; claude: "stream-json"; codex: nil` |
+| `backends.<name>.stream_json_args` | `cursor: { "--output-format", "stream-json", "--stream-partial-output" }; claude: { "--output-format", "stream-json", "--verbose" }; codex: { "--json" }` |
+| `backends.<name>.stream_protocol` | `cursor: nil; claude: "claude"; codex: "codex"` |
+| `backends.<name>.subcommand` | `cursor: nil; claude: nil; codex: { "exec" }` |
+| `backends.<name>.whoami_args` | `cursor: { "status" }; claude: { "auth", "status" }; codex: { "login", "status" }` |
+| `capture_root` | `nil` |
+| `capture_root_candidates` | `{}` |
+| `cmd` | `nil` |
+| `cmd_env` | `"YANA_AGENT_BIN"` |
+| `context` | `{...}; see child paths` |
+| `context.include_file` | `false` |
+| `context.max_selection_lines` | `600` |
+| `debug_modules` | `{}` |
+| `debug_record` | `false` |
+| `diff_highlights` | `{...}; see child paths` |
+| `diff_highlights.deleted` | `{...}; see child paths` |
+| `diff_highlights.deleted.link` | `"DiffDelete"` |
+| `diff_highlights.hint` | `{...}; see child paths` |
+| `diff_highlights.hint.link` | `"Comment"` |
+| `diff_highlights.incoming` | `{...}; see child paths` |
+| `diff_highlights.incoming.link` | `"DiffAdd"` |
+| `image_paste` | `{...}; see child paths` |
+| `image_paste.enable` | `true` |
+| `image_paste.keep` | `20` |
+| `image_paste.key` | `{ "<C-v>", "<C-V>" }` |
+| `inline_edit` | `{...}; see child paths` |
+| `inline_edit.enable` | `true` |
+| `inline_edit.history` | `20` |
+| `inline_edit.max_height` | `6` |
+| `inline_edit.width` | `0.5` |
+| `inline_exec_allowlist` | `nil` |
+| `log_level` | `"info"` |
+| `mappings` | `{...}; see child paths` |
+| `mappings.accept_all` | `"cA"` |
+| `mappings.accept_file` | `"cf"` |
+| `mappings.accept_hunk` | `"ca"` |
+| `mappings.ask` | `false` |
+| `mappings.close` | `"q"` |
+| `mappings.completion_menu` | `"<C-Space>"` |
+| `mappings.focus_prompt` | `"i"` |
+| `mappings.history_next` | `"<C-n>"` |
+| `mappings.history_prev` | `"<C-p>"` |
+| `mappings.inline_edit` | `false` |
+| `mappings.model` | `"<C-g>"` |
+| `mappings.new_chat` | `"<C-n>"` |
+| `mappings.new_panel` | `"<M-n>"` |
+| `mappings.next_hunk` | `"]x"` |
+| `mappings.next_panel` | `"<M-.>"` |
+| `mappings.prev_hunk` | `"[x"` |
+| `mappings.prev_panel` | `"<M-,>"` |
+| `mappings.queue` | `"<M-q>"` |
+| `mappings.reject` | `"<C-x>"` |
+| `mappings.reject_file` | `"cx"` |
+| `mappings.reject_hunk` | `"cr"` |
+| `mappings.resend` | `"<M-r>"` |
+| `mappings.review` | `"<C-y>"` |
+| `mappings.steer` | `"<C-CR>"` |
+| `mappings.stop` | `"<C-c>"` |
+| `mappings.submit` | `"<C-s>"` |
+| `mappings.toggle` | `"<C-a>"` |
+| `mode_highlights` | `{...}; see child paths` |
+| `mode_highlights.agentic` | `{...}; see child paths` |
+| `mode_highlights.agentic.link` | `"WarningMsg"` |
+| `mode_highlights.ask` | `{...}; see child paths` |
+| `mode_highlights.ask.link` | `"Special"` |
+| `mode_highlights.inline` | `{...}; see child paths` |
+| `mode_highlights.inline.link` | `"Special"` |
+| `model` | `nil` |
+| `model_highlight` | `{...}; see child paths` |
+| `model_highlight.link` | `"Identifier"` |
+| `modes` | `{ "inline", "agentic", "ask" }` |
+| `open_capture` | `{...}; see child paths` |
+| `open_capture.mode` | `"auto"` |
+| `open_capture.on_unavailable` | `"refuse"` |
+| `profile` | `"factory"` |
+| `queue` | `{...}; see child paths` |
+| `queue.pause_on_error` | `false` |
+| `redirect` | `{...}; see child paths` |
+| `redirect.confirm_exit_timeout_ms` | `3000` |
+| `redirect.kill_grace_ms` | `1500` |
+| `redirect.marker` | `"[redirect — previous turn interrupted]"` |
+| `review` | `{...}; see child paths` |
+| `review.ignore` | `{}` |
+| `review.permissions` | `"ask"` |
+| `review.tabs` | `true` |
+| `sandbox` | `{...}; see child paths` |
+| `sandbox.agentic` | `"full"` |
+| `sandbox.inline` | `"full"` |
+| `selection_scope` | `{...}; see child paths` |
+| `selection_scope.cell_markers` | `{ "# %%", "#%%" }` |
+| `selection_scope.enforce` | `"reject"` |
+| `selection_scope.min_zone_lines` | `1` |
+| `selection_scope.rejection_cap` | `3` |
+| `selection_scope.unstructured` | `"warn"` |
+| `sessions` | `{...}; see child paths` |
+| `sessions.chats_dir` | `"~/.cursor/chats"` |
+| `sessions.dir` | `nil` |
+| `sessions.max` | `50` |
+| `single_file` | `{...}; see child paths` |
+| `single_file.enabled` | `false` |
+| `single_file.max_entries` | `0` |
+| `skill_dirs` | `{ "~/.cursor/skills", "~/.cursor/skills-cursor", "~/.claude/skills" }` |
+| `trust` | `true` |
+| `ui` | `{...}; see child paths` |
+| `ui.multi_panel_layout` | `"split"` |
+| `ui.position` | `"right"` |
+| `ui.prompt_height` | `6` |
+| `ui.review_buttons` | `{...}; see child paths` |
+| `ui.review_buttons.max_height` | `8` |
+| `ui.review_buttons.min_height` | `1` |
+| `ui.review_buttons.steal_ratio` | `nil` |
+| `ui.review_buttons.theme` | `"native"` |
+| `ui.show_thinking` | `false` |
+| `ui.show_usage` | `true` |
+| `ui.spinner` | `{ "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" }` |
+| `ui.width` | `0.4` |
+| `ui.wrap` | `true` |
+| `vendor_timeout_ms` | `300000` |
+| `workspace_roots` | `{}` |
+| `write_roots` | `{}` |
