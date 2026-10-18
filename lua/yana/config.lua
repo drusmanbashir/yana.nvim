@@ -63,6 +63,7 @@ local _backends = require("yana.configuration.config_backends").new({
 M.normalize_backends = _backends.normalize_backends
 M.normalize_backend = _backends.normalize_backend
 M.backend_descriptor = _backends.backend_descriptor
+M.expand_state_dir = _backends.expand_state_dir
 
 
 local _normalize = require("yana.configuration.config_normalize").new({

@@ -45,6 +45,9 @@ Versioning.
   so once.
 - In the `:YanaLogin` terminal, normal-mode `p`, Enter and `q` work as the
   window bar says; they were typed into the sign-in prompt as text.
+- Claude's own cache and lock files (for example its MCP logs) stay outside
+  review now that the home folder is captured; they follow `XDG_CACHE_HOME` and
+  `XDG_STATE_HOME` when those are set inside the home folder.
 
 ## 0.1.0-alpha.16 - 2026-10-03
 

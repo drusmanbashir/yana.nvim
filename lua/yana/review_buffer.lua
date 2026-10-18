@@ -16,6 +16,9 @@ local swap_told = {}
 local function tell_other_swap(bufnr)
   -- Neovim takes the next free name (.swo, .swn, ...) when the .swp is held.
   local own = vim.fn.swapname(bufnr)
+  if own:match("%.swp$") then
+    swap_told[own] = nil -- the .swp is free again; a later crash is news
+  end
   local swapname = own ~= "" and not own:match("%.swp$") and own:gsub("%.sw.$", ".swp") or nil
   if swapname and not swap_told[swapname] then
     swap_told[swapname] = true
@@ -30,10 +33,13 @@ end
 --- Run `fn` (a load or re-read of `bufnr`'s file) with the swap ATTENTION
 --- message suppressed, then name any other session's swap file once.
 function M.quiet_swap(fn, bufnr)
-  local shortmess = vim.o.shortmess
+  local had_a = vim.o.shortmess:find("A", 1, true) ~= nil
   vim.opt.shortmess:append("A")
   local ok, err = pcall(fn)
-  vim.o.shortmess = shortmess
+  -- Only the flag added here is taken back; anything the load itself set stays.
+  if not had_a then
+    vim.opt.shortmess:remove("A")
+  end
   if not ok then
     error(err, 0)
   end
@@ -201,7 +207,11 @@ function M.new(deps)
     if change.kind == "delete" then
       if vim.fn.filereadable(path) ~= 1 then
         change.disk_at_open = nil
-        return vim.fn.bufnr(path, true), nil
+        -- Loaded here, quietly: review open writes this buffer next, and a write to
+        -- an unloaded buffer loads it with the swap ATTENTION message (F-SWAP-LOAD).
+        local bufnr = vim.fn.bufnr(path, true)
+        M.load(bufnr)
+        return bufnr, nil
       end
       -- Fall back to B0 (spec buffer_state_change SPEC "Fall back to B0", BUILD row 7):
       -- a delete whose disk no longer holds the agent's base, or cannot be read, is

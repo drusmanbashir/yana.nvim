@@ -337,7 +337,10 @@ function M.wrap_cmd(argv, session)
 	local backend = cfg.backend_descriptor(session.backend)
 	if backend and type(backend.state_dirs) == "table" then
 		for _, dir in ipairs(backend.state_dirs) do
-			vim.list_extend(out, { "--state-dir", vim.fn.expand(dir) })
+			local path = cfg.expand_state_dir(dir)
+			if path then
+				vim.list_extend(out, { "--state-dir", path })
+			end
 		end
 	end
 

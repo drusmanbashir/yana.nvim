@@ -154,10 +154,11 @@ local backends = {
     close_stdin = true, -- row 66: a claude turn pays a fixed 3s wait for
                         -- stdin data Yana never sends ("Warning: no stdin data received
                         -- in 3s, proceeding without it"); closing stdin at spawn skips
-                        -- that wait outright. Directories the backend writes to at
-                        -- startup. These paths are bind-mounted read-write inside the
-                        -- overlay sandbox; everything else under $HOME stays read-only.
-    state_dirs = { "~/.claude", "~/.claude.json" },
+                        -- that wait outright. Paths the backend writes on its own --
+                        -- credentials and settings, its cache (MCP logs) and its lock
+                        -- files. They stay writable on the host and never enter review;
+                        -- the rest of $HOME is captured (CORE writable host exceptions).
+    state_dirs = { "~/.claude", "~/.claude.json", "$XDG_CACHE_HOME/claude-cli-nodejs", "$XDG_STATE_HOME/claude" },
   },
   codex = {
     cmd = "codex",

@@ -6,6 +6,30 @@ function M.new(deps)
   local home_dir = deps.home_dir
   local get_options = deps.get_options
 
+  -- A state_dirs entry may start with an XDG base directory, resolved the way the
+  -- vendor resolves it: the variable when it holds an absolute path, else its
+  -- standard default under the home folder. Nil when that lands outside the
+  -- home folder, which is never made writable.
+  local XDG_DEFAULTS = {
+    XDG_CACHE_HOME = "~/.cache",
+    XDG_STATE_HOME = "~/.local/state",
+    XDG_DATA_HOME = "~/.local/share",
+    XDG_CONFIG_HOME = "~/.config",
+  }
+  local function expand_state_dir(dir)
+    local var, rest = dir:match("^%$([A-Z_]+)(/.+)$")
+    if var and XDG_DEFAULTS[var] then
+      local value = vim.env[var]
+      local base = vim.fn.expand(type(value) == "string" and value:sub(1, 1) == "/" and value or XDG_DEFAULTS[var])
+      local home = home_dir()
+      if not home or home == "" or (base ~= home and base:sub(1, #home + 1) ~= home .. "/") then
+        return nil
+      end
+      return base .. rest
+    end
+    return vim.fn.expand(dir)
+  end
+
   -- Tokens Yana itself places at a fixed point via `resume_flag`/
   -- `select_model_flag`. No OTHER capability list may contain them -- an
   -- entry that tried would let its own "ask" or "allow_edits" or
@@ -530,24 +554,27 @@ function M.new(deps)
           if type(dir) ~= "string" or dir == "" then
             error("yana: backends." .. name .. ".state_dirs[" .. i .. "] must be a non-empty string", 0)
           end
-          local expanded = vim.fn.expand(dir)
-          -- Check if path is outside $HOME
-          if expanded:sub(1, 1) == "/" and (not home or home == "" or expanded:sub(1, #home) ~= home) then
-            error(
-              "yana: backends." .. name .. ".state_dirs[" .. i .. "] = " .. vim.inspect(dir)
-                .. " is outside $HOME (expanded to " .. expanded .. ") -- refused",
-              0
-            )
-          end
-          -- Check if path is under protected directories
-          for _, protected in ipairs(protected_prefixes) do
-            local protected_expanded = vim.fn.expand(protected)
-            if expanded == protected_expanded or expanded:sub(1, #protected_expanded + 1) == protected_expanded .. "/" then
+          -- An XDG entry outside the home folder is skipped, not refused.
+          local expanded = expand_state_dir(dir)
+          if expanded then
+            -- Check if path is outside $HOME
+            if expanded:sub(1, 1) == "/" and (not home or home == "" or expanded:sub(1, #home) ~= home) then
               error(
                 "yana: backends." .. name .. ".state_dirs[" .. i .. "] = " .. vim.inspect(dir)
-                  .. " is under protected directory " .. protected .. " -- refused",
+                  .. " is outside $HOME (expanded to " .. expanded .. ") -- refused",
                 0
               )
+            end
+            -- Check if path is under protected directories
+            for _, protected in ipairs(protected_prefixes) do
+              local protected_expanded = vim.fn.expand(protected)
+              if expanded == protected_expanded or expanded:sub(1, #protected_expanded + 1) == protected_expanded .. "/" then
+                error(
+                  "yana: backends." .. name .. ".state_dirs[" .. i .. "] = " .. vim.inspect(dir)
+                    .. " is under protected directory " .. protected .. " -- refused",
+                  0
+                )
+              end
             end
           end
         end
@@ -595,6 +622,7 @@ function M.new(deps)
     normalize_backends = normalize_backends,
     normalize_backend = normalize_backend,
     backend_descriptor = backend_descriptor,
+    expand_state_dir = expand_state_dir,
   }
 end
 

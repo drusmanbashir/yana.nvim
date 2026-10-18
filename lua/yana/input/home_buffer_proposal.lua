@@ -53,8 +53,9 @@ function M.capture(bufnr, opts)
 	local cfg = require("yana.config")
 	local backend = cfg.backend_descriptor and cfg.backend_descriptor(cfg.options.backend) or nil
 	for _, runtime in ipairs((backend and backend.state_dirs) or {}) do
-		local expanded = clean(vim.fn.expand(runtime))
-		if literal == expanded or literal:sub(1, #expanded + 1) == expanded .. "/" then
+		local path = cfg.expand_state_dir(runtime)
+		local expanded = path and clean(path)
+		if expanded and (literal == expanded or literal:sub(1, #expanded + 1) == expanded .. "/") then
 			return refusal(name, "the active backend owns this runtime path")
 		end
 	end
