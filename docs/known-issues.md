@@ -59,8 +59,10 @@ minutes) with `vendor deadline exceeded after N ms` plus the vendor's stderr.
   across presses.
 - **`o` / `O` on the edge of a one-line hunk** can grow the green band over your
   new line until the next repaint.
-- **Crash + reopen** (SIGKILL) shows Neovim's own swap-file prompt (E325) before
-  Yana restores the session; answer it as usual, the review state survives.
+- **Crash + reopen** (SIGKILL): a file you open yourself afterwards shows
+  Neovim's own swap-file prompt (E325); answer it as usual. Files Yana opens for
+  a review or End never prompt: Yana opens the saved file, keeps the swap file
+  for `:recover` and says so once.
 - **Undo-seq drift after `:bwipeout` / recreated undo tree** is named, not
   resynced: the proposal insertion is gone from the undo tree, so there is
   nothing left to rewind to or restore from.

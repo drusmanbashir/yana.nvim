@@ -604,14 +604,16 @@ function M.reload_file(path, opts)
   -- treesitter highlighter is already destroyed and nothing survives that can
   -- tell it was ever on. review_reread_highlight.lua carries the reasoning.
   pcall(require("yana.review_reread_highlight").capture, bufnr)
+  -- `:edit` re-checks swap files; another session's must not stop it (CORE F-SWAP-LOAD).
+  local quiet_swap = require("yana.review_buffer").quiet_swap
   local ok, err = pcall(vim.api.nvim_buf_call, bufnr, function()
     vim.cmd("checktime")
     if opts.force then
-      vim.cmd("edit!")
+      quiet_swap(function() vim.cmd("edit!") end, bufnr)
     elseif vim.bo.modified then
       error("buffer modified")
     else
-      vim.cmd("edit")
+      quiet_swap(function() vim.cmd("edit") end, bufnr)
     end
   end)
   if not ok then

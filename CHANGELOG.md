@@ -39,9 +39,10 @@ Versioning.
 
 ### Fixed
 
-- A review no longer fails with `Vim:E325: ATTENTION` when the file has a swap
-  file left by another or a crashed Neovim. Yana opens the saved file, keeps the
-  swap file for `:recover`, and says so once.
+- A swap file left by another or a crashed Neovim no longer stops a review
+  (`Vim:E325: ATTENTION`) or brings up Neovim's swap prompt during review or
+  End. Yana opens the saved file, keeps the swap file for `:recover`, and says
+  so once.
 - In the `:YanaLogin` terminal, normal-mode `p`, Enter and `q` work as the
   window bar says; they were typed into the sign-in prompt as text.
 

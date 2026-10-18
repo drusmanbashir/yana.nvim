@@ -6,23 +6,14 @@ local M = {}
 
 local NO_AFTER = "agent payload carried no after-content for this edit (nothing to review)"
 
--- CORE F-SWAP-LOAD. bufload() loads past a swap file left by another or a crashed
--- session, but its ATTENTION message reaches Lua as a thrown E325, which refused
--- the review of a file that had in fact loaded. The message is suppressed for
--- Yana's own load; the other swap file is kept for `:recover` and the operator is
--- told once per swap file.
+-- CORE F-SWAP-LOAD. A swap file left by another or a crashed session never stops
+-- a review. Loading or re-reading such a file goes ahead, but Neovim's ATTENTION
+-- message either prompts or, from code, is thrown as E325 -- which refused the
+-- review of a file that had in fact loaded. Yana's own loads, reloads and tab
+-- placement run with that message suppressed; the other swap file is kept for
+-- `:recover` and the operator is told once per swap file.
 local swap_told = {}
-function M.load(bufnr)
-  if vim.api.nvim_buf_is_loaded(bufnr) then
-    return
-  end
-  local shortmess = vim.o.shortmess
-  vim.opt.shortmess:append("A")
-  local ok, err = pcall(vim.fn.bufload, bufnr)
-  vim.o.shortmess = shortmess
-  if not ok then
-    error(err, 0)
-  end
+local function tell_other_swap(bufnr)
   -- Neovim takes the next free name (.swo, .swn, ...) when the .swp is held.
   local own = vim.fn.swapname(bufnr)
   local swapname = own ~= "" and not own:match("%.swp$") and own:gsub("%.sw.$", ".swp") or nil
@@ -33,6 +24,27 @@ function M.load(bufnr)
       vim.fn.fnamemodify(vim.api.nvim_buf_get_name(bufnr), ":~:."), vim.fn.fnamemodify(swapname, ":~"))
     log.write("WARN", line)
     vim.notify(line, vim.log.levels.WARN)
+  end
+end
+
+--- Run `fn` (a load or re-read of `bufnr`'s file) with the swap ATTENTION
+--- message suppressed, then name any other session's swap file once.
+function M.quiet_swap(fn, bufnr)
+  local shortmess = vim.o.shortmess
+  vim.opt.shortmess:append("A")
+  local ok, err = pcall(fn)
+  vim.o.shortmess = shortmess
+  if not ok then
+    error(err, 0)
+  end
+  if bufnr and vim.api.nvim_buf_is_loaded(bufnr) then
+    tell_other_swap(bufnr)
+  end
+end
+
+function M.load(bufnr)
+  if not vim.api.nvim_buf_is_loaded(bufnr) then
+    M.quiet_swap(function() vim.fn.bufload(bufnr) end, bufnr)
   end
 end
 

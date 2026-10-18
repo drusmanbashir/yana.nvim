@@ -193,6 +193,12 @@ function M.new(deps)
     local shown_tab, shown_win = tab_for_path(abs)
     local spare = spare_window()
     local out = { kind = placement_for(shown_tab ~= nil, tabs_on, rt ~= nil and rt.enabled == true, spare), path = rel }
+    if out.kind == "yana_tab" or out.kind == "reuse_win" then
+      -- Loaded first, so showing it never meets another session's swap file
+      -- (CORE F-SWAP-LOAD); a load failing for another reason is left to the
+      -- placement below, as before.
+      pcall(require("yana.review_buffer").load, spec.bufnr or vim.fn.bufadd(abs))
+    end
     if out.kind == "shown" then
       out.tab, out.win = shown_tab, shown_win
       -- A tab this turn once owned keeps its owner when the file is still
