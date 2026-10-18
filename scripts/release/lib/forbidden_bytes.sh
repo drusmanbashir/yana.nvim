@@ -33,7 +33,8 @@ forbidden_bytes_allowed_path() {
 		| .claude/* | */.claude/* | worktrees/* | */worktrees/* \
 		| evidence/* | .evidence/* | out/* \
 		| lua/yana/"$agents_name" | lua/yana/debug_buffer_states.lua \
-		| lua/yana/debug_buffer_states_bundle.lua | nvim/lua/user/yana.lua \
+		| lua/yana/debug_buffer_states_bundle.lua | lua/yana/config_development.lua \
+		| nvim/lua/user/yana.lua \
 		| tools/buffer-snapshot-triple.sh | prompt.txt \
 		| .github/workflows/tests.yml | bin/yana-ollama-agent | bin/yana-release \
 		| docs/repl.md | docs/security.md | assets/logo/* \

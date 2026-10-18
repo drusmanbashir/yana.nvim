@@ -6,9 +6,9 @@ If Neovim and your agent CLI already work, configure Yana to use that agent:
 
 | Installed agent | Command | Setup option |
 |---|---|---|
-| Claude Code | `claude` | `backend = "claude"` |
-| Codex | `codex` | `backend = "codex"` |
-| Cursor | `cursor-agent` | `backend = "cursor"` |
+| Claude Code | `claude` | `backends.default = "claude"` |
+| Codex | `codex` | `backends.default = "codex"` |
+| Cursor | `cursor-agent` | `backends.default = "cursor"` |
 
 With lazy.nvim:
 
@@ -17,7 +17,7 @@ With lazy.nvim:
   "drusmanbashir/yana.nvim",
   dependencies = { "drusmanbashir/yana-ui.nvim" },
   event = "VeryLazy",
-  opts = { backend = "claude" }, -- choose "claude", "codex" or "cursor"
+  opts = { backends = { default = "claude" } }, -- or "codex" / "cursor"
 }
 ```
 
@@ -29,9 +29,9 @@ key is required.
 If your agent is installed but not signed in, run `:YanaLogin` after configuring
 Yana. It opens the selected agent's official interactive login in a Neovim
 terminal. Follow its browser or terminal instructions, then submit your prompt
-again. Clicking or returning to the login window restores terminal input mode.
-Enter and paste also reach the login process from normal mode; `p`/`P` paste
-the selected register, and normal-mode `q` closes the window. The window shows
+again. Returning to the login window restores terminal input mode. In normal
+mode (for example after a click), paste and Enter still reach the login
+process, `p`/`P` paste the selected register, and `q` closes the window. The window shows
 an input hint. If login exits unsuccessfully, its output stays visible and the
 notice names the exit status. Yana does not store login tokens, log this
 terminal or replay a turn. The agent owns its credentials; existing API-key
@@ -55,10 +55,8 @@ from starting; installing the packages alone does not clear that restriction.
 Read the reported platform-specific diagnostic. If health cannot find the
 selected agent, see [troubleshooting](#troubleshooting).
 
-The opened project is already included. `:YanaRoots` adds extra folders;
-the startup notice that the extra capture set is empty does not mean your
-project is excluded. No `write_roots` or model setting is needed for normal
-first use; the chosen backend supplies its default model.
+The opened project is already included. The chosen agent supplies its default
+model unless you set one in its `backends` entry.
 
 ## System requirements
 
@@ -99,38 +97,22 @@ sudo dnf install -y git curl bubblewrap libcap python3 util-linux findutils gawk
 sudo pacman -S --needed git curl bubblewrap libcap python3 util-linux findutils gawk glibc inetutils
 ```
 
-`overlayfs-fast` does not require FUSE. For `fuse-compat`, also install
-`fuse-overlayfs` and the uid/gid mapping tools:
-
-```sh
-# Debian / Ubuntu
-sudo apt-get install -y fuse-overlayfs uidmap
-
-# Fedora / RHEL
-sudo dnf install -y fuse-overlayfs shadow-utils
-
-# Arch
-sudo pacman -S --needed fuse-overlayfs shadow
-```
-
 **macOS**
 
 Only **agentic** mode works on macOS: the agent writes your real files
 directly, with no overlay and no hunk review. Confined `ask` / `inline` need
 Linux kernel facilities (bubblewrap, overlayfs, `/proc`) that Homebrew cannot
 provide, so Yana refuses those modes on Darwin instead of silently falling
-back.
+back. Merge this field into the `opts` table above:
 
 ```lua
-opts = {
-  modes = { "agentic" },
-}
+modes = { "agentic" },
 ```
 
 For hunk review, run Yana on Linux.
 
-If you still need an agent CLI, install one or more below. Each installed CLI
-is selectable with `backend = "cursor" | "claude" | "codex"`.
+If you still need an agent CLI, install one or more below. Select it with
+`backends.default`.
 
 - **`cursor-agent`** — install line from Cursor's own docs
   ([cursor.com/docs/cli/installation](https://cursor.com/docs/cli/installation)):
@@ -163,49 +145,20 @@ is selectable with `backend = "cursor" | "claude" | "codex"`.
 Then run `:checkhealth yana` — it names any missing package, the agent
 binary it tried, and the fix.
 
-## Environment variables
+## Custom CLI location
 
-All optional. Yana reads these directly:
-
-```sh
-# Only needed when a CLI is not already on Neovim's PATH:
-export YANA_CURSOR_BIN=/custom/path/cursor-agent
-export YANA_CLAUDE_BIN=/custom/path/claude
-export YANA_CODEX_BIN=/custom/path/codex
-
-# Legacy Cursor-only override:
-export YANA_AGENT_BIN=~/.local/bin/cursor-agent
-
-# Opt-in diagnostics, both off by default:
-export YANA_DEBUG_EVENTS=1     # record every turn's raw agent stream
-export YANA_LIFECYCLE_LOG=1    # record what each turn did, event by event
-```
-
-`YANA_DEBUG_EVENTS` writes the raw stream and decoded `events.jsonl` into that
-turn's private state directory. `YANA_LIFECYCLE_LOG` adds structured turn,
-claim, and review rows to Yana's durable log. They exist for diagnosis and add
-extra writes, so leave them unset for normal use.
-
-The vendor-specific variables need no Lua configuration. `YANA_AGENT_BIN`
-remains supported for Cursor; point the top-level `cmd_env` at any existing
-variable if you use another legacy name:
+If Neovim cannot find an installed CLI on its `$PATH`, set its command in the
+matching backend entry:
 
 ```lua
-opts = { cmd_env = "CURSOR_CLI_BIN" }
-```
-```sh
-export CURSOR_CLI_BIN=~/.local/bin/cursor-agent
+backends = {
+  default = "claude",
+  claude = { cmd = "/custom/path/claude" },
+},
 ```
 
-To pick which account bills from your shell instead of `:YanaBackend` every
-session, read your own variable in your lazy.nvim spec and pass it through —
-Yana itself never reads `YANA_BACKEND`, this is just the pattern:
-
-```lua
-opts = function()
-  return { backend = vim.env.YANA_BACKEND or "cursor" }
-end
-```
+The named entries also accept an optional `model`. See
+[configuration](configuration.md#agent-and-backend) for the full setup sample.
 
 ## Manual installation
 
@@ -226,7 +179,7 @@ Then add this to your Neovim configuration, choosing the backend from the table
 above:
 
 ```lua
-require("yana").setup({ backend = "claude" }) -- or "codex" / "cursor"
+require("yana").setup({ backends = { default = "claude" } }) -- or "codex" / "cursor"
 ```
 
 ## Verify installation

@@ -146,8 +146,8 @@ function M.discard(session)
 		pcall(vim.fn.delete, session.private_dir, "rf")
 	end
 	if not session.preserve_layer then
-		-- Every root's layer, not just the workspace's: a turn that wrote into a
-		-- declared root and was discarded must leave nothing of that root's
+		-- Every root's layer, not just the workspace's: a turn that wrote into an
+		-- extra root and was discarded must leave nothing of that root's
 		-- proposal behind either.
 		for _, root in ipairs(M.session_roots(session)) do
 			if root.layer_dir then

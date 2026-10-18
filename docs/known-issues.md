@@ -29,21 +29,16 @@ minutes) with `vendor deadline exceeded after N ms` plus the vendor's stderr.
   proposed line ever reaches disk without your own `:w` — and Yana never adopts
   it in a later session. Delete it if it bothers you.
 
-- **The agent cannot edit any folder you point it at — the folder must be in
-  your Yana roots first.** Yana confines every turn to a writable region chosen
-  before the agent starts, from your configuration and the folder you opened.
-  A write anywhere else fails with a read-only-filesystem error, is recorded,
-  and names the folder you would have to add. Reading is unrestricted; only
-  writing is bounded. Add a folder with `:YanaRoots`, or set `write_roots` in
-  `setup{}`; either takes effect on your NEXT turn, because the writable region
-  is mounted before the agent process exists and cannot be widened while it
-  runs. This is deliberate: the boundary is what makes the review the only route
-  from agent bytes to your files.
+- **Inline turns can write only in your home folder, writable data disks and
+  the turn's own folder.** A write anywhere else (for example a system folder)
+  fails with a read-only-filesystem error and is recorded. Reading is
+  unrestricted. A disk with another filesystem mounted inside it is not
+  captured, because the overlay cannot cover the inner filesystem.
 - **Explicit `sandbox.inline = "vendor-default"` can deny headless edits.**
   It inherits vendor permission settings; a headless turn cannot answer an
   approval prompt. The default `full` permits edits inside Yana's overlay,
   with review controlling which changes reach disk. A stricter explicit
-  vendor level may narrow a declared root; `:checkhealth yana` reports it.
+  vendor level may narrow what Yana captures; `:checkhealth yana` reports it.
 - **A vendor can hide a kernel refusal inside its JSON stream.** Yana records
   `system_refused` when the real vendor process exposes EROFS on stderr. Codex
   0.151.0 can instead put the child error inside JSON stdout, narrate the

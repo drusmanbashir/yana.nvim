@@ -31,6 +31,30 @@ expect_red() {
 	echo "MUTATION PASS: $name -> $expected"
 }
 
+check_nvim_verification_setup() {
+	python3 - "$1" <<'PY'
+import json, pathlib, sys
+tree = pathlib.Path(sys.argv[1])
+checks = [
+    ("ci", ".github/workflows/ci.yml", "release-tree", "Verify public tree"),
+    ("release", ".github/workflows/release.yml", "draft", "Verify tag and public tree"),
+]
+for name, relative, job_name, verify_name in checks:
+    workflow = json.loads((tree / relative).read_text())
+    steps = workflow["jobs"][job_name]["steps"]
+    install = [step for step in steps if step.get("name") == "Install Neovim for configuration verification"]
+    verify = [step for step in steps if step.get("name") == verify_name]
+    if len(install) != 1 or len(verify) != 1:
+        raise SystemExit(f"WORKFLOW POLICY FAIL: {name} Neovim setup or verification step missing")
+    run = install[0].get("run", "")
+    if "scripts/release/install-neovim.sh 0.12.4" not in run or '>> "$GITHUB_PATH"' not in run:
+        raise SystemExit(f"WORKFLOW POLICY FAIL: {name} Neovim setup must use the pinned installer and GITHUB_PATH")
+    if steps.index(install[0]) >= steps.index(verify[0]):
+        raise SystemExit(f"WORKFLOW POLICY FAIL: Neovim setup must precede verification in {name}")
+print("WORKFLOW POLICY PASS: pinned Neovim precedes public verification in CI and release")
+PY
+}
+
 legacy_upper=NEO
 legacy_upper+=CURSOR
 
@@ -69,6 +93,36 @@ escaped_version=$(printf '%s' "$version" | sed 's/[.[\\*^$+?{}|()]/\\&/g')
 sed -i "s/$escaped_version/0.1.0/g" "$stable_tree/CHANGELOG.md" "$stable_tree/doc/yana.txt"
 "$stable_tree/scripts/release/verify.sh" "$stable_tree" 'v0.1.0' >/dev/null
 echo "CONTROL PASS: stable tag and stable tree agree"
+check_nvim_verification_setup "$tree"
+
+move_nvim_setup_after_verify() {
+	python3 - "$1" "$2" "$3" "$4" <<'PY'
+import json, pathlib, sys
+workflow_path, job_name, setup_name, verify_name = sys.argv[1:]
+path = pathlib.Path(workflow_path)
+doc = json.loads(path.read_text())
+steps = doc["jobs"][job_name]["steps"]
+install = next(step for step in steps if step.get("name") == setup_name)
+steps.remove(install)
+verify_index = next(index for index, step in enumerate(steps) if step.get("name") == verify_name)
+steps.insert(verify_index + 1, install)
+path.write_text(json.dumps(doc, indent=2) + "\n")
+PY
+}
+
+case_tree=$(copy_case ci-nvim-after-verify)
+move_nvim_setup_after_verify "$case_tree/.github/workflows/ci.yml" release-tree \
+	"Install Neovim for configuration verification" "Verify public tree"
+expect_red ci-nvim-after-verify \
+	"WORKFLOW POLICY FAIL: Neovim setup must precede verification in ci" \
+	check_nvim_verification_setup "$case_tree"
+
+case_tree=$(copy_case release-nvim-after-verify)
+move_nvim_setup_after_verify "$case_tree/.github/workflows/release.yml" draft \
+	"Install Neovim for configuration verification" "Verify tag and public tree"
+expect_red release-nvim-after-verify \
+	"WORKFLOW POLICY FAIL: Neovim setup must precede verification in release" \
+	check_nvim_verification_setup "$case_tree"
 
 case_tree=$(copy_case missing-pattern)
 sed -i "/^${legacy_upper}$/d" "$case_tree/scripts/release/forbidden-patterns.txt"
@@ -78,6 +132,31 @@ expect_red missing-pattern "required scanner pattern missing" \
 case_tree=$(copy_case extra-file)
 printf '%s\n' 'return {}' >"$case_tree/lua/yana/unlisted.lua"
 expect_red extra-file "exported files differ from manifest" \
+	"$case_tree/scripts/release/verify.sh" "$case_tree" "v$version"
+
+# Development-only setup must not be injected through the manifest or appear
+# accidentally as an unlisted file in an exported tree.
+case_tree=$(copy_case development-config-tree)
+printf '%s\n' 'return {}' >"$case_tree/lua/yana/config_development.lua"
+expect_red development-config-tree "exported files differ from manifest" \
+	"$case_tree/scripts/release/verify.sh" "$case_tree" "v$version"
+
+# The shared classifier must reject this exact extension independently of
+# manifest membership; a later verifier refusal is not a substitute for the
+# path policy itself.
+if bash -c 'source "$1"; forbidden_bytes_allowed_path "$2"' _ \
+	"$tree/scripts/release/lib/forbidden_bytes.sh" lua/yana/config_development.lua; then
+	echo "MUTATION FAIL: development config path accepted by public classifier" >&2
+	exit 1
+fi
+echo "MUTATION PASS: development config path rejected by public classifier"
+
+case_tree=$(copy_case development-config-manifest)
+printf '%s\n' 'return {}' >"$case_tree/lua/yana/config_development.lua"
+LC_ALL=C sort -u -o "$case_tree/scripts/release/manifest.txt" \
+	<(cat "$case_tree/scripts/release/manifest.txt"; printf '%s\n' 'lua/yana/config_development.lua')
+expect_red development-config-manifest \
+	"manifest path outside the allowed public classes: lua/yana/config_development.lua" \
 	"$case_tree/scripts/release/verify.sh" "$case_tree" "v$version"
 
 case_tree=$(copy_case legacy-bytes)

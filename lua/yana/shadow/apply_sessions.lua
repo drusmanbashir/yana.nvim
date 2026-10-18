@@ -487,7 +487,7 @@ end
 ---
 --- The primary root goes through `ensure_session` untouched, so a single-root
 --- pass -- and every pass built by hand, which carries `diary_session` and no
---- `diary_begin` at all -- behaves exactly as before. A declared write root
+--- `diary_begin` at all -- behaves exactly as before. An extra root
 --- opens its own journal, rooted at itself, the first time an accept on that
 --- root reaches this point; a turn whose extra-root changes are all rejected
 --- never creates one.

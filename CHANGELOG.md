@@ -3,6 +3,48 @@
 All notable changes to Yana are documented here. Versions follow Semantic
 Versioning.
 
+## 0.2.0-alpha.1 - 2026-10-18
+
+### Breaking
+
+- Configuration uses one `backends` table: `backends.default` selects
+  `"cursor"`, `"claude"` or `"codex"`, and `backends.<name>` accepts only `cmd`
+  and `model`. The top-level `backend` setting is internal and refused.
+- Folder grants are retired: `write_roots`, `capture_root` and
+  `capture_root_candidates` are ignored with one warning, and `:YanaRoots` is
+  removed. They are no longer needed (see Changed).
+- The `open_capture` setting and its unused FUSE backend are removed;
+  `open_capture` is ignored with one warning. `:checkhealth yana` no longer
+  lists FUSE tools.
+- Public setup refuses development logging fields; `log_level` is the only
+  public logging setting.
+
+### Changed
+
+- Inline turns can propose edits anywhere in your home folder and on every
+  writable data disk, wherever the turn starts -- for example editing
+  `~/.bashrc` or another repository from `~/code/project`. Writes stay private
+  until you accept them at End. System folders stay read-only, and a home folder
+  or disk with another filesystem mounted inside it is not captured.
+- In Neovim, a turn started in your home folder with no file open now runs
+  like any other turn instead of being refused with "pick a project
+  subdirectory"; only `/` is refused. Like every workspace, it keeps Neovim's fallback
+  `nvim.log` writable there, so an empty `~/nvim.log` may appear.
+- Yana's own state is mounted read-only inside the sandbox, so the agent can
+  never write it or plant a private copy of it.
+- The inline instruction is one short sentence; it no longer lists directories
+  or tells the agent to ask for folder grants.
+- Configuration documentation is simplified, and every configuration example
+  in the documentation is checked against the real settings before release.
+
+### Fixed
+
+- A review no longer fails with `Vim:E325: ATTENTION` when the file has a swap
+  file left by another or a crashed Neovim. Yana opens the saved file, keeps the
+  swap file for `:recover`, and says so once.
+- In the `:YanaLogin` terminal, normal-mode `p`, Enter and `q` work as the
+  window bar says; they were typed into the sign-in prompt as text.
+
 ## 0.1.0-alpha.16 - 2026-10-03
 
 ### Changed

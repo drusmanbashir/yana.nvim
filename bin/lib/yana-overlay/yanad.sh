@@ -97,7 +97,7 @@ import sys
 
 from yanad.claims import path_key
 
-answer_path, encoded, session_id, *declared_roots = sys.argv[1:]
+answer_path, encoded, session_id, *extra_roots = sys.argv[1:]
 frame = json.loads(encoded)
 result = frame["result"]
 launch = result["launch"] if "launch" in result else result
@@ -108,7 +108,7 @@ with open(answer_path, "w", encoding="utf-8") as stream:
 layers = launch["layers"]
 workspace = layers["workspace"]
 values = [os.path.join(workspace, "upper"), os.path.join(workspace, "work")]
-for root in declared_roots:
+for root in extra_roots:
     layer = layers["roots"][path_key(root)]
     values.extend((os.path.join(layer, "upper"), os.path.join(layer, "work")))
 sys.stdout.buffer.write(b"\0".join(os.fsencode(value) for value in values) + b"\0")
@@ -264,7 +264,7 @@ parse_yanad_admin_args() {
 	[[ -n "$SESSION_ID" ]] || die_usage "--session is required"
 }
 
-# Direct overlay probe: tests and overlay_gate.sh pass explicit layer dirs and only need
+# Direct overlay probe: tests and the CLI pass explicit layer dirs and only need
 # workspace validation + confinement, not a yanad turn.
 cmd_run_direct() {
 	[[ -n "$WORKSPACE" && -n "$UPPER" && -n "$WORK" ]] \

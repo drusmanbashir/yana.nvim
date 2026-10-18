@@ -92,9 +92,6 @@ function M.setup(opts)
   pcall(function()
     local persisted = require("yana.runtime.persisted_state")
     persisted.apply_model_selection(config.options)
-    if persisted.apply_write_roots(config.options) then
-      config.options.write_roots = config.normalize_write_roots(config.options.write_roots)
-    end
   end)
 
   -- One canonical STARTUP event: the resolved configuration (agent binary on THIS
@@ -111,8 +108,6 @@ function M.setup(opts)
       agent_bin = ok_bin and resolved and resolved.value or nil,
       mode = config.options.mode,
       enable_agentic = config.options.enable_agentic and true or false,
-      capture_root = config.options.capture_root,
-      write_roots = config.options.write_roots,
       state_root = ok_state and state_root or nil,
       overlay_available = ok_jail and jail_available and true or false,
     })
@@ -177,13 +172,6 @@ function M.setup(opts)
       end)
     end, { silent = true, desc = "yana: inline edit selection" })
   end
-
-  -- Empty capture set: one-line notify naming :YanaRoots; deferred so setup() stays non-blocking.
-  vim.schedule(function()
-    log.guard("yana capture-set empty notify", function()
-      require("yana.panel.ui_roots").maybe_notify_on_empty()
-    end)
-  end)
 
   return config.options
 end

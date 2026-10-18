@@ -13,7 +13,7 @@ from . import liveness
 # nearest `.git` and hashing that directory's (dev, ino). Three things were
 # wrong with it. It made identity depend on Git, so one tree keyed differently
 # before and after `git init`. It walked the filesystem per item on a path that
-# must not walk. And -- measurably -- it COLLIDED: two declared roots inside one
+# must not walk. And -- measurably -- it COLLIDED: two roots inside one
 # repository resolved to the same ancestor and therefore to one key, so
 # `store.turn_dir` handed them a single shared layer directory instead of one
 # each. That is a cross-root bleed the multiroot gate's own premise forbids.

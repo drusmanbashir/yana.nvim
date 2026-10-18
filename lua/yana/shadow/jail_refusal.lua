@@ -20,87 +20,21 @@ local diff = require("yana.diff")
 local path_key = require("yana.paths.path_key")
 
 --- Why the write died, in the product's voice.
-M.OUT_OF_WORKSPACE_REASON = "the path is outside the claimed workspace, which yana confines by design"
+M.OUT_OF_WORKSPACE_REASON = "the path is outside the areas yana captures (your home folder and writable data "
+	.. "disks, unless another filesystem is mounted inside one, and the turn's own folder)"
 
---- What the operator can do about it TODAY. THE SINGLE PLACE this is written.
----
---- Every surface that shows a refused write (panel note, `:YanaRefusals` row, ledger
---- decision, the durable WARN) reads its remedy from here, so operator-declared write
---- roots landed as ONE new entry in this list rather than as four drifting copies of a
---- sentence. Nothing is promised here that does not exist today: `write_roots` ships
---- (`lua/yana/config.lua` and the external-roots module doc), and the other two lines
---- are what they always were.
----
---- The first entry carries a `<dir>` placeholder because the actionable
---- remedy names a REAL directory, and which directory that is can only be
---- known per refusal. `out_of_workspace_remedy` fills it from filesystem
---- state; when nothing can be derived the entry is dropped rather than
---- printed with a placeholder in it, which leaves exactly the two-line
---- message this list carried before.
-M.WRITE_ROOT_REMEDY = 1
+--- What the operator can do about it. THE SINGLE PLACE this is written: every
+--- surface that shows a refused write (panel note, `:YanaRefusals` row, ledger
+--- decision, the durable WARN) reads its remedy from here.
 M.OUT_OF_WORKSPACE_REMEDIES = {
-	'declare it in your yana setup: write_roots = { "<dir>" }',
 	"run the turn from that repository",
 	"or ask for the change as a patch and apply it there yourself",
 }
 
---- The directory the operator would actually declare to make this write legal.
----
---- DERIVED FROM THE FILESYSTEM, NEVER FROM TEXT. With no repository above it the answer
---- is the containing directory, which is the smallest root that would have allowed the
---- write. Nothing the agent said can reach this decision, which is the cardinal
---- principle applied to a REMEDY as well as to a boundary: the sentence is only a
---- suggestion, but a suggestion assembled out of agent text is how scope creep starts.
----
---- Returns nil rather than "/" or an empty string: a remedy that proposes the
---- filesystem root is not a remedy.
-function M.declarable_write_root(path)
-	if type(path) ~= "string" or path == "" or path:sub(1, 1) ~= "/" then
-		return nil
-	end
-	local dir = path
-	if vim.fn.isdirectory(dir) ~= 1 then
-		dir = vim.fn.fnamemodify(dir, ":h")
-	end
-	local probe, depth = dir, 0
-	while probe and probe ~= "" and probe ~= "/" and depth < 64 do
-		-- `.git` is a directory in a normal clone and a FILE in a worktree or a
-		-- submodule; both mean "this is the repository root".
-		if vim.fn.isdirectory(probe .. "/.git") == 1 or vim.fn.filereadable(probe .. "/.git") == 1 then
-			return probe
-		end
-		probe = vim.fn.fnamemodify(probe, ":h")
-		depth = depth + 1
-	end
-	if dir == "" or dir == "/" or vim.fn.isdirectory(dir) ~= 1 then
-		return nil
-	end
-	return dir
-end
-
---- The remedy sentence, specialised to the paths this refusal names.
----
---- Called with no argument it returns exactly the sentence it always returned,
---- so every caller that has not been taught about roots is unchanged.
-function M.out_of_workspace_remedy(paths)
-	local root
-	for _, path in ipairs(paths or {}) do
-		root = M.declarable_write_root(path)
-		if root then
-			break
-		end
-	end
-	local lines = {}
-	for i, line in ipairs(M.OUT_OF_WORKSPACE_REMEDIES) do
-		if i == M.WRITE_ROOT_REMEDY then
-			if root then
-				lines[#lines + 1] = (line:gsub("<dir>", (root:gsub("%%", "%%%%"))))
-			end
-		else
-			lines[#lines + 1] = line
-		end
-	end
-	return "remedy: " .. table.concat(lines, ", ")
+--- The remedy sentence. `paths` is accepted for callers that pass the refused
+--- paths; the remedy no longer depends on them.
+function M.out_of_workspace_remedy(_paths)
+	return "remedy: " .. table.concat(M.OUT_OF_WORKSPACE_REMEDIES, ", ")
 end
 
 --- `strerror(EROFS)` as any libc renders it, and the errno's own symbol as the
@@ -191,10 +125,8 @@ end
 --- path is also, trivially, unseeded.
 ---
 --- READ FROM THE PLAN AND MOUNTINFO, NEVER FROM CONFIGURATION -- which is the
---- point of having a class at all. The refusal this replaces answered "declare
---- it in write_roots", i.e. it told the operator to widen the boundary in
---- response to hitting it. A class states what the kernel and the plan make
---- true, and three of the four name no remedy, because none exists.
+--- point of having a class at all. A class states what the kernel and the plan
+--- make true, and three of the four name no remedy, because none exists.
 ---
 --- Returns `class, remedy`; `remedy` is nil when there is none.
 M.OUTSIDE_CAPTURE_CLASSES = { "protected", "mount-kind", "host-mount", "unseeded" }

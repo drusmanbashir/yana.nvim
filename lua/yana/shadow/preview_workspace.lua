@@ -4,6 +4,7 @@
 -- directly (never through the facade, to avoid a load-time require cycle).
 local M = {}
 
+local capture_areas = require("yana.shadow.capture_areas")
 local config = require("yana.config")
 local diff = require("yana.diff")
 local path_key = require("yana.paths.path_key")
@@ -157,154 +158,37 @@ function M.new(deps)
 		return I.contains_path(a, b) or I.contains_path(b, a)
 	end
 
-	--- Every root this turn may write, in the order their claims are taken.
-	---
-	--- THE SET IS THE OPERATOR'S, CANONICALISED HERE AND NOWHERE ELSE. CORE's
-	--- cardinal principle: nothing agent-influenced selects confinement scope, so
-	--- `declared` arrives from `config.options.write_roots` (setup, or an explicit
-	--- operator command) and every entry is judged against the filesystem, never
-	--- against anything a turn produced. A root read out of workspace content or
-	--- agent output is a defect, not a configuration.
-	---
-	--- The resolved set is the maximal canonical path set from `{workspace} ∪
-	--- write_roots`: if one path contains another, the larger path absorbs the
-	--- smaller. This happens before any claim or mount is built. Refusals name only
-	--- non-overlap invalid roots, and happen at TURN START before launch.
-	---
-	--- Returns `roots` (a list of absolute paths, the workspace first, the declared
-	--- roots after it in canonical-path order) or `nil, reason`.
-	function I.resolve_roots(workspace, declared)
+	--- Every root this turn writes, in claim order: the workspace first, then each
+	--- capture area (`capture_areas.lua`: home folder, writable data disks) that
+	--- neither contains nor sits inside it. The area containing the workspace is
+	--- the broad root instead (`broad_root_for`). Filesystem position only; no
+	--- configuration and nothing a turn produced selects a root.
+	function I.resolve_roots(workspace)
 		local primary = diff.abs_path(workspace)
 		local primary_real = uv.fs_realpath(primary) or primary
-		local state = uv.fs_realpath(state_root()) or state_root()
-
-		local candidates = { primary_real }
-		local seen = { [primary_real] = true }
-		for _, entry in ipairs(declared or {}) do
-			local real = uv.fs_realpath(entry)
-			if not real then
-				return nil,
-					string.format(
-						"declared write root '%s' does not exist — create it or remove it from write_roots",
-						entry
-					)
-			end
-			if vim.fn.isdirectory(real) ~= 1 then
-				return nil, string.format("declared write root '%s' is not a directory", entry)
-			end
-			if I.paths_overlap(real, state) then
-				return nil,
-					string.format(
-						"declared write root '%s' resolves inside yana's state root (%s) — declare a project directory instead",
-						entry,
-						state
-					)
-			end
-			if not seen[real] then
-				seen[real] = true
-				candidates[#candidates + 1] = real
-			end
-		end
-
-		local maximal = {}
-		for _, candidate in ipairs(candidates) do
-			local contained = false
-			for _, other in ipairs(candidates) do
-				if other ~= candidate and I.contains_path(other, candidate) then
-					contained = true
-					break
-				end
-			end
-			if not contained then
-				maximal[#maximal + 1] = candidate
-			end
-		end
-		table.sort(maximal)
-
-		local primary_scope = primary_real
-		for _, root in ipairs(maximal) do
-			if I.contains_path(root, primary_real) then
-				primary_scope = root
-				break
-			end
-		end
-		local roots = { primary_scope }
-		for _, root in ipairs(maximal) do
-			if root ~= primary_scope then
-				roots[#roots + 1] = root
+		local roots = { primary_real }
+		for _, area in ipairs(capture_areas.list()) do
+			if not I.paths_overlap(area, primary_real) then
+				roots[#roots + 1] = area
 			end
 		end
 		return roots
 	end
 
-	--- THE BROAD ROOT: the ONE directory this turn's single overlay is mounted at.
+	--- THE BROAD ROOT: the ONE directory the workspace's overlay is mounted at -- the
+	--- capture area containing the workspace, else the workspace itself. Everything
+	--- beneath it lands in the turn's private upper layer: the opened repository, a
+	--- sibling repository, a directory that did not exist when the turn started.
 	---
-	--- Everything beneath it is writable inside the jail and lands in the turn's private
-	--- upper layer -- the opened repository, a sibling repository, a directory that did
-	--- not exist when the turn started -- and everything outside it stays the plain
-	--- read-only host bind. The kernel charges the same ~31 ms to mount an overlay over a
-	--- broad root as over one directory, so breadth is free; what is not free is a SECOND
-	--- mount and a SECOND claim, and there is exactly one of each.
-	---
-	--- Chosen, in order:
-	---   1. `capture_root`, the operator's explicit choice;
-	---   2. each configured `capture_root_candidates` entry in order;
-	---   3. the workspace itself.
-	---
-	--- `write_roots` is resolved separately as a maximal set. When an ancestor
-	--- write_root absorbs the opened workspace, that ancestor becomes root 1 rather
-	--- than a `broad_root` override.
-	---
-	--- THE STATE ROOT IS NEVER INSIDE IT. yana's layers, claims and journals are the
-	--- evidence this turn's review is read from; an overlay covering them would hand the
-	--- agent its own change set. A default candidate that contains the state root is
-	--- skipped (which is why an ordinary `~/.local/state/yana` install lands on `~/code`
-	--- and not on `$HOME`); an explicitly configured one refuses the turn BY NAME, because
-	--- silently narrowing an operator's own setting is worse than saying so.
-	---
-	--- CARDINAL PRINCIPLE: config and filesystem position only. No step reads
-	--- anything a turn produced.
-	---
-	--- Returns the absolute broad root, or nil plus a reason.
-	function I.broad_root_for(workspace, declared)
+	--- Yana's state root may be inside it: the launcher binds the real state root
+	--- read-only on top of every overlay that covers it
+	--- (`bin/lib/yana-overlay/mount.sh` `mount_state_root_shield`).
+	function I.broad_root_for(workspace)
 		local ws = diff.abs_path(workspace)
 		local ws_real = uv.fs_realpath(ws) or ws
-		local state = uv.fs_realpath(state_root()) or state_root()
-
-		local override, override_key = config.options.capture_root, "capture_root"
-		if override then
-			local real = uv.fs_realpath(override)
-			if not real or vim.fn.isdirectory(real) ~= 1 then
-				return nil,
-					string.format("%s '%s' does not exist or is not a directory", override_key, override)
-			end
-			if not I.contains_path(real, ws_real) then
-				return nil,
-					string.format(
-						"%s '%s' is not an ancestor of this turn's workspace (%s) — the capture root must contain the "
-							.. "repository the turn runs in",
-						override_key,
-						real,
-						ws_real
-					)
-			end
-			if I.contains_path(real, state) then
-				return nil,
-					string.format(
-						"%s '%s' contains yana's own state root (%s) — choose a directory that does not, or move the "
-							.. "state root (YANA_STATE_ROOT / XDG_STATE_HOME)",
-						override_key,
-						real,
-						state
-					)
-			end
-			return real, override_key
-		end
-
-		for _, candidate in ipairs(config.options.capture_root_candidates or {}) do
-			local real = uv.fs_realpath(candidate)
-			if real and vim.fn.isdirectory(real) == 1 and I.contains_path(real, ws_real) and not I.contains_path(real, state) then
-				return real, "capture_root_candidates"
+		for _, area in ipairs(capture_areas.list()) do
+			if I.contains_path(area, ws_real) then
+				return area, "capture_area"
 			end
 		end
 		return ws, "workspace"

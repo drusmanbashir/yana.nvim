@@ -5,9 +5,9 @@
 return {
   ---------------------------------------------------------------- mode sentences
   -- Sent on a mini-conversation's first request and whenever the mode changes.
-  mode_ask = "Yana ask mode: answer without changing files, replacing earlier Yana mode instructions.",
-  mode_inline = "Yana inline mode: edit files directly with your normal tools, including files outside this project, without running tests; Yana holds every write for review before it reaches disk, replacing earlier Yana mode instructions.",
-  mode_agentic = "Yana agentic mode: make requested file changes directly and validate as needed, replacing earlier Yana mode instructions.",
+  mode_ask = "Yana ask mode: answer without changing any files.",
+  mode_inline = "Yana inline mode: you are an inline editor I'm using inside Neovim. Make the requested changes by writing the files directly with your normal tools; you can read any file. Don't run tests.",
+  mode_agentic = "Yana agentic mode: make the requested changes directly and test them as needed.",
 
   ---------------------------------------------------------------- the request
   this_request_only = "For this request only: {text}",

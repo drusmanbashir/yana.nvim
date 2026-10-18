@@ -15,7 +15,6 @@ local gnu_stat_row = dependencies_probe.gnu_stat_row
 local gnu_find_row = dependencies_probe.gnu_find_row
 local gnu_date_row = dependencies_probe.gnu_date_row
 local kernel_rows = dependencies_probe.kernel_rows
-local open_capture_rows = dependencies_probe.open_capture_rows
 
 M.minimum_neovim = "0.11.2"
 
@@ -453,14 +452,7 @@ function M.check(mode, opts)
     rows[#rows + 1] = skill_row
   end
   if mode ~= "agentic" then
-    local capture_ok, capture_mode = pcall(config.resolve_open_capture_mode)
-    if capture_ok then
-      for _, capture_row in ipairs(open_capture_rows(capture_mode, opts.include_optional_capture)) do
-        rows[#rows + 1] = capture_row
-      end
-    else
-      rows[#rows + 1] = row("open_capture_mode_invalid", "error", tostring(capture_mode), "set open_capture.mode to auto, overlayfs-fast, fuse-compat, or off")
-    end; kernel_rows(rows)
+    kernel_rows(rows)
     local required_now = M.required_executables(mode)
     local python3_required = false
     for _, name in ipairs(required_now) do
@@ -499,7 +491,7 @@ function M.preflight(mode)
   --
   -- One refusal now names all of them, each with its own exact install command.
   local errors = {}
-  for _, item in ipairs(M.check(mode, { probe_agent_version = false, include_optional_capture = false })) do
+  for _, item in ipairs(M.check(mode, { probe_agent_version = false })) do
     if item.level == "error" then
       errors[#errors + 1] = string.format("[%s] %s - %s", item.id, item.message, item.remedy)
     end

@@ -27,10 +27,6 @@ function I.begin_turn(opts)
 		return nil, jail.OVERLAY_UNAVAILABLE_MSG
 	end
 	local turn_mode = config.resolve_mode(opts.mode or config.options.mode)
-	-- Resolve the open-capture mode once at turn start. The launcher receives
-	-- this pinned value through the session; it must not re-read mutable config
-	-- or infer a second backend selector.
-	local open_capture_mode = config.resolve_open_capture_mode(opts.open_capture_mode)
 
 	local flags = opts.launch_flags or opts.single_file_flags or {}
 	if flags.file then
@@ -43,32 +39,12 @@ function I.begin_turn(opts)
 	local stream = opts.stream or "default"
 	local turn_id = tostring(opts.turn_id or opts.turn_gen or "0")
 
-	-- Declared roots are resolved BEFORE any per-turn state is created: a turn
-	-- that cannot have the set it declared must not leave layer or turn state
-	-- behind for the next one to trip over.
-	local declared = opts.write_roots
-	if declared == nil then
-		declared = config.options.write_roots
-	end
-
-	-- THE BROAD ROOT IS CHOSEN BEFORE ANY PER-TURN STATE EXISTS, for the same
-	-- reason the declared set is: a turn that cannot have the scope it was
-	-- configured for must not leave a layer, a claim or a turn directory behind
-	-- for the next one to trip over.
-	local broad_root, broad_why
-	broad_root, broad_why = deps.workspace.broad_root_for(workspace, declared)
-	if not broad_root then
-		return nil, broad_why
-	end
-	local root_paths, roots_err = deps.workspace.resolve_roots(workspace, declared)
-	if not root_paths then
-		return nil, roots_err
-	end
+	-- Roots come from filesystem position only (capture areas: home folder and
+	-- writable data disks), resolved before any per-turn state exists.
+	local broad_root = deps.workspace.broad_root_for(workspace)
+	local root_paths = deps.workspace.resolve_roots(workspace)
 	local opened_workspace = workspace
-	local primary_workspace = root_paths[1] or workspace
-	if primary_workspace ~= workspace then
-		broad_root = primary_workspace
-	end
+	local primary_workspace = root_paths[1]
 	local turn_dir = deps.workspace.turn_dir(primary_workspace, stream, turn_id)
 	local private_dir = turn_dir .. "/private"
 	-- PANEL.md F-ADDENDUM-TURN: `opts.resume` runs the next cycle of this open
@@ -123,7 +99,6 @@ function I.begin_turn(opts)
 		upper_dir = nil,
 		yanad_session_id = yanad_session_id,
 		mode = turn_mode,
-		open_capture_mode = open_capture_mode,
 		read_only_workspace = opts.read_only_workspace == true,
 		-- Under yanad, reclaim evidence comes from status, not disk holder files.
 		reclaimed_from = nil,
@@ -149,8 +124,7 @@ end
 --- Every root of a turn, whatever shape the session is in.
 ---
 --- Sessions built by `begin_turn` carry `roots`; sessions built by hand -- the
---- headless rows and recovery paths that predate declared write roots do
---- exactly that -- carry only the aliases. Both answer here, so no caller has
+--- headless rows and recovery paths -- carry only the aliases. Both answer here, so no caller has
 --- to know which it holds.
 function I.session_roots(session)
 	return ops.session_roots(session)

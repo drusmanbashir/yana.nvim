@@ -43,7 +43,6 @@ end
 
 local function parse_common(args)
 	local workspace, upper, changes_out, json = nil, nil, nil, false
-	local write_roots = {}
 	local i = 1
 	while i <= #args do
 		local v
@@ -59,10 +58,7 @@ local function parse_common(args)
 				if v then
 					changes_out = v
 				else
-					v, i = parse_flag(args, i, "--write-root")
-					if v then
-						write_roots[#write_roots + 1] = v
-					elseif args[i] == "--json" then
+					if args[i] == "--json" then
 						json = true
 						i = i + 1
 					else
@@ -79,23 +75,14 @@ local function parse_common(args)
 		workspace = diff.abs_path(workspace),
 		upper = upper and diff.abs_path(upper) or nil,
 		changes_out = changes_out and diff.abs_path(changes_out) or nil,
-		write_roots = write_roots,
 		json = json,
 	}
 end
 
---- Declared write roots through the SAME resolver the editor uses
---- (`config.normalize_write_roots` + `preview.resolve_roots`), including
---- maximal-set absorption. No second implementation (audit F7).
+--- Turn roots through the SAME resolver the editor uses (`preview.resolve_roots`:
+--- the workspace, then each capture area). No second implementation (audit F7).
 local function resolve_cli_roots(opts)
-	local config = require("yana.config")
-	local preview = require("yana.shadow.preview")
-	local declared = config.normalize_write_roots(opts.write_roots or {})
-	local roots, err = preview.resolve_roots(opts.workspace, declared)
-	if not roots then
-		return nil, err
-	end
-	return roots
+	return require("yana.shadow.preview").resolve_roots(opts.workspace)
 end
 
 local function load_ops(opts)
@@ -384,8 +371,8 @@ local function cmd_check_deletes(args)
 	os.exit(0)
 end
 
---- Resolve declared write roots the way the editor does. Prints one absolute
---- path per line (maximal set). Refuses by name when resolution fails.
+--- Resolve a turn's roots the way the editor does. Prints one absolute path per
+--- line. Refuses by name when resolution fails.
 local function cmd_resolve_roots(args)
 	local opts = parse_common(args)
 	local roots, err = resolve_cli_roots(opts)

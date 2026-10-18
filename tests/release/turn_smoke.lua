@@ -77,8 +77,7 @@ require("yana.shadow.preview")._test.force_state_root = scratch .. "/state"
 
 require("yana").setup({
   mode = "inline",
-  cmd = agent_fixture,
-  write_roots = { workspace },
+  backends = { cursor = { cmd = agent_fixture } },
   sessions = { dir = scratch .. "/sessions-data", chats_dir = scratch .. "/chats" },
 })
 

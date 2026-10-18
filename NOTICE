@@ -182,6 +182,7 @@ Runtime provenance inventory:
 - post-fork original: `lua/yana/shadow/preview_settle.lua`
 - post-fork original: `lua/yana/shadow/preview_turn.lua`
 - post-fork original: `lua/yana/shadow/preview_workspace.lua`
+- post-fork original: `lua/yana/shadow/capture_areas.lua`
 - upstream-derived: `lua/yana/panel/ui_changes.lua`
 - upstream-derived: `lua/yana/panel/ui_claims.lua`
 - upstream-derived: `lua/yana/panel/ui_commands.lua`
@@ -201,10 +202,7 @@ Runtime provenance inventory:
 - upstream-derived: `lua/yana/panel/ui_winbar.lua`
 - post-fork original: `lua/yana/agent/vendor_stream_claude.lua`
 - post-fork original: `bin/lib/yana-overlay/cgroup.sh`
-- post-fork original: `bin/lib/yana-overlay/capture_plan.sh`
-- post-fork original: `bin/lib/yana-overlay/fuse.sh`
 - post-fork original: `bin/lib/yana-overlay/layer_edit.sh`
-- post-fork original: `bin/lib/yana-overlay/open_capture.sh`
 - post-fork original: `bin/lib/yana-overlay/yanad.sh`
 - post-fork original: `lua/yana/configuration/config_mappings.lua`
 - post-fork original: `lua/yana/paths/creation_touch.lua`
@@ -258,8 +256,6 @@ Runtime provenance inventory:
 - post-fork original: `lua/yana/review_watch_flush.lua`
 - post-fork original: `lua/yana/review_watch_ownership.lua`
 - post-fork original: `lua/yana/review_watch_register.lua`
-- post-fork original: `lua/yana/roots/model.lua`
-- post-fork original: `lua/yana/roots/view.lua`
 - post-fork original: `lua/yana/agent/steer_channel.lua`
 - post-fork original: `lua/yana/agent/agent_outcome.lua`
 - post-fork original: `lua/yana/turn/turn.lua`
@@ -304,7 +300,6 @@ Runtime provenance inventory:
 - post-fork original: `lua/yana/panel/ui_review_button_theme.lua`
 - post-fork original: `lua/yana/panel/ui_review_buttons.lua`
 - post-fork original: `lua/yana/panel/ui_review_buttons_signals.lua`
-- post-fork original: `lua/yana/panel/ui_roots.lua`
 - post-fork original: `lua/yana/undo_action_buffer_edit.lua`
 - post-fork original: `lua/yana/undo_action_decision.lua`
 - post-fork original: `lua/yana/undo_action_file_creation.lua`

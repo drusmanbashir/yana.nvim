@@ -267,8 +267,8 @@ end
 --- Every root this turn wrote, in claim order, whatever shape the session is in.
 ---
 --- A session from `preview.begin_turn` carries `roots`; a session built by hand
---- -- the headless rows, the recovery paths and every caller that predates
---- operator-declared write roots do exactly that -- carries only the primary's
+--- -- the headless rows, the recovery paths and every single-root caller --
+--- carries only the primary's
 --- aliases. Both answer here, so a single-root turn reaches the identical code
 --- path either way and no caller has to know which shape it holds.
 function M.session_roots(session)
@@ -332,9 +332,8 @@ end
 --- With no repository above it the answer is the operator-visible unit that
 --- still exists: the turn's own workspace when the path is inside it,
 --- otherwise the outermost directory below the broad root that contains it
---- (`~/code/newthing` for `~/code/newthing/a/b.txt`) -- the same "nearest
---- repository, else the containing project" shape `jail.declarable_write_root`
---- already uses for a refusal remedy.
+--- (`~/code/newthing` for `~/code/newthing/a/b.txt`): nearest repository, else
+--- the containing project.
 local function repo_root_for(abs, base, workspace)
 	if type(abs) ~= "string" or abs == "" then
 		return workspace or base

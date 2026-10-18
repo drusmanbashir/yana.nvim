@@ -72,8 +72,7 @@ vim.env.YANA_SIX_TURNS_TARGET = "notes.txt"
 
 local setup_opts = {
   mode = mode,
-  cmd = agent,
-  write_roots = { workspace },
+  backends = { cursor = { cmd = agent } },
   sessions = { dir = scratch .. "/sessions", chats_dir = scratch .. "/chats" },
 }
 if mode == "agentic" then

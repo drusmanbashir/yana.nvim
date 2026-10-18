@@ -414,9 +414,9 @@ function M.check()
     local backend = tostring(config.options.backend)
     warn(
       "inline vendor sandbox (" .. backend .. ") inherits its system-wide configuration through sandbox.inline = 'vendor-default'; "
-        .. "that vendor configuration may silently narrow Yana's declared write_roots.",
+        .. "that vendor configuration may silently narrow what Yana lets the agent write.",
       {
-        "Check the " .. backend .. " vendor configuration if a declared root is refused.",
+        "Check the " .. backend .. " vendor configuration if a write Yana should capture is refused.",
         "Or set sandbox.inline to an explicit vendor-neutral level in require('yana').setup().",
       }
     )

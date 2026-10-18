@@ -19,9 +19,6 @@ end
 -- below, so the two can never drift apart from each other.
 local EXEC_PACKAGE = {
   bwrap = { apt = "bubblewrap", dnf = "bubblewrap", pacman = "bubblewrap" },
-  ["fuse-overlayfs"] = { apt = "fuse-overlayfs", dnf = "fuse-overlayfs", pacman = "fuse-overlayfs" },
-  newuidmap = { apt = "uidmap", dnf = "shadow-utils", pacman = "shadow" },
-  newgidmap = { apt = "uidmap", dnf = "shadow-utils", pacman = "shadow" },
   unshare = { apt = "util-linux", dnf = "util-linux", pacman = "util-linux" },
   capsh = { apt = "libcap2-bin", dnf = "libcap", pacman = "libcap" },
   flock = { apt = "util-linux", dnf = "util-linux", pacman = "util-linux" },
@@ -135,57 +132,6 @@ local function executable_row(name, required)
     remedy = "install " .. package_hint(name) .. " to enable this optional feature: " .. install_command(name)
   end
   return row("exec:" .. name, level, name .. " not found on PATH", remedy)
-end
-
---- Named open-capture dependency rows. FUSE is optional for `auto`: missing
---- tools are health warnings and never block the fast backend.
-local function open_capture_rows(mode, include_optional)
-  if mode == "off" then return {} end
-  if mode == "auto" and include_optional == false then return {} end
-  local required = mode == "fuse-compat"
-  local level = required and "error" or "warn"
-  local rows = {}
-  local function exe(id, name)
-    local resolved = vim.fn.exepath(name)
-    if resolved ~= "" then return row(id, "ok", name .. " found: " .. resolved, nil, resolved) end
-    return row(id, level, name .. " not found on PATH", "install " .. package_hint(name) .. ": " .. install_command(name))
-  end
-  rows[#rows + 1] = exe("open_capture_dep_fuse_overlayfs", "fuse-overlayfs")
-  local stat = (vim.uv or vim.loop).fs_stat("/dev/fuse")
-  rows[#rows + 1] = stat and stat.type == "char"
-    and row("open_capture_dep_dev_fuse", "ok", "/dev/fuse is available")
-    or row("open_capture_dep_dev_fuse", level, "/dev/fuse is unavailable", "load the FUSE device and allow it in the turn namespace")
-  rows[#rows + 1] = exe("open_capture_dep_newuidmap", "newuidmap")
-  rows[#rows + 1] = exe("open_capture_dep_newgidmap", "newgidmap")
-  local subgid, user = "/etc/subgid", vim.fn.expand("$USER")
-  local uid = tostring((vim.uv or vim.loop).getuid())
-  local covered = false
-  if vim.fn.filereadable(subgid) == 1 then
-    for _, line in ipairs(vim.fn.readfile(subgid)) do
-      local owner, _, count = line:match("^([^:]+):(%d+):(%d+)%s*$")
-      if owner and (owner == user or owner == uid) and tonumber(count) and tonumber(count) > 0 then covered = true end
-    end
-  end
-  rows[#rows + 1] = covered
-    and row("open_capture_dep_subordinate_gids", "ok", "subordinate gid coverage found in " .. subgid)
-    or row("open_capture_dep_subordinate_gids", level, "no subordinate gid range covers the invoking user", "add a subordinate gid range in /etc/subgid")
-  local status, caps = vim.fn.filereadable("/proc/self/status") == 1 and vim.fn.readfile("/proc/self/status") or {}, false
-  for _, line in ipairs(status) do
-    local effective = line:match("^CapEff:%s*([%da-fA-F]+)")
-    if effective and effective ~= "0" and effective ~= "0000000000000000" then caps = effective end
-  end
-  rows[#rows + 1] = caps
-    and row("open_capture_capabilities", level, "effective capabilities retained: " .. caps, "drop write-bypassing capabilities before launch")
-    or row("open_capture_capabilities", "ok", "no effective host capabilities retained")
-  local root = vim.env.YANA_STATE_ROOT
-  if not root or root == "" then root = vim.fn.stdpath("state") .. "/yana" end
-  local parent = vim.fn.fnamemodify(root, ":h")
-  local storage_ok = vim.fn.isdirectory(root) == 1
-    or (vim.fn.isdirectory(parent) == 1 and vim.fn.getfperm(parent):find("w", 1, true) ~= nil)
-  rows[#rows + 1] = storage_ok
-    and row("open_capture_storage", "ok", "open-capture state root is available: " .. root, nil, root)
-    or row("open_capture_storage", level, "open-capture state root is unavailable: " .. root, "create a writable state root outside the project")
-  return rows
 end
 
 -- Runs `cmd` and returns (true, systemobj_result) on completion, or (false,
@@ -510,7 +456,6 @@ M.gnu_stat_row = gnu_stat_row
 M.gnu_find_row = gnu_find_row
 M.gnu_date_row = gnu_date_row
 M.kernel_rows = kernel_rows
-M.open_capture_rows = open_capture_rows
 -- Exposed for tests/release/install_remedy_smoke.lua: proves the exact
 -- one-liner a distro actually gets, without needing to fake /etc/os-release
 -- or PATH on the test host itself.

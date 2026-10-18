@@ -6,7 +6,6 @@ function M.new(deps)
   local defaults = deps.defaults
   local get_options = deps.get_options
   local backend_descriptor = deps.backend_descriptor
-  local normalize_open_capture_mode = deps.normalize_open_capture_mode
 
   ----------------------------------------------------------------------
   -- THE MODE DIAL
@@ -27,20 +26,6 @@ function M.new(deps)
     agentic = "YanaModeAgentic",
   }
   local model_hl_group = "YanaModel"
-
-  --- Resolve the open-capture selector once for a turn. The test-only
-  --- environment override exercises each backend; normal users select it
-  --- through setup({ open_capture = ... }).
-  local function resolve_open_capture_mode(requested)
-    local mode = requested
-    if mode == nil or mode == "" then
-      local override = vim.env.YANA_OPEN_CAPTURE_MODE
-      mode = (override ~= nil and override ~= "")
-        and override
-        or (get_options().open_capture or defaults.open_capture).mode
-    end
-    return normalize_open_capture_mode(mode)
-  end
 
   local MODE_HELP = ' — one of "ask" (read and answer), "inline" (hunks you review), "agentic" (the agent edits files itself)'
 
@@ -377,7 +362,6 @@ function M.new(deps)
     mode_enabled = mode_enabled,
     resolve_mode = resolve_mode,
     mode_instruction = mode_instruction,
-    resolve_open_capture_mode = resolve_open_capture_mode,
     overlay_mode = overlay_mode,
     review_mode_active = review_mode_active,
     agent_permission_mode = agent_permission_mode,

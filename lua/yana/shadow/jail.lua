@@ -137,11 +137,11 @@ end
 
 --- Layer sub-paths for a turn. The overlay refuses a layer root holding
 --- anything other than `upper/`, `work/` and its own mount marker, so every
---- turn needs its own root — and, since operator-declared write roots landed,
---- every ROOT of every turn needs its own too.
+--- turn needs its own root — and every ROOT of every turn (the workspace plus
+--- each extra capture area) needs its own too.
 ---
---- This returns the PRIMARY root's layer, which is what every caller written
---- before declared write roots means by "the turn's layer". `root_layer_paths`
+--- This returns the PRIMARY root's layer, which is what every single-root caller
+--- means by "the turn's layer". `root_layer_paths`
 --- answers the same question for one root of the set.
 function M.layer_paths(session)
 	local root = session and session.layer_dir
@@ -266,18 +266,19 @@ function M.wrap_cmd(argv, session)
 	-- Read from the session `preview.begin_turn` built out of filesystem position and
 	-- operator configuration; nothing in this process may widen it, and nothing a turn
 	-- produced can reach it.
+	-- Every turn takes the broad-root launch shape, even when the broad root is the
+	-- workspace itself: only that shape mounts writable-host exceptions after every
+	-- overlay, so neither an extra root nor a workspace that holds them (the home
+	-- folder) can hide them (CAPTURE.md OC-HOME).
 	local broad_root = session.broad_root
-	if type(broad_root) == "string" and broad_root ~= "" and broad_root ~= workspace then
+	if type(broad_root) == "string" and broad_root ~= "" then
 		vim.list_extend(out, { "--broad-root", broad_root })
 	end
 
-	-- One repeated group per operator-declared write root beyond the workspace,
-	-- in the order `preview.resolve_roots` fixed (canonical-path order, which is
-	-- also the launcher's claim order). A turn that declared none adds nothing
-	-- here, so its argv is exactly the argv this function has always built.
-	--
-	-- Under yanad the daemon mints each root's layer; the editor only names the
-	-- declared root path.
+	-- One repeated group per capture area beyond the workspace and its broad root
+	-- (home folder, writable data disks), in the order `preview.resolve_roots`
+	-- fixed. Under yanad the daemon mints each root's layer; the editor only names
+	-- the root path.
 	local roots = require("yana.shadow.ops").session_roots(session)
 	for i = 2, #roots do
 		local root = roots[i]
@@ -347,9 +348,6 @@ function M.wrap_cmd(argv, session)
 		YANA_OVERLAY_BWRAP = bwrap_bin(),
 		YANA_STATE_ROOT = require("yana.shadow.preview").state_root(),
 	}
-	if type(cfg.options.open_capture) == "table" and type(cfg.options.open_capture.mode) == "string" then
-		env.YANA_OPEN_CAPTURE_MODE = cfg.options.open_capture.mode
-	end
 	if vim.env.XDG_RUNTIME_DIR and vim.env.XDG_RUNTIME_DIR ~= "" then
 		env.XDG_RUNTIME_DIR = vim.env.XDG_RUNTIME_DIR
 	end
@@ -364,9 +362,7 @@ end
 local jail_refusal = require("yana.shadow.jail_refusal")
 
 M.OUT_OF_WORKSPACE_REASON = jail_refusal.OUT_OF_WORKSPACE_REASON
-M.WRITE_ROOT_REMEDY = jail_refusal.WRITE_ROOT_REMEDY
 M.OUT_OF_WORKSPACE_REMEDIES = jail_refusal.OUT_OF_WORKSPACE_REMEDIES
-M.declarable_write_root = jail_refusal.declarable_write_root
 M.out_of_workspace_remedy = jail_refusal.out_of_workspace_remedy
 M.consume_answer = jail_refusal.consume_answer
 M.run_overlay_shell = jail_refusal.run_overlay_shell

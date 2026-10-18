@@ -125,6 +125,17 @@ user_manager_endpoints() {
 	done
 }
 
+# CAPTURE.md OC-13: a capture root such as $HOME contains Yana's state root.
+# Bind the real state root (staged read-only by yana-overlay) over the overlay so
+# the agent can read it but never write it or plant a private copy of it.
+mount_state_root_shield() {
+	local target=${YANA_OVERLAY_STATE_SHIELD:-}
+	[[ -n "$target" ]] || return 0
+	[[ -d "$NEUTRAL_STATE_SHIELD" && -d "$target" ]] || exit "$EXIT_MOUNT"
+	mount --bind "$NEUTRAL_STATE_SHIELD" "$target" || exit "$EXIT_MOUNT"
+	mount -o bind,remount,ro "$target" || exit "$EXIT_MOUNT"
+}
+
 mount_user_manager_endpoints() {
 	local endpoint
 	while IFS= read -r endpoint; do
@@ -155,9 +166,8 @@ mount_overlays() {
 #
 mount_cursor_exception() {
 	if [[ -n "$CURSOR_DIR" ]]; then
-		# The self-bind fallback is for tests/overlay_gate.sh and
-		# tests/overlay_broadroot_gate.sh, which drive this helper directly with their own
-		# bwrap argv and make no staging bind.
+		# The self-bind fallback is for a caller that drives this helper directly
+		# with its own bwrap argv and makes no staging bind.
 		local cursor_src=$CURSOR_DIR
 		[[ -e "$NEUTRAL_CURSOR" ]] && cursor_src=$NEUTRAL_CURSOR
 		mount --bind "$cursor_src" "$CURSOR_DIR" || exit "$EXIT_MOUNT"
@@ -207,87 +217,3 @@ mount_state_dirs() {
 	done
 }
 
-mount_reconstruct_capture_plan() {
-	local plan=$1 alias source
-	RECONSTRUCTED_CAPTURE_MOUNTS=()
-	while IFS=$'\t' read -r alias source; do
-		[[ -n "$alias" && -n "$source" ]] || continue
-		mount --bind "$alias" "$source" || return 1
-		mount -o bind,remount,rw "$source" || return 1
-		RECONSTRUCTED_CAPTURE_MOUNTS+=("$source")
-	done < <(python3 - "$plan" <<'PY'
-import json
-import sys
-with open(sys.argv[1], encoding="utf-8") as stream:
-    data = json.load(stream)
-project = data.get("project_cwd", "")
-rows = []
-for row in data.get("aliases", []):
-    alias = row.get("alias_prefix", "")
-    source = row.get("source_prefix", "")
-    if alias and source and alias == project:
-        rows.append((alias.count("/"), alias, source))
-for _, alias, source in sorted(rows, reverse=True):
-    print(f"{alias}\t{source}")
-PY
-	)
-}
-
-
-mount_decode_alias_proposals() {
-	local plan=$1 layer=$2
-	python3 - "$plan" "$layer" <<'PY'
-import json
-import os
-import shutil
-import sys
-plan, layer = sys.argv[1:]
-upper = os.path.join(layer, "upper")
-if not os.path.isdir(upper):
-    raise SystemExit(0)
-with open(plan, encoding="utf-8") as stream:
-    data = json.load(stream)
-project = data.get("project_cwd", "")
-for row in data.get("aliases", []):
-    alias = row.get("alias_prefix")
-    source = row.get("source_prefix")
-    decoded_file = row.get("reconstructed_private_abs", "")
-    if not alias or not source or alias != project or not decoded_file:
-        continue
-    host_upper = ""
-    targets = data.get("targets", [])
-    if targets and isinstance(targets[0], dict):
-        host_upper = targets[0].get("private_proposal_abs", "")
-    if host_upper and decoded_file == host_upper or (host_upper and decoded_file.startswith(host_upper.rstrip(os.sep) + os.sep)):
-        rel_decoded = os.path.relpath(decoded_file, host_upper)
-        decoded_file = os.path.join(upper, rel_decoded)
-    decoded_root = os.path.dirname(decoded_file)
-    os.makedirs(decoded_root, exist_ok=True)
-    for name in sorted(os.listdir(upper)):
-        if name == ".yana-decoded":
-            continue
-        src = os.path.join(upper, name)
-        dst = os.path.join(decoded_root, name)
-        os.makedirs(os.path.dirname(dst), exist_ok=True)
-        if os.path.exists(dst):
-            if os.path.isdir(dst) and not os.path.islink(dst):
-                shutil.rmtree(dst)
-            else:
-                os.unlink(dst)
-        os.replace(src, dst)
-PY
-}
-
-mount_teardown_reconstructed() {
-	local idx path count
-	count=0
-	if declare -p RECONSTRUCTED_CAPTURE_MOUNTS >/dev/null 2>&1; then
-		count=${#RECONSTRUCTED_CAPTURE_MOUNTS[@]}
-	fi
-	for (( idx=count-1; idx>=0; idx-- )); do
-		path=${RECONSTRUCTED_CAPTURE_MOUNTS[$idx]}
-		[[ -n "$path" ]] || continue
-		umount "$path" >/dev/null 2>&1 || true
-	done
-	RECONSTRUCTED_CAPTURE_MOUNTS=()
-}

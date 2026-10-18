@@ -112,6 +112,10 @@ function M.new(deps)
     edit = { "inline", "agentic" },
   }
   local SANDBOX_LEVELS = { "full", "workspace", "read-only", "vendor-default" }
+  local BUILTIN_BACKENDS = {}
+  for name in pairs(defaults.backends or {}) do
+    BUILTIN_BACKENDS[name] = true
+  end
 
   -- Vendor sandbox levels: missing translation is
   -- a setup refusal, never a silent fallback to another level.
@@ -256,20 +260,49 @@ function M.new(deps)
     return out
   end
 
-  --- The "zoo" table. Merges `value` onto the shipped
-  --- defaults with `vim.tbl_deep_extend("force", ...)` -- an operator entry with a name
-  --- already shipped here (e.g. overriding just `claude.cmd`) extends that entry
-  --- field-by-field; a genuinely new name (their own vendor) is added whole.
-  ---
-  --- Every capability is validated for SHAPE here (right type, non-empty, contains what
-  --- Yana's own parser/placement logic depends on).
+  --- Resolve the public selector and its two supported overrides onto Yana's
+  --- private transport descriptors. Transport fields remain owned by defaults.
   local function normalize_backends(value)
-    local base = vim.deepcopy(defaults.backends)
-    local out = base
-    if type(value) == "table" then
-      out = vim.tbl_deep_extend("force", base, value)
-    elseif value ~= nil then
+    if value ~= nil and type(value) ~= "table" then
       error("yana: backends must be a table of named entries", 0)
+    end
+    value = value or {}
+
+    local default_backend = value.default
+    if default_backend == nil then
+      default_backend = defaults.backend
+    elseif type(default_backend) ~= "string" or not BUILTIN_BACKENDS[default_backend] then
+      error("yana: backends.default must be cursor, claude, or codex", 0)
+    end
+
+    local overrides = {}
+    for name, entry in pairs(value) do
+      if name ~= "default" then
+        if type(name) ~= "string" or not BUILTIN_BACKENDS[name] then
+          error("yana: backends." .. tostring(name) .. " is not a built-in backend", 0)
+        end
+        if type(entry) ~= "table" then
+          error("yana: backends." .. name .. " must be a table", 0)
+        end
+        local override = {}
+        for key, setting in pairs(entry) do
+          if key ~= "cmd" and key ~= "model" then
+            error("yana: backends." .. name .. "." .. tostring(key) .. " is not a public backend setting", 0)
+          end
+          if type(setting) ~= "string" or setting == "" then
+            error("yana: backends." .. name .. "." .. key .. " must be a non-empty string", 0)
+          end
+          override[key] = setting
+        end
+        overrides[name] = override
+      end
+    end
+
+    local out = vim.deepcopy(defaults.backends)
+    for name, override in pairs(overrides) do
+      for key, setting in pairs(override) do
+        out[name][key] = setting
+      end
     end
     for name, entry in pairs(out) do
       if type(name) ~= "string" or name == "" then
@@ -520,7 +553,7 @@ function M.new(deps)
         end
       end
     end
-    return out
+    return out, default_backend
   end
 
   --- The active backend name (layer 1). Must name an entry present in

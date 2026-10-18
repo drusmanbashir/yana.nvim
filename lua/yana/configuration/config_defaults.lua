@@ -65,15 +65,6 @@ local defaults = {
   -- `mode` and `enable_agentic` keys translate onto this list at setup.
   modes = { "inline", "agentic", "ask" },
 
-  -- Optional open capture. `auto` may choose the kernel fast backend after the
-  -- launcher's topology plan proves it safe, then the optional FUSE backend
-  -- when its own preflight succeeds. It always refuses when unavailable; it
-  -- never changes an inline turn into direct execution.
-  open_capture = {
-    mode = "auto",
-    on_unavailable = "refuse",
-  },
-
   -- Vendor sandbox levels: Yana owns this
   -- vocabulary; each backend descriptor owns its argv translation.
   -- Inline grants vendor edit permission without a prompt; the overlay and
@@ -82,7 +73,6 @@ local defaults = {
 
   -- Pass --trust so the workspace is trusted in headless mode (no prompt).
   trust = true,
-
 
   -- Pass --approve-mcps so MCP servers do not block on interactive consent.
   approve_mcps = false,
@@ -96,55 +86,10 @@ local defaults = {
   -- Ask and agentic modes do not receive the rule.
   inline_exec_allowlist = nil,
 
-  -- Extra directories that a turn may write. Turn start takes the union of the
-  -- opened workspace and these roots, then keeps only the maximal canonical
-  -- paths; an ancestor entry absorbs the opened workspace and becomes root 1.
-  --
-  -- THE SET IS OPERATOR-DECLARED AND NOTHING ELSE MAY WIDEN IT. CORE's cardinal
-  -- principle is that nothing agent-influenced selects confinement scope, so these come
-  -- from setup()/config or an explicit operator command and from nowhere else: not from
-  -- agent output, not from a path found in the workspace, not from an env var a turn
-  -- could set. A write into a directory that is not the workspace and not listed here
-  -- stays EROFS, and the refusal names the `write_roots` line that would declare it.
-  --
-  -- Entries are absolute (a leading `~` is expanded here); everything else --
-  -- existence and resolving inside yana's own state root -- is checked at TURN
-  -- START, where a bad entry refuses by name before the agent is launched.
-  -- Overlap never refuses: the maximal root absorbs contained roots before any
-  -- claim or mount exists.
-  write_roots = {},
-
   single_file = {
     enabled = false,
     max_entries = 0,
   },
-
-  -- Everything beneath it is writable inside the jail and every write lands in the
-  -- turn's private upper layer -- the opened repository, a sibling repository, a
-  -- directory that did not exist when the turn started. Everything outside it stays the
-  -- plain read-only host bind.
-  --
-  -- `nil` means "choose it from filesystem position", which is the default and the
-  -- cardinal principle applied to breadth: `$HOME/code` when it is an ancestor of the
-  -- resolved workspace, else `$HOME`, else the workspace itself. Set it to NARROW that
-  -- choice (one monorepo instead of all of `~/code`) or to widen it deliberately. It is
-  -- an OPERATOR setting and nothing a turn produces may reach it: not agent output, not
-  -- a path found in the workspace, not an env var a turn could set.
-  --
-  -- Validated at TURN START, where a bad value refuses the turn by name: it
-  -- must exist, must be an ancestor of (or equal to) the resolved workspace,
-  -- and must not contain yana's own state root -- the overlay may never cover
-  -- the layers it is written into.
-  capture_root = nil,
-
-  -- Ordered broad-root candidates used when capture_root is nil
-  -- (external-roots.md, capture-set ruling). EMPTY by default: nothing wider
-  -- than the resolved workspace is captured until an operator names a root
-  -- here, because no directory layout can be assumed. Entries are tried in
-  -- order; missing, non-ancestor, and state-root-containing entries are normal
-  -- misses, and the workspace itself is the final outcome when none qualify
-  -- (as with an empty list). Widening breadth here does not change write_roots.
-  capture_root_candidates = {},
 
   -- Workspace resolution asks, in order: the nearest `.git` root at or above the open
   -- file; then the entry here that contains it; then the file's own folder. A
@@ -356,7 +301,6 @@ local defaults = {
 		keep = 20,          -- pasted images retained in the cache dir
 	},
 
-
 	-- Diagnostic recording, OFF by default. When true, every raw cursor-agent
 	-- stdout line is teed verbatim to `<turn_dir>/private/stream.ndjson` and a
 	-- `meta.json` sidecar (argv, cwd, mode, model, timestamps, exit code,
@@ -379,6 +323,5 @@ local defaults = {
 		max = 50,
 	},
 }
-
 
 return defaults

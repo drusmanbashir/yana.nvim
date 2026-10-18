@@ -50,13 +50,8 @@ stable: `ask` appears as **Ask**, `inline` as **Inline**, and `agentic` as
 
 ### Global — `<C-a>` toggles the sidebar by default
 
-| Setting (`mappings`) | Default | Action |
-|---|---|---|
-| `toggle` | `<C-a>` | Open/close the panel from any normal-mode buffer, including the panel |
-| `ask` | `false` | Optional shortcut to ask about the current line/selection (normal + visual) |
-| `inline_edit` | `false` | Optional shortcut to inline-edit the visual selection |
-
-With those optional shortcuts disabled, use `:YanaAsk` and `:YanaEdit`.
+`<C-a>` opens or closes the panel from any normal-mode buffer. Use `:YanaAsk`
+and `:YanaEdit` for the current line or visual selection.
 
 ## Commands
 
@@ -82,7 +77,7 @@ With those optional shortcuts disabled, use `:YanaAsk` and `:YanaEdit`.
 | `:YanaStop` | Stop the in-flight response |
 | `:YanaSteer` | Interrupt the in-flight response and resend the prompt as a new turn |
 | `:YanaQueue` | View/edit/delete/reorder queued follow-up prompts |
-| `:YanaPasteImage` | Paste an image from the system clipboard into the prompt (when `image_paste.enable = true`, the default) |
+| `:YanaPasteImage` | Paste an image from the system clipboard into the prompt |
 | `:YanaDump` | Write a diagnostic dump of the current turn and review state, for bug reports |
 | `:YanaFlowReport[!]` | Write the per-turn flow report (`!` also opens it) |
 | `:YanaRenderCheck` | Reconcile every open review's display against its actual state |
@@ -90,10 +85,11 @@ With those optional shortcuts disabled, use `:YanaAsk` and `:YanaEdit`.
 
 ## Highlight Groups
 
-| Group | Paints | Configured via |
+| Group | Paints | Default link |
 |---|---|---|
-| `YanaDiffIncoming` | Added/incoming lines in an open review | `diff_highlights.incoming` (default links to `DiffAdd`) |
-| `YanaDiffDeleted` | Removed lines in an open review | `diff_highlights.deleted` (default links to `DiffDelete`) |
-| `YanaInlineHint` | The hint text between hunks | `diff_highlights.hint` (default links to `Comment`) |
-| `YanaModeAsk` / `YanaModeInline` / `YanaModeAgentic` | The mode chip in the winbar | `mode_highlights.ask` / `.inline` / `.agentic` |
-| `YanaModel` | The model chip in the winbar | `model_highlight` |
+| `YanaDiffIncoming` | Added/incoming lines in an open review | `DiffAdd` |
+| `YanaDiffDeleted` | Removed lines in an open review | `DiffDelete` |
+| `YanaInlineHint` | The hint text between hunks | `Comment` |
+| `YanaModeAsk` / `YanaModeInline` | The mode chip in the winbar | `Special` |
+| `YanaModeAgentic` | The Agent mode chip | `WarningMsg` |
+| `YanaModel` | The model chip in the winbar | `Identifier` |

@@ -6,6 +6,36 @@ local M = {}
 
 local NO_AFTER = "agent payload carried no after-content for this edit (nothing to review)"
 
+-- CORE F-SWAP-LOAD. bufload() loads past a swap file left by another or a crashed
+-- session, but its ATTENTION message reaches Lua as a thrown E325, which refused
+-- the review of a file that had in fact loaded. The message is suppressed for
+-- Yana's own load; the other swap file is kept for `:recover` and the operator is
+-- told once per swap file.
+local swap_told = {}
+function M.load(bufnr)
+  if vim.api.nvim_buf_is_loaded(bufnr) then
+    return
+  end
+  local shortmess = vim.o.shortmess
+  vim.opt.shortmess:append("A")
+  local ok, err = pcall(vim.fn.bufload, bufnr)
+  vim.o.shortmess = shortmess
+  if not ok then
+    error(err, 0)
+  end
+  -- Neovim takes the next free name (.swo, .swn, ...) when the .swp is held.
+  local own = vim.fn.swapname(bufnr)
+  local swapname = own ~= "" and not own:match("%.swp$") and own:gsub("%.sw.$", ".swp") or nil
+  if swapname and not swap_told[swapname] then
+    swap_told[swapname] = true
+    local line = string.format("yana: %s has a swap file from another or crashed Neovim (%s); "
+      .. "Yana opened the saved file and kept the swap file — :recover in another Neovim retrieves it",
+      vim.fn.fnamemodify(vim.api.nvim_buf_get_name(bufnr), ":~:."), vim.fn.fnamemodify(swapname, ":~"))
+    log.write("WARN", line)
+    vim.notify(line, vim.log.levels.WARN)
+  end
+end
+
 local function snapshot_lines(text)
   local lines = vim.split(text or "", "\n", { plain = true })
   if #lines > 0 and lines[#lines] == "" then
@@ -87,7 +117,7 @@ function M.new(deps)
       if not (bufnr and vim.api.nvim_buf_is_valid(bufnr)) then
         bufnr = vim.fn.bufnr(path, true)
       end
-      vim.fn.bufload(bufnr)
+      M.load(bufnr)
       -- Seals B1 off from what review open writes, so it stays one undo step back.
       deps.break_undo_block(bufnr)
       change.undo_pre_stage_seq = deps.buf_undo_seq(bufnr)
@@ -131,7 +161,7 @@ function M.new(deps)
 
     local function stage(bufnr, text)
       log.buffer_event("baseline_stage_begin", { change = change, bufnr = bufnr })
-      vim.fn.bufload(bufnr)
+      M.load(bufnr)
       deps.break_undo_block(bufnr)
       change.undo_pre_stage_seq = deps.buf_undo_seq(bufnr)
       local ok, err = pcall(

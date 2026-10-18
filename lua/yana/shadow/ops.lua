@@ -294,7 +294,7 @@ end
 
 --- Build inline review change objects for one turn, across every root it wrote.
 ---
---- ONE WALK AND ONE CLASSIFICATION PER ROOT. Two declared roots may hold the
+--- ONE WALK AND ONE CLASSIFICATION PER ROOT. Two roots may hold the
 --- same relative path, and `classify_artifacts` keys its exclusions by `rel`, so
 --- a single pass over the merged list would let one root's `dist/` exclusion
 --- silence the other root's file of the same name. Per root, the behaviour is

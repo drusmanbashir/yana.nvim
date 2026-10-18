@@ -14,6 +14,7 @@ readonly NEUTRAL_LOWER=/tmp/yana/lower
 readonly NEUTRAL_LAYER=/tmp/yana/layer
 readonly NEUTRAL_CURSOR=/tmp/yana/cursor
 readonly NEUTRAL_STATE=/tmp/yana/state
+readonly NEUTRAL_STATE_SHIELD=/tmp/yana/yana-state
 readonly MOUNT_MARKER=.yana-overlay-mounted
 readonly MOUNT_MARKER_CONTENT=mounted
 
@@ -37,11 +38,11 @@ helper pays it.
 
 Internal mount-namespace helper invoked only by yana-overlay. The first form
 is the single-root shape yana-overlay has always built when a turn declares
-no broad root and no extra root; it is unchanged, byte for byte, and is the
-shape tests/overlay_gate.sh drives this helper with directly.
+no broad root and no extra root (only a direct launcher call without
+--broad-root builds it; Yana always sends --broad-root).
 
-The second form is the broad-root shape (PLAN-R1-capture.md WI-1, "one
-broad-root overlay for fast, total capture"): ONE overlay is mounted at DIR
+The second form is the broad-root shape (the capture area holding the
+workspace): ONE overlay is mounted at DIR
 with -o volatile, and then -- ON TOP of that overlay -- the ~/.cursor
 writable exception is mounted at its own real absolute path. Mounting it
 here, after the overlay, rather than as an outer bwrap arg before it, is the
@@ -56,8 +57,8 @@ what the operator's account can read, so this helper no longer accepts or
 mounts anything of that shape. See bin/yana-overlay's own
 "Secret mask — RETIRED" comment and the core contract doc.
 
-The third form mounts one overlay per operator-declared write root (the
-pre-broad-root shape, retained unchanged pending its own deletion). Root 1 is
+The third form mounts one overlay per root when extra roots arrive without
+--broad-root (Yana itself always sends --broad-root with extra roots). Root 1 is
 always the opened workspace and keeps the neutral bind pair the single-root
 form uses; root i uses /tmp/yana/r<i>/lower and /tmp/yana/r<i>/layer, which
 yana-overlay binds inside bwrap's private /tmp.
@@ -84,50 +85,12 @@ CURSOR_DIR=""
 ROOTS=()
 EXEC_ALLOW=()
 STATE_DIRS=()
-CAPTURE_PLAN=""
-OPEN_CAPTURE_BACKEND=""
 # volatile applies to the broad-root shape only: teardown_work() chmod -R's before
 # deleting and copes with it, a bare `rm -rf` does not, and the single-root and
 # --roots shapes must stay byte-identical.
 VOLATILE_OPT=""
 
-source "$INNER_DIR/lib/yana-overlay/capture_plan.sh"
-
-if [[ ${1:-} == "--capture-plan" ]]; then
-	shift
-	CAPTURE_PLAN=${1:?--capture-plan requires a file}
-	shift
-	[[ ${1:-} == "--backend" ]] || { echo "yana-overlay-inner: --capture-plan requires --backend" >&2; exit "$EXIT_USAGE"; }
-	shift
-	OPEN_CAPTURE_BACKEND=${1:?--backend requires a value}
-	shift
-	ROOTS=("$(capture_plan_field "$CAPTURE_PLAN" project_cwd)")
-	while [[ $# -gt 0 && "$1" != "--" ]]; do
-		case "$1" in
-			--cursor)
-				[[ $# -ge 2 ]] || { echo "yana-overlay-inner: --cursor requires a directory" >&2; exit "$EXIT_USAGE"; }
-				CURSOR_DIR=$2
-				shift 2
-				;;
-			--state-dir)
-				[[ $# -ge 2 ]] || { echo "yana-overlay-inner: --state-dir requires a path" >&2; exit "$EXIT_USAGE"; }
-				STATE_DIRS+=("$2")
-				shift 2
-				;;
-			--exec-allow)
-				[[ $# -ge 2 ]] || { echo "yana-overlay-inner: --exec-allow requires a path" >&2; exit "$EXIT_USAGE"; }
-				EXEC_ALLOW+=("$2")
-				shift 2
-				;;
-			*)
-				echo "yana-overlay-inner: unknown capture-plan option '$1'" >&2
-				exit "$EXIT_USAGE"
-				;;
-		esac
-	done
-	[[ ${1:-} == "--" ]] || { echo "yana-overlay-inner: expected -- after capture-plan options" >&2; exit "$EXIT_USAGE"; }
-	shift
-elif [[ ${1:-} == "--broad-root" ]]; then
+if [[ ${1:-} == "--broad-root" ]]; then
 	shift
 	BROAD_ROOT=${1:?--broad-root requires a directory}
 	VOLATILE_OPT=",volatile"
@@ -225,15 +188,8 @@ fi
 LAYERS=()
 
 source "$INNER_DIR/lib/yana-overlay/mount.sh"
-source "$INNER_DIR/lib/yana-overlay/fuse.sh"
 
 inner_run_agent_without_caps() {
-	if [[ "$OPEN_CAPTURE_BACKEND" == fuse-compat ]]; then
-		# FUSE reaches this door after mounting its view, before the ordinary
-		# overlay branch below can install the writable host exceptions.
-		mount_cursor_exception
-		mount_state_dirs
-	fi
 	mount_user_manager_endpoints
 	local capsh_path cap_now
 	local -a cmd=( "$@" )
@@ -241,31 +197,23 @@ inner_run_agent_without_caps() {
 		echo "yana-overlay-inner: capsh not found on PATH" >&2
 		exit "$EXIT_REFUSE"
 	}
-	if (( ${#EXEC_ALLOW[@]} != 0 )); then
-		echo "yana-overlay-inner: fuse-compat exec allowlist is not available" >&2
-		exit "$EXIT_REFUSE"
-	fi
 	if [[ -n "${YANA_INLINE_EXEC_ALLOW_PATH:-}" ]]; then
 		export PATH="$YANA_INLINE_EXEC_ALLOW_PATH"
 	fi
 	exec "$capsh_path" --drop=all --caps= -- -c '
 cap_now=$(awk "/^CapEff:/ {print \$2}" /proc/self/status)
 if [ "$cap_now" != 0000000000000000 ]; then
-	echo open_capture_capabilities >&2
+	echo "yana-overlay-inner: effective capabilities retained after drop" >&2
 	exit 65
 fi
 shopt -s execfail; [ -z "$YANA_AGENT_STARTED" ] || echo started >"$YANA_AGENT_STARTED"; exec "$@"; [ -z "$YANA_AGENT_STARTED" ] || echo exec_failed >"$YANA_AGENT_STARTED"; exit 127
 ' capsh "${cmd[@]}"
 }
 
-if [[ -n "$CAPTURE_PLAN" && "$OPEN_CAPTURE_BACKEND" == fuse-compat ]]; then
-	fuse_run inner_run_agent_without_caps "$@"
-	exit $?
-fi
-
 mount_overlays
 mount_cursor_exception
 mount_state_dirs
+mount_state_root_shield
 mount_user_manager_endpoints
 
 # Markers are written only after the FULL set has mounted: yana-overlay reads

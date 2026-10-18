@@ -4,7 +4,7 @@ local target = assert(os.getenv("RELEASE_MISSING_EXEC"), "RELEASE_MISSING_EXEC r
 local dependencies = require("yana.runtime.dependencies")
 local config = require("yana.config")
 
-config.setup({ cmd = root .. "/tests/release/fake-cursor-agent", mode = "inline" })
+config.setup({ backends = { cursor = { cmd = root .. "/tests/release/fake-cursor-agent" } }, mode = "inline" })
 
 local function die(message)
   error("dependency smoke: " .. message)

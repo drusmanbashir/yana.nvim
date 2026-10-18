@@ -38,8 +38,7 @@ If not using the installer, you can follow steps below for the prerequisites:
 #### 1. Install an agent
 
 Choose an installed agent CLI: Claude Code (`claude`), Codex
-(`codex`) or Cursor (`cursor-agent`). Use the matching `backend` value
-`"claude"`, `"codex"` or `"cursor"` in the Neovim setup below.
+(`codex`) or Cursor (`cursor-agent`). Choose the matching agent in `backends.default` in the Neovim setup below.
 After setup, run `:YanaLogin` to sign in through that agent's official login
 in a Neovim terminal. Existing API-key authentication keeps working.
 
@@ -93,72 +92,22 @@ macOS supports `agentic` mode only. See the
 
 ### Neovim setup
 
-Add this plugin declaration to your lazy.nvim configuration. The example
-starts with Claude; change `backend` to `"codex"` or `"cursor"` for another CLI.
-The table shows the public plugin's configurable mapping defaults. Change
-their values during setup; omitted entries keep their defaults.
+Add this plugin declaration to lazy.nvim. This sample starts with Claude; set
+`backends.default` to `"codex"` or `"cursor"` to use another installed agent.
+See [Usage](docs/usage.md) for key bindings and
+[Configuration](docs/configuration.md) for optional settings.
 
 ```lua
 {
   "drusmanbashir/yana.nvim",
   dependencies = { "drusmanbashir/yana-ui.nvim" },
   event = "VeryLazy",
-  opts = {
-    backend = "claude",
-    mappings = {
-      -- Global: available from any buffer
-      toggle = "<C-a>", -- open or close the panel
-      ask = false, -- optional shortcut for asking about code
-      inline_edit = false, -- optional visual shortcut for the instruction float
-
-      -- Reviewed buffers: normal and visual modes
-      accept_hunk = "ca", -- accept the change under the cursor
-      reject_hunk = "cr", -- reject the change under the cursor
-      accept_file = "cf", -- accept all changes in the current file
-      reject_file = "cx", -- reject all changes in the current file
-      accept_all = "cA", -- accept all changes in the turn
-      next_hunk = "]x", -- next change
-      prev_hunk = "[x", -- previous change
-
-      -- Panel prompt and inline-edit float: normal and insert modes
-      submit = "<C-s>", -- send the prompt
-      stop = "<C-c>", -- stop the response; close the float in insert mode
-
-      -- Panel
-      model = "<C-g>", -- choose an agent and model
-      new_chat = "<C-n>", -- start a new chat
-      resend = "<M-r>", -- then r: here, n: new chat, a: new agent chat
-      review = "<C-y>", -- review pending changes
-      reject = "<C-x>", -- reject pending changes
-      focus_prompt = "i", -- focus the prompt from the conversation
-      close = "q", -- close the panel or float (normal mode)
-      next_panel = "<M-.>", -- next panel, from the prompt
-      prev_panel = "<M-,>", -- previous panel, from the prompt
-      completion_menu = "<C-Space>", -- prompt completion (insert mode)
-      new_panel = "<M-n>", -- open another panel
-      queue = "<M-q>", -- open the prompt queue
-      steer = "<C-CR>", -- send instructions to the running agent
-
-      -- Inline-edit float: normal and insert modes
-      history_prev = "<C-p>", -- previous instruction
-      history_next = "<C-n>", -- next instruction
-    },
-  },
+  opts = { backends = { default = "claude" } },
 }
 ```
 
-Set an optional mapping to `false` to disable it. The seven review mappings
-cannot be disabled: `false` or `""` restores their defaults. Review keys `cR`,
-`cU`, `u`, `U` and `<C-r>` are fixed. If your terminal treats `<C-CR>` as Enter,
-change `steer` to another key, such as `"<M-CR>"`.
-
-lazy.nvim installs the required `yana-ui.nvim` dependency. If you omit
-`backend`, Yana starts with Cursor; it does not guess from installed CLIs.
-
-Restart Neovim in your project, run `:checkhealth yana`, then press
-`<C-a>`. The opened project is included automatically. Use `:YanaRoots`
-only to add other folders; no model or project-path setting is needed for
-normal use.
+With `opts = {}`, Yana starts with Cursor. It does not guess from installed
+CLIs.
 
 ## Use
 

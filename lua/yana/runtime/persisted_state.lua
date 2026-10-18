@@ -82,33 +82,6 @@ function M.save_model_selection(options)
 	})
 end
 
---- Merge saved capture roots onto the hand-authored setup defaults.
-function M.apply_write_roots(options)
-	options = options or {}
-	local saved = M.get("write_roots")
-	if type(saved) ~= "table" then
-		return false
-	end
-	local merged, seen = {}, {}
-	for _, path in ipairs(options.write_roots or {}) do
-		if type(path) == "string" and path ~= "" and not seen[path] then
-			seen[path], merged[#merged + 1] = true, path
-		end
-	end
-	for _, path in ipairs(saved) do
-		if type(path) == "string" and path ~= "" and not seen[path] then
-			seen[path], merged[#merged + 1] = true, path
-		end
-	end
-	options.write_roots = merged
-	return true
-end
-
-function M.save_write_roots(options)
-	options = options or {}
-	M.set("write_roots", vim.deepcopy(options.write_roots or {}))
-end
-
 M._test = {
 	set_path = function(path)
 		override_path = path

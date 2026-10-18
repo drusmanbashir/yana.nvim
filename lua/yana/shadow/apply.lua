@@ -61,7 +61,7 @@ function M.begin_pass(shadow_turn, changes)
 	-- ONE JOURNAL PER ROOT, and the root is read off the change, never guessed.
 	-- `safety/diary.lua` refuses a target outside its session's workspace ("path escapes
 	-- workspace") and `safety/checkpoint.lua` refuses to capture one, which is exactly the
-	-- boundary that makes a journal trustworthy. A declared write root is a workspace in
+	-- boundary that makes a journal trustworthy. An extra root is a workspace in
 	-- its own right, so it gets its own journal rooted at itself rather than a widened
 	-- check on the workspace's.
 	local primary = shadow_turn.workspace
@@ -106,7 +106,7 @@ M.accept_composed = apply_accept.accept_composed
 --- The panel-local journal a standalone accept or scope revert writes through.
 ---
 --- Primary-root changes keep `panel._standalone_diary`, opened at the review
---- workspace exactly as before. A change from a declared write root cannot be
+--- workspace exactly as before. A change from an extra root cannot be
 --- journalled there -- the diary refuses a target outside its own workspace --
 --- so it gets its own panel-local journal rooted at that root, kept beside the
 --- first one and reused for every later change from the same root.
@@ -170,7 +170,7 @@ function M.accept_standalone(panel, change, composed, opts)
 		-- must not leave a diary directory behind.
 		return apply_accept.commit(nil, change, plan, opts and opts.own_splice)
 	end
-	-- A change from a declared write root journals at THAT root: the diary's
+	-- A change from an extra root journals at THAT root: the diary's
 	-- own "path escapes workspace" refusal is a boundary worth keeping, so the
 	-- root becomes the journal's workspace rather than the check being widened.
 	-- A primary-root change keeps the panel journal it has always used.

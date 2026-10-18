@@ -54,9 +54,7 @@ while IFS= read -r member; do
 		[[ "$mode" == 644 || "$mode" == 664 ]] \
 			|| { echo "archive: $member must be mode 644, found $mode" >&2; exit 1; }
 		;;
-	bin/lib/yana-overlay/capture_plan.sh | bin/lib/yana-overlay/fuse.sh \
-		| bin/lib/yana-overlay/layer_edit.sh \
-		| bin/lib/yana-overlay/mount.sh | bin/lib/yana-overlay/open_capture.sh)
+	bin/lib/yana-overlay/layer_edit.sh | bin/lib/yana-overlay/mount.sh)
 		[[ "$mode" == 644 || "$mode" == 664 ]] \
 			|| { echo "archive: $member must be mode 644, found $mode" >&2; exit 1; }
 		;;

@@ -13,114 +13,50 @@ shown). After End-turn, `u` / `<C-r>` are native Neovim. Nothing reaches disk
 until you accept; accepted bytes are written through an applier that refuses
 if the file drifted underneath.
 
-**Confinement.** The agent runs inside a sandbox (bubblewrap) where the whole
-host is read-only and one overlay layer captures every write inside your
-workspace. Secret stores (`~/.ssh`, `~/.gnupg`, `~/.aws`, credential files)
-are masked inside the sandbox. Writes Yana itself refuses (control-plane
-paths like `.git/`, binary artifacts, anything outside the workspace) are
-named in the panel and in `:YanaRefusals`, never dropped silently.
+**Confinement.** In `ask` and `inline`, the agent runs inside a sandbox
+(bubblewrap). Proposed writes go into a private overlay; the agent's own
+configuration and session directories may remain writable. The sandbox limits
+writes; it does not prevent reading files your account can read. Refused
+writes, including `.git/` metadata and paths outside the captured areas, are
+named in the panel and in `:YanaRefusals`.
 
-**Workspace scope.** A turn may write inside the workspace you opened — the
-nearest `.git` root above the file, or the folder itself when there is no
-`.git` above it. Anything outside that boundary stays read-only, and a
-refusal always names the exact boundary that would allow it.
+**Write scope.** An `inline` turn can propose edits anywhere in your home
+folder, on every writable data disk (a mounted ordinary filesystem whose top
+folder you can write) and in the turn's own folder, wherever the turn starts.
+There is nothing to configure. The turn's folder is normally the nearest
+`.git` root above the file, or the file's folder when there is no `.git` above
+it. Other paths, such as system folders, stay read-only.
 
 **Modes.** One dial, three results: `ask` (reads and answers, no edits),
 `inline` (edits become hunks), `agentic` (direct, unconfined). `modes` picks
 which of the three are available: the first entry is the starting mode,
 `:YanaMode` cycles in that order, and a mode not listed cannot be entered.
 Yana assigns no cycle shortcut; bind the command in your own keymap configuration.
-Switching mid-chat hands the next session a short brief of what you asked,
-what landed, and what was refused, once.
 
-**Backends — two layers of "which model".** Layer 1 is the backend: which
-binary, which account, which bill (`cursor`, `claude`, `codex`, or a vendor
-you add yourself). Layer 2 is the model within that backend. Conflating them
-is a real trap: picking `claude-4-sonnet` *inside* `cursor-agent` is Cursor's
-own resale of Claude, billed on Cursor's meter — a different product from
-running `claude-sonnet-5` through your own Anthropic account, even though
-both chips once said only `model: claude-4-sonnet`. `:YanaBackend` and
-`:YanaModel` are deliberately different commands and keys so a mis-press
-never changes the wrong one; switching backend always resets the model,
-because a model id from one vendor is meaningless to another. A map of your
-own can call the two in sequence — backend, then model — without merging
-them. The active backend's model list is fetched the first time you open
-the model picker, and then cached, so opening it again (or `:YanaModel`)
-reads from memory instead of re-spawning the vendor CLI. A
-`--resume`
-session id is vendor-specific too: resuming a session recorded under a
-different backend is refused by name, naming both backends.
+**Backends and models.** Yana supports `cursor`, `claude`, and `codex`. Set
+`backends.default` to choose the starting agent. Each named `backends` entry
+can set `cmd` to a custom executable path and `model` to that agent's model ID.
+The picker can change agent and model during a session; saved picker choices
+continue to take precedence after restart. See
+[configuration](configuration.md#agent-and-backend) for the setup syntax.
 
-Backends are declared in `config.backends` — a named table of vendor entries.
-Three ship today (`cursor`, `claude`, `codex`); `codex`'s entry shows the fields a vendor whose
-CLI shape genuinely differs needs (non-interactive mode as a subcommand
-rather than a flag, a positional resume id, its own JSON stream token):
+Yana applies the CLI sandbox policy automatically: ask uses read-only access,
+while inline and agentic use full vendor access by default. Inline changes still
+pass through Yana's overlay and review before they reach files.
 
-```lua
-opts = {
-  sandbox = { inline = "full", agentic = "full" },
-  backends = {
-    codex = {
-      cmd = "codex",
-      subcommand = { "exec" },
-      noninteractive_flag = false,
-      stream_protocol = "codex",
-      stream_json_args = { "--json" },
-      sandbox_args = {
-        full = { "-c", 'sandbox_mode="danger-full-access"' },
-        workspace = { "-c", 'sandbox_mode="workspace-write"' },
-        ["read-only"] = { "-c", 'sandbox_mode="read-only"' },
-        ["vendor-default"] = {},
-      },
-      allow_edits_args = { "--skip-git-repo-check" },
-      select_model_flag = "--model",
-      resume_subcommand = { "resume" },
-      list_models_args = { "debug", "models" },
-      list_models_format = "json_models",
-      close_stdin = true,
-    },
-  },
-}
-```
-
-`sandbox` uses Yana's four vendor-neutral levels: `full`, `workspace`,
-`read-only`, and `vendor-default` (append no sandbox flag). Ask always uses
-`read-only`; inline and agentic default to `full`. Each shipped backend translates
-the selected level into its own CLI spelling. Inline grants headless edit
-permission while Yana's overlay and review enforce its write boundary. An explicit
-`vendor-default` inherits vendor settings and can require permission that a
-headless turn cannot obtain.
-Custom backends must declare all four `sandbox_args` entries. A token-bearing
-map also needs dated vendor-version stamps; missing levels refuse at setup
-instead of silently tightening a turn.
-
-Every field is a spelling, never a policy: an entry can't make a turn
-interactive, swap the event-stream format Yana parses, leave an edit-capable
-mode silently unable to write, or inject a token Yana itself places. All of
-it is validated by name at `setup()` time, never discovered mid-turn.
-
-**Machine-specific resolution.** The agent binary resolves in order: an
-explicit `cmd`, then `YANA_CURSOR_BIN`, then the environment variable named by
-`cmd_env` (default `YANA_AGENT_BIN`), then `cursor-agent` on `$PATH`. Claude and
-Codex similarly check `YANA_CLAUDE_BIN` and `YANA_CODEX_BIN` before their
-standard command names. `:checkhealth yana`
-reports which step resolved, and every candidate it tried.
+**Machine-specific resolution.** Yana searches Neovim's `$PATH` for each CLI.
+For a custom location, set `backends.<name>.cmd` to its path. `:checkhealth yana`
+reports whether the selected executable was found.
 
 **Liveness and logs.** While a turn runs the panel shows elapsed time and
 activity — "working silently (CPU n%)" when a sub-agent is busy but quiet,
 "stalled — :YanaStop" only when nothing moves. A stopped stall leaves a
 forensics bundle and `bin/yana-stall-report` classifies every stalled turn by
-cause. Every turn can record its raw agent stream and a per-event history
-(`YANA_DEBUG_EVENTS`, `YANA_LIFECYCLE_LOG`, both off by default) under the
-state root.
+cause.
 
-**Where a turn may run.** The workspace is any folder, not only a git
-project, but never your whole home, `/`, or a top-level folder such as
-`/home` or `/tmp` (fewer than two path components below `/`). Those are
-refused by name with the remedy "pick a project subdirectory" — start Yana
-inside `~/code/myproject`, `~/notes`, and so on. `:Yana --workspace DIR` binds
-one turn to a named directory; the old `:Yana --file` shortcut now refuses by
-name.
+**Where a turn may run.** The workspace can be any folder, including your
+home folder itself when Neovim starts there with no file open; only `/` is
+refused. `:Yana --workspace DIR` binds one turn to a named directory.
 
 **Recovery.** One claim per workspace keeps two editors from clobbering each
 other; a second turn on a busy repo is refused by name. If Neovim dies with a
@@ -156,10 +92,9 @@ signature-help's default insert-mode `<C-s>` untouched everywhere else.
 The default steer key (`<C-CR>`) is indistinguishable from plain `<CR>` on
 many terminals without the Kitty keyboard protocol or an equivalent, which
 `:checkhealth yana` reports as INFO on a terminal it cannot confirm supports
-it — rebind it, e.g. `mappings.steer = "<M-CR>"`, if `<C-CR>` never
-steers for you.
+it.
 
-Yana ships no completion provider of its own, so `mappings.completion_menu`
-(default `<C-Space>`) only shows Yana-scoped slash-command/@mention
+Yana ships no completion provider of its own, so `<C-Space>` only shows
+Yana-scoped slash-command/@mention
 completions when your own blink.cmp config special-cases
 `vim.b.yana_prompt`, which `:checkhealth yana` also reports as INFO.

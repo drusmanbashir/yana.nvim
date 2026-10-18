@@ -1,6 +1,6 @@
 local source = debug.getinfo(1, "S").source:sub(2)
 local root = vim.fn.fnamemodify(source, ":h:h:h")
-require("yana.config").setup({ cmd = root .. "/tests/release/fake-cursor-agent", mode = "inline" })
+require("yana.config").setup({ backends = { cursor = { cmd = root .. "/tests/release/fake-cursor-agent" } }, mode = "inline" })
 
 local dependencies = require("yana.runtime.dependencies")
 local ready, reason = dependencies.preflight("inline")

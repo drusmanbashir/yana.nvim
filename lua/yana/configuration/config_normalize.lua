@@ -3,25 +3,6 @@ local M = {}
 
 function M.new(deps)
   local defaults = deps.defaults
-  local OPEN_CAPTURE_MODES = { auto = true, ["overlayfs-fast"] = true, ["fuse-compat"] = true, off = true }
-  local function checked_open_capture_mode(value)
-    if type(value) ~= "string" or not OPEN_CAPTURE_MODES[value] then error("open_capture_mode_invalid: " .. vim.inspect(value) .. " -- valid modes: auto, overlayfs-fast, fuse-compat, off", 0) end
-    return value
-  end
-
-  local function normalize_open_capture(value)
-    local base = vim.deepcopy(defaults.open_capture or { mode = "auto", on_unavailable = "refuse" })
-    if value == nil then return base end
-    if type(value) ~= "table" then error("yana: open_capture must be a table", 0) end
-    local out = vim.tbl_deep_extend("force", base, value)
-    out.mode = checked_open_capture_mode(out.mode)
-    if out.on_unavailable ~= "refuse" then error("yana: open_capture.on_unavailable " .. vim.inspect(out.on_unavailable) .. " is invalid -- only refuse is supported", 0) end
-    return { mode = out.mode, on_unavailable = "refuse" }
-  end
-
-  local function normalize_open_capture_mode(value)
-    return checked_open_capture_mode((value == nil or value == "") and defaults.open_capture.mode or value)
-  end
   local ENFORCE_MODES = { reject = true, warn = true, off = true }
 
   local function normalize_enforce(value, fallback)
@@ -264,50 +245,6 @@ function M.new(deps)
     return out
   end
 
-  --- Shape only. A `write_roots` entry that does not exist or lands inside the
-  --- state root is a TURN-START refusal naming the root (`shadow/preview.lua`'s
-  --- resolve_roots), not a setup error: the directory may legitimately appear
-  --- after the editor started, and a refusal that names the offending root at the
-  --- moment a turn needs it is the actionable one.
-  ---
-  --- Overlap is set arithmetic: turn start unions the opened workspace with every
-  --- declared root and keeps only maximal canonical paths before claims or mounts
-  --- exist. An ancestor root absorbs the opened workspace and becomes root 1.
-  ---
-  --- Entries are sorted here. Acquisition order is fixed after maximal-set
-  --- reduction, so two editors racing for the same final root set attempt claims
-  --- in the same sequence and neither ends up holding half.
-  local function normalize_write_roots(roots)
-    if roots == nil then
-      return {}
-    end
-    if type(roots) ~= "table" then
-      error("write_roots must be a list of absolute directory paths")
-    end
-    local out, seen = {}, {}
-    for _, entry in ipairs(roots) do
-      if type(entry) ~= "string" or entry == "" then
-        error("write_roots entries must be non-empty absolute directory paths")
-      end
-      local expanded = vim.fn.expand(entry)
-      if type(expanded) ~= "string" or expanded == "" then
-        error("write_roots entry could not be expanded: " .. entry)
-      end
-      if expanded:sub(1, 1) ~= "/" then
-        error("write_roots entries must be absolute paths (a leading ~ is expanded): " .. entry)
-      end
-      expanded = expanded:gsub("/+$", "")
-      if expanded == "" then
-        error("write_roots may not declare the filesystem root")
-      end
-      if not seen[expanded] then
-        seen[expanded] = true
-        out[#out + 1] = expanded
-      end
-    end
-    table.sort(out)
-    return out
-  end
 
   -- Legacy compatibility only. The retired selector must not be reactivated by
   -- setup({ single_file = ... }); keep a disabled shape for older callers.
@@ -315,7 +252,7 @@ function M.new(deps)
     return vim.deepcopy(defaults.single_file)
   end
 
-  --- Shape only, with the same delayed-validation pattern as write_roots:
+  --- Shape only, with delayed validation:
   --- existence and ancestor/state-root questions are TURN-START refusals naming the directory
   --- (`shadow/preview.lua`'s `workspace_for_turn`/`broad_root_for`), because the
   --- directory may legitimately appear after the editor started.
@@ -358,61 +295,7 @@ function M.new(deps)
     return out
   end
 
-  --- Shape only. One absolute directory or nil; everything else is a TURN-START
-  --- refusal naming it.
-  local function normalize_capture_root(root)
-    if root == nil or root == "" then
-      return nil
-    end
-    if type(root) ~= "string" then
-      error("capture_root must be an absolute directory path, or nil")
-    end
-    local expanded = vim.fn.expand(root)
-    if type(expanded) ~= "string" or expanded == "" then
-      error("capture_root could not be expanded: " .. root)
-    end
-    if expanded:sub(1, 1) ~= "/" then
-      error("capture_root must be an absolute path (a leading ~ is expanded): " .. root)
-    end
-    expanded = expanded:gsub("/+$", "")
-    if expanded == "" then
-      error("capture_root may not be the filesystem root")
-    end
-    return expanded
-  end
 
-  --- Ordered broad-root candidate paths. Shape is fixed at setup; existence,
-  --- ancestry, and state-root containment are turn-start filesystem facts.
-  local function normalize_capture_root_candidates(roots)
-    if roots == nil then
-      return {}
-    end
-    if type(roots) ~= "table" then
-      error("capture_root_candidates must be a list of absolute directory paths")
-    end
-    local out, seen = {}, {}
-    for _, entry in ipairs(roots) do
-      if type(entry) ~= "string" or entry == "" then
-        error("capture_root_candidates entries must be non-empty absolute directory paths")
-      end
-      local expanded = vim.fn.expand(entry)
-      if type(expanded) ~= "string" or expanded == "" then
-        error("capture_root_candidates entry could not be expanded: " .. entry)
-      end
-      if expanded:sub(1, 1) ~= "/" then
-        error("capture_root_candidates entries must be absolute paths (a leading ~ is expanded): " .. entry)
-      end
-      expanded = expanded:gsub("/+$", "")
-      if expanded == "" then
-        error("capture_root_candidates may not declare the filesystem root")
-      end
-      if not seen[expanded] then
-        seen[expanded] = true
-        out[#out + 1] = expanded
-      end
-    end
-    return out
-  end
 
   -- Validate/dedupe single-component prefix names; error on separators.
   local function normalize_artifact_dir_prefixes(prefixes)
@@ -483,17 +366,12 @@ function M.new(deps)
     normalize_image_paste = normalize_image_paste,
     normalize_redirect = normalize_redirect,
     normalize_inline_edit = normalize_inline_edit,
-    normalize_open_capture = normalize_open_capture,
-    normalize_open_capture_mode = normalize_open_capture_mode,
     normalize_log_level = normalize_log_level,
     normalize_sandbox = normalize_sandbox,
     normalize_review = normalize_review,
     normalize_skill_dirs = normalize_skill_dirs,
-    normalize_write_roots = normalize_write_roots,
     normalize_single_file = normalize_single_file,
     normalize_workspace_roots = normalize_workspace_roots,
-    normalize_capture_root = normalize_capture_root,
-    normalize_capture_root_candidates = normalize_capture_root_candidates,
     normalize_artifact_dir_prefixes = normalize_artifact_dir_prefixes,
     normalize_inline_exec_allowlist = normalize_inline_exec_allowlist,
   }

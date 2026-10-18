@@ -3,6 +3,47 @@ local M = {}
 
 M.defaults = require("yana.configuration.config_defaults")
 
+local function adjacent_development_extension()
+  local source = debug.getinfo(1, "S").source
+  if source:sub(1, 1) == "@" then
+    source = source:sub(2)
+  end
+  local path = vim.fn.fnamemodify(source, ":p:h") .. "/config_development.lua"
+  local stat, stat_error = vim.uv.fs_stat(path)
+  if not stat then
+    if type(stat_error) == "string" and stat_error:match("^ENOENT:") then
+      return nil
+    end
+    error("yana: cannot inspect adjacent config_development.lua: " .. tostring(stat_error), 0)
+  end
+  if stat.type ~= "file" then
+    error("yana: adjacent config_development.lua exists but is not a regular file", 0)
+  end
+  local chunk, err = loadfile(path)
+  if not chunk then
+    error("yana: cannot load adjacent config_development.lua: " .. tostring(err), 0)
+  end
+  local extension = chunk()
+  if type(extension) ~= "table" or type(extension.apply) ~= "function" then
+    error("yana: adjacent config_development.lua must return a table with apply(options, validators)", 0)
+  end
+  return extension
+end
+
+local DEVELOPMENT = adjacent_development_extension()
+
+local public_backends = { default = M.defaults.backend }
+for name in pairs(M.defaults.backends or {}) do
+  public_backends[name] = {}
+end
+
+M.public_defaults = {
+  backends = public_backends,
+  modes = vim.deepcopy(M.defaults.modes),
+  inline_edit = vim.deepcopy(M.defaults.inline_edit),
+  log_level = M.defaults.log_level,
+}
+
 M.options = vim.deepcopy(M.defaults)
 M._setup_done = false
 M._single_file_notice_emitted = false
@@ -35,14 +76,10 @@ M.normalize_log_level = _normalize.normalize_log_level
 M.normalize_sandbox = _normalize.normalize_sandbox
 M.normalize_review = _normalize.normalize_review
 M.normalize_skill_dirs = _normalize.normalize_skill_dirs
-M.normalize_write_roots = _normalize.normalize_write_roots
 M.normalize_single_file = _normalize.normalize_single_file
 M.normalize_workspace_roots = _normalize.normalize_workspace_roots
-M.normalize_capture_root = _normalize.normalize_capture_root
-M.normalize_capture_root_candidates = _normalize.normalize_capture_root_candidates
 M.normalize_artifact_dir_prefixes = _normalize.normalize_artifact_dir_prefixes
 M.normalize_inline_exec_allowlist = _normalize.normalize_inline_exec_allowlist
-M.normalize_open_capture = _normalize.normalize_open_capture
 
 local _resolve = require("yana.configuration.config_resolve").new({
   defaults = M.defaults,
@@ -52,7 +89,6 @@ local _resolve = require("yana.configuration.config_resolve").new({
   backend_descriptor = function(name)
     return M.backend_descriptor(name)
   end,
-  normalize_open_capture_mode = _normalize.normalize_open_capture_mode,
 })
 M.mode_hl_groups = _resolve.mode_hl_groups
 M.model_hl_group = _resolve.model_hl_group
@@ -68,7 +104,6 @@ M.resolve_cmd = _resolve.resolve_cmd
 M.cmd = _resolve.cmd
 M.normalize_modes = _resolve.normalize_modes
 M.mode_enabled = _resolve.mode_enabled
-M.resolve_open_capture_mode = _resolve.resolve_open_capture_mode
 
 local _mappings = require("yana.configuration.config_mappings")
 
@@ -175,6 +210,20 @@ function M.setup(opts)
   -- A private copy: nothing below writes into the caller's table, so a second
   -- setup() with the same table resolves to the same options.
   opts = vim.deepcopy(opts or {})
+  for _, key in ipairs({ "backend", "model", "cmd", "cmd_env", "trust", "approve_mcps" }) do
+    if opts[key] ~= nil then
+      error("yana: config." .. key .. " is internal; configure it through backends", 0)
+    end
+  end
+  for _, key in ipairs({ "profile", "debug_modules", "debug_record" }) do
+    if opts[key] ~= nil and not DEVELOPMENT then
+      error("yana: config." .. key .. " requires the adjacent development configuration", 0)
+    end
+  end
+  local runtime_backends, selected_backend = M.normalize_backends(opts.backends)
+  opts.backends = nil
+  opts.backend = selected_backend
+  opts.model = runtime_backends[selected_backend].model
   if opts.single_file ~= nil and not M._single_file_notice_emitted then
     M._single_file_notice_emitted = true
     vim.notify(
@@ -182,7 +231,24 @@ function M.setup(opts)
       vim.log.levels.WARN
     )
   end
+  -- CAPTURE.md OC-48: folder grants and the capture-engine selector are retired;
+  -- inline turns reach the home folder and writable data disks without them.
+  -- Old keys warn once, never error.
+  local retired = {}
+  for _, key in ipairs({ "write_roots", "capture_root", "capture_root_candidates", "open_capture" }) do
+    if opts[key] ~= nil then
+      retired[#retired + 1] = key
+      opts[key] = nil
+    end
+  end
+  if #retired > 0 and not M._retired_roots_notice_emitted then
+    M._retired_roots_notice_emitted = true
+    vim.notify("yana: " .. table.concat(retired, ", ") .. " retired and ignored -- inline turns can edit "
+      .. "your home folder and writable data disks without grants", vim.log.levels.WARN)
+  end
   local next_options = vim.tbl_deep_extend("force", vim.deepcopy(M.defaults), opts)
+  next_options.backends = runtime_backends
+  next_options.backend = selected_backend
   -- Replace (do not deep-merge) each highlight role so a custom bg/fg does not
   -- keep a leftover defaults.link (e.g. DiffAdd) that would win at apply time.
   if opts.diff_highlights then
@@ -215,22 +281,22 @@ function M.setup(opts)
   next_options.review = M.normalize_review(next_options.review)
   next_options.skill_dirs = M.normalize_skill_dirs(next_options.skill_dirs)
   next_options.artifact_dir_prefixes = M.normalize_artifact_dir_prefixes(next_options.artifact_dir_prefixes)
-  next_options.write_roots = M.normalize_write_roots(next_options.write_roots)
   next_options.single_file = M.normalize_single_file(next_options.single_file)
   next_options.workspace_roots = M.normalize_workspace_roots(next_options.workspace_roots)
-  next_options.capture_root = M.normalize_capture_root(next_options.capture_root)
-  next_options.capture_root_candidates = M.normalize_capture_root_candidates(next_options.capture_root_candidates)
-  next_options.open_capture = M.normalize_open_capture(next_options.open_capture)
   next_options.inline_exec_allowlist = M.normalize_inline_exec_allowlist(next_options.inline_exec_allowlist)
   next_options.cmd_env = M.normalize_cmd_env(next_options.cmd_env)
   next_options.sandbox = M.normalize_sandbox(next_options.sandbox)
-  next_options.backends = M.normalize_backends(next_options.backends)
   next_options.backend = M.normalize_backend(next_options.backend, next_options.backends)
   next_options.modes = M.normalize_modes(opts)
   derive(next_options)
   next_options.log_level = M.normalize_log_level(next_options.log_level)
-  next_options.profile = M.normalize_profile(next_options.profile)
-  next_options.debug_modules = M.normalize_debug_modules(next_options.debug_modules, next_options.profile)
+  if DEVELOPMENT then
+    DEVELOPMENT.apply(next_options, M.normalize_profile, M.normalize_debug_modules)
+  else
+    next_options.profile = "factory"
+    next_options.debug_modules = {}
+    next_options.debug_record = false
+  end
   next_options.ui = next_options.ui or {}
   next_options.ui.multi_panel_layout = M.normalize_multi_panel_layout(next_options.ui.multi_panel_layout)
   require("yana.panel.ui_review_button_theme").check(next_options.ui.review_buttons.theme)

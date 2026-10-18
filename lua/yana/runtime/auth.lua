@@ -58,13 +58,10 @@ local function bind_login_input(session)
       { buffer = buf, silent = true, desc = "Paste into agent sign-in" })
   end
   session.group = vim.api.nvim_create_augroup("yana_login_" .. buf, { clear = true })
+  -- Normal mode stays normal (PANEL.md F-AGENT-LOGIN): forcing terminal input on
+  -- every switch typed the advertised normal-mode keys into the sign-in prompt.
   vim.api.nvim_create_autocmd({ "WinEnter", "BufEnter" }, {
     group = session.group, buffer = buf, callback = function() enter_login(session) end,
-  })
-  vim.api.nvim_create_autocmd("ModeChanged", {
-    group = session.group, pattern = { "*:n", "*:nt" }, callback = function()
-      if vim.api.nvim_get_current_buf() == buf then enter_login(session) end
-    end,
   })
   vim.api.nvim_create_autocmd("BufWipeout", {
     group = session.group, buffer = buf, once = true, callback = function() retire_login(session) end,

@@ -14,7 +14,7 @@ end
 check(vim.fn.isdirectory(root .. "/spec") == 0, "installed plugin has no internal specification tree")
 local yana = require("yana")
 local options = yana.setup({
-  cmd = root .. "/tests/release/fake-cursor-agent",
+  backends = { cursor = { cmd = root .. "/tests/release/fake-cursor-agent" } },
   mode = "ask",
 })
 check(options.mode == "ask", "setup returns public configuration")

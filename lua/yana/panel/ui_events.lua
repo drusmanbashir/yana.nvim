@@ -491,7 +491,7 @@ end
 -- The record reuses the existing `system_refused` machinery (panel note,
 -- `p.system_refusals` → `:YanaRefusals`, a ledger decision, a durable WARN),
 -- not a parallel one. Reason and remedy come from `jail.lua`'s single
--- constants, so operator-declared write roots extend the remedy in one place.
+-- constants.
 --
 -- TOTAL AND INERT ON AN ORDINARY TURN: no refusal record on the turn means an
 -- immediate `0`, nothing rendered, nothing logged, nothing recorded.
@@ -509,10 +509,6 @@ local function record_confinement_refusals(p, turn)
 	local home = type(home_input) == "string" and home_input ~= "" and vim.fs.normalize(home_input):gsub("/+$", "") or nil
   for _, row in ipairs(rows) do
     local paths = type(row.paths) == "table" and row.paths or {}
-    -- PER REFUSAL, not once per turn: the remedy names the `write_roots` line
-    -- that would have made THIS write legal, derived from the refused path's
-    -- own ancestors on disk (jail.declarable_write_root). A refusal that named
-    -- no path gets the unspecialised sentence, exactly as before.
 	local remedy = jail.out_of_workspace_remedy(paths)
 	if home then
 		for _, path in ipairs(paths) do

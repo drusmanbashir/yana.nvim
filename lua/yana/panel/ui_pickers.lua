@@ -164,9 +164,10 @@ function M.new(deps)
       return false
     end
     local from_model = config.options.model
+    local to_model = (config.options.backends[choice] or {}).model
     config.options.backend = choice
-    -- Reset to absence (auto): a foreign model id would reach a vendor that has never heard of it.
-    config.options.model = nil
+    -- Each public backend entry owns its starting model; absent means auto.
+    config.options.model = to_model
     -- Mode tokens are vendor-declared spellings; never carry them across a backend switch.
     config.options.model_modes = nil
     pcall(function()
@@ -185,10 +186,11 @@ function M.new(deps)
       from = from_backend,
       to = choice,
       model_from = from_model,
-      model_to = nil,
+      model_to = to_model,
     })
     notify_one_line(
-      "yana: backend (layer 1) → " .. choice .. " — model reset to auto; open chats continue as new sessions under " .. choice,
+      "yana: backend (layer 1) → " .. choice .. " — model set to " .. (to_model or "auto")
+        .. "; open chats continue as new sessions under " .. choice,
       vim.log.levels.INFO
     )
     return true

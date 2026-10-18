@@ -28,6 +28,11 @@
           "run": "set -euo pipefail\nsysctl kernel.apparmor_restrict_unprivileged_userns\nprobe=(bwrap --unshare-user --unshare-pid --die-with-parent --ro-bind / / --dev /dev --proc /proc --uid \"$(id -u)\" --gid \"$(id -g)\" -- true)\nset +e\n\"${probe[@]}\"\nbefore=$?\nset -e\nprintf 'Bubblewrap namespace probe before profile: rc=%s\\n' \"$before\"\nif grep -rl /usr/bin/bwrap /etc/apparmor.d/; then\n  echo \"Using the existing Bubblewrap AppArmor profile\"\nelse\nprintf '%s\\n' 'abi <abi/4.0>,' 'include <tunables/global>' 'profile yana-bwrap /usr/bin/bwrap flags=(unconfined) {' '  userns,' '}' | sudo tee /etc/apparmor.d/yana-bwrap\nsudo apparmor_parser -r /etc/apparmor.d/yana-bwrap\nfi\n\"${probe[@]}\"\nsysctl kernel.apparmor_restrict_unprivileged_userns\nprintf 'Bubblewrap namespace probe after profile: rc=0\\n'"
         },
         {
+          "name": "Install Neovim for configuration verification",
+          "shell": "bash",
+          "run": "set -euo pipefail\nbin=$(scripts/release/install-neovim.sh 0.12.4 \"$RUNNER_TEMP/nvim-verify\" | tail -1)\necho \"$bin\" >> \"$GITHUB_PATH\""
+        },
+        {
           "name": "Verify public tree",
           "run": "scripts/release/verify.sh ."
         },

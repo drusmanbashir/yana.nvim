@@ -212,7 +212,7 @@ end
 
 --- Move an unsafe proposal out of the reusable layer namespace before claim
 --- release, for EVERY root the turn wrote. The primary's target is returned so
---- the single-root callers that predate declared write roots are unchanged;
+--- single-root callers are unchanged;
 --- `session.recovered_paths` carries one entry per root that had a layer.
 function I.recover_layer(session)
 	if type(session) ~= "table" then

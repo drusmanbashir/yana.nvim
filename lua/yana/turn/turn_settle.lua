@@ -102,7 +102,7 @@ local function save_buffer_for(f, change, path, fixed_bufnr)
     return existing, false
   end
   local bufnr = vim.fn.bufadd(path)
-  vim.fn.bufload(bufnr)
+  require("yana.review_buffer").load(bufnr)
   return bufnr, true
 end
 

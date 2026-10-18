@@ -16,6 +16,9 @@ readonly NEUTRAL_LAYER=/tmp/yana/layer
 # `--bind`, not `--ro-bind` -- it is read-write without a remount.
 readonly NEUTRAL_CURSOR=/tmp/yana/cursor
 readonly NEUTRAL_STATE=/tmp/yana/state
+# Read-only staging of Yana's own state root, bound back over it when a capture
+# root contains it (state_root_shield_args / mount.sh mount_state_root_shield).
+readonly NEUTRAL_STATE_SHIELD=/tmp/yana/yana-state
 readonly MOUNT_MARKER=.yana-overlay-mounted
 readonly MOUNT_MARKER_CONTENT=mounted
 
@@ -56,9 +59,9 @@ TOUCHED_FILES=()
 # Overlay copies: one
 # PATH=FROM per open buffer; yanad.sh checks them and copies them into the uppers.
 SEEDS=()
-# Operator-declared write roots beyond the opened workspace (the external-roots
-# contract). One parallel entry per extra root, in the canonical-path order the
-# caller passed them; index 0 here is root 2 of the turn, because the primary
+# Extra roots: the capture areas beyond the one holding the opened workspace.
+# One parallel entry per extra root, in the canonical-path order the caller
+# passed them; index 0 here is root 2 of the turn, because the primary
 # workspace is always root 1 and is never listed. Empty in every single-root
 # launch, which is what keeps that launch byte-identical to the one this file
 # has always made.
@@ -70,8 +73,6 @@ EXEC_ALLOW=()
 STATE_DIRS=()
 BROAD_ROOT=""
 READ_ONLY_WORKSPACE=0
-CAPTURE_PLAN=""
-OPEN_CAPTURE_BACKEND=""
 # Every path of the confined tree that a mask, the writable-host exception or
 # TMPDIR must not swallow: the workspace, its layer root, then each extra root
 # and its layer root. Built once by validate_paths. Deliberately does NOT
@@ -87,9 +88,6 @@ CURSOR_DIR=""
 OPERATOR_HOME=""
 
 source "$DIR/lib/yana-overlay/paths.sh"
-source "$DIR/lib/yana-overlay/capture_plan.sh"
-source "$DIR/lib/yana-overlay/fuse.sh"
-source "$DIR/lib/yana-overlay/open_capture.sh"
 source "$DIR/lib/yana-overlay/yanad.sh"
 source "$DIR/lib/yana-overlay/layer_edit.sh"
 source "$DIR/lib/yana-overlay/cgroup.sh"
@@ -105,6 +103,23 @@ source "$DIR/lib/yana-overlay/mount.sh"
 # the agent runs as PID 2, so orphaned `npx` and MCP children are reaped by the
 # reaper. Handing PID 1 to a Node process that performs no init duties would
 # leave them as zombies.
+# CAPTURE.md OC-13: when a capture area (e.g. $HOME as broad root) contains
+# Yana's own state root, stage the REAL state root read-only for
+# yana-overlay-inner, which binds it over the overlay
+# (mount.sh mount_state_root_shield). Prints bwrap args; nothing otherwise.
+state_root_shield_args() {
+	local state root
+	state=$(realpath_safe "$STATE_ROOT")
+	[[ -d "$state" ]] || return 0
+	for root in "$@"; do
+		[[ -n "$root" ]] || continue
+		if path_is_prefix "$(realpath_safe "$root")" "$state"; then
+			printf '%s\0' --ro-bind "$state" "$NEUTRAL_STATE_SHIELD" --setenv YANA_OVERLAY_STATE_SHIELD "$state"
+			return 0
+		fi
+	done
+}
+
 run_overlay() {
 	prepare_neovim_state
 	if (( READ_ONLY_WORKSPACE == 1 )); then
@@ -129,8 +144,7 @@ run_overlay() {
 		return $?
 	fi
 	# `mount_root` is the single point that names what gets mounted, on purpose: reverting
-	# WI-1 to a narrow-root mount is then a one-line change (mount_root=$WORKSPACE),
-	# exactly the mutation tests/overlay_broadroot_gate.sh drives.
+	# WI-1 to a narrow-root mount is then a one-line change (mount_root=$WORKSPACE).
 	if [[ -n "$BROAD_ROOT" ]]; then
 		local mount_root=$BROAD_ROOT
 		local -a inner_args=("--broad-root" "$mount_root")
@@ -171,6 +185,9 @@ run_overlay() {
 		if (( ${#extra_binds[@]} > 0 )); then
 			bwrap_args+=("${extra_binds[@]}")
 		fi
+		local -a shield_args=()
+		mapfile -d '' -t shield_args < <(state_root_shield_args "$mount_root" ${EXTRA_ROOTS[@]+"${EXTRA_ROOTS[@]}"})
+		bwrap_args+=(${shield_args[@]+"${shield_args[@]}"})
 		# The per-backend writable state directories, staged under bwrap's own /tmp tmpfs
 		# rather than bound straight onto their real paths. yana-overlay-inner mounts them
 		# from there onto their real paths AFTER the overlay(s), because a bind stacked HERE
@@ -224,7 +241,7 @@ run_overlay() {
 	fi
 
 	# Everything below is UNCHANGED, byte for byte, from before --broad-root existed: one
-	# overlay per declared root, each at its own real absolute path, each from its own
+	# overlay per root, each at its own real absolute path, each from its own
 	# neutral bind pair inside bwrap's private /tmp. The primary keeps /tmp/yana/lower and
 	# /tmp/yana/layer, so a single-root launch (no --broad-root, no --extra-root) builds
 	# exactly the argv it always did; root i (2-based, the workspace being root 1) uses
@@ -271,6 +288,9 @@ run_overlay() {
 	if (( ${#extra_binds[@]} > 0 )); then
 		bwrap_args+=("${extra_binds[@]}")
 	fi
+	local -a shield_args=()
+	mapfile -d '' -t shield_args < <(state_root_shield_args "$WORKSPACE" ${EXTRA_ROOTS[@]+"${EXTRA_ROOTS[@]}"})
+	bwrap_args+=(${shield_args[@]+"${shield_args[@]}"})
 	# The per-backend writable state directories, staged under bwrap's own /tmp tmpfs
 	# rather than bound straight onto their real paths. yana-overlay-inner mounts them from
 	# there onto their real paths AFTER the overlay(s), because a bind stacked HERE at a
@@ -381,20 +401,6 @@ parse_run_args() {
 				ANSWER_OUT=$2
 				shift 2
 				;;
-			--capture-plan)
-				[[ $# -ge 2 ]] || die_usage "--capture-plan requires a file path"
-				CAPTURE_PLAN=$2
-				shift 2
-				;;
-			--backend)
-				[[ $# -ge 2 ]] || die_usage "--backend requires a value"
-				OPEN_CAPTURE_BACKEND=$2
-				case "$OPEN_CAPTURE_BACKEND" in
-					overlayfs-fast|fuse-compat) ;;
-					*) die_usage "--backend must be overlayfs-fast or fuse-compat" ;;
-				esac
-				shift 2
-				;;
 			--touched)
 				[[ $# -ge 2 ]] || die_usage "--touched requires an absolute path"
 				TOUCHED_FILES+=("$2")
@@ -424,7 +430,7 @@ parse_run_args() {
 				STATE_DIRS+=("$2")
 				shift 2
 				;;
-			# One operator-declared write root per group. --extra-root opens the
+			# One extra root per group. --extra-root opens the
 			# group; the three that follow attach to it. Placeholders keep the
 			# four arrays index-aligned so a missing member of a group is a
 			# usage error naming the root rather than a silent off-by-one.
@@ -473,11 +479,7 @@ cmd_run() {
 	parse_run_args "$@"
 	collect_neovim_state
 	if [[ -n "$UPPER" && -n "$WORK" ]]; then
-		if [[ -n "$CAPTURE_PLAN" || -n "${YANA_OPEN_CAPTURE_MODE:-}" ]]; then
-			cmd_run_direct_open_capture
-		else
-			cmd_run_direct
-		fi
+		cmd_run_direct
 	elif [[ -n "$TURN_ID" && -n "$MODE" && -n "$ANSWER_OUT" ]]; then
 		cgroup_ensure_user_scope "$0" "${launch_args[@]}" || exit "$EXIT_NO_SANDBOX"
 		cmd_run_yanad

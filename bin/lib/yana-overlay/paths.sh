@@ -22,33 +22,31 @@ the layer cannot be established the command never runs.
 
 --broad-root DIR mounts the ONE overlay at DIR instead of at the workspace,
 where DIR must be the workspace itself or an ancestor of it
-(PLAN-R1-capture.md WI-1). Every write anywhere under DIR then lands as a
+(the capture area holding it). Every write anywhere under DIR then lands as a
 hunk — the open repo, a sibling repo, or a brand-new directory — with zero
 EROFS, because there is one overlay covering the whole broad root rather than
-one overlay per declared root. The overlay is mounted -o volatile (no
-per-copy-up fsync); the ~/.cursor exception is mounted by yana-overlay-inner
-AFTER the overlay, so the bind is not shadowed by the broad-root mount
-covering the path it sits on. Omit --broad-root and this launcher's argv,
-mounts and messages are byte-identical to what they have always been: the
-single overlay sits at the workspace's own path, and the exception is an
-outer bwrap arg, exactly as before this flag existed. --broad-root may not
-be combined with --extra-root.
+one overlay per root. The overlay is mounted -o volatile (no
+per-copy-up fsync); the writable-host exceptions are mounted by
+yana-overlay-inner AFTER every overlay, so no overlay shadows them -- which is
+why a workspace that holds an exception (the home folder) needs --broad-root.
+Omit --broad-root and the single overlay sits at the workspace's own path, with
+~/.cursor as an outer bwrap arg.
 
-The host tree is read-only with exactly one exception: ~/.cursor is bind-mounted
-read-write so cursor-agent can refresh its own credentials. Nothing else under
-the home directory is writable, and a symlink placed inside ~/.cursor resolves
+The host tree is read-only except the writable-host exceptions: ~/.cursor, so
+cursor-agent can refresh its own credentials, the --state-dir backend state and
+Neovim's own state and log files. A symlink placed inside ~/.cursor resolves
 through the read-only host bind, so it is not a route out. Adding an exception
 is a spec change (the isolation contract). Set YANA_OVERLAY_CURSOR_DIR
 to relocate the exception; the gate uses it so probes never touch real
 credentials.
 
-An operator-declared write root beyond the workspace is passed as a repeated
+An extra root (a capture area beyond the workspace's) is passed as a repeated
 group: --extra-root starts a group and --extra-upper/--extra-work attach to the
 group before them. Each root is mounted as its own overlay at its own real
 absolute path, with its own upper layer and work dir, so its change set is
 separate and reviewable on its own. Roots must be disjoint from each other and
 from every turn layer. Nothing here infers a root: the set comes from the
-caller, which takes it from operator configuration only.
+caller (lua/yana/shadow/capture_areas.lua).
 
 --seed PATH=FROM places FROM's bytes (the editor's buffer text for PATH) in the
 upper layer of the root holding PATH, before the overlay is mounted, so the
@@ -111,25 +109,6 @@ realpath_safe() {
 path_is_prefix() {
 	local parent=$1 child=$2
 	[[ "$child" == "$parent" || "$child" == "$parent"/* ]]
-}
-
-# Ported from bin/yana-sandbox's components_below_root: counts path segments
-# below /, so / itself is 0 and a two-segment path is 2. validate_workspace_sanity
-# uses it to refuse a workspace too shallow to be a real project directory.
-components_below_root() {
-	local p="${1%/}"
-	if [[ -z "$p" || "$p" == "/" ]]; then
-		echo 0
-		return
-	fi
-	local rest="${p#/}"
-	local count=1
-	local tail="$rest"
-	while [[ "$tail" == */* ]]; do
-		count=$((count + 1))
-		tail="${tail#*/}"
-	done
-	echo "$count"
 }
 
 # Filesystem identity, not spelling. The launch table is populated once after
@@ -216,8 +195,8 @@ identity_contains() {
 build_launch_identity_table() {
 	LAUNCH_PATH_IDENTITY=()
 	local -a roots=("$WORKSPACE" "$UPPER" "$WORK" "$LAYER_ROOT" "$CURSOR_DIR")
-	# Every declared root and its layer join the closure: the alias checks below
-	# are only as complete as this table, and a bind alias between two declared
+	# Every root and its layer join the closure: the alias checks below
+	# are only as complete as this table, and a bind alias between two
 	# roots is exactly the case a pathname comparison cannot see.
 	roots+=(${EXTRA_ROOTS[@]+"${EXTRA_ROOTS[@]}"})
 	roots+=(${EXTRA_UPPERS[@]+"${EXTRA_UPPERS[@]}"})
@@ -275,10 +254,12 @@ operator_home() {
 # host stays on the read-only bind.
 #
 # The exception is resolved to a real path so exactly one host directory becomes
-# writable, and it must not overlap the confined tree in either direction: a
-# workspace inside it would be writable at its real absolute path, and a layer
-# root inside it would let the agent rewrite the very upper layer the change set
-# is read from.
+# writable. It must never contain the workspace, by path or by identity -- the
+# workspace would be writable at its real absolute path -- nor overlap a layer
+# root, which would let the agent rewrite the very upper layer the change set is
+# read from. It may sit inside the workspace only where it is mounted on top of
+# the workspace's own view: a read-only workspace, or a broad-root launch, which
+# mounts it after every overlay (the home folder, CAPTURE.md OC-HOME).
 resolve_cursor_dir() {
 	local dir
 	dir="${YANA_OVERLAY_CURSOR_DIR:-}"
@@ -295,15 +276,15 @@ resolve_cursor_dir() {
 	if [[ ! -d "$dir" ]]; then
 		refuse "writable-host exception '$dir' is not a directory"
 	fi
-	# A read-only HOME workspace may contain the backend's one writable runtime
-	# directory. The reverse direction and equality remain forbidden: either
-	# would make the selected workspace writable through the exception.
-	local readonly_workspace_runtime=0
-	if [[ "$READ_ONLY_WORKSPACE" == 1 && "$dir" != "$WORKSPACE" ]] \
-		&& path_is_prefix "$WORKSPACE" "$dir"; then
-		readonly_workspace_runtime=1
+	local exception_in_workspace=0
+	if [[ "$dir" != "$WORKSPACE" ]] && path_is_prefix "$WORKSPACE" "$dir"; then
+		if [[ "$READ_ONLY_WORKSPACE" == 1 || -n "$BROAD_ROOT" ]]; then
+			exception_in_workspace=1
+		else
+			refuse "writable-host exception ($dir) is inside the workspace ($WORKSPACE), whose overlay would hide it — launch with --broad-root"
+		fi
 	fi
-	if (( ! readonly_workspace_runtime )) \
+	if (( ! exception_in_workspace )) \
 		&& { path_is_prefix "$dir" "$WORKSPACE" || path_is_prefix "$WORKSPACE" "$dir"; }; then
 		refuse "writable-host exception ($dir) must be disjoint from the workspace ($WORKSPACE)"
 	fi
@@ -325,11 +306,12 @@ resolve_cursor_dir() {
 	local protected
 	for protected in ${PROTECTED_PATHS[@]+"${PROTECTED_PATHS[@]}"}; do
 		[[ -n "$protected" ]] || continue
-		if [[ "$protected" == "$WORKSPACE" && "$readonly_workspace_runtime" == 1 ]]; then
+		if [[ "$protected" == "$WORKSPACE" && "$exception_in_workspace" == 1 ]]; then
 			continue
 		fi
+		exception_inside_extra_root "$dir" "$protected" && continue
 		if path_is_prefix "$dir" "$protected" || path_is_prefix "$protected" "$dir"; then
-			refuse "writable-host exception ($dir) must be disjoint from every declared write root and its layer ($protected)"
+			refuse "writable-host exception ($dir) must be disjoint from every extra root and its layer ($protected)"
 		fi
 	done
 	dir_id=$(path_identity "$dir")
@@ -338,7 +320,20 @@ resolve_cursor_dir() {
 	if [[ -z "$dir_id" || -z "$ws_id" || -z "$layer_id" ]]; then
 		refuse "cannot establish filesystem identity for the writable-host exception ($dir), the workspace ($WORKSPACE) or the layer root ($LAYER_ROOT)"
 	fi
-	if [[ "$readonly_workspace_runtime" != 1 ]] && identity_overlaps "$dir" "$WORKSPACE"; then
+	local rc
+	if (( exception_in_workspace )); then
+		# Inside by name is not inside by identity: a bind alias of the workspace
+		# or one of its parents would make the workspace writable.
+		set +e
+		identity_contains "$dir" "$WORKSPACE"
+		rc=$?
+		set -e
+		if (( rc == 0 )); then
+			refuse "writable-host exception ($dir, $dir_id) aliases the workspace ($WORKSPACE, $ws_id) or one of its parents despite sitting inside it by name"
+		elif (( rc == 2 )); then
+			refuse "cannot establish filesystem identity between the writable-host exception ($dir) and the workspace ($WORKSPACE)"
+		fi
+	elif identity_overlaps "$dir" "$WORKSPACE"; then
 		refuse "writable-host exception ($dir, $dir_id) aliases the workspace ($WORKSPACE, $ws_id) — same directory or one contains the other despite disjoint pathnames"
 	fi
 	if identity_overlaps "$dir" "$LAYER_ROOT"; then
@@ -346,11 +341,12 @@ resolve_cursor_dir() {
 	fi
 	for protected in ${PROTECTED_PATHS[@]+"${PROTECTED_PATHS[@]}"}; do
 		[[ -n "$protected" ]] || continue
-		if [[ "$protected" == "$WORKSPACE" && "$readonly_workspace_runtime" == 1 ]]; then
+		if [[ "$protected" == "$WORKSPACE" && "$exception_in_workspace" == 1 ]]; then
 			continue
 		fi
+		exception_inside_extra_root "$dir" "$protected" && continue
 		if identity_overlaps "$dir" "$protected"; then
-			refuse "writable-host exception ($dir, $dir_id) aliases a declared write root or its layer ($protected) — same directory or one contains the other despite disjoint pathnames"
+			refuse "writable-host exception ($dir, $dir_id) aliases an extra root or its layer ($protected) — same directory or one contains the other despite disjoint pathnames"
 		fi
 	done
 	validate_root_identities
@@ -374,16 +370,16 @@ reduce_capture_set_by_identity() {
 		if (( rc == 0 )); then
 			continue
 		elif (( rc == 2 )); then
-			refuse "cannot establish filesystem identity between broad root '$BROAD_ROOT' and declared write root '$root'"
+			refuse "cannot establish filesystem identity between broad root '$BROAD_ROOT' and extra root '$root'"
 		fi
 		set +e
 		identity_contains "$root" "$BROAD_ROOT"
 		rc=$?
 		set -e
 		if (( rc == 0 )); then
-			refuse "declared write root '$root' contains broad root '$BROAD_ROOT' — remove it or declare a disjoint capture root"
+			refuse "extra root '$root' contains broad root '$BROAD_ROOT'"
 		elif (( rc == 2 )); then
-			refuse "cannot establish filesystem identity between broad root '$BROAD_ROOT' and declared write root '$root'"
+			refuse "cannot establish filesystem identity between broad root '$BROAD_ROOT' and extra root '$root'"
 		fi
 		kept_roots+=("$root")
 		kept_uppers+=("${EXTRA_UPPERS[$i]}")
@@ -394,6 +390,28 @@ reduce_capture_set_by_identity() {
 	EXTRA_UPPERS=("${kept_uppers[@]}")
 	EXTRA_WORKS=("${kept_works[@]}")
 	EXTRA_LAYER_ROOTS=("${kept_layers[@]}")
+}
+
+# CAPTURE.md OC-13: a capture root may contain Yana's state root, and so every
+# turn layer under it, because yana-overlay binds the real state root read-only
+# over every overlay that covers it (state_root_shield_args). True when PATH sits
+# inside that shielded state root and ROOT contains the state root.
+shielded_by_state_root() {
+	local root=$1 path=$2 state
+	state=$(realpath_safe "$STATE_ROOT")
+	path_is_prefix "$root" "$state" && path_is_prefix "$state" "$path"
+}
+
+# A writable-host exception inside an extra capture root is mounted on top of
+# that root's overlay (yana-overlay-inner mounts every overlay first), exactly
+# as one inside the broad root is.
+exception_inside_extra_root() {
+	local dir=$1 protected=$2 root
+	[[ "$dir" != "$protected" ]] && path_is_prefix "$protected" "$dir" || return 1
+	for root in ${EXTRA_ROOTS[@]+"${EXTRA_ROOTS[@]}"}; do
+		[[ "$root" == "$protected" ]] && return 0
+	done
+	return 1
 }
 
 rebuild_protected_paths() {
@@ -423,21 +441,22 @@ validate_root_identities() {
 			rc=$?
 			set -e
 			if (( rc == 0 )); then
-				refuse "declared write root '$b' aliases '$a' — same directory or one contains the other despite disjoint pathnames"
+				refuse "root '$b' aliases '$a' — same directory or one contains the other despite disjoint pathnames"
 			fi
 			if (( rc == 2 )); then
-				refuse "cannot establish filesystem identity for the declared write roots '$a' and '$b'"
+				refuse "cannot establish filesystem identity for the roots '$a' and '$b'"
 			fi
 		done
 		for (( j = 0; j < ${#EXTRA_LAYER_ROOTS[@]}; j++ )); do
 			b=${EXTRA_LAYER_ROOTS[$j]}
 			[[ -n "$b" ]] || continue
+			shielded_by_state_root "$a" "$b" && continue
 			set +e
 			identity_overlaps "$a" "$b"
 			rc=$?
 			set -e
 			if (( rc == 0 )); then
-				refuse "declared write root '$a' aliases a turn layer root ($b) — the agent could rewrite the change set it is reviewed from"
+				refuse "root '$a' aliases a turn layer root ($b) — the agent could rewrite the change set it is reviewed from"
 			fi
 		done
 	done
@@ -469,44 +488,15 @@ ensure_bwrap() {
 	fi
 }
 
-# Ported from bin/yana-sandbox's validate_workspace (bin/yana-sandbox:127-152): the four
-# refusals that keep an operator from launching a turn whose workspace IS the operator's
-# home, the passwd-recorded home, the filesystem root, or a directory too shallow to be
-# a real project. Applied only to the primary workspace root (root_noun == "workspace")
-# -- an --extra-root or --broad-root is additional write surface inside an
-# already-accepted workspace, not a new place the operator could mistake for a project
-#
-# It runs before resolve_cursor_dir, which is where the writable-host
-# exception (~/.cursor) collides with workspace == $HOME and produces the
-# "must be disjoint from the workspace" refusal -- a true but misleading
-# symptom of the real problem this function names directly. That
-# disjointness check stays in place as defence in depth; this function just
-# makes sure the operator sees the right refusal first.
+# The refusal that keeps an operator from launching a turn whose workspace IS the
+# filesystem root. Any other folder is allowed: a data disk's top folder or the
+# home folder itself is a capture area (CAPTURE.md OC-03, OC-HOME).
+# Applied only to the primary workspace root (root_noun == "workspace") -- an
+# --extra-root or --broad-root is additional write surface inside an
+# already-accepted workspace, not a new place the operator could mistake for a project.
 validate_workspace_sanity() {
-	local ws_real=$1
-	local passwd_home env_home depth
-
-	passwd_home=$(getent passwd "${USER:-$(id -un)}" 2>/dev/null | cut -d: -f6 || true)
-	if [[ -n "$passwd_home" ]]; then
-		passwd_home=$(realpath_safe "$passwd_home")
-	fi
-	env_home=""
-	if [[ -n "${HOME:-}" ]]; then
-		env_home=$(realpath_safe "$HOME")
-	fi
-
-	if [[ "$ws_real" == "/" ]]; then
+	if [[ "$1" == "/" ]]; then
 		refuse "workspace resolves to / — refusing to sandbox the filesystem root"
-	fi
-	if [[ -n "$passwd_home" && "$ws_real" == "$passwd_home" ]]; then
-		refuse "workspace resolves to the user home directory ($passwd_home, passwd lookup) — pick a project subdirectory"
-	fi
-	if [[ -n "$env_home" && "$ws_real" == "$env_home" ]]; then
-		refuse "workspace resolves to the user home directory ($env_home, \$HOME) — pick a project subdirectory"
-	fi
-	depth=$(components_below_root "$ws_real")
-	if (( depth < 2 )); then
-		refuse "workspace '$ws_real' has fewer than 2 path components below root — pick a deeper directory (a project folder inside your home directory)"
 	fi
 }
 
@@ -535,15 +525,8 @@ validate_root_triple() {
 	if [[ ! -d "$ws" ]]; then
 		refuse "$root_noun '$root_in' does not exist or is not a directory"
 	fi
-	# Sanity refusal fires only for the primary workspace root, before
-	# resolve_cursor_dir gets a chance to raise the misleading writable-host
-	# disjointness refusal for the same underlying mistake (workspace == $HOME).
-	# Open capture deliberately allows the primary workspace to be $HOME. Its
-	# CapturePlan owns the private upper and keeps the state root mounted after
-	# the capture view, so the legacy project-depth guard would reject the
-	# supported home-dotfile and cross-project workflow before that plan runs.
-	if [[ "$root_noun" == "workspace" && "$READ_ONLY_WORKSPACE" != 1 && -z "$CAPTURE_PLAN" \
-		&& "${YANA_OPEN_CAPTURE_MODE:-off}" == off ]]; then
+	# Sanity refusal fires only for the primary workspace root.
+	if [[ "$root_noun" == "workspace" && "$READ_ONLY_WORKSPACE" != 1 ]]; then
 		validate_workspace_sanity "$ws"
 	fi
 	if [[ -e "$upper" && ! -d "$upper" ]]; then
@@ -617,20 +600,21 @@ validate_paths() {
 	local -a kept_roots=() kept_uppers=() kept_works=() kept_layers=()
 	for (( i = 0; i < ${#EXTRA_ROOTS[@]}; i++ )); do
 		validate_root_triple "${EXTRA_ROOTS[$i]}" "${EXTRA_UPPERS[$i]}" "${EXTRA_WORKS[$i]}" \
-			"declared write root" "extra upper" "extra work"
+			"extra root" "extra upper" "extra work"
 		if [[ -n "$BROAD_ROOT" ]]; then
 			if path_is_prefix "$BROAD_ROOT" "$VALIDATED_ROOT"; then
 				continue
 			fi
 			if path_is_prefix "$VALIDATED_ROOT" "$BROAD_ROOT"; then
-				refuse "declared write root '$VALIDATED_ROOT' contains broad root '$BROAD_ROOT' — remove it or declare a disjoint capture root"
+				refuse "extra root '$VALIDATED_ROOT' contains broad root '$BROAD_ROOT'"
 			fi
 		fi
 		for (( j = 0; j < ${#PROTECTED_PATHS[@]}; j++ )); do
 			protected=${PROTECTED_PATHS[$j]}
 			[[ -n "$protected" ]] || continue
+			shielded_by_state_root "$VALIDATED_ROOT" "$protected" && continue
 			if path_is_prefix "$protected" "$VALIDATED_ROOT" || path_is_prefix "$VALIDATED_ROOT" "$protected"; then
-				refuse "declared write root '$VALIDATED_ROOT' overlaps '$protected' — every declared root must be disjoint from the workspace, from the other roots and from every turn layer"
+				refuse "extra root '$VALIDATED_ROOT' overlaps '$protected' — every extra root must be disjoint from the workspace, from the other roots and from every turn layer"
 			fi
 		done
 		kept_roots+=("$VALIDATED_ROOT")

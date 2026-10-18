@@ -7,14 +7,14 @@ vim.fn.mkdir(scratch, "p")
 vim.fn.writefile({ "#!/bin/sh", "echo fixture-version" }, agent)
 vim.uv.fs_chmod(agent, 493)
 
-require("yana.config").setup({ cmd = agent, mode = "inline" })
+require("yana.config").setup({ backends = { cursor = { cmd = agent } }, mode = "inline" })
 local dependencies = require("yana.runtime.dependencies")
 for _, backend in ipairs({ "cursor", "claude", "codex" }) do
   local binary = backend == "cursor" and "cursor-agent" or backend
   local path = scratch .. "/" .. binary
   vim.fn.writefile({ "#!/bin/sh", "echo fixture-version" }, path)
   vim.uv.fs_chmod(path, 493)
-  require("yana.config").setup({ backend = backend, backends = { [backend] = { cmd = path } }, mode = "agentic" })
+  require("yana.config").setup({ backends = { default = backend, [backend] = { cmd = path } }, mode = "agentic" })
   local version
   for _, item in ipairs(dependencies.check("agentic")) do
     if item.id == "exec:" .. binary .. "-version" then version = item end
@@ -22,7 +22,7 @@ for _, backend in ipairs({ "cursor", "claude", "codex" }) do
   assert(version and version.message == binary .. " version: fixture-version",
     "version health row does not name selected binary " .. binary)
 end
-require("yana.config").setup({ backend = "cursor", cmd = agent, mode = "inline" })
+require("yana.config").setup({ backends = { default = "cursor", cursor = { cmd = agent } }, mode = "inline" })
 local before
 for _, row in ipairs(dependencies.check("inline")) do
   if row.id == "exec:cursor-agent" then before = row end

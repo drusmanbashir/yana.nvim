@@ -259,17 +259,6 @@ cmd("YanaEdit", function(opts)
   end)
 end, { nargs = "*", range = true, desc = "Inline edit the current line/selection (agent mode)" })
 
--- Capture set (write_roots): dialog with no arg; direct add with a directory.
--- Spec: modules/external-roots.md §CAPTURE SET — one command, both behaviours.
-cmd("YanaRoots", function(opts)
-  log.guard("YanaRoots", function()
-    require("yana.panel.ui_roots").command(opts)
-  end)
-end, {
-  nargs = "?",
-  complete = "dir",
-  desc = "Edit the capture set (write_roots): dialog, or add <dir> directly",
-})
 -- Diagnostics. All three are pure reads plus one report file; none of them
 -- resolves a review, rerenders, or touches the real tree.
 cmd("YanaDump", function()

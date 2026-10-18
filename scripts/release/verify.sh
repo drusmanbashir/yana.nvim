@@ -167,23 +167,16 @@ grep -Fqx "https://github.com/just-nibble/$(printf neo)$(printf cursor).git" "$t
 grep -Fqx "Recorded fork point: e85d8e077bec53237810fc848f635e4ad440284a" "$tree/NOTICE" \
 	|| note_fail "fork point missing from NOTICE"
 
-# Public diagnostic environment surface. Keep this explicit: adding a runtime
-# YANA_* dial without adding it here leaves release verification unaware of a
-# host-controlled behavior change. Fresh-install still starts under env -i;
-# this registry checks declaration/documentation, not inheritance.
-public_diagnostic_env=(YANA_DEBUG_EVENTS YANA_LIFECYCLE_LOG)
-for env_name in "${public_diagnostic_env[@]}"; do
-	grep -Fq "$env_name" "$tree/doc/yana.txt" \
-		|| note_fail "public diagnostic variable missing from help: $env_name"
-	grep -Rqs "$env_name" "$tree/lua/yana" \
-		|| note_fail "public diagnostic variable has no runtime reader: $env_name"
-done
 while IFS= read -r runtime_path; do
 	if ! grep -Fqx -- "- upstream-derived: \`$runtime_path\`" "$tree/NOTICE" \
 		&& ! grep -Fqx -- "- post-fork original: \`$runtime_path\`" "$tree/NOTICE"; then
 		note_fail "runtime provenance classification missing: $runtime_path"
 	fi
 done < <(grep -E '^(bin/|lua/|plugin/)' "$manifest")
+
+nvim_bin=$(command -v nvim) || die "Neovim required to verify public configuration"
+"$tree/tests/release/config_reference_gate.sh" "$tree" "$nvim_bin" \
+	|| die "public configuration references or setup policy failed"
 
 for helper in "$tree"/bin/yana-*; do
 	[[ -x "$helper" ]] || note_fail "helper is not executable: ${helper#$tree/}"
