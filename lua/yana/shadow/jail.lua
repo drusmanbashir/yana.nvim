@@ -1,31 +1,19 @@
--- Shadow confinement launchers.
---
--- Two launchers live here and they are not interchangeable.
---
--- `wrap_cmd` is the turn path: it runs the agent under `bin/yana-overlay`,
--- the kernel overlayfs confinement described by the isolation contract. The
--- real workspace is the read-only lower layer, the agent's writes land in a
--- private upper layer; yanad owns turn lifecycle and file arbitration.
---
--- `build_shell_argv` / `run_shell` remain on the older `bin/yana-jail`
--- bind-mount sandbox. That launcher shows the agent a pre-copied shadow tree
--- rather than an overlay, which is what the git isolation helper and its
--- headless tests expect. It is confined, but it is not the turn path.
+-- Shadow confinement launcher: `wrap_cmd` runs the agent under `bin/yana-overlay`.
+-- The real workspace is the read-only lower layer; the agent's writes land in a
+-- private upper layer, and yanad owns turn lifecycle and file arbitration.
 local M = {}
 
 local diff = require("yana.diff")
+local uv = vim.uv or vim.loop
 
 M.UNAVAILABLE_MSG = "shadow sandbox unavailable (bwrap missing or denied)"
 M.OVERLAY_UNAVAILABLE_MSG = "overlay confinement unavailable (bwrap or yana-overlay missing)"
 
 M._test = {
 	force_bwrap = nil,
-	force_jail_bin = nil,
-	force_overlay_bin = nil,
 }
 
 local STRIP_ENV = {
-	NVIM = true,
 	VIM = true,
 	VIMRUNTIME = true,
 	YANA_JAIL_WORKSPACE = true,
@@ -34,6 +22,11 @@ local STRIP_ENV = {
 	YANA_JAIL_BWRAP = true,
 	YANA_OVERLAY_BWRAP = true,
 	YANA_OVERLAY_INNER = true,
+	-- Neovim running as git's editor: the agent's git must use its own working folder (CAPTURE.md OC-GIT).
+	GIT_DIR = true,
+	GIT_WORK_TREE = true,
+	GIT_COMMON_DIR = true,
+	GIT_INDEX_FILE = true,
 }
 
 local function bwrap_bin()
@@ -50,25 +43,12 @@ local function bwrap_bin()
 end
 
 local function repo_dir()
-	return debug.getinfo(1, "S").source:sub(2):gsub("/lua/yana/shadow/jail%.lua$", "")
+	local source = vim.fn.fnamemodify(debug.getinfo(1, "S").source:sub(2), ":p")
+	return source:gsub("/lua/yana/shadow/jail%.lua$", "")
 end
 
-local function jail_bin()
-	if M._test.force_jail_bin then
-		return M._test.force_jail_bin
-	end
-	local candidate = repo_dir() .. "/bin/yana-jail"
-	if vim.fn.filereadable(candidate) == 1 then
-		return candidate
-	end
-	return nil
-end
-
--- Path to bin/yana-overlay if it exists (or the test override), else nil.
+-- Path to bin/yana-overlay if it exists, else nil.
 function M.overlay_bin()
-	if M._test.force_overlay_bin then
-		return M._test.force_overlay_bin
-	end
 	local candidate = repo_dir() .. "/bin/yana-overlay"
 	if vim.fn.filereadable(candidate) == 1 then
 		return candidate
@@ -81,87 +61,161 @@ function M.available()
 	return bwrap_bin() ~= nil and M.overlay_bin() ~= nil
 end
 
---- True when the older bind-mount sandbox (run_shell) can run.
-function M.jail_available()
-	return bwrap_bin() ~= nil and jail_bin() ~= nil
+function M.mcp_runtime_dir()
+	return require("yana.shadow.preview").state_root() .. "/mcp-runtime"
 end
+
+local function toml_value(value)
+	if type(value) ~= "table" then return (vim.json.encode(value):gsub("\\/", "/")) end
+	local parts = {}
+	if vim.islist(value) then
+		for _, item in ipairs(value) do parts[#parts + 1] = toml_value(item) end
+		return "[" .. table.concat(parts, ", ") .. "]"
+	end
+	for _, key in ipairs(vim.fn.sort(vim.tbl_keys(value))) do parts[#parts + 1] = key .. " = " .. toml_value(value[key]) end
+	return "{ " .. table.concat(parts, ", ") .. " }"
+end
+
+-- TOML lines for a table: plain keys first, then each sub-table as a section.
+local function toml_lines(value, prefix, out)
+	local tables = {}
+	for _, key in ipairs(vim.fn.sort(vim.tbl_keys(value))) do
+		assert(key:match("^[%w_-]+$"), "yana: MCP config key is not a bare TOML key: " .. key)
+		if type(value[key]) == "table" and not vim.islist(value[key]) then
+			tables[#tables + 1] = key
+		else
+			out[#out + 1] = key .. " = " .. toml_value(value[key])
+		end
+	end
+	for _, key in ipairs(tables) do
+		local name = prefix and (prefix .. "." .. key) or key
+		out[#out + 1] = "[" .. name .. "]"
+		toml_lines(value[key], name, out)
+	end
+	return out
+end
+
+local function write_mcp_document(path, document, format)
+	local encoded = format == "toml" and table.concat(toml_lines(document, nil, {}), "\n") .. "\n"
+		or vim.json.encode(document)
+	local fd, err = uv.fs_open(path, "w", 384)
+	if not fd then return nil, err end
+	local wrote, write_err = uv.fs_write(fd, encoded, 0)
+	uv.fs_close(fd)
+	return wrote, write_err
+end
+
+-- Write one run's MCP config from the backend's inline_mcp descriptor.
+-- Returns the path to remove and the run's env;
+-- format "cli" writes no file and returns the `<flag> key=<TOML value>` tokens.
+function M.write_mcp_config(run_id, policy, runtime_dir)
+	local spec = policy.config
+	local repo = repo_dir()
+	local server = { command = "python3", args = { "-m", "mcpyana" }, cwd = repo, env = { PYTHONPATH = repo } }
+	if spec.server then server = vim.tbl_deep_extend("force", server, spec.server) end
+	local document = vim.deepcopy(spec.settings or {})
+	document[spec.servers_key] = { yana = server }
+	local env, home, path = vim.deepcopy(policy.env or {}), nil, nil
+	if spec.format == "cli" then
+		local tokens = {}
+		for _, key in ipairs(vim.fn.sort(vim.tbl_keys(document))) do
+			vim.list_extend(tokens, { spec.flag, key .. "=" .. toml_value(document[key]) })
+		end
+		return tokens, env
+	end
+	if policy.home_env then
+		home = runtime_dir .. "/home"
+		local made, mkdir_err = uv.fs_mkdir(home, 448)
+		if not made then return nil, mkdir_err end
+		env[policy.home_env], path = home, home .. "/" .. spec.file
+	else
+		path = runtime_dir .. "/mcp.json"
+	end
+	local wrote, write_err = write_mcp_document(path, document, spec.format)
+	if not wrote then M.remove_mcp_config(home or path); return nil, write_err end
+	if spec.native_file then
+		local native = { [spec.servers_key] = document[spec.servers_key] }
+		wrote, write_err = write_mcp_document(vim.fs.joinpath(home, spec.native_file), native, spec.format)
+		if not wrote then M.remove_mcp_config(home); return nil, write_err end
+	end
+	if home and policy.auth == "linked" then
+		local native = vim.env[policy.home_env] or vim.fn.expand(policy.native_home)
+		for name, access in pairs(policy.home_links) do
+			local source = vim.fs.joinpath(native, name)
+			if access == "write" then
+				vim.fn.mkdir(source, "p", 448)
+			end
+			if uv.fs_stat(source) then
+				local linked, link_err = uv.fs_symlink(source, vim.fs.joinpath(home, name))
+				if not linked then M.remove_mcp_config(home); return nil, link_err end
+			end
+		end
+	end
+	return home or path, env
+end
+
+function M.remove_mcp_config(path)
+	if type(path) == "string" then vim.fn.delete(path, "rf") end
+end
+
+-- The daemon turn's launcher options, appended to `out`. Editor never mints
+-- layers/claims; the launcher asks the daemon (turn.request / turn.resume).
+local function turn_args(session, out, buffer)
+	local session_id = session.yanad_session_id or session.session_id
+	local turn_id = session.turn_id
+	local mode = require("yana.config").resolve_mode(session.mode) or "inline"
+	if turn_id == nil or tostring(turn_id) == "" then
+		return nil, "yanad turn_id missing"
+	end
+	vim.list_extend(out, { "--turn", tostring(turn_id), "--mode", tostring(mode) })
+	if not buffer then
+		local private = M.private_dir(session)
+		vim.fn.mkdir(private, "p")
+		session.yanad_answer_out = private .. "/yanad-answer.json"
+		vim.list_extend(out, { "--answer-out", session.yanad_answer_out })
+	end
+	if type(session_id) == "string" and session_id ~= "" then
+		vim.list_extend(out, { "--session", session_id })
+	else
+		table.insert(out, "--session-auto")
+	end
+	-- Touched files for turn.request intersection (absolute).
+	for _, path in ipairs(session.touched_files or {}) do
+		vim.list_extend(out, { "--touched", diff.abs_path(path) })
+	end
+	-- PANEL.md F-ADDENDUM-TURN: every run names its generation, the lifecycle
+	-- pass's (none is minted here). A follow-up resumes the Turn (daemon `turn.resume`).
+	local generation = buffer and session.generation or session.turn_pass and session.turn_pass.generation
+	if generation ~= nil then
+		vim.list_extend(out, { "--generation", tostring(generation) })
+	end
+	if session.resume then
+		if generation == nil then
+			return nil, "yanad turn.resume needs the run generation of the lifecycle pass"
+		end
+		table.insert(out, "--resume")
+	end
+	return out
+end
+
+function M.wrap_mcp_cmd(argv, session, socket_dir)
+	local launcher = repo_dir() .. "/bin/yana-confine"
+	if vim.fn.executable(launcher) ~= 1 then
+		return nil, "MCP launcher unavailable (yana-confine missing)"
+	end
+	local workspace = diff.abs_path(session.workspace)
+	local env = { YANA_STATE_ROOT = require("yana.shadow.preview").state_root() }
+	local wrapped, turn_err = turn_args(session, { launcher, "--workspace", workspace, "--runtime-dir", socket_dir }, true)
+	if not wrapped then return nil, turn_err end
+	table.insert(wrapped, "--")
+	vim.list_extend(wrapped, argv)
+	return wrapped, env
+end
+
 
 -- Return the session's private directory path.
 function M.private_dir(session)
 	return session.private_dir
-end
-
---- Build argv to run ``inner_cmd`` inside the jail (string passed to /bin/sh -c).
-function M.build_shell_argv(opts)
-	opts = opts or {}
-	local workspace = diff.abs_path(opts.workspace or opts.shadow_root or vim.fn.getcwd())
-	local shadow_dir = diff.abs_path(opts.shadow_dir or opts.shadow_root or workspace)
-	local private_dir = diff.abs_path(opts.private_dir or (shadow_dir .. "/../private"))
-	local inner = opts.cmd
-	if not inner or inner == "" then
-		inner = "true"
-	end
-
-	local jb = jail_bin()
-	if not jb then
-		return nil, M.UNAVAILABLE_MSG
-	end
-	if not bwrap_bin() then
-		return nil, M.UNAVAILABLE_MSG
-	end
-
-	vim.fn.mkdir(private_dir, "p")
-	vim.fn.mkdir(shadow_dir, "p")
-
-	local env = {
-		YANA_JAIL_WORKSPACE = workspace,
-		YANA_JAIL_SHADOW_DIR = shadow_dir,
-		YANA_JAIL_PRIVATE_DIR = private_dir,
-		YANA_JAIL_BWRAP = bwrap_bin(),
-		HOME = vim.env.HOME or private_dir,
-	}
-	if opts.git_env then
-		for k, v in pairs(opts.git_env) do
-			env[k] = v
-		end
-	end
-
-	return {
-		cmd = { jb, "/bin/sh", "-c", inner },
-		env = env,
-		workspace = workspace,
-		shadow_dir = shadow_dir,
-		private_dir = private_dir,
-	}, nil
-end
-
---- Layer sub-paths for a turn. The overlay refuses a layer root holding
---- anything other than `upper/`, `work/` and its own mount marker, so every
---- turn needs its own root — and every ROOT of every turn (the workspace plus
---- each extra capture area) needs its own too.
----
---- This returns the PRIMARY root's layer, which is what every single-root caller
---- means by "the turn's layer". `root_layer_paths`
---- answers the same question for one root of the set.
-function M.layer_paths(session)
-	local root = session and session.layer_dir
-	if not root or root == "" then
-		return nil
-	end
-	return { root = root, upper = root .. "/upper", work = root .. "/work" }
-end
-
---- Layer sub-paths for ONE root of a turn.
-function M.root_layer_paths(root)
-	local dir = root and root.layer_dir
-	if not dir or dir == "" then
-		return nil
-	end
-	return {
-		root = dir,
-		upper = root.upper_dir or (dir .. "/upper"),
-		work = root.work_dir or (dir .. "/work"),
-	}
 end
 
 --- Wrap a cursor-agent argv for jobstart so the agent runs inside the kernel
@@ -177,80 +231,22 @@ function M.wrap_cmd(argv, session)
 		return nil, M.OVERLAY_UNAVAILABLE_MSG
 	end
 	local workspace = diff.abs_path(session.workspace)
-	-- Editor never mints layers/claims; launcher asks the daemon and mounts from the
-	-- answer file's launch.layers.
-	local session_id = session.yanad_session_id or session.session_id
-	local turn_id = session.turn_id
-	local mode = require("yana.config").resolve_mode(session.mode) or "inline"
-	if turn_id == nil or tostring(turn_id) == "" then
-		return nil, "yanad turn_id missing"
-	end
+	local out, turn_err = turn_args(session, { ob, "--workspace", workspace })
+	if not out then return nil, turn_err end
 	local private = M.private_dir(session)
-	vim.fn.mkdir(private, "p")
-	local answer_out = private .. "/yanad-answer.json"
-	session.yanad_answer_out = answer_out
+	local generation = session.turn_pass and session.turn_pass.generation
 
-	local out = {
-		ob,
-		"--workspace",
-		workspace,
-		"--turn",
-		tostring(turn_id),
-		"--mode",
-		tostring(mode),
-		"--answer-out",
-		answer_out,
-	}
-	if type(session_id) == "string" and session_id ~= "" then
-		vim.list_extend(out, { "--session", session_id })
-	else
-		table.insert(out, "--session-auto")
-	end
-	if session.read_only_workspace then
-		table.insert(out, "--read-only-workspace")
-	end
-
-	-- Touched files for turn.request intersection (absolute). Prefer an
-	-- explicit list; otherwise scan a pre-staged upper if the test path left
-	-- one (legacy staging under private/stage/).
-	local touched = session.touched_files
-	if type(touched) ~= "table" or #touched == 0 then
-		touched = {}
-		local stage = private .. "/stage"
-		if vim.fn.isdirectory(stage) == 1 then
-			local files = vim.fn.glob(stage .. "/**/*", false, true)
-			for _, path in ipairs(files) do
-				if vim.fn.filereadable(path) == 1 then
-					local rel = path:sub(#stage + 2)
-					touched[#touched + 1] = workspace .. "/" .. rel
-				end
-			end
-		end
-	end
-	for _, path in ipairs(touched) do
-		vim.list_extend(out, { "--touched", diff.abs_path(path) })
-	end
-
-		-- Overlay copies: the
+	-- Overlay copies: the
 	-- launcher puts each `from` (the buffer text at submit) in the upper layer at
 	-- `path`, so the agent reads the buffer instead of the saved file.
 	for _, seed in ipairs(session.seed_files or {}) do
 		vim.list_extend(out, { "--seed", seed.path .. "=" .. seed.from })
 	end
 
-	-- PANEL.md F-ADDENDUM-TURN: every run names its generation, the lifecycle
-	-- pass's (none is minted here). A follow-up resumes the Turn on its own layer
-	-- (daemon `turn.resume`), and its layer edits make unopened files match the
-	-- selected review view; the launcher records their inverse facts under private/.
-	local generation = session.turn_pass and session.turn_pass.generation
-	if generation ~= nil then
-		vim.list_extend(out, { "--generation", tostring(generation) })
-	end
+	-- A follow-up's layer edits make unopened files match the selected review view;
+	-- the launcher records their inverse facts under private/.
 	if session.resume then
-		if generation == nil then
-			return nil, "yanad turn.resume needs the run generation of the lifecycle pass"
-		end
-		vim.list_extend(out, { "--resume", "--layer-inverse", private .. "/layer-inverse/g" .. tostring(generation) })
+		vim.list_extend(out, { "--layer-inverse", private .. "/layer-inverse/g" .. tostring(generation) })
 		for _, edit in ipairs(session.layer_edits or {}) do
 			if edit.op == "put" then
 				vim.list_extend(out, { "--layer-put", edit.path .. "=" .. edit.from })
@@ -335,6 +331,11 @@ function M.wrap_cmd(argv, session)
 	-- the active backend, so a session that names none resolves the same way
 	-- every other consumer does.
 	local backend = cfg.backend_descriptor(session.backend)
+	for _, path in ipairs(cfg.options.ignore_folders) do
+		if vim.fn.isdirectory(path) == 1 then
+			vim.list_extend(out, { "--ignore-folder", path })
+		end
+	end
 	if backend and type(backend.state_dirs) == "table" then
 		for _, dir in ipairs(backend.state_dirs) do
 			local path = cfg.expand_state_dir(dir)
@@ -342,6 +343,12 @@ function M.wrap_cmd(argv, session)
 				vim.list_extend(out, { "--state-dir", path })
 			end
 		end
+	end
+
+	-- CAPTURE.md OC-GIT: the starting repository's `.git` folder is read-only.
+	local git_dir = require("yana.shadow.git_shield").dir(session)
+	if git_dir then
+		vim.list_extend(out, { "--read-only", git_dir })
 	end
 
 	vim.list_extend(out, { "--", "sh", "-c", 'cd "$1" && shift && exec "$@"', "_", workspace })
@@ -389,42 +396,6 @@ end
 -- Merge jail_env over the stripped host environment; returns a new table.
 function M.merge_spawn_env(jail_env)
 	return merge_env({}, jail_env)
-end
-
---- Run a shell command inside the jail. Returns ok, err_or_output, exit_code.
-function M.run_shell(opts)
-	local spec, err = M.build_shell_argv(opts)
-	if not spec then
-		return false, err, nil
-	end
-	local merged = merge_env({}, spec.env)
-	local out = {}
-	local job = vim.fn.jobstart(spec.cmd, {
-		cwd = spec.workspace,
-		env = merged,
-		stdout_buffered = true,
-		stderr_buffered = true,
-		on_stdout = function(_, data)
-			if data then
-				vim.list_extend(out, data)
-			end
-		end,
-		on_stderr = function(_, data)
-			if data then
-				vim.list_extend(out, data)
-			end
-		end,
-	})
-	if not job or job <= 0 then
-		return false, "jobstart failed", nil
-	end
-	local wait = vim.fn.jobwait({ job })
-	local code = wait[1]
-	if code == -1 or code == -2 then
-		code = 1
-	end
-	local output = table.concat(out, "\n")
-	return code == 0, output, code
 end
 
 return M

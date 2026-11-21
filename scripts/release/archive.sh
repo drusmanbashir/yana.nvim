@@ -25,7 +25,7 @@ mkdir -p "$out"
 (
 	cd "$tree"
 	printf '%s\n' LICENSE NOTICE README.md CHANGELOG.md VERSION scripts/install-deps.sh
-	find assets doc docs lua plugin bin -type f -print
+	find assets doc docs lua plugin bin mcpyana -type f -print
 ) | LC_ALL=C sort -u >"$list"
 
 # verify.sh proved the export's links; the tarball is a different file set, so
@@ -44,9 +44,7 @@ done < <(grep -E '\.md$' "$list")
 # drifted mode). Enforce the Git mode shape while tolerating the checkout
 # umask's group-write bit, which tar normalizes away below. Executable
 # classes: bin launchers (bin/yana-*, bin/yanad), the optional dependency
-# installer, and executable overlay shell
-# helpers. The four sourced overlay modules below remain non-executable, as do
-# bin/lib/yanad/*.py and every other archive member.
+# installer. The sourced confinement helpers and Python modules are non-executable.
 while IFS= read -r member; do
 	mode=$(stat -c %a "$tree/$member")
 	case $member in
@@ -54,7 +52,7 @@ while IFS= read -r member; do
 		[[ "$mode" == 644 || "$mode" == 664 ]] \
 			|| { echo "archive: $member must be mode 644, found $mode" >&2; exit 1; }
 		;;
-	bin/lib/yana-overlay/layer_edit.sh | bin/lib/yana-overlay/mount.sh)
+	bin/lib/yana-confine/*.sh)
 		[[ "$mode" == 644 || "$mode" == 664 ]] \
 			|| { echo "archive: $member must be mode 644, found $mode" >&2; exit 1; }
 		;;

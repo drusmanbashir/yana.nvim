@@ -287,6 +287,5 @@ M._test.active = function()
 end
 M._test.close = close_float
 M._test.submit = submit
-M._test.step_history = step_history
 
 return M

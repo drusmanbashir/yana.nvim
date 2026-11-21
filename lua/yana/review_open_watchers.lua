@@ -3,14 +3,6 @@ local hunk_ledger = require("yana.hunk_ledger")
 
 local Factory = {}
 
-local function retired_single_file_reload_refusal(change)
-  if not (change and change.single_file) then
-    return nil
-  end
-  local name = vim.fn.fnamemodify(change.single_file.real_path or change.path or "file", ":t")
-  return "retired single-file review cannot be reloaded for " .. name .. "; close it and rerun Yana on the real file"
-end
-
 --- A reload during review falls back to B0 against the agent's revision. `lines` are B0;
 -- each pending hunk's lines go at the B0 rows it was built on (`b0_span`, stamped
 -- at open), so no text is compared to find where a hunk belongs. Returns the
@@ -228,7 +220,7 @@ function Factory.new(deps)
       local captured = type(change.buffer_capture) == "table"
       -- Disk holding the review buffer's own text is the operator's `:w` of it,
       -- not a change on disk: the review is restored as for unchanged disk
-      -- (CORE "Saving is Neovim's", LEDGER N51).
+      -- (CORE "Saving is Neovim's").
       local expected = state.reload_unload_text or state.staged_text
       local disk_moved = disk_now ~= base and disk_now ~= expected
       if (not captured and disk_moved) or type(state.staged_text) ~= "string" then
@@ -334,12 +326,6 @@ function Factory.new(deps)
               -- the do-not-reopen-while-exiting guard (this return).
               -- Behaviour-preserving: the dropped path was a pure in-memory scrub
               -- today.
-              return
-            end
-            local sfm_refusal = retired_single_file_reload_refusal(state.change)
-            if sfm_refusal then
-              state.reload_restore_error = nil
-              M._record_shadow_accept_refusal(state, sfm_refusal)
               return
             end
             -- Buffer listeners die with the buffer; the ledger record stays Turn-owned

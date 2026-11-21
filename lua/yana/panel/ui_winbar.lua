@@ -107,7 +107,7 @@ function M.new(deps)
   end
 
   -- ESCAPE THE PERCENTS: 'winbar' is statusline syntax, so a bare "%" in p.title raises E539 ("%{" E540); an
-  -- update_winbar throw in on_done (before maybe_drain_queue) would stop queue draining and session persistence.
+  -- A winbar error here would interrupt turn completion and session persistence.
   local function session_segment(p)
     local sess
     if p.title and p.title ~= "" then
@@ -123,12 +123,6 @@ function M.new(deps)
     local pending = #diff.pending(p.changes)
     reconcile_pending(p, pending)
     return pending > 0 and (" · " .. pending .. " pending") or ""
-  end
-
-  local function queued_segment(p)
-    local qn = #p.queue
-    local promoted = p.steer_pending and " · 1 promoted" or ""
-    return qn > 0 and (" · " .. qn .. " queued" .. promoted) or promoted
   end
 
   local function shell_fail_segment(p)
@@ -163,21 +157,19 @@ function M.new(deps)
 
   local function winbar_text(p)
     local pend = pending_segment(p)
-    local queued = queued_segment(p)
     local shell_fail = shell_fail_segment(p)
     local confinement = confinement_segment()
     local sess = session_segment(p)
     -- Liveness sits right after the state word: the most volatile segment. update_winbar computes the fit itself
     -- (fit_winbar) rather than trusting Neovim's draw-time clip, whose ">" is a real painted character.
     return string.format(
-      "%s · %s%s%s · %s%s%s%s%s%%<  · %s",
+      "%s · %s%s%s · %s%s%s%s%%<  · %s",
       brand_chip(p),
       mode_chip(p),
       activity_segment(p),
       liveness_text(p),
       model_chip(p),
       pend,
-      queued,
       shell_fail,
       confinement,
       sess
@@ -229,7 +221,7 @@ function M.new(deps)
   -- A winbar that does not fit must SAY it was shortened (one trailing "…") and drop whole SEGMENTS from the right,
   -- never cut a word. Confinement is dropped LAST among droppables (it is the one safety fact).
   -- nvim_eval_statusline is the fit oracle throughout.
-  local WINBAR_DROP_ORDER = { "session", "pending", "queued", "shell_fail", "confinement" }
+  local WINBAR_DROP_ORDER = { "session", "pending", "shell_fail", "confinement" }
 
   local function fit_winbar(p, winid)
     local full = winbar_text(p)
@@ -245,7 +237,6 @@ function M.new(deps)
 
     local pieces = {
       pending = pending_segment(p),
-      queued = queued_segment(p),
       shell_fail = shell_fail_segment(p),
       confinement = confinement_segment(),
       session = " · " .. session_segment(p),
@@ -254,7 +245,7 @@ function M.new(deps)
 
     local function assemble(keep, shortened)
       local buf = { core }
-      for _, name in ipairs({ "pending", "queued", "shell_fail", "confinement", "session" }) do
+      for _, name in ipairs({ "pending", "shell_fail", "confinement", "session" }) do
         if keep[name] then
           buf[#buf + 1] = pieces[name]
         end
@@ -266,7 +257,7 @@ function M.new(deps)
       return out
     end
 
-    local keep = { pending = true, queued = true, shell_fail = true, confinement = true, session = true }
+    local keep = { pending = true, shell_fail = true, confinement = true, session = true }
     for _, name in ipairs(WINBAR_DROP_ORDER) do
       keep[name] = nil
       local cand = assemble(keep, true)

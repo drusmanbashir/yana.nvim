@@ -143,11 +143,6 @@ function M.capture_tracked_evidence(workspace)
   return { status = "repo", paths = set, submodules = submodules }
 end
 
--- Return only the pre-turn tracked paths, discarding evidence detail.
-function M.capture_tracked(workspace)
-  return M.capture_tracked_evidence(workspace).paths
-end
-
 -- Mark rel as declared this turn by setting pass.declared[rel] = true.
 function M.note_declared(pass, rel)
   if pass and rel and rel ~= "" then

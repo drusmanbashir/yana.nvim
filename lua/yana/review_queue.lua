@@ -18,7 +18,6 @@ function M.carryable_review_opts(opts)
   opts = opts or {}
   return {
     on_close = opts.on_close,
-    review_tabs_state_path = opts.review_tabs_state_path,
     review_owner = opts.review_owner,
     review_turn = opts.review_turn,
     on_accept = opts.on_accept,
@@ -161,26 +160,13 @@ end
 --- for: `u` is a key shared with Neovim, the operator asked for an undo and got one,
 ---
 function M._announce_open_failure(change, text, level)
+  -- A system refusal was said once, at INFO, where it was decided (review_open, F-LOGGING).
+  if type(change) == "table" and change.status == "system_refused" then
+    return
+  end
   local line = "yana: " .. text
   log.write("WARN", line)
   notify_one_line(line, level)
-end
-
--- The guarded entry for the diff-theme preview. A failed attachment must
--- release its buffer resources before another review can claim that buffer.
-function M.open_guarded(change, opts)
-  local ok, err = open_or_abandon(change, opts)
-  if not ok then
-    -- review_error is already stamped by open_or_abandon, before its announce.
-    M._announce_open_failure(change, "inline review failed: " .. notify.error_headline(err), vim.log.levels.ERROR)
-    return false, nil
-  end
-  -- M.open attaches this change to the pool synchronously, before it can still
-  -- throw (see the comment above M.cleanup) -- open_or_abandon's own (ok,
-  -- err) collapsed the state out of its return, but it is still right there.
-  local st = pool_for(opts or {})
-  local state = st.open[change]
-  return true, state
 end
 
 local process_next_for
@@ -322,10 +308,6 @@ end
 -- when no window shows the review buffer.
 function M._review_tabs_place(path, bufnr)
   return review_tabs.place_for_path(path, bufnr)
-end
-
-function M.review_tabs_state_path(opts)
-  return review_tabs.state_path(opts or {})
 end
 
 function M.prompt_close_owned_tabs(opts)

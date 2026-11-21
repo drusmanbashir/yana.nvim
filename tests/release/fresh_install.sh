@@ -9,16 +9,6 @@ nvim=$(realpath "$2")
 expect_refusal=0
 [[ ${3:-} == "--expect-refusal" ]] && expect_refusal=1
 tmp=${YANA_HEADLESS_TMPDIR:-${TMPDIR:-/tmp}}
-# GitHub Actions runners put /tmp on a tmpfs that bwrap overlays empty; CI must
-# point YANA_HEADLESS_TMPDIR at $RUNNER_TEMP (or similar) outside /tmp.
-if [[ -n ${GITHUB_ACTIONS:-} ]]; then
-	case $tmp in
-	/tmp | /tmp/*)
-		echo "fresh-install: CI requires YANA_HEADLESS_TMPDIR outside /tmp (got: $tmp)" >&2
-		exit 65
-		;;
-	esac
-fi
 scratch=$(mktemp -d "$tmp/yana-fresh.XXXXXX")
 turn_scratch=
 
@@ -216,27 +206,7 @@ printf 'FRESH INSTALL PASS nvim=%s root=%s\n' "$($nvim --version | head -1)" "$p
 # appears, accept it, undo and save. Check the buffer and disk at each step,
 # including native buffer undo after End, and reject Lua/Vim errors.
 #
-# Needs real bwrap confinement (mode=inline), same requirement as
-# tests/release/confined_turn_gate.sh: the overlay applies `--tmpfs /tmp`
-# while building the sandbox, so a scratch under /tmp binds in empty and the
-# turn cannot run. Same resolution order as that gate: an explicit
-# YANA_HEADLESS_TMPDIR wins, then a TMPDIR that is itself not under /tmp,
-# else refuse rather than hand the overlay a root that cannot work.
-if [[ -n ${YANA_HEADLESS_TMPDIR:-} ]]; then
-	jail_tmpdir=$YANA_HEADLESS_TMPDIR
-elif [[ -n ${TMPDIR:-} && $TMPDIR != /tmp && $TMPDIR != /tmp/* ]]; then
-	jail_tmpdir=$TMPDIR
-else
-	echo "fresh-install: refusing the turn smoke -- overlay workspace root needs YANA_HEADLESS_TMPDIR or a TMPDIR outside /tmp (the jail mounts a fresh tmpfs over /tmp)" >&2
-	exit 65
-fi
-mkdir -p "$jail_tmpdir"
-turn_scratch=$(mktemp -d "$jail_tmpdir/yana-fresh-turn.XXXXXX")
-
-# A real positive control prevents an absent user manager from making the
-# confined fixture's negative execution check pass accidentally.
-systemd-run --user --quiet --wait --pipe --collect -- /usr/bin/true
-echo 'fresh-install: host user-manager execution control passed'
+turn_scratch=$(mktemp -d "$tmp/yana-fresh-turn.XXXXXX")
 
 set +e
 env -i \
@@ -280,10 +250,6 @@ if (( turn_rc != 0 )); then
     \( -name '*.log' -o -name '*.json' -o -name '*.jsonl' -o -name '*.ndjson' -o -name '*.stderr' -o -name '*.path' -o -name '*.pid' \) -print0 2>/dev/null)
 fi
 
-if [[ $turn_rc == 65 ]]; then
-	echo "fresh-install: turn smoke INCONCLUSIVE -- bwrap unavailable" >&2
-	exit 65
-fi
 [[ $turn_rc == 0 ]] || exit "$turn_rc"
 
 printf 'FRESH INSTALL TURN SMOKE PASS nvim=%s root=%s\n' "$($nvim --version | head -1)" "$plugin"

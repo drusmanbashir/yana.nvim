@@ -194,23 +194,6 @@ function M.save_transcript(id, lines)
   f:close()
 end
 
--- Returns the transcript as a list of lines, or nil if none saved.
-function M.load_transcript(id)
-  if not id or id == "" then
-    return nil
-  end
-  local f = io.open(M.transcript_path(id), "r")
-  if not f then
-    return nil
-  end
-  local raw = f:read("*a")
-  f:close()
-  if raw == "" then
-    return nil
-  end
-  return vim.split(raw, "\n", { plain = true })
-end
-
 function M.attachments_path(id)
   return attachments_dir() .. "/" .. id .. ".json"
 end
@@ -226,20 +209,6 @@ function M.save_attachments(id, attachments)
   end
   f:write(vim.json.encode(attachments))
   f:close()
-end
-
-function M.load_attachments(id)
-  if not id or id == "" then
-    return nil
-  end
-  local f = io.open(M.attachments_path(id), "r")
-  if not f then
-    return nil
-  end
-  local raw = f:read("*a")
-  f:close()
-  local ok, decoded = pcall(vim.json.decode, raw)
-  return ok and type(decoded) == "table" and decoded or nil
 end
 
 ----------------------------------------------------------------------
@@ -504,16 +473,6 @@ function M.delete(id, cwd)
     end
   end
   return removed
-end
-
---- Delete every listed session for `cwd` (registry + discovered). Returns count.
-function M.delete_all(cwd)
-  cwd = cwd or vim.fn.getcwd()
-  local list = M.list(cwd)
-  for _, entry in ipairs(list) do
-    M.delete(entry.id, cwd)
-  end
-  return #list
 end
 
 return M

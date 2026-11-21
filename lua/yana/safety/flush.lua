@@ -46,8 +46,6 @@ local uv = vim.uv or vim.loop
 M.timeout_ms = 600000
 
 M._test = {
-	--- Take the on-loop path, for a caller that wants the old timing.
-	force_sync = false,
 	--- Injected failures. `fail_fsync` — refuse before any request is made.
 	--- `fail_async_fsync` — the message the libuv callback reports, which is the ONLY way
 	--- to fail a flush that is already off the loop, and so the only honest way to prove
@@ -55,9 +53,6 @@ M._test = {
 	fault = {},
 	--- Counters, so a row can prove which path a flush actually took.
 	stats = { async = 0, sync = 0 },
-	--- Called on the loop AFTER the request is queued and BEFORE the wait, so a
-	--- row can act inside the window the flush is off the loop.
-	on_wait = nil,
 }
 
 local function count(kind)
@@ -78,7 +73,7 @@ function M.fsync(fd)
 	-- from inside another flush's callback would be exactly that. Falling back
 	-- to the on-loop form there is correct rather than merely safe: the loop is
 	-- already not turning.
-	if M._test.force_sync or vim.in_fast_event() then
+	if vim.in_fast_event() then
 		count("sync")
 		return uv.fs_fsync(fd)
 	end
@@ -103,10 +98,6 @@ function M.fsync(fd)
 		return uv.fs_fsync(fd)
 	end
 	count("async")
-
-	if M._test.on_wait then
-		M._test.on_wait()
-	end
 
 	local started = uv.hrtime()
 	local wait_err = nil

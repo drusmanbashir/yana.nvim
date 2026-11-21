@@ -62,13 +62,4 @@ function M.step(ordered, p, delta)
   return ordered[((at - 1 + delta) % #ordered) + 1]
 end
 
---- In rotate mode only the focused panel should have windows in `tab`.
---- In split mode every panel that already has (or is opening) a view may.
-function M.should_show(panel, focused, _tab)
-  if M.is_split() then
-    return true
-  end
-  return panel == focused
-end
-
 return M

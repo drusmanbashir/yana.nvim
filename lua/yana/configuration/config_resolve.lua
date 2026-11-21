@@ -112,9 +112,7 @@ function M.new(deps)
 		if m == nil or m == "" then
 			m = options.mode
 		end
-		-- No remaining caller anywhere in the tree passes the literal string "agent" into
-		-- resolve_mode/set_mode (verified: `git grep -n 'set_mode([^,]*, *"agent")'`), so the
-		-- alias has nothing legitimate left to serve.
+		-- "agent" is not a mode: it is refused by name below.
 		if m == "agent" then
 			error(
 				'yana: "agent" is not a yana mode ("ask"/"inline"/"agentic") -- it was removed as an alias for '
@@ -141,7 +139,10 @@ function M.new(deps)
   --- Instruction sentence for the resolved mode, or nil when unknown.
   local function mode_instruction(mode)
     local m = resolve_mode(mode)
-    return MODE_PROMPT_KEYS[m] and prompts.render(MODE_PROMPT_KEYS[m])
+    local policy = (m == "inline" or m == "ask")
+      and require("yana.configuration.config_backends").inline_mcp_route(backend_descriptor(), m)
+    return MODE_PROMPT_KEYS[m] and prompts.render(policy and ("mode_" .. m .. "_mcp") or MODE_PROMPT_KEYS[m],
+      { max_files = get_options().review.max_files, read_tools = policy and policy.read_tools })
   end
 
   -- True when resolved mode is ask/inline (agent runs under the overlay).
@@ -319,8 +320,7 @@ function M.new(deps)
     -- any operator override of it) follows its optional environment override -- already
     -- validated executable (or PATH-deferred, see the defaults.backends doc comment) at
     -- setup, so there is nothing left to try. Only "cursor" with `cmd = nil` falls
-    -- through to the historical config/cmd_env/PATH chain below, which is what keeps
-    -- the default byte-identical to pre-backends Yana.
+    -- through to the config/cmd_env/PATH chain below.
     if type(entry.cmd) == "string" and entry.cmd ~= "" then
       return resolve_backend_cmd(active, entry, candidates)
     end

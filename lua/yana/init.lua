@@ -224,7 +224,7 @@ function M.sessions(opts)
   return ui().list_live_sessions(opts)
 end
 
--- Recover one daemon-kept review, or reopen the recovery picker with no id.
+-- Recover one frozen partial End, or reopen its picker with no id.
 function M.recover(id)
   return ui().recover(id)
 end
@@ -281,10 +281,6 @@ function M.steer()
 end
 
 -- View/edit/delete/reorder queued follow-ups.
-function M.queue()
-  ui().pick_queue()
-end
-
 -- Paste an image from the system clipboard into the current prompt.
 function M.paste_image()
   ui().paste_image()

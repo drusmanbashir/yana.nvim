@@ -2,7 +2,6 @@
 import json
 import pathlib
 import re
-import shlex
 import sys
 
 
@@ -50,18 +49,10 @@ def inspect_steps(workflow: dict, name: str) -> None:
 
 inspect_steps(ci, "ci")
 inspect_steps(release, "release")
-profile_lines = [
-    "abi <abi/4.0>,", "include <tunables/global>",
-    "profile yana-bwrap /usr/bin/bwrap flags=(unconfined) {", "  userns,", "}",
-]
-profile_text = "\n".join(profile_lines)
-for doc in ("README.md", "docs/installation.md", "scripts/install-deps.sh"):
-    if profile_text not in (root / doc).read_text():
-        fail(f"Bubblewrap AppArmor profile differs in {doc}")
 ci_steps = ci["jobs"]["release-tree"]["steps"]
-setup = next(step["run"] for step in ci_steps if step.get("name") == "Permit Bubblewrap namespaces on the disposable runner")
-if not all(line in shlex.split(setup) for line in profile_lines) or "sudo apparmor_parser -r /etc/apparmor.d/yana-bwrap" not in setup:
-    fail("CI Bubblewrap AppArmor setup differs from the documented profile")
+dependency_step = next(step for step in ci_steps if step.get("name") == "System dependencies")
+if re.search(r"\b(?:bwrap|bubblewrap)\b", dependency_step["run"], re.IGNORECASE):
+    fail("CI system dependencies contain Bubblewrap")
 release_steps = release["jobs"]["draft"]["steps"]
 guards = [step for step in release_steps if step.get("name") == "Require successful CI for the tag commit"]
 if len(guards) != 1 or release_steps.index(guards[0]) >= next(

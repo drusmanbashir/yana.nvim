@@ -1,7 +1,5 @@
 # Known issues
 
-Blocked user namespaces produce `:checkhealth yana` ERROR `[bwrap:userns]`
-with the AppArmor remedy, and refuse confined turns.
 Unavailable cgroup delegation produces ERROR `[cgroup:delegation]` with the
 required setup, and refuses confined turns.
 An unsupported Neovim produces ERROR `[nvim:min]` naming the minimum version.
@@ -29,24 +27,6 @@ minutes) with `vendor deadline exceeded after N ms` plus the vendor's stderr.
   proposed line ever reaches disk without your own `:w` — and Yana never adopts
   it in a later session. Delete it if it bothers you.
 
-- **Inline turns can write only in your home folder, writable data disks and
-  the turn's own folder.** A write anywhere else (for example a system folder)
-  fails with a read-only-filesystem error and is recorded. Reading is
-  unrestricted. A disk with another filesystem mounted inside it is not
-  captured, because the overlay cannot cover the inner filesystem.
-- **Explicit `sandbox.inline = "vendor-default"` can deny headless edits.**
-  It inherits vendor permission settings; a headless turn cannot answer an
-  approval prompt. The default `full` permits edits inside Yana's overlay,
-  with review controlling which changes reach disk. A stricter explicit
-  vendor level may narrow what Yana captures; `:checkhealth yana` reports it.
-- **A vendor can hide a kernel refusal inside its JSON stream.** Yana records
-  `system_refused` when the real vendor process exposes EROFS on stderr. Codex
-  0.151.0 can instead put the child error inside JSON stdout, narrate the
-  failure, and exit 0 without any EROFS-bearing stderr (unrelated warnings may
-  still be present). Yana does not trust vendor-authored narration enough to
-  create a filesystem fact, so that case has no structured refusal yet. The
-  outside target remains unchanged because the kernel mount boundary still
-  refused the write.
 - **`:earlier` / `:later` / `g-` / `g+` rewind the WHOLE review, not one
   hunk.** Crossing the point where Yana inserted the proposal takes the whole
   review back — every decision in it, together — and crossing it forward
@@ -66,19 +46,10 @@ minutes) with `vendor deadline exceeded after N ms` plus the vendor's stderr.
 - **Undo-seq drift after `:bwipeout` / recreated undo tree** is named, not
   resynced: the proposal insertion is gone from the undo tree, so there is
   nothing left to rewind to or restore from.
-- **Confined modes are Linux-only.** Overlay + hunk review (`ask`, `inline`)
-  need bubblewrap, overlayfs, `/proc`, and capsh. macOS cannot provide those;
-  Homebrew cannot either. On Darwin, preflight refuses confined turns (no
-  silent fallback). **Agentic** works if your `modes` list includes
-  `"agentic"` — the agent writes the real tree, with no overlay and no
-  review. Windows is still unsupported. macOS itself is not tested on real
-  hardware; the Darwin refusal path is covered only by an automated test, not
-  a real Mac.
-- **WSL2 is untested.** Yana has not been run against a WSL2 kernel. Ubuntu
-  under WSL2 ships the same AppArmor user-namespace restriction as Ubuntu
-  24.04 desktop, so expect the `bwrap:userns` remedy from `:checkhealth yana`;
-  whether overlayfs behaves under WSL2's kernel has not been measured. Reports
-  welcome.
+- **Ask and inline are Linux-only.** Yana needs `/proc` and delegated
+  cgroup v2 to identify and stop agent processes. On macOS, use
+  `modes = { "agentic" }`. Windows is unsupported.
+- **WSL2 is untested.**
 - **Only x86_64 is tested.** Testing installs the x86_64 Neovim tarball.
   aarch64 Linux is expected to work (nothing in Yana is architecture-specific)
   but has not been run.

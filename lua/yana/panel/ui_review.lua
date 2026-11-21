@@ -29,7 +29,6 @@ function M.new(deps)
   local change_footer_text = deps.change_footer_text
   local conv_base_line = deps.conv_base_line
   local stamp_undeclared_badge = deps.stamp_undeclared_badge
-  local bump_review_rejection = deps.bump_review_rejection
 
 -- THE panel review-status view (F-PANEL-REVIEW-STATUS): every change block's header glyph and footer, every
 -- claim line and the winbar's pending count, each read from the changes at paint time. Every status transition
@@ -40,6 +39,21 @@ local function render_review_status(p)
     refresh_review_claim(p, c)
   end
   update_winbar(p)
+end
+
+-- One pending repaint per panel: render_review_status already sweeps every change, so a repaint per change is
+-- quadratic in the change set.
+local function schedule_review_status(p)
+  if p.review_status_scheduled then
+    return
+  end
+  p.review_status_scheduled = true
+  vim.schedule(function()
+    p.review_status_scheduled = false
+    log.guard("yana.ui review status repaint", function()
+      render_review_status(p)
+    end)
+  end)
 end
 
 -- One subscription per (panel, Turn). The Turn writes the final `change.status` in terminal cleanup and only then
@@ -61,6 +75,21 @@ local function observe_turn(p, turn)
   end
   turn:register({
     name = "panel_review_status",
+    turn_sealed = function()
+      local closing = { prompts = {} }
+      p.end_closing = closing
+      local on_result = turn.end_context.on_result
+      turn.end_context.on_result = function(result)
+        if on_result then pcall(on_result, result) end
+        if p.end_closing ~= closing then return end
+        p.end_closing = nil
+        vim.schedule(function()
+          for _, text in ipairs(closing.prompts) do
+            S.submit_panel(p, { text = text, ordinary = true })
+          end
+        end)
+      end
+    end,
     review_alive = render,
     review_finished = render,
     turn_end = render,
@@ -71,14 +100,15 @@ local MAX_REVIEW_RETRY = 5
 local REVIEW_RETRY_EXHAUSTED = "retry_exhausted"
 
 local function inline_review_opts(p, change)
-  local apply_mode = config.review_mode_active()
+  -- The Run's own mode: another chat may have changed the shared mode since it started.
+  local run_mode = p.turn_modes and p.turn_modes[(change and change.turn_gen) or p.turn_gen]
+  local apply_mode = config.review_mode_active(run_mode)
   local journaled = config.overlay_mode()
   local ws = (change and change.review_workspace) or panel_claimed_workspace(p)
-  local turn = p.shadow_turn or (p.shadow_pass and p.shadow_pass.shadow_turn)
+  local turn = p.shadow_turn or p.mcp_run or (p.shadow_pass and p.shadow_pass.shadow_turn)
   return {
     workspace = ws,
     review_tabs = not (config.options.review and config.options.review.tabs == false),
-    review_tabs_state_path = nil,
     review_paths = p.shadow_pass and p.shadow_pass.paths or nil,
     review_owner = { panel_id = p.id, epoch = p.review_epoch },
     review_turn = turn,
@@ -155,23 +185,32 @@ local function inline_review_opts(p, change)
           retention_error = c.retention_error,
         })
       end
+      require("yana.panel.ui_review_nothing").on_refused(p, c, function(text)
+        if S.render_note then
+          S.render_note(p, text)
+        elseif append then
+          append(p, { "  " .. text, "" }, "note")
+        end
+      end)
       render_review_status(p)
     end,
     on_reject = function(c)
       render_review_status(p)
       notify_one_line("yana: rejected " .. c.rel .. " (reverted)", vim.log.levels.INFO)
-      bump_review_rejection(p, c)
     end,
     on_close = function(_state, _accepted, on_closed)
       if not apply_mode then
         if on_closed then on_closed(true) end
+        require("yana.panel.ui_review_nothing").after_release(p, true)
         return true
       end
       -- Authority is `turn_undecided_hunks`: close means zero undecided hunks.
       -- Never latch: every >0-to-0 edge must fire again.
       local inline_ok, inline = pcall(require, "yana.inline_diff")
+      local nothing = require("yana.panel.ui_review_nothing")
       if not inline_ok then
         if on_closed then on_closed(false, "inline_diff_unavailable") end
+        nothing.after_release(p, false, "inline_diff_unavailable")
         return false
       end
       local pending = inline.turn_undecided_hunks({
@@ -184,24 +223,23 @@ local function inline_review_opts(p, change)
       local close_cause = _state and _state.close_cause
       if pending ~= 0 and close_cause == nil then
         if on_closed then on_closed(false, "review_still_pending") end
+        nothing.after_release(p, false, "undecided hunks remain in this chat")
         return false
       end
-      -- The daemon's review_close ACK is the durable boundary; tabs, preview evidence and the next queue item stay
+      -- The daemon's review_close ACK is the durable boundary; tabs and preview evidence stay
       -- owned until Turn cleanup succeeds and the receipt is finalised.
       release_shadow_turn(p, "review closed", function(ok, err, receipt)
-        -- Defer until every owner callback returned and turn_bind completed the aggregate turn_end; draining in
+        -- Defer until every owner callback returned and turn_bind completed the aggregate turn_end. A submit inside
         -- the first owner callback can attach the next owner to a still-closing Turn.
-        local function drain()
+        local function finish_handover()
           if not (_state and _state._redo_hold_active) then
-            vim.schedule(function() S.maybe_drain_queue(p) end)
+            vim.schedule(function() S.finish_handover(p) end)
           end
         end
         -- REGISTER BEFORE ANSWERING. `on_closed` hands the ACK to the Turn, and
         -- the Turn may run cleanup and publish `gone` inside that very call --
         -- so anything registered afterwards is registered against a Turn that
-        -- has already finished. The old code registered a `turn_end` listener
-        -- here, one line too late to ever fire, and a listener has no answer
-        -- the Turn reads anyway.
+        -- has already finished.
         local turn_owned = false
         if ok and receipt ~= nil then
           local bound = require("yana.turn.turn_bind").get(p)
@@ -215,19 +253,22 @@ local function inline_review_opts(p, change)
               if finalized == false then
                 return false, reason or "panel receipt finalization refused"
               end
-              drain()
+              finish_handover()
               return true
             end) == true
           end
         end
         if on_closed then on_closed(ok, err) end
+        -- A review with nothing to show retires only now that its overlay answered (F-NOTHING-CLOSE); its
+        -- receipt was registered above, so the retirement's cleanup finalises it.
+        nothing.after_release(p, ok, not ok and ("overlay release failed: " .. tostring(err)) or nil)
         if not ok then
           return
         end
         -- A Turn close defers local finalisation to the receipt: ownership drops only once the Turn published, so a
         -- refusing cleanup keeps panel/epoch/turn/pass to retry with. Non-Turn callers finalise in the request helper.
         if receipt == nil then
-          drain()
+          finish_handover()
           return
         end
         -- Decided BEFORE `on_closed`: that call can run the Turn to `gone`, so asking turn_bind again here would
@@ -235,7 +276,7 @@ local function inline_review_opts(p, change)
         if not turn_owned then
           receipt.finalize(receipt)
           render_review_status(p)
-          drain()
+          finish_handover()
         end
       end, { defer_local_release = true })
       return "pending"
@@ -334,6 +375,7 @@ local function flush_review_batch(p)
     if owner.review_epoch ~= nil and owner.review_epoch ~= p.review_epoch then
       goto continue_flush
     end
+    if owner.renamed_to then goto continue_flush end
     if owner.status == "pending" then
       if owner.net_noop then
         owner.status = "kept_unreviewed"
@@ -349,9 +391,6 @@ local function flush_review_batch(p)
   return n
 end
 
--- new_chat only, not panel close: there is no panel-destroy lifecycle, inline
--- reviews open in the source buffers, and a turn finishing behind a closed panel
--- reviews fine. Dropping on window close would discard reviewable edits.
 local function drop_review_batch(p)
   local inline = require("yana.inline_diff")
   local opts = inline_review_opts(p)
@@ -365,6 +404,78 @@ local function drop_review_batch(p)
   p.review_batch = {}
   p.review_batch_by_path = {}
   render_review_status(p)
+end
+
+local function quit_review(p)
+  if p._new_chat_pending then
+    return nil, "New Chat is already closing this review"
+  end
+  local turn = require("yana.turn.turn_bind").get()
+  if not turn then return end
+  local mine, foreign = false, false
+  for _, file in ipairs(turn.files) do
+    local opts = file.review_opts or (file.review_state and file.review_state.opts)
+    local owner = file.review_owner or (opts and opts.review_owner)
+    owner = owner or (file.change and { panel_id = file.change.panel_id, epoch = file.change.review_epoch })
+    if type(owner) == "table" and owner.panel_id == p.id and owner.epoch == p.review_epoch then
+      mine = true
+    else
+      foreign = true
+    end
+  end
+  if not mine then return end
+  if foreign then
+    return nil, "the open review contains proposals from another conversation; finish the review before quitting"
+  end
+  if turn.ending then
+    return nil, "the review is already closing"
+  end
+  local session = p.job_shadow_turn or p.shadow_turn
+  if session and session.resume then
+    local run = require("yana.turn.turn_cycle").run_of(session)
+    if not run.published then
+      local state = run.owner and run.owner.state
+      if state == "running" or state == "preparing" or state == "publishing" then
+        return nil, "a follow-up is running or publishing. Let it finish before quitting"
+      end
+      return nil, "a follow-up result is unresolved. End or recover the review before quitting"
+    end
+  end
+  return turn
+end
+
+local function discard_for_quit(p, stopped, done)
+  local review, reason = quit_review(p)
+  if reason then return done(false, reason) end
+  if stopped then
+    local answer = require("yana.shadow.jail").consume_answer(stopped)
+    local refusal = answer and answer.refuse
+    if refusal and refusal.code == "writer_unconfirmed" then
+      return done(false, refusal.reason or "the background writer has not stopped")
+    end
+  end
+
+  local function discard_queue()
+    local opts = inline_review_opts(p)
+    drop_review_batch(p)
+    require("yana.inline_diff").discard_for_owner(opts.review_owner, opts)
+    release_shadow_turn(p, "conversation quit", done)
+  end
+
+  if not review then return discard_queue() end
+  return review:end_turn("abort", {
+    source = "panel_quit",
+    confirmed = true,
+    owner = { panel_id = p.id, epoch = p.review_epoch },
+    on_result = function(result)
+      if result.status == "completed" or (result.status == "partial" and result.review_ended == true) then
+        local ok, err = pcall(discard_queue)
+        if not ok then done(false, err) end
+      else
+        done(false, result.reason or result.status)
+      end
+    end,
+  })
 end
 
 local function render_tool_change(p, change)
@@ -423,22 +534,21 @@ local function render_tool_change(p, change)
       table.insert(p.review_batch, change)
       inline.mark_batched(change.path, inline_review_opts(p))
     end
-    vim.schedule(function()
-      log.guard("yana.ui review batch refresh", function()
-        render_review_status(p)
-      end)
-    end)
+    schedule_review_status(p)
   end
 end
 
   return {
     render_review_status = render_review_status,
+    schedule_review_status = schedule_review_status,
     MAX_REVIEW_RETRY = MAX_REVIEW_RETRY,
     REVIEW_RETRY_EXHAUSTED = REVIEW_RETRY_EXHAUSTED,
     inline_review_opts = inline_review_opts,
     coalesce_into_owner = coalesce_into_owner,
     flush_review_batch = flush_review_batch,
     drop_review_batch = drop_review_batch,
+    quit_review = quit_review,
+    discard_for_quit = discard_for_quit,
     render_tool_change = render_tool_change,
   }
 end

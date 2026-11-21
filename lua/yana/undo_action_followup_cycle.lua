@@ -74,7 +74,7 @@ local function preflight(self, env, undoing)
 			end
 			if not undoing and file then return nil, name .. ": it is already a member of the review" end
 			parts[#parts + 1] = { key = key, name = name, joined = true, path = p.path, change = p.change, record = p,
-				file = file, state = state, doors = doors, leaving = undoing }
+				file = file, state = state, doors = doors, leaving = undoing, row = self }
 		elseif not (from and to and from.native and to.native and type(to.native.seq) == "number" and to.state) then
 			return nil, name .. ": the publication recorded no endpoint to restore"
 		else
@@ -114,11 +114,22 @@ local function restore_joined_native(state, before, expected_attached)
 	end
 	if not (before and state and state.bufnr and vim.api.nvim_buf_is_loaded(state.bufnr)) then return end
 	jump(state.bufnr, before.seq)
-	if diff.buffer_bytes_snapshot(state.bufnr) ~= before.bytes_ref then
+	if before.bytes_ref ~= nil and diff.buffer_bytes_snapshot(state.bufnr) ~= before.bytes_ref then
 		error("joined file did not return to its pre-publication bytes", 0)
 	end
 	vim.bo[state.bufnr].modified = before.modified
 end
+
+-- A loaded buffer has a measurable endpoint. An unloaded buffer's floor is captured by review open after load.
+local function before_join(path)
+	local bufnr = vim.fn.bufnr(path, false)
+	local loaded = bufnr > 0 and vim.api.nvim_buf_is_loaded(bufnr)
+	return { seq = loaded and M.seq_of(bufnr) or nil,
+		bytes_ref = loaded and diff.buffer_bytes_snapshot(bufnr) or nil,
+		modified = loaded and vim.bo[bufnr].modified or false }
+end
+
+local capture_with_file
 
 -- A joined file's membership: `leave` withdraws its Turn membership, queued review and panel record; `join`
 -- re-admits the same change through the first-run door (an attached or queued review with no decisions).
@@ -129,16 +140,26 @@ local function membership(part, leave)
 		end
 		restore_joined_native(part.state, part.record.before_native, part.record.native.bufnr ~= nil)
 		if part.doors.leave(part.path, part.change) ~= true then error("its membership could not be withdrawn", 0) end
+		part.left = true
 		return
 	end
+	local before = before_join(part.path)
 	local got = part.doors.join(part.path, { change = part.change })
 	if not (got and got.file) then error("it did not rejoin the review", 0) end
 	local state = got.file.review_state
 	part.file = got.file
 	part.state = state -- Compensation must restore this exact rejoined attachment.
 	if state and state.bufnr then
+		if before.seq == nil then before.seq = state.undo_pre_stage_seq end
+		-- The rejoined review's own endpoint, which a refused `u` re-installs (`back`), as commit's `joined_state`.
+		local ep = assert(capture_with_file(state, got.file))
+		part.record.before_native, part.record.state = before, ep
 		part.record.native = { bufnr = state.bufnr, seq = M.seq_of(state.bufnr),
 			bytes_ref = diff.buffer_bytes_snapshot(state.bufnr) }
+		-- The register's endpoint follows: the join staged a new native sequence (Register:seal, its one writer).
+		local reg = require("yana.turn.turn_register").for_workspace(part.row.workspace)
+		local event = reg:event_of(part.row)
+		if event and event.parts[part.key] then reg:seal(event.parts[part.key].after.ep_id, ep, part.record.native) end
 	end
 end
 
@@ -156,9 +177,37 @@ local function apply_part(part)
 	part.state.latest_undo_seq = part.to.native.seq
 end
 
+local paint
+
 -- The inverse of a (partial) `apply_part`; true when the file is verifiably back on `from`.
 local function back(part)
-	if part.joined then return not part.moved or (pcall(membership, part, not part.leaving)) end
+	if part.joined then
+		if not part.moved then return true end
+		local live = require("yana.turn.turn_bind").get()
+		local cycle = require("yana.turn.turn_cycle")
+		local file = live and (live:file(part.path) or live:file(cycle.canonical_path(part.path))) or nil
+		-- The leave door can detach the review and drop the panel record (marking the change withdrawn), then refuse:
+		-- that member counts as gone and rejoins. An unmarked change keeps its record, which a rejoin would duplicate.
+		if part.leaving and file and not file.review_state and part.change.review_withdrawn then file = nil end
+		if part.leaving and file then
+			local state, native, ep = file.review_state, part.record.native, part.record.state
+			if state and state.bufnr and native and vim.api.nvim_buf_is_loaded(state.bufnr)
+				and M.seq_of(state.bufnr) ~= native.seq then
+				local ok = pcall(jump, state.bufnr, native.seq)
+				if not ok then return false end
+			end
+			-- Its recorded endpoint follows the jump back, as a non-joined file's `install(part, part.from)`.
+			if state and state.bufnr and ep and (ep.attachment_state or {}).bufnr == state.bufnr then
+				local own = { state = state, bufnr = state.bufnr, pair = state._anchor_pair or {}, file = file }
+				if install(own, { state = ep, native = native }).ok ~= true then return false end
+			end
+			paint(state)
+			return state and state.bufnr and diff.buffer_bytes_snapshot(state.bufnr) == native.bytes_ref or false
+		end
+		if part.leaving then return pcall(membership, part, false) end
+		if file then return pcall(membership, part, true) end
+		return true
+	end
 	local ok = true
 	if part.moved then
 		ok = pcall(jump, part.bufnr, part.from.native.seq) and install(part, part.from).ok == true
@@ -167,8 +216,6 @@ local function back(part)
 	if part.token then ok = part.file:restore_version(part.token) ~= nil and ok end
 	return ok and diff.buffer_bytes_snapshot(part.bufnr) == part.from.native.bytes_ref
 end
-
-local paint
 
 -- All participants or none: a failed file compensates every file moved so far to its start; a compensation that
 -- cannot land halts (changed = true, the paths named) for the router's halt protocol and `recovery_required`.
@@ -218,16 +265,6 @@ end
 local function native_of(bufnr)
 	return { bufnr = bufnr, seq = M.seq_of(bufnr), tick = vim.api.nvim_buf_get_changedtick(bufnr),
 		bytes_ref = diff.buffer_bytes_snapshot(bufnr) }
-end
-
--- The joined file's pre-staging endpoint belongs to this action, not to its
--- mutable panel change. An unloaded file starts at the native floor.
-local function before_join(path, change)
-	local bufnr = vim.fn.bufnr(path, false)
-	local loaded = bufnr > 0 and vim.api.nvim_buf_is_loaded(bufnr)
-	return { seq = loaded and M.seq_of(bufnr) or 0,
-		bytes_ref = loaded and diff.buffer_bytes_snapshot(bufnr) or change.before or "",
-		modified = loaded and vim.bo[bufnr].modified or false }
 end
 
 -- Close the open undo group so the publication is its own native sequence (the `undolevels` idiom
@@ -280,7 +317,9 @@ local function write_text(bufnr, f)
 	else
 		replace_rows(bufnr, 1, vim.api.nvim_buf_line_count(bufnr) + 1, f.lines)
 	end
-	if not vim.deep_equal(vim.api.nvim_buf_get_lines(bufnr, 0, -1, false), f.lines) then
+	-- A buffer always keeps one line, so an empty result lands as one empty line.
+	local landed = #f.lines > 0 and f.lines or { "" }
+	if not vim.deep_equal(vim.api.nvim_buf_get_lines(bufnr, 0, -1, false), landed) then
 		error("publication text did not land as prepared for " .. f.path, 0)
 	end
 end
@@ -312,7 +351,7 @@ end
 
 -- `C`, the text the blocks' prior side indexes (blocks taken back over the result rows): the version's `base`,
 -- which End composes from when it runs without a buffer.
-local function base_bytes(f)
+local function base_bytes(f, file)
 	local rows = f.lines
 	for i = #f.blocks, 1, -1 do
 		local b, out = f.blocks[i], {}
@@ -321,6 +360,10 @@ local function base_bytes(f)
 		vim.list_extend(out, rows, b.new_start_line + #(b.new_lines or {}), #rows)
 		rows = out
 	end
+	if file and file.original_operation == "create" and file:accepted() then
+		local accepted = file:proposal_accepted() and (file.proposal or file.change or {}).after or file.version_base
+		if accepted == "" and #rows == 1 and rows[1] == "" then return "" end
+	end
 	return #rows > 0 and table.concat(rows, "\n") .. "\n" or ""
 end
 
@@ -328,13 +371,13 @@ end
 -- proposal, its base, and this cycle's write door; then the text, membership and model.
 local function install_file(state, f, rec, file, next)
 	if file then
-		rec.version = assert(file:install_version(vim.tbl_extend("force", next, { base = base_bytes(f) })))
+		rec.version = assert(file:install_version(vim.tbl_extend("force", next, { base = base_bytes(f, file) })))
 	end
 	local bufnr = state.bufnr
 	seal_group(bufnr)
+	rec.wrote = true
 	require("yana.review_watch").own_splice(bufnr, function() write_text(bufnr, f) end)
 	seal_group(bufnr)
-	rec.wrote = true
 	local blocks, model = blocks_and_model(f)
 	state.hunk_ledger:load_snapshot(blocks)
 	require("yana.review_hunk_split").restore_model_snapshot(state.model_hunks, model)
@@ -365,7 +408,7 @@ end
 
 -- One endpoint state, captured with the owning File so operation, verdict and mode decision are kept; the
 -- proposal fields come from the File's selected version (S4), which `state.change` may lag.
-local function capture_with_file(state, file)
+function capture_with_file(state, file)
 	local ep = require("yana.review_park_snapshot").capture_endpoint(state, { file = file })
 	local v = ep and file and file:version()
 	if v and v.proposal then
@@ -412,7 +455,7 @@ local function stale(state, f, file)
 		return "a decision was made after the result was prepared"
 	end
 	-- Neovim's write of a modified buffer moves changedtick and nothing else (CORE
-	-- "Saving is Neovim's", N51): an unmodified buffer at the prepared undo position
+	-- "Saving is Neovim's"): an unmodified buffer at the prepared undo position
 	-- with the prepared bytes was not edited.
 	local tick_moved = vim.api.nvim_buf_get_changedtick(state.bufnr) ~= at.tick
 		and (vim.bo[state.bufnr].modified or at.seq == nil or M.seq_of(state.bufnr) ~= at.seq)
@@ -463,7 +506,7 @@ function M.commit_publication(prepared, env)
 		rec.before_state = capture_with_file(item.state, file)
 		done[#done + 1] = rec
 		local ok, err = pcall(install_file, item.state, item.f, rec, file, { review_opts = env.review_opts(file),
-			change = env.results and env.results[item.path] and env.results[item.path].change })
+			change = env.results and env.results[item.path] and env.results[item.path].change, exists = item.f.exists })
 		if not ok then
 			failure = item.path .. ": " .. tostring(err)
 			break
@@ -473,9 +516,12 @@ function M.commit_publication(prepared, env)
 	-- A newly changed file joins the review inside this same action (F-ADDENDUM-RECOMPUTE), after the installs,
 	-- and its review state is captured before the row exists: attached (buffer open) or unattached (queued).
 	for _, item in ipairs(failure and {} or fresh) do
-		local before = before_join(item.path, item.f.change)
+		local before = before_join(item.path)
 		local had_history = env.was_reviewed and env.was_reviewed(item.path) == true
 		local ok, got = pcall(env.join, item.path, item.f)
+		if ok and before.seq == nil and got and got.file and got.file.review_state and got.file.review_state.bufnr then
+			before.seq = got.file.review_state.undo_pre_stage_seq
+		end
 		local j = ok and got and got.file and { path = item.path, f = item.f, file = got.file,
 			joined_state = got.file.review_state, before_native = before, had_history = had_history }
 		if j then
@@ -521,7 +567,8 @@ function M.commit_publication(prepared, env)
 		local key = f.key or f.file_id
 		participants[key] = { path = rec.path, native = rec.after, exists = f.exists ~= false,
 			native_edge = { from_seq = rec.before.seq, to_seq = rec.after.seq }, state = rec.after_state,
-			structural = f.lineage and f.lineage.segments, version = file and file:version() }
+			structural = f.lineage and f.lineage.coverage == "complete" and f.lineage.segments or nil,
+			version = file and file:version() }
 		before_states[key] = { path = rec.path, native = rec.before, state = rec.before_state, version = rec.version,
 			exists = true }
 		affected[#affected + 1], rels[#rels + 1] = rec.path, file and file.change and file.change.rel or rec.path

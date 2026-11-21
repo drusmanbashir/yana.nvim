@@ -15,6 +15,7 @@ local hash = require("yana.safety.hash")
 local control_plane = require("yana.safety.control_plane")
 local flush = require("yana.safety.flush")
 local manifest = require("yana.paths.manifest")
+local diary_store = require("yana.safety.diary_store")
 local uv = vim.uv or vim.loop
 
 M._config = {
@@ -25,13 +26,9 @@ M._config = {
 
 M._test = {
 	force_diary_root = nil,
-	force_no_space = false,
-	force_cap_bytes = nil,
 	fault = {},
 	inject = {},
 }
-
-local CHECKPOINT_WRITE = false
 
 -- Every name below stays a local of this file under its original name so no call site
 -- changes.
@@ -115,7 +112,11 @@ function M.open(diary_dir)
 end
 
 function M.begin(opts)
-	return diary_session.begin(opts)
+	local session, err = diary_session.begin(opts)
+	if session then
+		diary_store.prune(M)
+	end
+	return session, err
 end
 
 function M.validate_payload(opts)
@@ -138,7 +139,7 @@ function M.restore_workspace_bytes(opts)
 	return diary_session.restore_workspace_bytes(opts)
 end
 
--- End's journaled write takes its evidence from the file as it is now (CORE "Saving is Neovim's", N51).
+-- End's journaled write takes its evidence from the file as it is now (CORE "Saving is Neovim's").
 M.current_evidence = diary_state.current_evidence
 
 -- Every name below stays a local of this file under its original name so no call site
@@ -366,20 +367,6 @@ function M.apply_pending(opts)
 		end
 	end
 	return false, "no pending intent for path"
-end
-
--- Test hook: mark the session crashed after a given path, for replay tests.
-function M.simulate_crash(opts)
-	opts = opts or {}
-	local session = opts.session
-	session.crash_after = diff.abs_path(opts.after)
-	session.crashed = true
-	append_jsonl(journal_path(session), {
-		kind = "crash",
-		after = session.crash_after,
-		ts = os.time(),
-	})
-	return true
 end
 
 -- Delete orphan temp files from crashed writes, verifying identity first.

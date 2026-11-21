@@ -3,8 +3,7 @@
 -- F-ADDENDUM-UNDO, -EDIT-HISTORY, -UNDO-FLOOR). Per file, Endpoints form a tree
 -- whose edges are Events; `cur` (file_id -> EpRef) is the history position, with
 -- no global cursor. Events truncated off the register's reach or retired by a
--- reset stay here. Native projection, adoption, crossing and per-file redo
--- selection are M2.
+-- reset stay here.
 local M = {}
 
 local SCHEMA = 1
@@ -32,9 +31,9 @@ local function set_native(g, ep, native, journal)
 	local old = ep.native
 	local slots = g.arrival[ep.file_id]
 	local hist = old and old.seq and slots and slots[old.hist_inc or 0]
-	if ep.kind == "arrival" and hist and hist[old.seq] == ep.ep_id then hist[old.seq] = nil end
+	if hist and hist[old.seq] == ep.ep_id then hist[old.seq] = nil end
 	ep.native = native
-	if ep.kind ~= "arrival" or not (native and native.seq) then return end
+	if not (native and native.seq and (ep.kind == "arrival" or ep.decision_arrival)) then return end
 	g.arrival[ep.file_id] = slots or {}
 	local h = native.hist_inc or 0
 	g.arrival[ep.file_id][h] = g.arrival[ep.file_id][h] or {}
@@ -306,10 +305,117 @@ function M.install(Register, env)
 		return ep, ep and ep.states[at.revision]
 	end
 
+	-- Endpoints from this position to its root, with their indices by id.
+	function Register:ancestor_chain(at)
+		local path, index = {}, {}
+		local ep = at and self:endpoint(at)
+		while ep do
+			path[#path + 1] = ep
+			index[ep.ep_id] = #path
+			ep = ep.parent and self:endpoint(ep.parent) or nil
+		end
+		return path, index
+	end
+
 	function Register:position()
 		local out = {}
 		for file_id, at in pairs(self.graph.cur) do out[file_id] = at end
 		return out
+	end
+
+	-- A rejection that writes bytes gives its decision endpoint an arrival of
+	-- its own. A verdict with no native write keeps the preceding sequence.
+	function Register:record_decision_native(file_id, from, pre, post, splices)
+		local g = self.graph
+		local at = g.cur[file_id]
+		local ep = at and g.endpoints[at.ep_id]
+		local event = ep and g.events[ep.via]
+		local part = event and event.kind == "decision" and event.parts[file_id]
+		if not (part and part.row.count == 1) then return false end
+		local before = g.endpoints[part.before.ep_id]
+		if (from and before.ep_id ~= from.ep_id) or (not from and before.kind ~= "root") then return false end
+		if before.native == nil then set_native(g, before, { seq = pre }) end
+		if before.native.seq ~= pre then return false end
+		local native = vim.tbl_extend("force", {}, before.native, { seq = post })
+		ep.decision_arrival = true
+		set_native(g, ep, native)
+		part.splices = splices
+		part.native_edge = { hist_inc = native.hist_inc, from_seq = pre, to_seq = post }
+		return true
+	end
+
+	-- Plan a native move without moving any of the files. Only a publication
+	-- pulls in other files, whose later actions must come off newest first.
+	function Register:native_plan(file_id, seq, floor, turn_id)
+		local g, positions, steps = self.graph, self:position(), {}
+		local here = g.endpoints[positions[file_id] and positions[file_id].ep_id]
+		if here == nil or here.turn_id ~= turn_id then return nil, "no recorded history for this file" end
+		local histories = g.arrival[file_id] or {}
+		local root = g.endpoints[g.root_ep[file_id]]
+		local history = histories[here.native and here.native.hist_inc or 0] or {}
+		local target = g.endpoints[history[seq]]
+		if target == nil and root and (root.native and root.native.seq or floor) == seq then target = root end
+		if target == nil or target.turn_id ~= turn_id or target.reachable == false then
+			return nil, "the selected sequence is outside the retained review history"
+		end
+		local travel, cross
+		local visiting = {}
+		cross = function(event, back)
+			if not event or visiting[event] or event.turn_id ~= turn_id or event.halted or event.retired_at then
+				return nil, "a recorded action is unavailable on this branch"
+			end
+			visiting[event] = true
+			local leave, land = back and "after" or "before", back and "before" or "after"
+			while true do
+				local latest, route
+				for key, part in pairs(event.parts) do
+					local at = positions[key]
+					if not at or at.ep_id ~= part[leave].ep_id then
+						local chain, index = self:ancestor_chain(at)
+						local blocker = chain[1] and g.events[chain[1].via]
+						if not back and not index[part[leave].ep_id] then
+							route = { key, part[leave] }
+						elseif not index[part[leave].ep_id] or blocker == nil then
+							return nil, "a publication participant is on an incompatible branch"
+						elseif latest == nil or blocker.clock > latest.clock then
+							latest = blocker
+						end
+					end
+				end
+				if latest == nil and route == nil then break end
+				local ok, why
+				if latest then ok, why = cross(latest, true) else ok, why = travel(route[1], route[2]) end
+				if not ok then return nil, why end
+			end
+			for key, part in pairs(event.parts) do
+				positions[key] = part[land]
+				if g.endpoints[part[land].ep_id].reachable == false then return nil, "a native endpoint was pruned" end
+			end
+			local _, part = next(event.parts)
+			steps[#steps + 1] = { row = part.row, back = back }
+			visiting[event] = nil
+			return true
+		end
+		travel = function(key, destination)
+			local down, ancestors = self:ancestor_chain(destination)
+			local up = self:ancestor_chain(positions[key])
+			local common
+			for _, ep in ipairs(up) do
+				common = ancestors[ep.ep_id]
+				if common then break end
+				local ok, why = cross(g.events[ep.via], true)
+				if not ok then return nil, why end
+			end
+			if not common then return nil, "the selected branch does not share the review floor" end
+			for i = common - 1, 1, -1 do
+				local ok, why = cross(g.events[down[i].via], false)
+				if not ok then return nil, why end
+			end
+			return true
+		end
+		local ok, why = travel(file_id, ref(target))
+		if not ok then return nil, why end
+		return steps
 	end
 
 	-- Seal a captured EndpointState: the first seal fills the endpoint's revision, a
@@ -370,16 +476,21 @@ function M.install(Register, env)
 		for _, ep in pairs(self.graph.endpoints) do ep.pins[holder] = nil end
 	end
 
-	-- The native observer (M2) flags what Neovim's history no longer reaches.
+	-- The native observer flags what Neovim's history no longer reaches.
 	function Register:set_reachable(ep_id, reachable)
 		local ep = assert(self.graph.endpoints[ep_id], "turn register: unknown endpoint " .. tostring(ep_id))
 		ep.reachable = reachable == true
 	end
 
 	-- An ended Turn (End completed or Abort; turn.lua) is never walked again: its unpinned endpoints become
-	-- unreachable and the drop below removes what nothing else holds. Pinned records stay (B7).
+	-- unreachable and the drop below removes what nothing else holds. Pinned records stay (B7). Nor does it hold a
+	-- current position: a later Turn admits its own root there (F-ADDENDUM-TURN, -UNDO-FLOOR).
 	function Register:release_turn(turn_id)
 		if turn_id == nil then return end
+		for file_id, at in pairs(self.graph.cur) do
+			local ep = self.graph.endpoints[at.ep_id]
+			if ep and ep.turn_id == turn_id then self.graph.cur[file_id] = nil end
+		end
 		for id, ep in pairs(self.graph.endpoints) do
 			if ep.turn_id == turn_id and next(ep.pins) == nil then self:set_reachable(id, false) end
 		end

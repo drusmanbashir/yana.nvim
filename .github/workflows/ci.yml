@@ -20,12 +20,7 @@
         },
         {
           "name": "System dependencies",
-          "run": "sudo apt-get update && sudo apt-get install -y bubblewrap libcap2-bin apparmor"
-        },
-        {
-          "name": "Permit Bubblewrap namespaces on the disposable runner",
-          "shell": "bash",
-          "run": "set -euo pipefail\nsysctl kernel.apparmor_restrict_unprivileged_userns\nprobe=(bwrap --unshare-user --unshare-pid --die-with-parent --ro-bind / / --dev /dev --proc /proc --uid \"$(id -u)\" --gid \"$(id -g)\" -- true)\nset +e\n\"${probe[@]}\"\nbefore=$?\nset -e\nprintf 'Bubblewrap namespace probe before profile: rc=%s\\n' \"$before\"\nif grep -rl /usr/bin/bwrap /etc/apparmor.d/; then\n  echo \"Using the existing Bubblewrap AppArmor profile\"\nelse\nprintf '%s\\n' 'abi <abi/4.0>,' 'include <tunables/global>' 'profile yana-bwrap /usr/bin/bwrap flags=(unconfined) {' '  userns,' '}' | sudo tee /etc/apparmor.d/yana-bwrap\nsudo apparmor_parser -r /etc/apparmor.d/yana-bwrap\nfi\n\"${probe[@]}\"\nsysctl kernel.apparmor_restrict_unprivileged_userns\nprintf 'Bubblewrap namespace probe after profile: rc=0\\n'"
+          "run": "sudo apt-get update && sudo apt-get install -y ripgrep python3"
         },
         {
           "name": "Install Neovim for configuration verification",
@@ -39,7 +34,7 @@
         {
           "name": "Fresh Neovim matrix",
           "shell": "bash",
-          "run": "set -euo pipefail\nexport YANA_HEADLESS_TMPDIR=\"$RUNNER_TEMP/yana-headless\"\nmkdir -p \"$YANA_HEADLESS_TMPDIR\"\ncase $YANA_HEADLESS_TMPDIR in /tmp|/tmp/*) echo \"YANA_HEADLESS_TMPDIR must lie outside /tmp\" >&2; exit 1;; esac\nfor version in 0.10.4 0.11.2 0.12.4; do\n  bin=$(scripts/release/install-neovim.sh \"$version\" \"$RUNNER_TEMP/nvim-$version\" | tail -1)\n  if [[ $version == 0.10.4 ]]; then\n    tests/release/fresh_install.sh . \"$bin\" --expect-refusal\n  else\n    tests/release/fresh_install.sh . \"$bin\"\n  fi\ndone"
+          "run": "set -euo pipefail\nexport YANA_HEADLESS_TMPDIR=\"$RUNNER_TEMP/yana-headless\"\nmkdir -p \"$YANA_HEADLESS_TMPDIR\"\nfor version in 0.10.4 0.11.2 0.12.4; do\n  bin=$(scripts/release/install-neovim.sh \"$version\" \"$RUNNER_TEMP/nvim-$version\" | tail -1)\n  if [[ $version == 0.10.4 ]]; then\n    tests/release/fresh_install.sh . \"$bin\" --expect-refusal\n  else\n    tests/release/fresh_install.sh . \"$bin\"\n  fi\ndone"
         },
         {
           "name": "Release policy mutations",

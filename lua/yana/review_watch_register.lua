@@ -57,13 +57,10 @@ function M.new(deps)
   -- `buffer_edit` row rather than pushed beside it.
   --
   -- WHY NOT A ROW OF ITS OWN: the deletion and the fusion are ONE forward group
-  -- -- one native undo sequence, one keypress -- and the operator's group law
-  -- (2026-09-06) says such a group reverses as ONE unit on the boundaries it
-  -- applied forward. A separate register row would cost a SECOND `u` press and
-  -- would leave a state in between with the text back and the ledger still
-  -- merged, which is precisely the defect. Measured: with merges as their own
-  -- rows the cross-file walk in r_breaker_32 needed one extra press per merge
-  -- and ACTION16/17/18 stopped restoring C1/B2/A1 inside their budgets.
+  -- -- one native undo sequence, one keypress -- and the group law says such a group
+  -- reverses as ONE unit on the boundaries it applied forward. A separate register
+  -- row would cost a SECOND `u` press and would leave a state in between with the
+  -- text back and the ledger still merged.
   --
   -- `review_undo.spend_buffer_edit` reads `hunk_merges` and moves them in the
   -- same press, membership before text on `u` and after it on `<C-r>`.

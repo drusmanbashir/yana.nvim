@@ -10,7 +10,7 @@ M.CONTEXTS = {
   prompt = { "submit", "stop" },
   panel = {
     "model", "new_chat", "resend", "review", "reject", "focus_prompt", "close",
-    "next_panel", "prev_panel", "completion_menu", "new_panel", "queue", "steer",
+    "next_panel", "prev_panel", "completion_menu", "new_panel", "steer",
   },
   float = { "history_prev", "history_next" },
   global = { "toggle", "ask", "inline_edit" },

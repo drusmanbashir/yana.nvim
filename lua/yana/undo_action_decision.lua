@@ -5,9 +5,8 @@
 -- Pure wrap: the bodies already exist as `pop_decision`
 -- (review_undo_replay.lua:249) and `redo_local` (review_undo_replay.lua:117),
 -- reachable off the resolved target as `target_state._pop_decision` /
--- `target_state._redo_local`. This module adds no logic of its own besides
--- the `count`-loop lifted verbatim from the old switch
--- (review_undo.lua:442-453 for reverse, :369-380 for forward).
+-- `target_state._redo_local`. This module adds the `count`-loop of the old
+-- switch and the row's own redo payload (`row.undone`, set by reverse).
 --
 -- `env` carries nothing this class needs: unlike its siblings it never calls
 -- `resolve_target` itself (contract: "the only class that needs a resolved
@@ -95,13 +94,20 @@ function Factory.new(env) -- luacheck: no unused args
   end
 
   local function move_verdicts(row, forward)
-    local ok, reason = move_operation(row.operation, forward, row)
-    if not ok then
-      return false, reason
+    local operations = row.operations or (row.operation and { row.operation } or {})
+    local moved = {}
+    for _, operation in ipairs(operations) do
+      local ok, reason = move_operation(operation, forward, row)
+      if not ok then
+        for i = #moved, 1, -1 do move_operation(moved[i], not forward, row) end
+        return false, reason
+      end
+      moved[#moved + 1] = operation
     end
+    local ok, reason
     ok, reason = move_mode(row.mode, forward, row)
     if not ok then
-      move_operation(row.operation, not forward, row)
+      for i = #moved, 1, -1 do move_operation(moved[i], not forward, row) end
       return false, reason
     end
     return true
@@ -110,39 +116,75 @@ function Factory.new(env) -- luacheck: no unused args
   --- `count` x `target_state._pop_decision()`, stopping on the first result
   --- that is not `true` -- identical break rules to review_undo.lua's old
   --- `undo_key` loop, including the missing-method guard (a target resolved
-  --- to something that never wired `_pop_decision`).
-  local function reverse(row, target_state)
-    local moved = move_verdicts(row, false)
+  --- to something that never wired `_pop_decision`). The row keeps each entry
+  --- it took back (`row.undone`), its redo payload. A refused first pop
+  --- (`false`) takes nothing back: the verdicts return and the row refuses with
+  --- the reason `pop_decision` announced, which `undo_refuse` keeps on the change.
+  local function reverse(row, target_state, native_branch)
+    local moved, why = move_verdicts(row, false)
     if moved ~= true then
-      return false
+      return false, why
     end
     local count = row.count or 1
+    local undone = {}
     for _ = 1, count do
       if not target_state._pop_decision then
         break
       end
-      local ok = target_state._pop_decision()
+      local ok = target_state._pop_decision(native_branch)
+      if ok == false and #undone == 0 then
+        move_verdicts(row, true)
+        local change = target_state.change
+        return false, change and change.review_error or "the review refused to take it back"
+      end
       if ok ~= true then
         break
       end
+      local stack = target_state.undone_decisions
+      undone[#undone + 1] = stack and stack[#stack]
     end
+    row.undone = undone
     return true
   end
 
-  --- `count` x `target_state._redo_local()`, same stop rule, mirroring the
-  --- old `redo_key` loop (review_undo.lua:369-380).
-  local function forward(row, target_state)
-    local moved = move_verdicts(row, true)
+  --- `target_state._redo_local()` once per entry this row's undo took back,
+  --- newest first. A redone publication installs its endpoint's empty undone
+  --- stack, so the row puts its entry back there first (F-ADDENDUM-REDO), but
+  --- only when this review's ledger owns the entry's hunk: a file the
+  --- publication added rejoins as a new review, and the entry names the old
+  --- one's hunk. A resumed review's rebound copies stay as they are. Nothing
+  --- re-applied is a refusal with its reason, and takes back what it put there.
+  local function forward(row, target_state, native_branch)
+    local moved, why = move_verdicts(row, true)
     if moved ~= true then
-      return false
+      return false, why
     end
-    local count = row.count or 1
-    for _ = 1, count do
+    local entries = row.undone or {}
+    local ledger = target_state.hunk_ledger
+    for i = #entries, 1, -1 do
       if not target_state._redo_local then
         break
       end
-      local ok = target_state._redo_local()
+      local entry, stack = entries[i], target_state.undone_decisions
+      local ok, reason, pushed
+      if stack and #stack == 0 then
+        if ledger and ledger:owns(entry.block) then
+          stack[1], pushed = entry, true
+        else
+          ok, reason = false, tostring(row.rel) .. "'s review no longer has that hunk"
+        end
+      end
+      if reason == nil then
+        ok, reason = target_state._redo_local(native_branch)
+      end
       if ok ~= true then
+        if pushed and stack[#stack] == entry then
+          table.remove(stack)
+        end
+        if i == #entries then
+          move_verdicts(row, false)
+          return false, reason
+        end
         break
       end
     end

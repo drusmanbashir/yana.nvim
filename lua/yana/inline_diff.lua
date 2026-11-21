@@ -38,12 +38,11 @@ M._review_bulk_factory = require("yana.review_bulk")
 
 local NS = vim.api.nvim_create_namespace("YanaInlineDiff")
 local HINT_NS = vim.api.nvim_create_namespace("YanaInlineHint")
--- N8-A: the PAINT span and the POSITION AUTHORITY are two different questions
+-- The PAINT span and the POSITION AUTHORITY are two different questions
 -- and one extmark cannot answer both.
 --
 -- Paint wants an EXCLUSIVE end at (last_new_row + 1, col 0), because that is the only
--- encoding that colours the hunk's last new row even when that row is empty (the N8
--- fix). That is silent edit loss, and it happens at EOF too.
+-- encoding that colours the hunk's last new row even when that row is empty.
 --
 -- So the authority is its own extmark, in its own namespace, carrying the
 -- PRE-N8 geometry: end at (last_new_row, col 0), right_gravity = false,
@@ -53,7 +52,7 @@ local HINT_NS = vim.api.nvim_create_namespace("YanaInlineHint")
 -- hl_group, no virt_lines and no priority: it decorates nothing.
 --
 -- A separate namespace, not a bare unhighlighted mark in NS, because NS is the
--- namespace render_check sweeps for `leaked_decoration` and that the N8 gate
+-- namespace render_check sweeps for `leaked_decoration` and that the extent check
 -- counts marks in. An authority mark there would be a leak to one and an extra
 -- hunk mark to the other. Everything that clears NS clears AUTH_NS beside it.
 local AUTH_NS = vim.api.nvim_create_namespace("YanaInlineDiffAuthority")
@@ -215,7 +214,7 @@ local observers = {}
 ---
 --- ONE list, here, because there were two (`M.open`'s `_last_review_opts` stamp and
 --- `retrace_review_opts`'s carry) and they drifted: both named `on_close`,
---- `review_tabs_state_path`, `review_owner`, `review_turn` and neither named the four
+--- `review_owner`, `review_turn` and neither named the four
 --- DECISION callbacks. Adding a field in one place and not the other is how that comes
 --- back, so there is one place.
 ---
@@ -529,13 +528,8 @@ M._test = M._test or {}
 M._test.fault = FAULT
 M._test.pools = pools
 M._test.pool_for = pool_for
-M._test.state_for_rel = state_for_rel
 M._test.discard_pool = M.discard_pool
 M._test.discard_for_owner = M.discard_for_owner
-M._test.process_next = M.process_next
 M._test.owners_match = owners_match
-M._test.prompt_close_owned_tabs = M.prompt_close_owned_tabs
-M._test.close_owned_tabs = M.close_owned_tabs
-M._test.review_tabs_state_path = M.review_tabs_state_path
 
 return M

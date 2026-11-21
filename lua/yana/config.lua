@@ -40,13 +40,13 @@ end
 M.public_defaults = {
   backends = public_backends,
   modes = vim.deepcopy(M.defaults.modes),
+  review = { max_files = M.defaults.review.max_files },
   inline_edit = vim.deepcopy(M.defaults.inline_edit),
   log_level = M.defaults.log_level,
 }
 
 M.options = vim.deepcopy(M.defaults)
 M._setup_done = false
-M._single_file_notice_emitted = false
 
 function M.home_dir()
   return vim.fn.expand("~")
@@ -69,7 +69,6 @@ M.expand_state_dir = _backends.expand_state_dir
 local _normalize = require("yana.configuration.config_normalize").new({
   defaults = M.defaults,
 })
-M.normalize_selection_scope = _normalize.normalize_selection_scope
 M.normalize_image_paste = _normalize.normalize_image_paste
 M.normalize_redirect = _normalize.normalize_redirect
 M.normalize_inline_edit = _normalize.normalize_inline_edit
@@ -77,7 +76,6 @@ M.normalize_log_level = _normalize.normalize_log_level
 M.normalize_sandbox = _normalize.normalize_sandbox
 M.normalize_review = _normalize.normalize_review
 M.normalize_skill_dirs = _normalize.normalize_skill_dirs
-M.normalize_single_file = _normalize.normalize_single_file
 M.normalize_workspace_roots = _normalize.normalize_workspace_roots
 M.normalize_artifact_dir_prefixes = _normalize.normalize_artifact_dir_prefixes
 M.normalize_inline_exec_allowlist = _normalize.normalize_inline_exec_allowlist
@@ -101,8 +99,18 @@ M.review_mode_active = _resolve.review_mode_active
 M.agent_permission_mode = _resolve.agent_permission_mode
 M.agent_needs_permission_flag = _resolve.agent_needs_permission_flag
 M.normalize_cmd_env = _resolve.normalize_cmd_env
-M.resolve_cmd = _resolve.resolve_cmd
-M.cmd = _resolve.cmd
+-- After a refused setup() the options are factory defaults, not the caller's,
+-- so no vendor command resolves until a setup() call succeeds.
+local function refuse_after_refused_setup(resolve)
+  return function(...)
+    if M._setup_refusal then
+      error(M._setup_refusal, 0)
+    end
+    return resolve(...)
+  end
+end
+M.resolve_cmd = refuse_after_refused_setup(_resolve.resolve_cmd)
+M.cmd = refuse_after_refused_setup(_resolve.cmd)
 M.normalize_modes = _resolve.normalize_modes
 M.mode_enabled = _resolve.mode_enabled
 
@@ -121,6 +129,11 @@ derive(M.options)
 
 function M.setup_done()
   return M._setup_done == true
+end
+
+--- The reason the most recent setup() call was refused, or nil.
+function M.setup_refusal()
+  return M._setup_refusal
 end
 
 
@@ -207,7 +220,7 @@ function M.normalize_debug_modules(value, profile)
 end
 
 
-function M.setup(opts)
+local function apply_setup(opts)
   -- A private copy: nothing below writes into the caller's table, so a second
   -- setup() with the same table resolves to the same options.
   opts = vim.deepcopy(opts or {})
@@ -225,16 +238,8 @@ function M.setup(opts)
   opts.backends = nil
   opts.backend = selected_backend
   opts.model = runtime_backends[selected_backend].model
-  if opts.single_file ~= nil and not M._single_file_notice_emitted then
-    M._single_file_notice_emitted = true
-    vim.notify(
-      "yana: single_file config is deprecated and ignored",
-      vim.log.levels.WARN
-    )
-  end
-  -- CAPTURE.md OC-48: folder grants and the capture-engine selector are retired;
-  -- inline turns reach the home folder and writable data disks without them.
-  -- Old keys warn once, never error.
+  -- Folder-grant and capture-engine keys (CAPTURE.md OC-48) are ignored with a one-time
+  -- warning; inline turns reach the home folder and writable data disks without them.
   local retired = {}
   for _, key in ipairs({ "write_roots", "capture_root", "capture_root_candidates", "open_capture" }) do
     if opts[key] ~= nil then
@@ -250,6 +255,16 @@ function M.setup(opts)
   local next_options = vim.tbl_deep_extend("force", vim.deepcopy(M.defaults), opts)
   next_options.backends = runtime_backends
   next_options.backend = selected_backend
+  local ignore_folders = next_options.ignore_folders
+  assert(type(ignore_folders) == "table" and vim.islist(ignore_folders), "yana: ignore_folders must be a list of absolute paths")
+  for i, path in ipairs(ignore_folders) do
+    assert(type(path) == "string" and path ~= "", "yana: ignore_folders entries must be non-empty absolute paths")
+    local expanded = vim.fn.expand(path)
+    assert(expanded:sub(1, 1) == "/", "yana: ignore_folders entries must be absolute paths (or start with ~)")
+    local stat = vim.uv.fs_stat(expanded)
+    assert(not stat or stat.type == "directory", "yana: ignore_folders entries must name folders: " .. path)
+    ignore_folders[i] = expanded
+  end
   -- Replace (do not deep-merge) each highlight role so a custom bg/fg does not
   -- keep a leftover defaults.link (e.g. DiffAdd) that would win at apply time.
   if opts.diff_highlights then
@@ -275,14 +290,12 @@ function M.setup(opts)
   local timeout = next_options.vendor_timeout_ms
   assert(type(timeout) == "number" and timeout >= 1 and timeout <= 2147483647 and timeout == math.floor(timeout),
     "yana: vendor_timeout_ms must be a positive integer <= 2147483647")
-  next_options.selection_scope = M.normalize_selection_scope(next_options.selection_scope)
   next_options.image_paste = M.normalize_image_paste(next_options.image_paste)
   next_options.redirect = M.normalize_redirect(next_options.redirect)
   next_options.inline_edit = M.normalize_inline_edit(next_options.inline_edit)
   next_options.review = M.normalize_review(next_options.review)
   next_options.skill_dirs = M.normalize_skill_dirs(next_options.skill_dirs)
   next_options.artifact_dir_prefixes = M.normalize_artifact_dir_prefixes(next_options.artifact_dir_prefixes)
-  next_options.single_file = M.normalize_single_file(next_options.single_file)
   next_options.workspace_roots = M.normalize_workspace_roots(next_options.workspace_roots)
   next_options.inline_exec_allowlist = M.normalize_inline_exec_allowlist(next_options.inline_exec_allowlist)
   next_options.cmd_env = M.normalize_cmd_env(next_options.cmd_env)
@@ -313,6 +326,18 @@ function M.setup(opts)
   end)
   require("yana.log").set_level(next_options.log_level)
   return M.options
+end
+
+function M.setup(opts)
+  local ok, result = pcall(apply_setup, opts)
+  M._setup_refusal = not ok
+      and ("yana: setup() was refused, so no agent starts on factory settings; fix the configuration and restart Neovim: "
+        .. tostring(result))
+    or nil
+  if not ok then
+    error(result, 0)
+  end
+  return result
 end
 
 --- Apply winbar chip highlights from `mode_highlights` and `model_highlight`.

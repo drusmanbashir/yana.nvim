@@ -42,16 +42,21 @@ stable: `ask` appears as **Ask**, `inline` as **Inline**, and `agentic` as
 | `<C-c>` | Stop the in-flight response (prompt and conversation window) |
 | `<M-s>` | Pick a session |
 | `<M-n>` | Open an additional panel |
-| `<M-q>` | View/edit the queue |
 | `<C-CR>` | Steer: interrupt and resend the prompt as a new turn |
 | `<C-Space>` | Open the completion menu |
 | `i` | Focus the prompt |
 | `q` | Close the panel |
 
+With Claude, submit a follow-up while it runs to send it to the same process.
+Submit again with the prompt empty to interrupt while Claude is still taking in
+that follow-up. With a backend that cannot take live input, the first press
+keeps your text in the prompt and the second interrupts and resumes the conversation.
+
 ### Global — `<C-a>` toggles the sidebar by default
 
-`<C-a>` opens or closes the panel from any normal-mode buffer. Use `:YanaAsk`
-and `:YanaEdit` for the current line or visual selection.
+`<C-a>` opens or closes the panel from any normal-mode buffer. A conversation is told
+your file and cursor line once, and again when you change file. Use `:YanaAsk` to attach a visual selection and
+`:YanaEdit` to edit the current line or selection.
 
 ## Commands
 
@@ -60,7 +65,7 @@ and `:YanaEdit` for the current line or visual selection.
 | `:Yana` / `:YanaToggle` | Toggle the panel |
 | `:YanaOpen` / `:YanaClose` | Open or close the panel |
 | `:YanaLogin` | Sign in to the selected agent in a Neovim terminal; close it to cancel |
-| `:YanaAsk [question]` | Ask about the current line or visual selection |
+| `:YanaAsk [question]` | Open the panel, attaching a visual selection if given |
 | `:YanaEdit [instruction]` | Edit the current line or visual selection through inline review |
 | `:YanaNew` | Start a new chat |
 | `:YanaNewPanel` | Open an additional panel (parallel session) |
@@ -70,13 +75,11 @@ and `:YanaEdit` for the current line or visual selection.
 | `:YanaModel` | Pick the model (layer 2: within the active backend) |
 | `:YanaBackend` | Pick the backend (layer 1: which binary/account/bill) |
 | `:YanaRefusals` | List system-refused operations and recovery paths |
-| `:YanaIgnore` | List the review ignore list; `:YanaIgnore <pattern>` adds one (gitignore syntax, effective immediately) |
 | `:YanaReview` | Open a pending inline review |
 | `:YanaAccept` / `:YanaReject` | Accept or reject the pending file change |
 | `:YanaAbortReview` | Abort the open review: put the file back as it was before the hunks appeared |
 | `:YanaStop` | Stop the in-flight response |
 | `:YanaSteer` | Interrupt the in-flight response and resend the prompt as a new turn |
-| `:YanaQueue` | View/edit/delete/reorder queued follow-up prompts |
 | `:YanaPasteImage` | Paste an image from the system clipboard into the prompt |
 | `:YanaDump` | Write a diagnostic dump of the current turn and review state, for bug reports |
 | `:YanaFlowReport[!]` | Write the per-turn flow report (`!` also opens it) |

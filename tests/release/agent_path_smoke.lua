@@ -34,6 +34,8 @@ local done_code, done_message
 local job = require("yana.agent.agent").run({
   prompt = "must not start",
   jail_session = {},
+  inline_mcp = true,
+  mcp_context = {},
   on_done = function(code, message)
     done_code, done_message = code, message
   end,

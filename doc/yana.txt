@@ -33,26 +33,23 @@ Two public entries reach the same pipeline:
 
 QUICK INSTALLATION WITH LAZY.NVIM ~
 
-Choose the backend for the agent CLI you already use: "claude" for Claude Code,
-"codex" for Codex, or "cursor" for cursor-agent. An empty opts table selects
-Cursor; Yana does not automatically choose another installed agent.
+Use Claude Code ("claude"), Codex ("codex") or Grok ("grok") for all three
+modes. Cursor supports agentic. An empty opts table selects Claude.
 
 Add this plugin specification to your lazy.nvim configuration: >lua
 
     return {
         "drusmanbashir/yana.nvim",
         dependencies = { "drusmanbashir/yana-ui.nvim" },
-        opts = { backends = { default = "claude" } }, -- or "codex" / "cursor"
+        opts = { backends = { default = "claude" } }, -- or "codex"
     }
 <
 lazy.nvim installs yana-ui.nvim through the dependency entry. On Ubuntu the
-extra sandbox packages are bubblewrap and libcap2-bin (bwrap and capsh): >sh
+ask and inline packages are Python 3.11+ and ripgrep: >sh
 
-    sudo apt-get install bubblewrap libcap2-bin
+    sudo apt-get install python3 ripgrep
 <
 Restart Neovim in your project directory, run `:checkhealth yana`, then `:Yana`.
-If bwrap:userns fails, read its host-permission diagnostic; having the packages
-installed does not mean the host permits the sandbox. See |yana-health|.
 Inline turns can edit your home folder and every writable data disk, wherever
 the turn starts; no folder setting is needed. No model or project-path setting
 is required for normal first use.
@@ -95,7 +92,7 @@ maintained by the Neovim team): >sh
 
 Required:
 
-- Linux with user namespaces, overlayfs, and /proc
+- For ask and inline: Linux with user namespaces, cgroup v2, and /proc
 - Neovim 0.11.2 or newer (see |yana-install| for the Debian/Ubuntu
   AppImage / neovim-ppa/unstable install path and the apt-floor warning)
 - one agent CLI, installed and signed in:
@@ -113,21 +110,14 @@ Required:
         npm install -g @openai/codex
 <   What you need: an OpenAI ChatGPT account (`codex login`, or
     $OPENAI_API_KEY).
-- bash, bwrap, capsh (from libcap2-bin/libcap-utils, used to drop
-  capabilities before the confined agent starts), python3, GNU
-  coreutils/findutils, util-linux mount tools, awk, sed, grep, hostname,
-  getent, and id
-
-Most required tools are checked by name only, so a non-GNU build with the
-same name (e.g. BusyBox) can still pass; stat, find, date, bash, and bwrap
-are checked functionally instead (GNU stat/find/date behavior, bash 4.3+
-nameref support, and a real unprivileged-user-namespace probe), since those
-are the ones confinement actually depends on beyond presence. The
-Linux/overlayfs/proc requirement above is enforced only for confined modes
-(ask, inline); direct agentic mode skips it entirely, since it never
-sandboxes. Confined-mode workspace approval also requires the filesystem to
-report inode birth time (stat %w); `:checkhealth yana` probes your current
-working directory for this before you would otherwise hit a refusal.
+  - `grok` (xAI Grok CLI) — EXPERIMENTAL. Install: >sh
+        curl -fsSL https://x.ai/cli/install.sh | bash
+<   What you need: a grok.com or xAI account (`grok login`, or
+    $XAI_API_KEY). The installer puts `grok` in ~/.grok/bin; if that is not
+    on Neovim's PATH, set `backends.grok.cmd = "~/.grok/bin/grok"`.
+- For ask and inline: Python 3.11+, ripgrep (rg),
+  Bash 4.4+, awk, sed, and GNU coreutils. Yana needs systemd-run when it must
+  enter a delegated systemd user scope. Agentic runs the agent CLI directly.
 
 Optional session discovery uses md5sum or md5. Reading titles of sessions
 started outside Neovim uses sqlite3; without it, external Cursor session
@@ -139,19 +129,10 @@ PLATFORM WARNINGS ~
 
 - macOS is not tested on real hardware; the Darwin refusal path is covered
   only by an automated test, not a real Mac.
-- WSL2 is untested. Yana has not been run against a WSL2 kernel. Ubuntu under
-  WSL2 ships the same AppArmor user-namespace restriction as Ubuntu 24.04
-  desktop, so expect the `bwrap:userns` remedy from `:checkhealth yana`;
-  whether overlayfs behaves under WSL2's kernel has not been measured. Reports
-  welcome.
+- WSL2 is untested.
 - Only x86_64 is tested. Testing installs the x86_64 Neovim tarball. aarch64
   Linux is expected to work (nothing in Yana is architecture-specific) but
   has not been run.
-- Fedora/RHEL is tested in a container with SELinux labelling disabled. With
-  SELinux enforcing on a desktop, bubblewrap may need the `container_use_devices`
-  or an equivalent boolean; if `:checkhealth yana` reports `bwrap:userns`
-  failing with a permission error and the sysctl remedy does not apply, check
-  `ausearch -m avc -ts recent` first.
 - musl-based Linux (Alpine) is an open, named gap: Yana cannot print a cleaner
   refusal because Neovim itself fails to start before any plugin code runs.
 
@@ -172,26 +153,19 @@ PLATFORM WARNINGS ~
 
                                                     *:YanaAsk*
 :[range]YanaAsk [question]
-                    Ask about the current line or supplied visual range.
+                    Open the panel, attaching the range if one is given. A
+                    question is sent at once. A conversation is told your file
+                    and cursor line once, and again when you change file.
 
                                                     *:YanaEdit*
 :[range]YanaEdit [instruction]
-                    Request an inline edit of the current line or range.
+                    Request an inline edit of the current line or range. The
+                    range shows the agent where to look; it may change other
+                    lines and files when the request needs it.
 
                                                     *:YanaRefusals*
 :YanaRefusals       List system-refused artifact operations, durable metadata
                     listings, and unsafe-turn recovery paths.
-
-                                                    *:YanaIgnore*
-:YanaIgnore         List the review ignore list and the per-machine file it is
-                    stored in.
-:YanaIgnore {pat}   Add one gitignore-syntax pattern to that file, effective
-                    immediately. A matching create/modify of a regular file is
-                    written through to the workspace at turn end and never
-                    offered for review; the turn reports the count and paths in
-                    one line. Merged with `review.ignore` from setup(). Never
-                    reaches .git/, .hg/ or .svn/, and never applies a delete,
-                    symlink retarget or mode change unreviewed.
 
                                                     *:YanaReview*
 :YanaReview         Open a pending inline review.
@@ -211,7 +185,7 @@ PLATFORM WARNINGS ~
                     it dies.
 
                                                     *:YanaRecover*
-:YanaRecover [id]   Recover a daemon-kept review after editor death; no id
+:YanaRecover [id]   Recover a frozen partial End after editor death; no id
                     reopens the recovery picker.
 
                                                     *:YanaMode*
@@ -222,12 +196,14 @@ PLATFORM WARNINGS ~
                                                     *:YanaModel*
 :YanaModel          Select a model offered by the current agent.
 
-                                                    *:YanaQueue*
-:YanaQueue          Manage queued follow-up prompts.
-
                                                     *:YanaSteer*
 :YanaSteer          Interrupt the in-flight response and resend the prompt
                     buffer as a new turn.
+
+                    With Claude, submit sends your prompt to the running
+                    agent. Submit again with an empty prompt to interrupt
+                    while the follow-up is still pending. Other backends keep
+                    the draft on the first press and interrupt on the second.
 
                                                     *:YanaAbortReview*
 :YanaAbortReview    Abort the open review: put the file back as it was before
@@ -255,13 +231,22 @@ settings: >lua
 
 Public setup paths~
 
-- `backends`: table selecting and configuring installed agents.
-- `backends.default`: starting agent; `cursor`, `claude`, or `codex`.
-  Omission starts with Cursor.
-- `backends.<name>`: optional settings for one of those agents.
+- `backends`: table listing the agents Yana offers; only listed agents and
+  the default are enabled.
+- `backends.default`: starting agent; a listed name or a preset (`cursor`,
+  `claude`, `codex`, `grok`). Omission starts with Claude.
+- `backends.<name>`: one agent. A preset name switches it on and each setting
+  given replaces the preset's; a new name declares an agent in full (see the
+  presets in lua/yana/configuration/config_defaults_backends.lua). Settings are
+  plain data; functions are refused.
 - `backends.<name>.cmd`: custom executable path.
 - `backends.<name>.model`: model ID for that agent.
+- `backends.<name>.env`: environment variables added to every process Yana
+  starts for that agent.
 - `modes`: available modes and their order; the first is the starting mode.
+- `review`: review settings.
+- `review.max_files`: most files one review can hold; default 30. A moved file
+  counts twice. A bigger change is refused and nothing is applied.
 - `inline_edit`: inline-edit float settings.
 - `inline_edit.enable`: enable the instruction float; default true.
 - `inline_edit.width`: at most 1 means a fraction of editor columns; above 1
@@ -293,23 +278,12 @@ selected command is available.
 ==============================================================================
 7. Security                                                   *yana-security*
 
-In `ask` and `inline`, the agent process runs in a private overlay. The agent
-cannot write the real workspace; only Yana's journaled applier can do so after
-an explicit acceptance. A failure to establish the overlay refuses the turn.
-There is no automatic fallback to direct writes.
-
-Non-interactive inline turns may require cursor-agent's permission-bypass flag
-so its tools can run without a terminal prompt. This flag weakens the vendor's
-own prompt layer. It does not weaken Yana's host boundary: Bubblewrap, the
-overlay, change classification, review, and the journaled applier remain in
-force. `:checkhealth yana` warns whenever this exposure applies.
-
-Generated trees such as target, build, and __pycache__ are terminal
-system-refused groups. Their bytes remain inspectable only until settlement;
-their complete per-operation metadata survives for the newest five turns and
-at most seven days. |:YanaRefusals| expands that metadata. Unsafe destructive
-operations apply nothing, release the workspace claim, and name a preserved
-recovery directory.
+                                                        *yana-mcp*
+In ask and inline, Yana uses the agent CLI's tool permissions. The CLI
+starts from a private directory. Ask exposes Yana's read tools.
+Inline also exposes Yana's proposal tools. The tools see unsaved Neovim text
+from submit time. Inline changes enter review at the end of the run.
+Other programs' writes cannot become proposals.
 
                                                           *yana-workspace*
 WHERE A TURN MAY RUN. The workspace is the nearest `.git` root above the file
@@ -325,20 +299,16 @@ and use the ordinary review/accept path. `:Yana --workspace DIR` binds one
 turn to `DIR`.
 
                                                         *yana-write-scope*
-Inline writes are captured in a private overlay for review before
-application, wherever they land: your home folder, every writable data disk (a
-mounted ordinary filesystem whose top folder you can write) and the turn's own
-folder. A home folder or disk with another filesystem mounted inside it is not
-captured. Other paths, including system folders, stay read-only, and Yana
-names the boundary that refused a write.
+The agent can propose text edits to ordinary files that your Neovim can edit,
+including files outside the starting project. Each proposal goes to review.
 
                                                         *yana-workspace-roots*
 By default, the workspace is the nearest `.git` root above the file, or the
 file's folder when no repository is present. `:Yana --workspace DIR` binds
 one turn to a directory.
 
-Direct `agentic` mode does not use the overlay or review. The selected agent
-CLI can write directly wherever its own permissions allow. Agentic is in the
+In agentic mode the agent CLI can write directly wherever its own
+permissions allow. Agentic is in the
 default `modes` and reached with `:YanaMode`. Omit it from the list to make it
 unavailable, or list it first to start in Agent mode.
 
@@ -356,9 +326,7 @@ Health reports the Neovim version, resolved cursor-agent path (and, since
 |yana-machine-config|, exactly which resolution step found it and every
 candidate tried), required Linux tools, optional session helpers, whether
 the configured skill directories and the cursor-agent chats directory were
-found or skipped, current safety mode, and durable-log status. It also
-probes whether the current workspace's filesystem supports the
-inode birth time confined-mode approval requires. It checks yana's own
+found or skipped, current safety mode, and durable-log status. It checks Yana's own
 default panel keymaps against anything already mapped: a genuine collision
 with a global user/plugin mapping warns, naming both sides; merely shadowing
 a Neovim built-in (yana's panel keymaps are buffer-local, so e.g. `<C-s>`

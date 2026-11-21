@@ -182,6 +182,7 @@ local function section_events(L, out)
     { "· tool_call", c.events_tool_call },
     { "· result", c.events_result },
     { "· error", c.events_error },
+    { "· warning", c.events_warning },
     { "· other", c.events_other },
     { "tool_call completed", c.tool_calls_completed },
     { "dropped stale at the generation gate", c.events_stale_dropped },
@@ -196,7 +197,6 @@ local function section_events(L, out)
     { "artifact ops system-refused", c.ops_system_refused },
     { "review retries", c.review_retries },
     { "agent retry announcements", c.retry_announcements },
-    { "scope rejections", c.scope_rejections },
     { "panel appends", c.panel_appends },
     { "· lines appended", c.panel_append_lines },
     { "stream re-renders", c.stream_renders },
@@ -287,7 +287,7 @@ local function section_hunks(L, out)
       out[#out + 1] = ""
     end
   end
-  -- The N8 line: state it explicitly rather than leaving it to be inferred
+  -- The worst render check: state it explicitly rather than leaving it to be inferred
   -- from two columns.
   local worst = nil
   for _, rc in ipairs(L.render_checks) do

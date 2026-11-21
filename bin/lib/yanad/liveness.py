@@ -148,7 +148,9 @@ def seal_cgroup(cgroup):
             wait_unpopulated(path)
         path.rmdir()
         return "sealed", None
-    except OSError:
+    except OSError as exc:
+        if isinstance(exc, FileNotFoundError) and not path.exists():
+            return "sealed", None
         try:
             procs = " ".join((path / "cgroup.procs").read_text().split())
         except OSError:

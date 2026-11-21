@@ -138,7 +138,8 @@ function M.new(deps)
       M.load(bufnr)
       -- Seals B1 off from what review open writes, so it stays one undo step back.
       deps.break_undo_block(bufnr)
-      change.undo_pre_stage_seq = deps.buf_undo_seq(bufnr)
+      change.undo_pre_stage_seq = #vim.api.nvim_buf_call(bufnr, function() return vim.fn.undotree().entries end) == 0
+        and 0 or deps.buf_undo_seq(bufnr)
       return bufnr, nil
     end
 
@@ -181,7 +182,8 @@ function M.new(deps)
       log.buffer_event("baseline_stage_begin", { change = change, bufnr = bufnr })
       M.load(bufnr)
       deps.break_undo_block(bufnr)
-      change.undo_pre_stage_seq = deps.buf_undo_seq(bufnr)
+      change.undo_pre_stage_seq = #vim.api.nvim_buf_call(bufnr, function() return vim.fn.undotree().entries end) == 0
+        and 0 or deps.buf_undo_seq(bufnr)
       local ok, err = pcall(
         vim.api.nvim_buf_set_lines,
         bufnr,
@@ -238,6 +240,9 @@ function M.new(deps)
       -- on disk; End's save creates the file only if it is accepted (spec
       -- buffer_state_change BUILD, disk audit; BLOCKERS end-2).
       change.disk_at_open = ""
+      if change.kind == "create" and change.renamed_from and change.review_before ~= nil then
+        return stage(vim.fn.bufnr(path, true), change.review_before)
+      end
       return stage(vim.fn.bufnr(path, true), "")
     end
 

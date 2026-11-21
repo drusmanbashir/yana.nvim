@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 # Optional helper for the README "Prerequisites" steps: checks Neovim and the
-# agent CLIs, installs Bubblewrap and, on Ubuntu, adds the AppArmor permission
-# Bubblewrap needs. Keep its packages and profile in step with README.md.
+# agent CLIs and offers to install the MCP tools listed in README.md.
 #
 # Run as your normal user: Neovim and agent CLIs usually live on that user's
 # PATH. Every system command is printed and runs with sudo only after "y".
@@ -9,12 +8,6 @@
 set -uo pipefail
 
 docs=https://github.com/drusmanbashir/yana.nvim/blob/main/docs/installation.md
-profile_path=/etc/apparmor.d/yana-bwrap
-profile='abi <abi/4.0>,
-include <tunables/global>
-profile yana-bwrap /usr/bin/bwrap flags=(unconfined) {
-  userns,
-}'
 
 usage() {
 	cat <<'USAGE'
@@ -76,7 +69,7 @@ check_neovim() {
 
 check_agents() {
 	local exe backend found=0
-	for exe in claude:claude codex:codex cursor-agent:cursor; do
+	for exe in claude:claude codex:codex cursor-agent:cursor grok:grok; do
 		backend=${exe#*:}
 		exe=${exe%%:*}
 		if command -v "$exe" >/dev/null 2>&1; then
@@ -85,92 +78,46 @@ check_agents() {
 		fi
 	done
 	((found)) && return
-	say "need  an agent CLI: Claude Code, Codex or Cursor. Install one: $docs#system-requirements"
+	say "need  an agent CLI: Claude Code, Codex, Cursor or Grok. Install one: $docs#system-requirements"
 	fail=1
 }
 
-install_bubblewrap() {
-	local cmd
-	if command -v bwrap >/dev/null 2>&1 && command -v capsh >/dev/null 2>&1; then
-		say "ok    Bubblewrap and capsh"
+install_mcp_dependencies() {
+	local cmd tool
+	local -a missing=()
+	for tool in python3 rg; do
+		if command -v "$tool" >/dev/null 2>&1; then
+			say "ok    $tool"
+		else
+			case $tool in
+				rg) missing+=(ripgrep) ;;
+				*) missing+=("$tool") ;;
+			esac
+		fi
+	done
+	if (( ${#missing[@]} == 0 )); then
 		return
 	fi
 	if command -v apt-get >/dev/null 2>&1; then
-		cmd="apt-get install -y bubblewrap libcap2-bin"
+		cmd="apt-get install -y ${missing[*]}"
 	elif command -v dnf >/dev/null 2>&1; then
-		cmd="dnf install -y bubblewrap libcap"
+		cmd="dnf install -y ${missing[*]}"
 	elif command -v pacman >/dev/null 2>&1; then
-		cmd="pacman -S --needed bubblewrap libcap"
+		cmd="pacman -S --needed ${missing[*]/python3/python}"
 	else
-		say "need  the packages that provide bwrap and capsh: $docs#system-requirements"
+		say "need  ${missing[*]}: $docs#system-requirements"
 		fail=1
 		return
 	fi
-	privileged "$cmd"
-	if command -v bwrap >/dev/null 2>&1 && command -v capsh >/dev/null 2>&1; then
-		say "ok    Bubblewrap and capsh"
-	else
-		say "need  Bubblewrap and capsh"
-		fail=1
-	fi
-}
-
-# The same check :checkhealth yana runs before a confined turn.
-bwrap_starts() {
-	bwrap --unshare-user --unshare-pid --die-with-parent --ro-bind / / \
-		--dev /dev --proc /proc --uid "$(id -u)" --gid "$(id -g)" -- true >/dev/null 2>&1
-}
-
-allow_bubblewrap() {
-	local restrict="" existing foreign tmp
-	command -v bwrap >/dev/null 2>&1 || return
-	if bwrap_starts; then
-		say "ok    Bubblewrap can start its sandbox"
-		return
-	fi
-	read -r restrict 2>/dev/null </proc/sys/kernel/apparmor_restrict_unprivileged_userns
-	if [[ "$restrict" != 1 ]]; then
-		say "need  Bubblewrap cannot start here (container or kernel setting): $docs#troubleshooting"
-		fail=1
-		return
-	fi
-	existing=$(grep -rl /usr/bin/bwrap /etc/apparmor.d/ 2>/dev/null)
-	foreign=$(grep -vxF "$profile_path" <<<"$existing")
-	if [[ -n "$foreign" ]]; then
-		say "need  an AppArmor profile for /usr/bin/bwrap already exists:"
-		say "$foreign"
-		say "      Ask your administrator to add 'userns,' to it and reload it with"
-		say "      sudo apparmor_parser -r FILE. Do not add a second profile."
-		fail=1
-		return
-	fi
-	if [[ -z "$existing" ]]; then
-		say "Ubuntu restricts user namespaces. This profile lets Bubblewrap use them:"
-		say "$profile"
-		tmp=$(mktemp) || { fail=1; return; }
-		printf '%s\n' "$profile" >"$tmp"
-		privileged "apt-get install -y apparmor" "install -m 0644 $tmp $profile_path" \
-			"apparmor_parser -r $profile_path"
-		rm -f "$tmp"
-	else
-		privileged "apparmor_parser -r $profile_path"
-	fi
-	if bwrap_starts; then
-		say "ok    Bubblewrap can start its sandbox"
-		say "      To undo: sudo apparmor_parser -R $profile_path && sudo rm $profile_path"
-	else
-		say "need  Bubblewrap still cannot start: $docs#troubleshooting"
-		fail=1
-	fi
+	privileged "$cmd" || fail=1
 }
 
 check_neovim
 check_agents
 if [[ "$(uname -s)" == Darwin ]]; then
-	say "note  macOS runs agentic mode only; Bubblewrap is not needed."
+	say "note  macOS runs agentic mode only."
 else
-	install_bubblewrap
-	allow_bubblewrap
+	install_mcp_dependencies
 fi
 
 if ((fail)); then

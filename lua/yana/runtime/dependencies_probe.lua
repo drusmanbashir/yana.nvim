@@ -1,33 +1,21 @@
--- System/toolchain-level dependency probes, split out of lua/yana/runtime/dependencies.lua
---. This module holds the
--- checks that are self-contained -- no config.lua dependency: binary-presence rows, the
--- shared timeout-guarded subprocess probe, GNU coreutils vs BusyBox feature probes
--- (stat/find/date), the bwrap user-namespace probe, and kernel feature rows
--- (namespaces, overlayfs, cgroup v2). The agent-binary resolution rows
+-- Host capabilities used by the MCP launcher and dependency preflight.
 local M = {}
 
 local function row(id, level, message, remedy, resolved)
   return { id = id, level = level, message = message, remedy = remedy, resolved = resolved }
 end
 
--- Package name for each dependency on each of the three package managers
--- yana's remedies target. A missing distro key means the executable's own
--- name is also its package name there -- true for most of
--- dependencies.lua's confined_executables (sed, python3, id, mkdir, ...);
--- only the entries below differ. One table backs both the distro-agnostic
--- prose (package_hint) and the exact copy-paste command (install_command)
--- below, so the two can never drift apart from each other.
+-- Missing executables use these package names in installation advice.
 local EXEC_PACKAGE = {
-  bwrap = { apt = "bubblewrap", dnf = "bubblewrap", pacman = "bubblewrap" },
-  unshare = { apt = "util-linux", dnf = "util-linux", pacman = "util-linux" },
-  capsh = { apt = "libcap2-bin", dnf = "libcap", pacman = "libcap" },
-  flock = { apt = "util-linux", dnf = "util-linux", pacman = "util-linux" },
-  mount = { apt = "util-linux", dnf = "util-linux", pacman = "util-linux" },
-  umount = { apt = "util-linux", dnf = "util-linux", pacman = "util-linux" },
-  find = { apt = "findutils", dnf = "findutils", pacman = "findutils" },
-  awk = { apt = "gawk", dnf = "gawk", pacman = "gawk" },
-  getent = { apt = "libc-bin", dnf = "glibc-common", pacman = "glibc" },
+  python3 = { apt = "python3", dnf = "python3", pacman = "python" },
+  rg = { apt = "ripgrep", dnf = "ripgrep", pacman = "ripgrep" },
+  ["systemd-run"] = { apt = "systemd", dnf = "systemd", pacman = "systemd" },
+  awk = { apt = "mawk", dnf = "gawk", pacman = "gawk" },
 }
+
+for _, name in ipairs({ "realpath", "sha256sum", "stat", "id", "mkdir", "rmdir", "readlink", "dirname" }) do
+  EXEC_PACKAGE[name] = { apt = "coreutils", dnf = "coreutils", pacman = "coreutils" }
+end
 
 local function package_name(name, pkg_manager)
   local entry = EXEC_PACKAGE[name]
@@ -174,182 +162,16 @@ local function probe(cmd, timeout_ms)
   return true, result
 end
 
--- bwrap on PATH proves nothing about whether THIS kernel will let it create an
--- unprivileged user namespace: kernel.apparmor_restrict_unprivileged_userns=1 (Ubuntu
--- 24 default-ish) or a denied userns_clone passes every presence check and then fails
--- bin/yana-overlay's `--unshare-user` at run_overlay(), after the workspace claim is
--- already taken.
-local function bwrap_userns_row()
-  local bwrap = vim.fn.exepath("bwrap")
-  if bwrap == "" then
-    return row(
-      "bwrap:userns",
-      "error",
-      "cannot probe unprivileged user namespaces: bwrap not found on PATH",
-      "install the 'bubblewrap' package and restart Neovim: " .. install_command("bwrap")
-    )
-  end
-  local ok_probe, result, probe_err = probe({
-    bwrap,
-    "--unshare-user",
-    "--unshare-pid",
-    "--die-with-parent",
-    "--ro-bind",
-    "/",
-    "/",
-    "--dev",
-    "/dev",
-    "--proc",
-    "/proc",
-    -- The production uid, not 0: bin/yana-overlay runs the agent as the
-    -- invoking user, and bwrap reaches a non-zero sandbox uid through an
-    -- INTERMEDIATE user namespace -- a different kernel path from `--uid 0`,
-    -- and one a policy can deny on its own. A probe that still asked for
-    -- uid 0 would pass on a host where every real turn refuses.
-    "--uid",
-    tostring(vim.loop.getuid()),
-    "--gid",
-    tostring(vim.loop.getgid()),
-    "--",
-    "true",
-  }, 1500)
-  if not ok_probe then
-    return row(
-      "bwrap:userns",
-      "error",
-      "bwrap user-namespace probe " .. probe_err,
-      "retry; a probe that will not complete cannot be treated as passing"
-    )
-  end
-  if result.code == 0 then
-    return row("bwrap:userns", "ok", "bwrap can create an unprivileged user namespace with bind/proc/dev mounts")
-  end
-  local detail = (result.stderr or ""):gsub("%s+$", "")
-  if detail == "" then
-    detail = string.format("bwrap exited %d", result.code)
-  end
-  return row(
-    "bwrap:userns",
-    "error",
-    "bwrap cannot create an unprivileged user namespace: " .. detail,
-    "on Ubuntu, grant /usr/bin/bwrap an AppArmor userns exception as documented in "
-      .. "docs/installation.md#troubleshooting; on Debian/others, check kernel.unprivileged_userns_clone=1; "
-      .. "then restart Neovim and run :checkhealth yana"
-  )
-end
-
--- The runtime shells out to bash 4.3+ nameref (bin/yana-sandbox
--- build_bwrap_args' `local -n`) and to associative arrays, both of which a
--- name-only check for "bash" cannot distinguish from bash 3.x (macOS
--- default) or a POSIX-only /bin/sh symlinked to `bash`. Namereference is the
--- stricter of the two floors, so one probe covers both.
-local function bash_nameref_row()
-  local bash = vim.fn.exepath("bash")
-  if bash == "" then
-    return row(
-      "bash:nameref",
-      "error",
-      "cannot probe bash: bash not found on PATH",
-      "install bash 4.3 or newer and restart Neovim"
-    )
-  end
-  local ok_probe, result, probe_err = probe({ bash, "-c", "declare -n x=y" }, 1000)
-  if not ok_probe then
-    return row("bash:nameref", "error", "bash nameref probe " .. probe_err, "install bash 4.3 or newer")
-  end
-  if result.code == 0 then
-    return row("bash:nameref", "ok", "bash supports 'declare -n' (nameref, bash 4.3+)")
-  end
-  return row(
-    "bash:nameref",
-    "error",
-    "bash lacks 'declare -n' (nameref); the sandbox launcher requires bash 4.3+",
-    "install GNU bash 4.3 or newer and ensure it resolves first on PATH"
-  )
-end
-
--- bin/yana-sandbox's root-identity check reads inode birth time with
--- `stat -c %w` (isolation.md's same-second delete/recreate close). BusyBox
--- `stat` answers to the same name with no `-c` support at all: usage banner
--- to stderr, non-zero exit. A name-only check cannot tell them apart.
 local function gnu_stat_row()
-  local stat = vim.fn.exepath("stat")
-  if stat == "" then
-    return row(
-      "stat:gnu",
-      "error",
-      "cannot probe stat: stat not found on PATH",
-      "install GNU coreutils and restart Neovim"
-    )
+  local ok_probe, result, detail = probe({ "stat", "-fc", "%T", "." }, 1000)
+  if ok_probe and result.code == 0 and vim.trim(result.stdout or "") ~= "" then
+    ok_probe, result, detail = probe({ "stat", "-c", "%u", "." }, 1000)
+    if ok_probe and result.code == 0 and vim.trim(result.stdout or ""):match("^%d+$") then
+      return row("stat:gnu", "ok", "stat reports filesystem type and directory owner")
+    end
   end
-  local ok_probe, result, probe_err = probe({ stat, "-c", "%w", "." }, 1000)
-  if not ok_probe then
-    return row("stat:gnu", "error", "GNU stat probe " .. probe_err, "install GNU coreutils")
-  end
-  if result.code == 0 then
-    return row("stat:gnu", "ok", "stat is GNU coreutils stat (-c supported)")
-  end
-  return row(
-    "stat:gnu",
-    "error",
-    "stat is not GNU coreutils stat (-c unsupported); root-identity tracking requires it",
-    "install GNU coreutils (the 'coreutils' package) and ensure it resolves first on PATH"
-  )
-end
-
--- bin/yana-sandbox's root-size walk reads type and size with
--- `find -printf`. BusyBox find has no -printf.
-local function gnu_find_row()
-  local find = vim.fn.exepath("find")
-  if find == "" then
-    return row(
-      "find:gnu",
-      "error",
-      "cannot probe find: find not found on PATH",
-      "install GNU findutils and restart Neovim"
-    )
-  end
-  local ok_probe, result, probe_err = probe({ find, ".", "-maxdepth", "0", "-printf", "" }, 1000)
-  if not ok_probe then
-    return row("find:gnu", "error", "GNU find probe " .. probe_err, "install GNU findutils")
-  end
-  if result.code == 0 then
-    return row("find:gnu", "ok", "find is GNU findutils (-printf supported)")
-  end
-  return row(
-    "find:gnu",
-    "error",
-    "find is not GNU findutils (-printf unsupported); the root-size walk requires it",
-    "install GNU findutils (the 'findutils' package) and ensure it resolves first on PATH"
-  )
-end
-
--- bin/yana-sandbox normalises inode birth time with `date -d @<epoch>
--- +%s%N`. BusyBox/mawk-era `date -d` sets the clock instead of parsing one,
--- so the check also pins the parsed output, not only the exit code.
-local function gnu_date_row()
-  local date = vim.fn.exepath("date")
-  if date == "" then
-    return row(
-      "date:gnu",
-      "error",
-      "cannot probe date: date not found on PATH",
-      "install GNU coreutils and restart Neovim"
-    )
-  end
-  local ok_probe, result, probe_err = probe({ date, "-d", "@0", "+%s" }, 1000)
-  if not ok_probe then
-    return row("date:gnu", "error", "GNU date probe " .. probe_err, "install GNU coreutils")
-  end
-  if result.code == 0 and (result.stdout or ""):gsub("%s+$", "") == "0" then
-    return row("date:gnu", "ok", "date is GNU coreutils date (-d supported)")
-  end
-  return row(
-    "date:gnu",
-    "error",
-    "date is not GNU coreutils date (-d unsupported); birth-time normalisation requires it",
-    "install GNU coreutils (the 'coreutils' package) and ensure it resolves first on PATH"
-  )
+  return row("stat:gnu", "error", "stat cannot report filesystem type or directory owner: "
+    .. (detail or result.stderr or ""), "install GNU coreutils")
 end
 
 local function cgroup_context()
@@ -376,7 +198,7 @@ local function kernel_rows(rows)
   local darwin = uname.sysname == "Darwin"
   -- Confined modes stay Linux-only (S-24). On Darwin, name the operator
   -- choice — explicit agentic, or Linux — never "mount procfs".
-  local mac_confined_remedy = "ask/inline need Linux overlayfs+bwrap; on macOS set enable_agentic=true and mode='agentic' (no overlay, no review), or run Yana on Linux. Yana never falls back to agentic by itself"
+  local mac_confined_remedy = "ask and inline require Linux and Bubblewrap; on macOS select agentic explicitly"
   if uname.sysname == "Linux" then
     rows[#rows + 1] = row("kernel:linux", "ok", "Linux kernel: " .. tostring(uname.release))
   else
@@ -396,21 +218,6 @@ local function kernel_rows(rows)
       "error",
       "/proc is unavailable",
       darwin and mac_confined_remedy or "mount procfs before starting Neovim"
-    )
-  end
-
-  local filesystems = ""
-  if vim.fn.filereadable("/proc/filesystems") == 1 then
-    filesystems = table.concat(vim.fn.readfile("/proc/filesystems"), "\n")
-  end
-  if filesystems:match("[%s]overlay[%s]*$") or filesystems:match("[%s]overlay\n") then
-    rows[#rows + 1] = row("kernel:overlayfs", "ok", "overlayfs is available")
-  else
-    rows[#rows + 1] = row(
-      "kernel:overlayfs",
-      "error",
-      "overlayfs is not listed by /proc/filesystems",
-      darwin and mac_confined_remedy or "load or enable the Linux overlay filesystem"
     )
   end
 
@@ -450,11 +257,7 @@ end
 M.row = row
 M.probe = probe
 M.executable_row = executable_row
-M.bwrap_userns_row = bwrap_userns_row
-M.bash_nameref_row = bash_nameref_row
 M.gnu_stat_row = gnu_stat_row
-M.gnu_find_row = gnu_find_row
-M.gnu_date_row = gnu_date_row
 M.kernel_rows = kernel_rows
 -- Exposed for tests/release/install_remedy_smoke.lua: proves the exact
 -- one-liner a distro actually gets, without needing to fake /etc/os-release

@@ -1,6 +1,7 @@
 -- Turn-wide undo, redo, action policy, and refusal bookkeeping.
 local M = {}
 local review_turn_reset_factory = require("yana.review_turn_reset")
+local RENAME_LABEL = "rename %s -> %s"
 
 function M.new(deps)
   local M = deps.facade
@@ -81,7 +82,11 @@ local function compound_mode_text(change)
     return nil
   end
   local parts = {}
-  if change.kind == "delete" then
+  if change.renamed_from then
+    local root = change.review_workspace or vim.fn.getcwd()
+    parts[#parts + 1] = string.format(RENAME_LABEL, vim.fs.relpath(root, change.renamed_from) or change.renamed_from,
+      change.rel or change.path)
+  elseif change.kind == "delete" then
     parts[#parts + 1] = "delete " .. tostring(change.rel or change.path)
   end
   if change.base_mode and change.after_mode and mode_perm(change.base_mode) ~= mode_perm(change.after_mode) then
@@ -125,14 +130,12 @@ end
 --- fresh block carries the index, and `Ledger:rebuild` carries the name across
 --- on that.
 ---
---- THE ORDINARY INDEXLESS CONTINUATION is the case that used to fall through.
+--- THE ORDINARY INDEXLESS CONTINUATION needs a name too.
 --- `review_model.stamp_model_index` leaves `model_index = nil` on whole classes
 --- of perfectly ordinary hunks -- a pure deletion, a block no payload run
 --- starts at, a block spanning several runs, and every hunk of a
 --- `model_unavailable` change -- so those hunks have no index to ride across.
---- Bytes used to carry them, badly; with that carrier gone they arrived fresh,
---- and the frames naming them stopped resolving
---- (`INDEXLESS_REBUILD old=lin-1 fresh=lin-2 inherited=false undo_ok=false`).
+--- Without a carried name they arrive fresh, and the frames naming them stop resolving.
 ---
 --- So this owner names them, and the name it uses is ORDINAL, not content: both
 --- lists are in buffer order and both come out of the SAME derivation over the

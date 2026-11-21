@@ -77,9 +77,8 @@ live_block_range = function(bufnr, block)
 end
 late.live_block_range = live_block_range
 
---- Neovim owns the modified flag, so a decision no longer sets it by
---- comparing the buffer with the file on disk. Kept as a no-op for its four
---- callers outside this module until they are removed.
+--- Neovim owns the modified flag, so a decision does not set it. A no-op kept
+--- for its callers.
 function M._recompute_modified(_bufnr, _blocks, _path)
 end
 

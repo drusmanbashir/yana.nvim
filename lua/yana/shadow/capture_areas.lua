@@ -49,25 +49,63 @@ function M.mounts(text)
 	return rows
 end
 
---- The sorted capture areas. A candidate with another filesystem mounted inside
---- it is left out: a kernel overlay does not cross mounts in its lower layer, so
---- covering it would hide that inner filesystem from the agent.
---- `opts.home`, `opts.mountinfo` and `opts.writable(path)` exist for tests.
-function M.list(opts)
-	opts = opts or {}
-	local text = opts.mountinfo
-	if not text then
-		local fh = io.open("/proc/self/mountinfo", "r")
-		text = fh and fh:read("*a") or ""
-		if fh then
-			fh:close()
+local function read(path)
+	local fh = io.open(path, "r")
+	local text = fh and fh:read("*a") or ""
+	if fh then
+		fh:close()
+	end
+	return text
+end
+
+-- The legacy test launcher uses the same views folder.
+local VIEW_DIR = "/.yana"
+
+--- The views `/etc/fstab` names, `{ [root] = view }`: an entry whose target is a
+--- folder inside `/.yana` gives the launcher a mount-free read-only view of its
+--- source to cover that root from.
+function M.views(text)
+	local views = {}
+	for line in text:gmatch("[^\n]+") do
+		local source, target = line:match("^%s*([^#%s]%S*)%s+(%S+)")
+		if source then
+			target = unescape(target)
+			if target ~= VIEW_DIR and inside(VIEW_DIR, target) then
+				views[unescape(source)] = target
+			end
 		end
 	end
+	return views
+end
+
+--- TEXT with every view path written as the root it shows, so a launch error
+--- names `/s`, never `/.yana/s`. The views are read once, when this is built.
+function M.view_hider(fstab)
+	local views = M.views(fstab or read("/etc/fstab"))
+	return function(text)
+		for root, view in pairs(views) do
+			text = text:gsub(vim.pesc(view), (root:gsub("%%", "%%%%")))
+		end
+		return text
+	end
+end
+
+--- The sorted capture areas. A candidate with another filesystem mounted inside
+--- it is left out unless it has a view: a kernel overlay refuses a lower layer
+--- that holds a mount, and the view is the same files with no mount inside.
+--- `opts.home`, `opts.mountinfo`, `opts.fstab` and `opts.writable(path)` exist for tests.
+function M.list(opts)
+	opts = opts or {}
+	local text = opts.mountinfo or read("/proc/self/mountinfo")
+	local views = M.views(opts.fstab or read("/etc/fstab"))
 	local writable = opts.writable or function(path)
 		return uv.fs_access(path, "W") == true
 	end
 	local mounts = M.mounts(text)
 	local function has_inner_mount(root)
+		if views[root] then
+			return false
+		end
 		for _, row in ipairs(mounts) do
 			if row.mountpoint ~= root and inside(root, row.mountpoint) then
 				return true

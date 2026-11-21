@@ -79,7 +79,12 @@ function M.blocked(p)
 			"accept or reject them first (ca / :YanaReject)"
 		)
 	end
-	if require("yana.inline_diff").active_state({}) ~= nil then
+	-- F-MODES-OPEN-REVIEW: this chat's live review Turn is open even with nothing
+	-- pending and no review buffer (every member refused, all decided, End owed).
+	local shadow = p.shadow_turn or (p.shadow_pass and p.shadow_pass.shadow_turn)
+	if require("yana.inline_diff").active_state({}) ~= nil
+		or (shadow and require("yana.turn.turn_bind").owned_by(shadow.turn_id))
+	then
 		return refusal("review_open", "a review is open", "finish or reject it first (ca / :YanaReject)")
 	end
 
@@ -109,75 +114,6 @@ function M.blocked(p)
 	return nil
 end
 
-local function status_refusal(p, status)
-	local own_session = p.yanad_session_id and tostring(p.yanad_session_id) or nil
-	for _, sess in ipairs(status.sessions or {}) do
-		if own_session and tostring(sess.session_id) == own_session and sess.review then
-			local sid = tostring(sess.session_id or "?")
-			return refusal(
-				"review_open_disk",
-				"this session still has an open review recorded by yanad",
-				"finish or reject it first (ca / :YanaReject); or abort with: bin/yana-overlay review-abort --session '"
-					.. sid
-					.. "'"
-			)
-		end
-		if own_session and tostring(sess.session_id) == own_session then
-			for _, turn in ipairs(sess.turns or {}) do
-				local active = turn.state == "running" or turn.state == "settling" or turn.state == "reviewing"
-				if active then
-					return refusal(
-						"turn_open",
-						string.format(
-							"yanad still has this session's turn open (session %s turn %s state %s)",
-							tostring(sess.session_id),
-							tostring(turn.turn_id),
-							tostring(turn.state)
-						),
-						"wait for that turn to settle, or resolve the session with review-abort / session-delete"
-					)
-				end
-			end
-		end
-	end
-	return nil
-end
-
-local status_seq = 0
-
---- Check renewal without blocking. Ask skips daemon status because it cannot
---- claim or write the workspace.
-function M.check_blocked(p, target_mode, done)
-	local local_refusal = M.blocked(p)
-	if local_refusal then
-		done(local_refusal)
-		return true
-	end
-	if target_mode == "ask" then
-		done(nil)
-		return true
-	end
-	status_seq = status_seq + 1
-	local request_id = table.concat({
-		"renewal",
-		"status",
-		tostring((vim.uv or vim.loop).hrtime()),
-		tostring(status_seq),
-	}, ":")
-	require("yana.runtime.yanad").status({}, request_id, function(ok, result_or_code)
-		if not ok or type(result_or_code) ~= "table" then
-			done(refusal(
-				"status_unknown",
-				"yanad status is unavailable (" .. tostring(result_or_code or "unknown") .. ")",
-				"wait for yanad to recover, then switch mode again"
-			))
-			return
-		end
-		done(status_refusal(p, result_or_code))
-	end)
-	return true
-end
-
 local function render_refusal(r)
 	if not r then
 		return nil
@@ -186,12 +122,6 @@ local function render_refusal(r)
 		return r.condition
 	end
 	return r.condition .. " — " .. r.action
-end
-
-function M.check_blocked_reason(p, target_mode, done)
-	return M.check_blocked(p, target_mode, function(r)
-		done(render_refusal(r))
-	end)
 end
 
 --- The operator-facing rendering of `M.blocked`: condition, then action appended.
@@ -376,15 +306,6 @@ function M.changed_mind_gap(p, question)
 		),
 		"say what you want done in this message, or resume the earlier chat (:YanaSessions) and switch mode from there"
 	)
-end
-
---- The rendered form, for the notification.
-function M.changed_mind_gap_reason(p, question)
-	local r = M.changed_mind_gap(p, question)
-	if not r then
-		return nil
-	end
-	return r.condition .. " — " .. r.action
 end
 
 --- The toggle_mode cycle: config.modes, in list order.

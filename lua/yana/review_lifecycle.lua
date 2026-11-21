@@ -2,13 +2,8 @@
 --
 -- Teardown mechanics are NOT here. They live in `yana.review_resources`, which
 -- owns the single buffer-owner table and is the only thing entitled to decide
--- whether this state may still touch a shared resource. This file used to carry
--- its own copy of that body, keyed on `state.bufnr` alone: it cleared the paint,
--- authority, anchor and hint namespaces and every `state.keys` entry on that
--- buffer with no currency or owner test at all, so a review closing after a
--- NEWER review had attached to the same buffer stripped the live one's marks and
--- maps. The two functions below are the whole of what remains: a name callers
--- already use, pointed at the owner.
+-- whether this state may still touch a shared resource. The two functions below
+-- are a name callers already use, pointed at the owner.
 local Factory = {}
 local apply_sessions = require("yana.shadow.apply_sessions")
 local hunk_ledger = require("yana.hunk_ledger")
@@ -91,9 +86,8 @@ function Factory.new(deps)
     -- trailing-newline shape before the buffer is snapshotted or saved.
     --
     -- Declared here, not further down: the shadow_apply branch below returns
-    -- before the legacy path and so never ran this, which made every shadow
-    -- accept of a file without a trailing newline write one anyway — and turned
-    -- an agent-created EMPTY file into a one-byte "\n" file.
+    -- before the legacy path and needs this too, or a file without a trailing
+    -- newline gets one written and an agent-created EMPTY file becomes a one-byte "\n" file.
     local function match_eol(snapshot)
       local wants_eol = (snapshot or ""):match("\n$") ~= nil
       vim.bo[bufnr].fixendofline = wants_eol
@@ -111,12 +105,9 @@ function Factory.new(deps)
         -- Accept options carry this review's splice door to the applier's reconcile.
         local accept_opts = { staged_bufnr = bufnr, own_splice = review_watch.own_splice }
         if change.kind == "delete" then
-          -- Same guard the legacy accept path below carries, and it was missing here: a
-          -- deletion accept never reads the review buffer, so human text typed into it
-          -- during the review would vanish with no trace. This branch returns before
-          -- that guard is reached, and it snapshotted the buffer regardless of kind,
-          -- which made shadow-apply a third unguarded discard site once E9 routed every
-          -- turn through it. Refuse by name and keep both versions: their text in the
+          -- Same guard the legacy accept path below carries: a deletion accept never
+          -- reads the review buffer, so human text typed into it during the review would
+          -- vanish with no trace. Refuse by name and keep both versions.
           if not staged_snapshot_unchanged(state) then
             ok, err = false, "buffer holds edits that accepting this deletion would discard"
           else

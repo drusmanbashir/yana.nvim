@@ -31,9 +31,13 @@ function M.new(deps)
 		local origin = opts.origin
 
 		if selection and selection.buf and vim.api.nvim_buf_is_valid(selection.buf) then
+			-- A URL-style name (`oil:///dir/`) names a real path after its scheme; a directory
+			-- buffer is its own folder, and a name naming no folder falls through to cwd.
 			local name = vim.api.nvim_buf_get_name(selection.buf)
-			if name ~= "" then
-				return vim.fn.fnamemodify(diff.abs_path(name), ":h")
+			local abs = name ~= "" and diff.abs_path(name:match("^%a[%w+.-]*://(/.*)$") or name) or ""
+			local dir = vim.fn.isdirectory(abs) == 1 and abs or vim.fn.fnamemodify(abs, ":h")
+			if abs ~= "" and vim.fn.isdirectory(dir) == 1 then
+				return dir
 			end
 		end
 		if origin and origin.name and origin.name ~= "" then
@@ -44,26 +48,6 @@ function M.new(deps)
 			return vim.fn.fnamemodify(abs, ":h")
 		end
 		return cwd
-	end
-
-	function I.buffer_real_path(opts)
-		opts = opts or {}
-		local selection = opts.selection
-		if selection and selection.buf and vim.api.nvim_buf_is_valid(selection.buf) then
-			local name = vim.api.nvim_buf_get_name(selection.buf)
-			if name ~= "" then
-				return diff.abs_path(name)
-			end
-		end
-		local origin = opts.origin
-		if origin and origin.name and origin.name ~= "" and vim.fn.isdirectory(origin.name) ~= 1 then
-			return origin.name:match("^/") and diff.abs_path(origin.name) or diff.abs_path(origin.name)
-		end
-		local name = vim.api.nvim_buf_get_name(0)
-		if name ~= "" then
-			return diff.abs_path(name)
-		end
-		return nil
 	end
 
 	--- THE TURN'S WORKSPACE: the repository the candidate directory belongs to.
@@ -182,7 +166,7 @@ function M.new(deps)
 	---
 	--- Yana's state root may be inside it: the launcher binds the real state root
 	--- read-only on top of every overlay that covers it
-	--- (`bin/lib/yana-overlay/mount.sh` `mount_state_root_shield`).
+	--- (`bin/yana-overlay` `state_root_shield_args`).
 	function I.broad_root_for(workspace)
 		local ws = diff.abs_path(workspace)
 		local ws_real = uv.fs_realpath(ws) or ws

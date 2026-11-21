@@ -1,39 +1,50 @@
-#!/usr/bin/env bash
-# turn_smoke_agent — fixture agent for tests/release/turn_smoke.lua ONLY.
-#
-# tests/release/fake-cursor-agent (used by every other release smoke) never
-# edits a file: its stream is three fixed narration lines and nothing else,
-# which is exactly why the release smoke that used it never drove a real
-# turn (fresh install ran `yana.setup()` and opened the panel, never
-# submitted a prompt). This script is deliberately different: it makes ONE
-# real file edit as a side effect of its own execution -- the same technique
-# tests/release/confined_turn_smoke.lua's raw `sh -c` command already uses
-# and proves works under the real bwrap-confined overlay -- and THEN emits a
-# narration stream, so a turn driven through the ordinary product path
-# (yana.agent.run -> yana.vendor_stream -> overlay walk -> yana.inline_diff
-# review) produces a real, reviewable hunk instead of a no-op turn.
-#
-# The edit must happen for real, inside whatever confinement wraps this
-# process (bin/yana-overlay-inner via bwrap for mode=inline/ask): the whole
-# point of turn_smoke.lua is that the review it asserts on is derived from
-# the overlay's own upper-layer diff at turn end, never from parsing this
-# stream's JSON content.
-set -euo pipefail
-for arg in "$@"; do
-	if [[ "$arg" == "--list-models" ]]; then
-		printf 'Available models\n\nauto - Auto (current)\n'
-		exit 0
-	fi
-done
-# The fresh-install harness first proves this manager can execute on the host.
-# The same request from the real confined turn must be refused.
-if systemd-run --user --quiet --wait --pipe --collect -- /usr/bin/true; then
-	echo 'turn smoke: host user manager executed from inside confinement' >&2
-	exit 1
-fi
-target="${YANA_TURN_SMOKE_TARGET:-notes.txt}"
-printf 'turn smoke edit\n' >>"$target"
-printf '%s\n' \
-	'{"type":"system","subtype":"init","session_id":"yana-turn-smoke","model":"Auto"}' \
-	'{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"turn smoke edit"}]},"session_id":"yana-turn-smoke"}' \
-	'{"type":"result","subtype":"success","is_error":false,"result":"turn smoke edit","session_id":"yana-turn-smoke","usage":{"inputTokens":1,"outputTokens":1}}'
+#!/usr/bin/env python3
+"""Exercise MCP through the generated Claude configuration in an installed tree."""
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+args = sys.argv[1:]
+if "--list-models" in args:
+    print("Available models\n\nauto - Auto (current)")
+    raise SystemExit(0)
+target = os.environ.get("YANA_TURN_SMOKE_TARGET", "notes.txt")
+if "--mcp-config" in args:
+    assert "--restricted" in args and "--strict-mcp-config" in args
+    assert args[args.index("--tools") + 1] == ""
+    assert Path.cwd() == Path(os.environ["YANA_STATE_ROOT"]) / "mcp-agent"
+    assert not Path(target).exists()
+    config = json.loads(Path(args[args.index("--mcp-config") + 1]).read_text())
+    server = config["mcpServers"]["yana"]
+    with subprocess.Popen([server["command"], *server["args"]], cwd=server["cwd"],
+                          env={**os.environ, **server["env"]}, stdin=subprocess.PIPE,
+                          stdout=subprocess.PIPE, text=True) as process:
+        def call(number, method, params):
+            process.stdin.write(json.dumps({"jsonrpc": "2.0", "id": number,
+                                            "method": method, "params": params}) + "\n")
+            process.stdin.flush()
+            response = json.loads(process.stdout.readline())
+            result = response["result"]
+            assert not result.get("isError"), result
+            return result
+
+        call(1, "initialize", {"protocolVersion": "2025-11-25", "capabilities": {},
+                               "clientInfo": {"name": "release-smoke", "version": "1"}})
+        if server["env"].get("YANA_MCP_MODE") == "ask":
+            call(2, "tools/call", {"name": "read", "arguments": {"name": target}})
+        else:
+            result = call(2, "tools/call", {"name": "open_buffer", "arguments": {"name": target}})
+            opened = json.loads(result["content"][0]["text"])
+            call(3, "tools/call", {"name": "edit_buffer", "arguments": {
+                "buffer_ref": opened["buffer_ref"], "after_text": opened["text"] + "turn smoke edit\n"}})
+        process.stdin.close()
+        if process.wait(timeout=5):
+            raise SystemExit("MCP server failed")
+else:
+    raise SystemExit("missing Claude MCP configuration")
+session = "yana-turn-smoke"
+print(json.dumps({"type": "system", "subtype": "init", "session_id": session, "model": "Auto"}))
+print(json.dumps({"type": "result", "subtype": "success", "is_error": False,
+                  "result": "turn smoke edit", "session_id": session}))

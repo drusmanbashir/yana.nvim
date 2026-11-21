@@ -6,12 +6,6 @@ local notify_one_line = notify.one_line
 
 local M = {}
 
-local PENDING_TURN_STATES = {
-  settling = true,
-  reviewing = true,
-  dead_unsealed = true,
-}
-
 local function clean_path(path)
   return vim.fn.fnamemodify(tostring(path or ""), ":p"):gsub("/+$", "")
 end
@@ -27,26 +21,9 @@ local function sid8(choice)
   return choice and type(choice.session_id) == "string" and choice.session_id:sub(1, 8) or ""
 end
 
-local function pending_state(row)
-  if row.review then
-    return "reviewing"
-  end
-  for _, turn in ipairs(row.turns or {}) do
-    if PENDING_TURN_STATES[turn.state] then
-      return turn.state
-    end
-  end
-  return nil
-end
-
 local function pending_for_workspace(row, workspace)
-  if type(row) ~= "table" or clean_path(row.workspace) ~= workspace then
-    return false
-  end
-  if row.kind == "nvim" and row.liveness == "live" then
-    return false
-  end
-  return pending_state(row) ~= nil
+  return type(row) == "table" and clean_path(row.workspace) == workspace
+    and row.frozen_end == true and row.liveness ~= "live"
 end
 
 local function age_text(since, elapsed)
@@ -75,7 +52,7 @@ local function recovery_rows(status, workspace)
   for _, row in ipairs(status.sessions or {}) do
     if pending_for_workspace(row, workspace) then
       row = vim.tbl_extend("force", {}, row)
-      row._yana_state = pending_state(row)
+      row._yana_state = "frozen End"
       row._yana_age = type(row.review_age_seconds) == "number"
         and age_text(row.review_age_seconds, true)
         or age_text(since_by_session[row.session_id])
@@ -160,7 +137,6 @@ function M.new(deps)
         end
         return
       end
-      require("yana.runtime.yanad_recover").note_discovery_prunes(status.pruned)
       local rows = recovery_rows(status, workspace)
       if #rows == 0 then
         if opts.notify_empty then

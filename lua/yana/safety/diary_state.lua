@@ -99,7 +99,7 @@ function M.new(deps)
 
 	--- `evidence_of` the path as it is NOW, stamped with this read's time, or nil
 	--- plus the named refusal. End's journaled write takes its evidence here
-	--- (CORE "Saving is Neovim's", LEDGER N51): a file the operator saved with
+	--- (CORE "Saving is Neovim's"): a file the operator saved with
 	--- `:w` during review is the file End acts on, not drift.
 	local function current_evidence(path)
 		local state, serr = observe_state(path)
@@ -193,8 +193,8 @@ function M.new(deps)
 	--- matches only absent, and type, mode, symlink target and content must all
 	--- agree.
 	local function state_matches(op, state)
-		-- Mutation seam (gate): the pre-fix content-only fallback for an operation
-		-- carrying no tag. It is what made absence and an empty file compare equal.
+		-- Mutation seam (gate): content-only fallback for an operation carrying no tag;
+		-- it makes absence and an empty file compare equal.
 		if test_state.fault.allow_untagged_base and op.base_state == nil then
 			return (state.kind == "absent" and hash_bytes("") or state.hash) == op.base_hash
 		end

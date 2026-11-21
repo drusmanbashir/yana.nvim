@@ -8,6 +8,7 @@ local notify = require("yana.notify")
 
 local M = {}
 local uv = vim.uv or vim.loop
+local inline_runs = {}
 
 -- req: { prompt, mode, model, session_id, images? }
 --
@@ -47,7 +48,7 @@ local function build_cmd(req, resolved_command)
   vim.list_extend(cmd, bd.stream_json_args or {})
   if stream_channel then
     -- Hold stdin open for user/control frames.
-    vim.list_extend(cmd, { "--input-format", "stream-json" })
+    vim.list_extend(cmd, { "--input-format", "stream-json", "--replay-user-messages" })
   end
 
   -- `o.trust` / `o.approve_mcps` only ever meant "cursor-agent, don't prompt me
@@ -59,6 +60,15 @@ local function build_cmd(req, resolved_command)
     if o.approve_mcps then
       table.insert(cmd, "--approve-mcps")
     end
+  end
+
+  if req.inline_mcp then
+    local policy = req.inline_policy or require("yana.configuration.config_backends").inline_mcp_route(
+      bd, req.yana_mode or (req.mode == "ask" and "ask" or "inline")) or bd.inline_mcp
+    if not policy then error("yana: backend " .. tostring(backend_name) .. " does not support inline MCP", 0) end
+    -- "{config}" is the config path, or the override tokens of a "cli" config.
+    local config_tokens = type(req.mcp_config_path) == "table" and req.mcp_config_path or { req.mcp_config_path }
+    for _, token in ipairs(policy.args) do vim.list_extend(cmd, token == "{config}" and config_tokens or { token }) end
   end
 
   -- Vendor sandbox levels: Yana selects one level; the descriptor supplies the
@@ -74,7 +84,7 @@ local function build_cmd(req, resolved_command)
     end
     sandbox_level = config.options.sandbox[yana_mode]
   end
-  local sandbox_tokens = bd.sandbox_args[sandbox_level]
+  local sandbox_tokens = req.inline_mcp and {} or bd.sandbox_args[sandbox_level]
   if type(sandbox_tokens) ~= "table" then
     error(
       "yana: backend " .. tostring(backend_name) .. " has no sandbox_args for level " .. tostring(sandbox_level),
@@ -85,7 +95,9 @@ local function build_cmd(req, resolved_command)
 
   -- Non-sandbox permission/launch tokens stay separate; `plan` survives only as
   -- the historical ask alias.
-  if mode == "ask" or mode == "plan" then
+  if req.inline_mcp then
+    -- The MCP tool allowlist is the only edit route; do not add a vendor edit mode.
+  elseif mode == "ask" or mode == "plan" then
     -- ask_args contains only non-sandbox tokens and may be empty or absent.
     if bd.ask_args then
       vim.list_extend(cmd, bd.ask_args)
@@ -142,9 +154,15 @@ local function build_cmd(req, resolved_command)
     end
   end
 
-  -- Prompt is positional unless the stream-json channel sends it as stdin.
+  -- Prompt is positional unless the stream-json channel sends it as stdin. A
+  -- prompt_flag vendor takes it as one `flag=prompt` token, so a prompt that
+  -- starts with "-" is never parsed as an option.
   if not stream_channel then
-    table.insert(cmd, req.prompt)
+    if bd.prompt_flag then
+      table.insert(cmd, bd.prompt_flag .. "=" .. req.prompt)
+    else
+      table.insert(cmd, req.prompt)
+    end
   end
   return cmd
 end
@@ -191,21 +209,28 @@ local start_cpu_sampler = agent_cpu_sampler.start
 local stop_cpu_sampler = agent_cpu_sampler.stop
 local stderr_tail = agent_cpu_sampler.stderr_tail
 M.status = agent_cpu_sampler.status
-M._test.set_sample_interval_ms = agent_cpu_sampler.set_sample_interval_ms
-M._test.force_status = agent_cpu_sampler.force_status
 
 -- run a request. yana_mode (string?) is the yana dial value for THIS turn
 -- (config.panel_mode(p.mode) at submit time); the jail session's mode is set only from it.
 function M.run(req)
+  local setup_refusal = config.setup_refusal()
+  if setup_refusal then
+    if req.on_done then
+      req.on_done(-1, setup_refusal)
+    end
+    return nil
+  end
+
   -- CONFINEMENT IS AN INVARIANT OF THE MODE, NOT A COURTESY OF THE CALLER.
   -- `inline` AND `ask` promise the agent is confined (a property of the harness,
   -- not of whether the turn proposes anything). If it cannot be, the turn does not
   -- run: there is no degraded confined turn, and silently becoming `agentic`
   -- because a session was missing is the failure the mode dial exists to prevent.
-  if config.overlay_mode() and not req.jail_session then
+  local yana_mode = config.panel_mode(req.yana_mode)
+  if yana_mode ~= "agentic" and not (req.inline_mcp and req.jail_session and req.mcp_context) then
     local msg = string.format(
-      "yana: %s mode requires the agent to run confined, and no overlay session was established for this turn — refusing to run it unconfined",
-      config.options.mode
+      "yana: %s mode requires a confined MCP session",
+      yana_mode
     )
     if req.panel_id then
       local L0 = ledger.ensure(req.panel_id, req.turn_gen)
@@ -236,12 +261,54 @@ function M.run(req)
     return nil
   end
 
-  local ready, dependency_error = dependencies.preflight(config.options.mode)
+  local ready, dependency_error = dependencies.preflight(yana_mode)
   if not ready then
     if req.on_done then
       req.on_done(-1, "yana: dependency preflight refused before agent start: " .. dependency_error)
     end
     return nil
+  end
+  local inline_run
+  local io_host
+  local jail = require("yana.shadow.jail")
+  local job_env
+  if req.inline_mcp then
+    local policy = req.inline_policy
+    if not policy then
+      if req.on_done then req.on_done(-1, "yana: selected backend does not support inline MCP") end
+      return nil
+    end
+    local context = req.mcp_context
+    context.input = req.mcp_input and req.mcp_input.input
+    context.turn_pass = req.turn_pass
+    local runtime_dir = jail.mcp_runtime_dir()
+    vim.fn.mkdir(runtime_dir, "p", 448)
+    local io_err
+    io_host, io_err = require("yana.runtime.mcp_inline_io").new(context, runtime_dir)
+    if not io_host then
+      context:close(function()
+        if req.on_done then req.on_done(-1, "yana: could not create MCP socket: " .. tostring(io_err)) end
+      end)
+      return nil
+    end
+    context.io_host = io_host
+    local listening, listen_err = io_host:start()
+    if not listening then
+      context:close(function()
+        if req.on_done then req.on_done(-1, "yana: could not start MCP socket: " .. tostring(listen_err)) end
+      end)
+      return nil
+    end
+    local config_path, mcp_env = jail.write_mcp_config(context.id, policy, io_host.dir)
+    if not config_path then
+      context:close(function()
+        if req.on_done then req.on_done(-1, "yana: could not create MCP config: " .. tostring(mcp_env)) end
+      end)
+      return nil
+    end
+    inline_run = { context = context, host = io_host, config_path = config_path }
+    req.mcp_config_path = config_path
+    job_env = vim.tbl_extend("force", mcp_env, { YANA_MCP_SOCKET = io_host.path, YANA_MCP_WORKSPACE = req.cwd })
   end
   local cmd = build_cmd(req, resolution.value)
   -- The resolved agent binary (cmd[1]), captured before `cmd` may be reassigned to a
@@ -253,36 +320,17 @@ function M.run(req)
   -- second process?".
   local L = req.panel_id and ledger.ensure(req.panel_id, req.turn_gen) or nil
   local spawn = nil
-  local job_env = nil
-  local jail = nil
-  if config.overlay_mode() and req.jail_session then
-    jail = require("yana.shadow.jail")
-    -- NEVER req.mode here: that is the VENDOR permission mode, while jail.wrap_cmd
-    -- feeds this into config.resolve_mode(session.mode).
-    req.jail_session.mode = req.yana_mode or config.options.mode
-    local wrapped, jail_env = jail.wrap_cmd(cmd, req.jail_session)
+  if req.inline_mcp then
+    local wrapped, launch_env = jail.wrap_mcp_cmd(cmd, req.jail_session, io_host.dir)
     if not wrapped then
-      if L then
-        ledger.record_spawn(L, {
-          argv = cmd,
-          cmd = resolved_cmd,
-          cwd = req.cwd,
-          mode = req.mode,
-          model = req.model,
-          resume_session_id = req.session_id,
-          reason = req.spawn_reason or "submit",
-          jailed = true,
-          ok = false,
-          error = jail_env or jail.UNAVAILABLE_MSG,
-        })
-      end
-      if req.on_done then
-        req.on_done(-1, jail_env or jail.UNAVAILABLE_MSG)
-      end
+      jail.remove_mcp_config(inline_run.config_path)
+      inline_run.context:close(function()
+        if req.on_done then req.on_done(-1, launch_env) end
+      end)
       return nil
     end
     cmd = wrapped
-    job_env = jail.merge_spawn_env(jail_env)
+    job_env = vim.tbl_extend("force", job_env or {}, launch_env)
   end
   local pending = ""
   local stderr_acc = {}
@@ -291,6 +339,7 @@ function M.run(req)
   -- record and the panel see the same event.
   local last_event = nil
   local job_id = nil
+  local steer_channel = require("yana.agent.steer_channel")
   -- The requested/actual model comparison fires once per turn, from the first
   -- system event that names a model.
   local model_mismatch_checked = false
@@ -322,11 +371,10 @@ function M.run(req)
 
   -- LAYER 1 NARRATION. The normalizer translates every vendor's dialect into
   -- cursor's event shape so `on_event` never learns there was a second vendor. It is
-  -- narration only: the review list is derived from the overlay walk at turn end,
-  -- so a vendor that narrates nothing still yields reviewable hunks.
+  -- Narration is independent of the proposals submitted through Yana's MCP tools.
   local vendor_stream = require("yana.agent.vendor_stream")
   local vstate = vendor_stream.new_state({
-    protocol = (config.backend_descriptor(config.options.backend) or {}).stream_protocol or "cursor",
+    protocol = (config.backend_descriptor() or {}).stream_protocol or "cursor",
     cwd = req.cwd,
   })
 
@@ -334,8 +382,11 @@ function M.run(req)
     if line == nil or line == "" then
       return
     end
-      local ok, obj = pcall(vim.json.decode, line)
+    local ok, obj = pcall(vim.json.decode, line)
     if ok and type(obj) == "table" then
+      if job_id then
+        steer_channel.observe(job_id, obj)
+      end
       if obj.type == "result" then
         got_result = true
         result_failed = obj.is_error == true
@@ -402,8 +453,8 @@ function M.run(req)
   -- for every other backend, which keeps the cursor spawn path unchanged.
   local spawn_bd = config.backend_descriptor() or {}
   local jobstart_opts = {
-    cwd = req.cwd,
-    env = job_env,
+    cwd = inline_run and io_host.dir or req.cwd,
+    env = job_env and vim.tbl_extend("force", spawn_bd.env or {}, job_env) or spawn_bd.env,
     stdout_buffered = false,
     on_stdout = function(_, data)
       if not data then
@@ -457,6 +508,7 @@ function M.run(req)
           local stopped_by_yana = stop_reason ~= nil
           local failure = process_outcome.finish(code, table.concat(stderr_acc, "\n"), got_result, stopped_by_yana)
           if key then
+            steer_channel.exited(key)
             stop_reasons[key] = nil
             stop_cpu_sampler(key)
           end
@@ -510,65 +562,35 @@ function M.run(req)
               vim.log.levels.WARN
             )
           end
-          if job_env and job_env.YANA_INLINE_EXEC_ALLOWLIST_ACTIVE == "1" then
-            local stderr_text = table.concat(stderr_acc, "\n")
-            -- AUTHORITATIVE FIRST: bin/yana-overlay-inner's own exec attempt prints
-            -- `yana-exec-refused argv0=<path> errno=<NAME>` from the syscall's errno,
-            -- so it is trusted outright and the free-text scan never runs.
-            local structured_argv0, structured_errno =
-              stderr_text:match("yana%-exec%-refused argv0=(%S+) errno=(%S+)")
-            if structured_argv0 then
-              log.lifecycle("exec.refused", {
-                argv0 = structured_argv0,
-                errno = structured_errno,
-                allowlisted = false,
-                mode = req.mode or config.options.mode,
-              })
-            else
-              -- FALLBACK ONLY: a refusal deeper than this process's own final exec
-              -- never reaches the structured line, so this scan of raw stderr is a
-              -- heuristic (English shell text, not an errno) and is labelled as such.
-              local denied = stderr_text:match("([%w%._%-%+/]+): Permission denied")
-                or stderr_text:match("([%w%._%-%+/]+): Operation not permitted")
-                or stderr_text:match("([%w%._%-%+/]+): not found")
-                or stderr_text:match("exec[^:\n]*:%s*([%w%._%-%+/]+)")
-              if denied then
-                log.lifecycle("exec.refused", {
-                  argv0 = denied,
-                  errno = stderr_text:find("not found", 1, true) and "ENOENT" or "EACCES",
-                  allowlisted = false,
-                  mode = req.mode or config.options.mode,
-                  source = "stderr-heuristic",
-                })
-              end
-            end
-          end
-          if req.jail_session then
-            -- A vendor may exit 0 after one child write hit EROFS. Classify only raw
-            -- process stderr; jail_refusal supplies the EROFS and attribution gates.
-            local stderr_text = table.concat(stderr_acc, "\n")
-            if stderr_text ~= "" then
-              pcall(jail.record_vendor_job_refusal, req.jail_session, resolved_cmd, stderr_text, code)
-            end
-          end
           -- Gen-independent: fires for EVERY real job death, stale or not, so a
           -- redirect can wait for a CONFIRMED exit (jobstop only sends SIGTERM).
           -- Not called on the spawn-failure branch below: no process existed.
-          if req.on_exit_confirmed then
-            req.on_exit_confirmed(code)
+          local function deliver_completion()
+            log.guard("yana.agent MCP completion", function()
+              if inline_run and inline_run.bind_error then
+                failure = failure or inline_run.bind_error
+              end
+              if req.on_exit_confirmed then req.on_exit_confirmed(code) end
+              if req.on_done then
+                if (code ~= 0 or result_failed) and not stopped_by_yana then
+                  require("yana.runtime.auth").after_failure({
+                    backend = resolution.backend, command = resolution.value, is_current = req.is_current,
+                  })
+                end
+                req.on_done(code, table.concat(stderr_acc, "\n"), {
+                  argv0 = resolved_cmd, elapsed_ms = elapsed_ms, got_result = got_result, failure = failure,
+                })
+              end
+            end)
+            if inline_run then inline_runs[key] = nil end
           end
-          if req.on_done then
-            if (code ~= 0 or result_failed) and not stopped_by_yana then
-              require("yana.runtime.auth").after_failure({
-                backend = resolution.backend, command = resolution.value, is_current = req.is_current,
-              })
-            end
-            req.on_done(code, table.concat(stderr_acc, "\n"), {
-              argv0 = resolved_cmd,
-              elapsed_ms = elapsed_ms,
-              got_result = got_result,
-              failure = failure,
-            })
+          if inline_run then
+            jail.remove_mcp_config(inline_run.config_path)
+            inline_run.context:close()
+            jail.remove_mcp_config(inline_run.host.dir)
+            deliver_completion()
+          else
+            deliver_completion()
           end
         end)
       end)
@@ -598,13 +620,25 @@ function M.run(req)
         tee_path = rec and rec.stream_path or nil,
       })
     end
-    if req.on_done then
-      req.on_done(-1, "failed to start '" .. tostring(resolved_cmd) .. "' (is cursor-agent installed and on PATH?)")
-    end
+    local start_error = "failed to start '" .. tostring(resolved_cmd) .. "' (is cursor-agent installed and on PATH?)"
+    if inline_run then
+      jail.remove_mcp_config(inline_run.config_path)
+      inline_run.context:close(function()
+        if req.on_done then req.on_done(-1, start_error) end
+      end)
+    elseif req.on_done then req.on_done(-1, start_error) end
     return nil
   end
 
   job_id = job
+  if inline_run then
+    inline_runs[job] = inline_run
+    local pid = M.pid(job)
+    if not pid or not inline_run.host:bind_root(pid) then
+      inline_run.bind_error = "Yana MCP could not bind to the launched process identity"
+      M.stop(job, inline_run.bind_error)
+    end
+  end
   process_outcome.start(job, M.stop)
   start_cpu_sampler(job, M.pid(job))
   if L then
@@ -634,6 +668,8 @@ function M.stop(job, reason, extra)
   if job and job > 0 then
     local info = vim.tbl_extend("force", extra or {}, { reason = reason or M.DEFAULT_STOP_REASON })
     stop_reasons[job] = info
+    local inline_run = inline_runs[job]
+    if inline_run then inline_run.context:close(nil, true) end
     pcall(vim.fn.jobstop, job)
   end
 end

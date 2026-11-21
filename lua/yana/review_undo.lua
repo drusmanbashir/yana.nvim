@@ -179,7 +179,7 @@ function Factory.new(deps)
     -- THE STRUCTURAL RECORDS OF ONE BUFFER EDIT. A typed gap deletion is ONE
     -- native undo sequence that did TWO things: it removed text AND it fused two
     -- pending hunks (`Ledger:merge`, via the watcher's refusal seam). The
-    -- operator's group law (2026-09-06) says a forward group reverses as ONE
+    -- group law says a forward group reverses as ONE
     -- unit on the SAME boundaries it applied forward -- so this is ONE press,
     -- not two, and the membership inverse rides on the buffer row rather than
     -- standing beside it as a row of its own. A second row would also make the
@@ -317,7 +317,7 @@ function Factory.new(deps)
       return ok, changed, where, contradiction
     end
 
-    local function spend_buffer_edit(register, peeked, direction)
+    local function spend_buffer_edit(register, peeked, direction, native_branch)
       local undoing = direction == "undo"
       local function still_on_top()
         return (undoing and register:peek_back() or register:peek_forward()) == peeked
@@ -340,7 +340,7 @@ function Factory.new(deps)
         undo_refuse("buffer edit stopped part-way -- " .. peeked.halted)
         return false
       end
-      local move_env = { resolve_target = resolve_target, buf_undo_seq = buf_undo_seq }
+      local move_env = { resolve_target = resolve_target, buf_undo_seq = buf_undo_seq, native_branch = native_branch }
       -- MEMBERSHIP FIRST, TEXT SECOND, IN BOTH DIRECTIONS. The ledger frames the
       -- native move replays name the hunks this transition BEGAN with going
       -- back and the ones it ENDED with going forward, so the structural

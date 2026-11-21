@@ -230,7 +230,7 @@ local function execute(self, env, direction)
   -- The router moved this row's structural records BEFORE this text move, so
   -- every block they took off the ledger rides it (`Ledger:carry_through`).
   local ledger = target.hunk_ledger
-  local function run() return move(suppress, expect_seq, hooks) end
+  local function run() return move(suppress, expect_seq, hooks, env.native_branch) end
   local called, outcome
   if type(ledger) == "table" and type(ledger.carry_through) == "function" then
     called, outcome = ledger:carry_through(structural_blocks(self), run)

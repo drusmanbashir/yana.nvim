@@ -1,10 +1,8 @@
--- F-CLAIM-KEYS (S3): a directory-safe name for ONE real path.
+-- F-CLAIM-KEYS: a directory-safe name for ONE real path.
 --
--- The editor's own per-turn state directories used to be named by
--- a Git-derived workspace identity, which walked up to the nearest `.git`
--- and hashed that directory's `(dev, ino)`. That tied state identity to Git,
--- walked the filesystem on a path that must not walk, and collided: two
--- directories in one repository produced one key.
+-- A Git-derived workspace identity is not used: it would tie state identity to Git,
+-- walk the filesystem on a path that must not walk, and collide (two directories in
+-- one repository would produce one key).
 --
 -- This is the same rule `bin/lib/yanad/claims.py`'s `path_key` applies, and
 -- deliberately so -- the daemon mints the layer directories and the editor

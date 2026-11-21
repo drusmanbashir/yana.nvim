@@ -3,47 +3,6 @@ local M = {}
 
 function M.new(deps)
   local defaults = deps.defaults
-  local ENFORCE_MODES = { reject = true, warn = true, off = true }
-
-  local function normalize_enforce(value, fallback)
-    if type(value) == "string" and ENFORCE_MODES[value] then
-      return value
-    end
-    return fallback
-  end
-  -- Merge scope over defaults; sanitize enforce, markers, zone/cap fields.
-  local function normalize_selection_scope(scope)
-    local base = vim.deepcopy(defaults.selection_scope)
-    if type(scope) ~= "table" then
-      return base
-    end
-    local out = vim.tbl_deep_extend("force", base, scope)
-    out.enforce = normalize_enforce(out.enforce, base.enforce)
-    out.unstructured = normalize_enforce(out.unstructured, base.unstructured)
-    if type(out.cell_markers) ~= "table" or #out.cell_markers == 0 then
-      out.cell_markers = vim.deepcopy(base.cell_markers)
-    else
-      local markers = {}
-      for _, marker in ipairs(out.cell_markers) do
-        if type(marker) == "string" and marker ~= "" then
-          markers[#markers + 1] = marker
-        end
-      end
-      if #markers == 0 then
-        out.cell_markers = vim.deepcopy(base.cell_markers)
-      else
-        out.cell_markers = markers
-      end
-    end
-    if type(out.min_zone_lines) ~= "number" or out.min_zone_lines < 1 then
-      out.min_zone_lines = base.min_zone_lines
-    end
-    if type(out.rejection_cap) ~= "number" or out.rejection_cap < 1 then
-      out.rejection_cap = base.rejection_cap
-    end
-    return out
-  end
-
   -- Merge ip over defaults; normalize enable flag, key(s) into a list, keep.
   local function normalize_image_paste(ip)
     local base = vim.deepcopy(defaults.image_paste)
@@ -212,6 +171,9 @@ function M.new(deps)
     if type(out.tabs) ~= "boolean" then
       out.tabs = base.tabs
     end
+    if type(out.max_files) ~= "number" or out.max_files < 1 or out.max_files % 1 ~= 0 then
+      error("yana: review.max_files " .. vim.inspect(out.max_files) .. " is invalid -- must be a positive integer", 0)
+    end
     local permissions = require("yana.review_permissions")
     if not permissions.is_policy(out.permissions) then
       error(
@@ -245,12 +207,6 @@ function M.new(deps)
     return out
   end
 
-
-  -- Legacy compatibility only. The retired selector must not be reactivated by
-  -- setup({ single_file = ... }); keep a disabled shape for older callers.
-  local function normalize_single_file(value)
-    return vim.deepcopy(defaults.single_file)
-  end
 
   --- Shape only, with delayed validation:
   --- existence and ancestor/state-root questions are TURN-START refusals naming the directory
@@ -362,7 +318,6 @@ function M.new(deps)
   end
 
   return {
-    normalize_selection_scope = normalize_selection_scope,
     normalize_image_paste = normalize_image_paste,
     normalize_redirect = normalize_redirect,
     normalize_inline_edit = normalize_inline_edit,
@@ -370,7 +325,6 @@ function M.new(deps)
     normalize_sandbox = normalize_sandbox,
     normalize_review = normalize_review,
     normalize_skill_dirs = normalize_skill_dirs,
-    normalize_single_file = normalize_single_file,
     normalize_workspace_roots = normalize_workspace_roots,
     normalize_artifact_dir_prefixes = normalize_artifact_dir_prefixes,
     normalize_inline_exec_allowlist = normalize_inline_exec_allowlist,

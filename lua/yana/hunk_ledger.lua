@@ -1,13 +1,3 @@
--- Owns ONE FILE's hunk list and every verdict on it.
---
--- The header this replaces said "one review's hunk list". It still gets a ledger,
--- because the ruling makes cA decide every yana hunk of the turn and an absorbed human
--- edit is yana's to store. So the unit this object scopes to is the FILE.
---
--- The one deliberate exception: `log.lifecycle_info`, so the three mutators that change
--- MEMBERSHIP (split/merge/rebuild) record it at the seam that actually knows it,
--- instead of every caller re-deriving the same fact.
-local log = require("yana.log")
 local extent = require("yana.hunk_extent")
 local lifecycle = require("yana.hunk_ledger_lifecycle")
 local buffer_history = require("yana.hunk_ledger_buffer_history")
@@ -399,24 +389,6 @@ function Ledger:decide_all(action)
 	end
 	self.last_batch = batch
 	signal_dirty(self)
-end
-
--- The verdicts ONE door recorded, taken back. An applier refusal is the only
--- caller: the write it was asked for never happened, so the action that asked
--- for it must be retryable, while every decision made before that door stands
--- (the operator's `3,2,1,4`). Reject deltas are not reversed here because a
--- reject-only completion writes nothing and so is never refused.
-function Ledger:take_back_last_batch()
-	local n = 0
-	for _, block in ipairs(self.last_batch or {}) do
-		if block.verdict ~= nil and block.verdict ~= "pending" and index_of(self.hunks, block) then
-			block.verdict = "pending"
-			n = n + 1
-		end
-	end
-	self.last_batch = nil
-	signal_dirty(self)
-	return n
 end
 
 -- Reverses one decision; re-arms the edge so a later all-decided fires again

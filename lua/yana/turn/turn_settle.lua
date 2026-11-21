@@ -1,7 +1,7 @@
 -- Turn settlement at End/abort: ONE projection calculation, two write doors.
 --
 -- F-APPLY-JOURNAL. The operator's `:w` never comes here: saving is Neovim's
--- (CORE "Saving is Neovim's", LEDGER N51).
+-- (CORE "Saving is Neovim's").
 --
 --   snapshot -> turn_projection.compute -> then either
 --   accepted content: final text into the buffer -> Neovim's `:write`, or
@@ -37,8 +37,14 @@ end
 --- selected version's proposal), or nil when it proposes no mode of its own: none
 --- differing from the effective mode (the accepted mode an earlier cycle carried,
 --- else the original). A fresh mode change thus waits for its own decision.
+--- A created file has no original mode for a proposal to differ from, so it is
+--- never a permission question; it keeps the agent's mode unasked (turn_projection,
+--- paths/REVIEW.md).
 function M.mode_proposal_key(f)
   local change = type(f) == "table" and f.change or nil
+  if type(change) == "table" and change.base_mode == nil and change.before_mode == nil then
+    return nil
+  end
   local proposed = type(change) == "table" and (f.proposal or change).after_mode or nil
   local effective = type(f) == "table" and f.accepted_mode or nil
   if effective == nil and proposed ~= nil then effective = change.base_mode or change.before_mode end
@@ -118,7 +124,9 @@ local function write_through_buffer(f, change, path, plan, fixed_bufnr)
   if lines == nil or bufnr ~= (fixed_bufnr or f.bufnr) then
     lines = snapshot.lines_of_bytes(bufnr, plan.bytes)
   end
-  local wants_eol = plan.bytes:sub(-1) == "\n"
+  local line_ending = vim.bo[bufnr].fileformat == "mac" and "\r" or "\n"
+  local wants_eol = plan.bytes:sub(-#line_ending) == line_ending
+  local native_fixendofline = vim.bo[bufnr].fixendofline
   local ok, err = pcall(function()
     if not vim.deep_equal(vim.api.nvim_buf_get_lines(bufnr, 0, -1, false), lines) then
       require("yana.review_watch").own_splice(bufnr, function()
@@ -144,6 +152,8 @@ local function write_through_buffer(f, change, path, plan, fixed_bufnr)
       error("Neovim did not write the buffer", 0)
     end
   end)
+  local restored, restore_err = pcall(function() vim.bo[bufnr].fixendofline = native_fixendofline end)
+  if not restored then return false, tostring(restore_err) end
   if ok and loaded_here and vim.api.nvim_buf_is_valid(bufnr) then
     pcall(vim.api.nvim_buf_delete, bufnr, { force = true })
   end
@@ -160,6 +170,14 @@ end
 --- the commit receipt whenever the write committed, so a committed-but-
 --- readback/reconcile-failed attempt is never mistaken for no write at all.
 --- Returns `true`, `false, reason`, or `"pending"`.
+-- The agent removed this folder, so it goes with its last file. rmdir only removes an empty folder: a kept file keeps it.
+local function remove_emptied_dirs(path, top)
+  local dir = vim.fs.dirname(path)
+  while (dir == top or dir:sub(1, #top + 1) == top .. "/") and vim.uv.fs_rmdir(dir) do
+    dir = vim.fs.dirname(dir)
+  end
+end
+
 local function run(f, purpose, done, end_item, end_binding)
   local has_done = type(done) == "function"
   local finished, result_ok, result_err = false, nil, nil
@@ -281,7 +299,7 @@ local function run(f, purpose, done, end_item, end_binding)
   end
   if (plan.action == "none" or committed_already) and not save_kept then
     if plan.action == "none" and input.original.present == true then
-      -- A creation that ends absent over a file its buffer did not write (N51).
+      -- A creation that ends absent over a file its buffer did not write.
       require("yana.turn.turn_save_record").report_kept(change.rel or path)
     end
     local detail = {
@@ -300,14 +318,26 @@ local function run(f, purpose, done, end_item, end_binding)
 
   -- END SAVES ACCEPTED CONTENT THROUGH THE BUFFER, and a kept file whose final
   -- buffer owes a save (above). Only an accepted deletion and an accepted
-  -- permission change stay on the journaled writer below.
-  if save_kept or (plan.action == "replace" and plan.mode == input.original.mode) then
+  -- permission change stay on the journaled writer below. A creation's mode is
+  -- the agent's, unasked (projection): the buffer creates the file, then it
+  -- takes that mode.
+  local created_mode = input.original.exists == false and plan.mode or nil
+  if save_kept or (plan.action == "replace" and (plan.mode == input.original.mode or created_mode ~= nil)) then
     local wrote, write_err = write_through_buffer(f, change, path, plan, bufnr)
     if not wrote then
       finish(false, write_err, { phase = "write", written = false, via = "buffer" })
       return answer()
     end
     local detail = { phase = "write", written = true, via = "buffer" }
+    if created_mode ~= nil then
+      local moded, mode_err = (vim.uv or vim.loop).fs_chmod(path, created_mode)
+      if not moded then
+        -- The content is saved; only the agent's mode is missing, and the operator can set it.
+        detail.mode_error = tostring(mode_err)
+        require("yana.notify").one_line(string.format("yana: %s saved, but its mode %o could not be set: %s",
+          change.rel or path, created_mode, tostring(mode_err)), vim.log.levels.WARN)
+      end
+    end
     -- What was written is known exactly, so the change's evidence moves to it
     -- without reading the file back.
     local recorded, record_err = record(f, {
@@ -357,6 +387,15 @@ local function run(f, purpose, done, end_item, end_binding)
         seq = vim.api.nvim_buf_call(bufnr, vim.fn.changenr),
       }
     end
+  end
+
+  local function clear_deleted_buffer_modified()
+    if plan.action ~= "delete" or not staged_proof or not snapshot.valid_buffer(bufnr) then return end
+    if vim.api.nvim_buf_get_name(bufnr) ~= path
+      or vim.api.nvim_buf_get_changedtick(bufnr) ~= staged_proof.tick then
+      return
+    end
+    vim.bo[bufnr].modified = false
   end
 
   local accept_opts = {
@@ -415,9 +454,16 @@ local function run(f, purpose, done, end_item, end_binding)
       finish(false, reconcile_err, detail)
       return
     end
+    -- The accepted deletion has no terminal buffer text to reconcile. Keep its
+    -- unchanged source buffer clean so an ordinary BufLeave autosave cannot
+    -- recreate the path; a buffer edited while the claim was pending stays dirty.
+    clear_deleted_buffer_modified()
     -- The applier verified what it committed; the evidence moves to those
     -- known values without this module reading the file back.
     local deleted = plan.action == "delete"
+    if deleted and f.change and f.change.removed_dir then
+      remove_emptied_dirs(path, f.change.removed_dir)
+    end
     local recorded, record_err = record(f, {
       path = path,
       bytes = (not deleted) and plan.bytes or nil,
@@ -472,7 +518,7 @@ local function run(f, purpose, done, end_item, end_binding)
       if plan.action == "delete" and not input.original.exists
         and not require("yana.turn.turn_save_record").matches(path) then
         apply_sessions.clear_file_claim_grant(change)
-        -- Gone during the wait: nothing was kept, so nothing to say (critic N51 L2).
+        -- Gone during the wait: nothing was kept, so nothing to say.
         if require("yana.turn.turn_save_record").identity(path) ~= nil then
           require("yana.turn.turn_save_record").report_kept(change.rel or path)
         end

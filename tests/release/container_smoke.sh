@@ -22,9 +22,7 @@ matrix=$root/scripts/release/neovim-matrix.txt
 
 readonly BASE_IMAGE='ubuntu:24.04@sha256:33ceb71981b602c1a7443a53469e4dba065f7503eab3078a2d7a57a2ab987517'
 readonly NVIM_VERSION=0.12.4
-# Overlay turns need bwrap userns + a real FS under /var/yana/scratch.
-# Docker's container root is already overlayfs; yana-overlay cannot stack
-# another overlay there (same reason tests/distro_gate.sh mounts /state).
+# Protected turns need a writable cgroup hierarchy for process cleanup.
 readonly TURN_RUN_OPTS=(
 	--privileged
 	--security-opt label=disable

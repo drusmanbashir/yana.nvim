@@ -8,6 +8,9 @@ import re
 import shutil
 import time
 import uuid
+from pathlib import Path
+
+from . import liveness
 
 
 # Turn states (running -> settling -> reviewing
@@ -63,16 +66,6 @@ def _guard_lexical_escape(root, path):
     root_prefix = root_lexical.rstrip(os.sep) + os.sep
     if path_lexical == root_lexical or path_lexical.startswith(root_prefix):
         _inside_root(root, path)
-
-
-def _inside_any(roots, path):
-    for root in roots:
-        try:
-            _inside_root(root, path)
-            return True
-        except OutsideRoot:
-            pass
-    return False
 
 
 def _session_dir(root, session_id):
@@ -205,11 +198,13 @@ def create_session(root, workspace, backend, kind, owner, daemon_owner=None, ver
     return session_id
 
 
-def turn_dir(root, session_id, turn_id, cgroup, owner, mounted_root, roots, mode=None, plan=None, generation=0):
+def turn_dir(root, session_id, turn_id, cgroup, owner, mounted_root, roots, mode=None, plan=None, generation=0,
+             layers=True):
     """Create turn layer dirs and return daemon launch paths.
 
     `mode` is the per-turn yana mode (ask/inline/agentic/…). Persisted into
     meta.json so recovery can restore confinement without guessing (O8).
+    `layers=False` (a buffer/MCP turn) writes meta.json and no overlay dirs.
     """
     # Validation precedes every allocation below. `plan` stays optional until
     # the turn lifecycle (stage S5) builds one for every turn; a plan that IS
@@ -224,14 +219,17 @@ def turn_dir(root, session_id, turn_id, cgroup, owner, mounted_root, roots, mode
         _mkdir(base)
         write_json_atomic(plan_path, plan)
     workspace_layer = os.path.join(base, "layer")
-    _bare_layer(workspace_layer)
     root_layers = {}
-    for item in roots:
-        key = _path_key(item)
-        layer = os.path.join(base, "roots", key)
-        _bare_layer(layer)
-        root_layers[key] = layer
-    _mkdir(os.path.join(base, "private"))
+    if layers:
+        _bare_layer(workspace_layer)
+        for item in roots:
+            key = _path_key(item)
+            layer = os.path.join(base, "roots", key)
+            _bare_layer(layer)
+            root_layers[key] = layer
+        _mkdir(os.path.join(base, "private"))
+    else:
+        _mkdir(base)
     meta = {
         "state": "running",
         "cgroup": cgroup,
@@ -242,6 +240,8 @@ def turn_dir(root, session_id, turn_id, cgroup, owner, mounted_root, roots, mode
         "generation": generation,
     }
     write_json_atomic(os.path.join(base, "meta.json"), meta)
+    if not layers:
+        return {"turn_dir": base, "layers": None}
     return {"turn_dir": base, "layers": {"workspace": workspace_layer, "roots": root_layers}}
 
 
@@ -298,67 +298,15 @@ def _clear_turn_workdirs(turn, log=None):
             _force_rmtree(workdir, log=log)
 
 
-def _validated_review_bundle(root, session_id, turn_id, bundle):
-    if not isinstance(bundle, list):
-        raise Refused("review_unreadable", "bundle is not a list")
-    turn = _turn_dir(root, session_id, turn_id)
-    allowed_uppers = [os.path.join(turn, "layer", "upper")]
-    roots_dir = os.path.join(turn, "roots")
-    if os.path.isdir(roots_dir):
-        allowed_uppers.extend(
-            os.path.join(roots_dir, name, "upper")
-            for name in os.listdir(roots_dir)
-        )
-    required_strings = ("id", "path", "rel", "root", "kind", "base_state", "base_hash")
-    kept = []
-    for item in bundle:
-        if not isinstance(item, dict) or any(not isinstance(item.get(key), str) for key in required_strings):
-            raise Refused("review_unreadable", "bundle row has invalid fields")
-        if not re.fullmatch(r"[0-9a-f]{64}", item["base_hash"]):
-            raise Refused("review_unreadable", "bundle row has invalid base_hash")
-        expected = _real(os.path.join(item["root"], item["rel"]))
-        if _inside_root(item["root"], item["path"]) != expected:
-            raise Refused("review_unreadable", "bundle path does not match root and rel")
-        upper_path = item.get("upper_path")
-        if item["kind"] != "delete":
-            if not isinstance(upper_path, str):
-                raise Refused("review_unreadable", "bundle row has no upper_path")
-            if not _inside_any(allowed_uppers, upper_path):
-                raise Refused("review_unreadable", "bundle upper_path is outside turn layers")
-        elif upper_path is not None:
-            raise Refused("review_unreadable", "delete bundle row has upper_path")
-        home_buffer_only = item.get("home_buffer_only")
-        review_before = item.get("review_before")
-        if home_buffer_only is not None and home_buffer_only is not True:
-            raise Refused("review_unreadable", "bundle row has invalid home_buffer_only marker")
-        if home_buffer_only is True and not isinstance(review_before, str):
-            raise Refused("review_unreadable", "buffer-only bundle row has no review_before baseline")
-        # An ordinary row may carry B0 (the buffer text at submit) for a snapshotted file.
-        if home_buffer_only is None and review_before is not None and not isinstance(review_before, str):
-            raise Refused("review_unreadable", "ordinary bundle row has a non-string review_before")
-        kept.append({key: item.get(key) for key in (
-            "id", "path", "rel", "root", "root_index", "root_is_primary",
-            "kind", "base_state", "base_hash", "base_mode",
-            "base_hash_captured_ts", "after_mode", "upper_path",
-            "home_buffer_only", "review_before",
-        )})
-    return kept
-
-
-def open_review(root, session_id, turn_id, files, tabs, bundle=None):
+def open_review(root, session_id, turn_id, files, bundle=None, source=None):
     session_dir = _session_dir(root, session_id)
     row = _read_json(os.path.join(session_dir, "session.json"))
-    bundle = _validated_review_bundle(root, session_id, turn_id, [] if bundle is None else bundle)
     file_paths = [_real(item) for item in files]
-    if bundle and {item["path"] for item in bundle} != set(file_paths):
-        raise Refused("review_unreadable", "bundle paths do not match review files")
     review_dir = os.path.join(session_dir, "review")
     _mkdir(review_dir)
     now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     file_rows = ["yana-review-files 1", *file_paths]
     _write_text_atomic(os.path.join(review_dir, "files"), "\n".join(file_rows) + "\n")
-    write_json_atomic(os.path.join(review_dir, "tabs.json"), tabs)
-    write_json_atomic(os.path.join(review_dir, "bundle.json"), bundle)
     for item in file_paths:
         key = _path_key(item)
         pointer_dir = _inside_root(root, os.path.join(os.fspath(root), "claims", key, "reviews"))
@@ -482,6 +430,8 @@ def _force_rmtree(path, log=None):
 
 def delete_session(root, session_id, log=None, cause=None):
     session_dir = _session_dir(root, session_id)
+    if os.path.exists(os.path.join(session_dir, "partial-end.json")):
+        raise Refused("end_recovery_pending")
     if not os.path.exists(os.path.join(session_dir, "session.json")):
         raise Refused("unknown_session")
     for current, _, files in os.walk(os.path.join(session_dir, "turns")):
@@ -501,6 +451,60 @@ def delete_session(root, session_id, log=None, cause=None):
         )
     _force_rmtree(session_dir, log=log)
     return removed
+
+
+def discard_dead_session(root, session_id, log=None):  #AI
+    """Seal writers, then discard only this dead editor's attributed state."""
+    session_dir = Path(_session_dir(root, session_id))
+    session = _read_json(session_dir / "session.json")
+    turns = list((session_dir / "turns").glob("*/meta.json"))
+    for path in turns:
+        meta = _read_json(path)
+        if meta["state"] in {"running", "dead_unsealed"}:
+            state, reason = liveness.seal_cgroup(meta["cgroup"])
+            meta["state"] = "dead" if state == "sealed" else state
+            if reason:
+                meta["reason"] = reason
+            write_json_atomic(path, meta)
+            if state != "sealed":
+                return False
+    if (session_dir / "partial-end.json").exists():
+        return False
+    for path in turns:
+        tid = path.parent.name
+        meta = _read_json(path)
+        others = [p for p in (Path(root) / "sessions").glob("*/turns/*/meta.json")
+                  if p.parent.name == tid and p.parent.parent.parent != session_dir]
+        if others:
+            continue
+        tag = hashlib.sha256((session_id + "/" + tid).encode()).hexdigest()[:16]
+        for folder in (Path(root) / "mcp-runtime").glob("ym" + tag + "*"):
+            _force_rmtree(folder, log=log)
+        record = Path(root) / "turns" / (re.sub(r"[^a-zA-Z0-9_.-]", "_", tid) + ".json")
+        if record.exists() and _read_json(record)["turn_id"] == tid:
+            record.unlink()
+        roots = {session["workspace"], meta["mounted_root"], *meta["roots"]}
+        for workspace in roots:
+            key = _path_key(workspace)
+            for folder in (Path(root) / "turns" / key).glob("*/*"):
+                if folder.name == tid:
+                    _force_rmtree(folder, log=log)
+            prefix = "%s-%s-" % (tid, session["owner"]["pid"])
+            for folder in (Path(root) / "recovered" / key).glob("*/*"):
+                if folder.name.startswith(prefix):
+                    _force_rmtree(folder, log=log)
+    removed = delete_session(root, session_id, log=log, cause="editor_dead")
+    for path in (Path(root) / "claims").glob("*/row.json"):
+        if _read_json(path)["session_id"] == session_id:
+            path.unlink(missing_ok=True)
+            removed.append(str(path))
+    for filename in removed[1:]:
+        for parent in (Path(filename).parent, Path(filename).parent.parent):
+            try:
+                parent.rmdir()
+            except OSError:
+                pass
+    return True
 
 
 def replay(root):

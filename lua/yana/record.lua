@@ -244,13 +244,6 @@ function Rec:note_decode_failure(bytes)
   self.malformed_raw_bytes = self.malformed_raw_bytes + (tonumber(bytes) or 0)
 end
 
--- Accumulate the total stderr byte length seen so far.
-function Rec:note_stderr(chunk)
-  if type(chunk) == "string" then
-    self.stderr_len = self.stderr_len + #chunk
-  end
-end
-
 --- Close the stream file and write the sidecar. Called from the exit path,
 --- which already runs inside `vim.schedule`, so `vim.json.encode` is safe
 --- here; nothing else in this module needs the Vim API.
@@ -371,44 +364,6 @@ function M.write_turn_record(dir, rec)
     return false, werr or "short turn-record write"
   end
   return true, path
-end
-
---- Every turn record under `dir`, oldest id first. An unreadable or
---- unparseable record is REPORTED as an unreadable retained turn rather than
---- skipped: a turn whose state cannot be read is the one case where guessing
---- "nothing was owed" is most expensive.
-function M.read_turn_records(dir)
-  local out = {}
-  if type(dir) ~= "string" or dir == "" or vim.fn.isdirectory(dir) ~= 1 then
-    return out
-  end
-  local names = vim.fn.readdir(dir) or {}
-  table.sort(names)
-  for _, name in ipairs(names) do
-    if name:match("%.json$") then
-      local path = dir .. "/" .. name
-      local f = io.open(path, "r")
-      local raw = nil
-      if f then
-        raw = f:read("*a")
-        f:close()
-      end
-      local ok, decoded = pcall(vim.json.decode, raw or "")
-      if ok and type(decoded) == "table" and decoded.turn_id ~= nil then
-        decoded.record_path = path
-        out[#out + 1] = decoded
-      else
-        out[#out + 1] = {
-          turn_id = name:gsub("%.json$", ""),
-          record_path = path,
-          unreadable = true,
-          -- Unknown is never rounded down to released.
-          open = true,
-        }
-      end
-    end
-  end
-  return out
 end
 
 --- Append one JSON object as a line to `<private_dir>/stream.ndjson`.

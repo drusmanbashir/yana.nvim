@@ -209,10 +209,6 @@ function Extent:runs()
 	return M.runs_in({ first = first, last = last }, self.classify)
 end
 
-function Extent:runs_overlapping(first, last)
-	return M.overlapping(self:runs(), first, last)
-end
-
 function Extent:placement(batch)
 	local first, last = batch and batch.start_line, batch and batch.end_line
 	if first == nil or last == nil then

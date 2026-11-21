@@ -4,9 +4,31 @@ local M = {}
 
 local diff = require("yana.diff")
 local hash = require("yana.safety.hash")
-local jail = require("yana.shadow.jail")
 local manifest = require("yana.paths.manifest")
 local uv = vim.uv or vim.loop
+
+-- The daemon answers a re-sent frame from its one execution (DAEMON.md), so a reply slower than the client's
+-- timeout is waited for; it is not a refusal.
+local REVIEW_FRAME_SENDS = 6
+local function send_review_frame(cmd, args, id, done)
+	local sent, settled = 0, false
+	local function send()
+		sent = sent + 1
+		local replied = false
+		return require("yana.runtime.yanad")[cmd](args, id, function(ok, res, meta)
+			if settled or replied then return end
+			replied = true
+			if not ok and res == "timeout" and sent < REVIEW_FRAME_SENDS then
+				return send()
+			end
+			settled = true
+			done(ok, res, meta)
+		end)
+	end
+	return send()
+end
+
+M.send_review_frame = send_review_frame
 
 function M.new(deps)
 	local I = {}
@@ -91,7 +113,7 @@ function I.retain_system_refused(session, change)
 	local bytes = change.after
 	-- vim.fn.sha256() over Neovim's Lua bridge: a Lua string with an embedded NUL is
 	-- always converted to a VimL Blob (confirmed empirically on 0.10.4, 0.11.2, 0.12.4
-	-- alike — `type()` reports 10/Blob in all three). hash.hash_bytes() is the existing N7
+	-- alike — `type()` reports 10/Blob in all three). hash.hash_bytes() is the existing
 	-- content-hash authority built for exactly this: NUL-free input still goes through
 	-- vim.fn.sha256 (a plain VimL String on every version), NUL-containing input falls
 	-- back to `sha256sum` via vim.system() — a formulation both versions accept, so no
@@ -241,6 +263,46 @@ function I.recover_layer(session)
 	return primary_target, primary_err
 end
 
+--- Copy a refused follow-up's changed regular files out of the layer it shares with the open review, into one fresh
+--- recovery folder per root (recover_layer's layout: <folder>/upper/<upper rel>). The layer itself is not touched.
+--- Returns the folders written, or nil and the copy error.
+function I.recover_run(session, changes)
+	local unique = string.format("%s-%d-%s", session.turn_id, uv.os_getpid(), tostring(uv.hrtime()))
+	local roots, folders, out = {}, {}, {}
+	for _, root in ipairs(deps.turn.session_roots(session)) do
+		if root.upper_dir then
+			roots[#roots + 1] = root
+		end
+	end
+	for _, change in ipairs(changes) do
+		local src = change.upper_path
+		local st = src and uv.fs_lstat(src)
+		for _, root in ipairs(st and st.type == "file" and roots or {}) do
+			local prefix = root.upper_dir .. "/"
+			if src:sub(1, #prefix) == prefix then
+				if not folders[root] then
+					local base = table.concat({
+						deps.state_root(), "recovered", deps.workspace.path_key(root.workspace), session.stream,
+					}, "/")
+					folders[root] = base .. "/" .. unique
+					out[#out + 1] = folders[root]
+				end
+				local dst = folders[root] .. "/upper/" .. src:sub(#prefix + 1)
+				vim.fn.mkdir(vim.fn.fnamemodify(dst, ":h"), "p")
+				local ok, err = uv.fs_copyfile(src, dst)
+				if not ok then
+					return nil, err
+				end
+				break
+			end
+		end
+	end
+	for _, folder in ipairs(out) do
+		deps.workspace.prune_recovered(vim.fn.fnamemodify(folder, ":h"))
+	end
+	return out
+end
+
 -- PANEL.md F-ADDENDUM-TURN: publication and cleanup frames name their run, the
 -- (Turn ID, generation) pair the daemon checks; the runtime client keys their
 -- journal ids per run. A recovered review carries the daemon's own generation.
@@ -275,7 +337,7 @@ function I.arm_review_open(session, on_marked)
 	local files = session.review_files or {}
 	if type(files) ~= "table" or #files == 0 then
 		-- Walk found nothing: review.none releases the claim.
-		require("yana.runtime.yanad").review_none(run_args(session, {
+		send_review_frame("review_none", run_args(session, {
 			session_id = session.yanad_session_id,
 		}), tostring(session.turn_id) .. ":review.none", function(ok)
 			session.review_open_marked = ok and true or false
@@ -295,10 +357,9 @@ function I.arm_review_open(session, on_marked)
 		end
 	end
 	session.review_open_requested = true
-	require("yana.runtime.yanad").review_open(run_args(session, {
+	send_review_frame("review_open", run_args(session, {
 		session_id = session.yanad_session_id,
 		files = abs,
-		tabs = session.review_tabs or {},
 		bundle = session.review_bundle or {},
 	}), tostring(session.turn_id) .. ":review.open", function(ok)
 		session.review_open_marked = ok and true or false
@@ -308,7 +369,7 @@ function I.arm_review_open(session, on_marked)
 	end)
 end
 
-function I.release(session, on_released)
+function I.release(session, on_released, require_stopped)
 	if not session then
 		if on_released then on_released(true) end
 		return true
@@ -325,7 +386,8 @@ function I.release(session, on_released)
 		return true
 	end
 	session._release_attempt_seq = (session._release_attempt_seq or 0) + 1
-	local command = session.review_open_requested and "review.close" or "review.none"
+	local command = require_stopped and "review.quit"
+		or (session.review_open_requested and "review.close" or "review.none")
 	local identity = session.yanad_session_id or session.turn_id or "local"
 	local attempt = {
 		id = string.format(
@@ -382,9 +444,7 @@ function I.release(session, on_released)
 		complete(true)
 		return true
 	end
-	local sender = session.review_open_requested
-		and require("yana.runtime.yanad").review_close
-		or require("yana.runtime.yanad").review_none
+	local sender = require("yana.runtime.yanad")[command:gsub("%.", "_")]
 	local args = run_args(session, { session_id = session.yanad_session_id })
 	local sent, send_err = pcall(sender, args, attempt.id, complete)
 	if not sent then

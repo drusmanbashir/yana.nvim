@@ -9,11 +9,7 @@ local M = {}
 local row = dependencies_probe.row
 local probe = dependencies_probe.probe
 local executable_row = dependencies_probe.executable_row
-local bwrap_userns_row = dependencies_probe.bwrap_userns_row
-local bash_nameref_row = dependencies_probe.bash_nameref_row
 local gnu_stat_row = dependencies_probe.gnu_stat_row
-local gnu_find_row = dependencies_probe.gnu_find_row
-local gnu_date_row = dependencies_probe.gnu_date_row
 local kernel_rows = dependencies_probe.kernel_rows
 
 M.minimum_neovim = "0.11.2"
@@ -37,59 +33,21 @@ end
 
 local confined_executables = {
   "bash",
-  "bwrap",
-  -- bin/yana-overlay-inner's final step, run inside the bwrap namespace, execs
-  -- `capsh --drop=all --caps=` (bin/yana-overlay-inner:31) to drop capabilities
-  -- before the agent starts. This is not optional hardening: it is the last
-  -- command in the chain, so its absence lets the overlay mount cleanly and
-  -- then the agent never runs at all -- name-only presence checks above
-  -- (bwrap, mount) would still report the machine ready.
-  "capsh",
-  -- bin/yana-overlay-inner re-execs itself under `unshare --mount` before it
-  -- mounts anything: the agent now runs as the invoking user, and at a
-  -- non-zero sandbox uid the mount namespace bwrap made is owned by an
-  -- ancestor user namespace, so every mount into it is EPERM. Absent, the
-  -- overlay never mounts and the turn refuses pre-agent -- so, like capsh,
-  -- presence of bwrap and mount alone would report a ready machine wrongly.
-  "unshare",
-  -- python3 is NOT here. It is a hard dependency only when
-  -- `inline_exec_allowlist` is configured (bin/yana-overlay-inner execs into
-  -- it to set up the Landlock ruleset -- see apply_exec_allowlist there);
-  -- every confined turn without that option never spawns python3 at all.
-  -- M.required_executables() below appends it conditionally, and M.check()
-  -- reports it as an optional (warn) row the rest of the time.
+  "python3",
+  "rg",
   "realpath",
   "sha256sum",
-  "flock",
-  "mount",
-  "umount",
-  "find",
   "stat",
   "awk",
   "sed",
-  "grep",
-  "sort",
-  "cut",
-  "tr",
-  "date",
-  "hostname",
-  "getent",
   "id",
   "mkdir",
-  "mktemp",
   "rmdir",
-  "chmod",
-  "cp",
-  "mv",
-  "rm",
-  "cat",
-  "touch",
   "readlink",
   "dirname",
-  "basename",
 }
 
--- Return executables required for mode; adds python3 if allowlist is set.
+-- Return executables required for the selected mode.
 function M.required_executables(mode)
   if mode == "agentic" then
     return {}
@@ -97,9 +55,6 @@ function M.required_executables(mode)
   local list = vim.deepcopy(confined_executables)
   if dependencies_probe.cgroup_needs_user_scope() then
     list[#list + 1] = "systemd-run"
-  end
-  if type(config.options.inline_exec_allowlist) == "table" then
-    list[#list + 1] = "python3"
   end
   return list
 end
@@ -289,7 +244,7 @@ end
 -- --output-format stream-json, --stream-partial-output, --trust, --mode ask, --force,
 -- --model, --resume (lua/yana/agent/agent.lua's build_cmd()), or the --list-models format
 -- M.list_models() parses. Reuses probe() (dependencies.lua's shared fail-closed spawn
--- helper), same as bwrap_userns_row/bash_nameref_row above, rather than a second ad hoc
+-- helper), so model inspection uses the same bounded subprocess execution.
 --
 -- Never "error": a working install that merely answers --version oddly (or not at all)
 -- must not be blocked on a heuristic this file cannot prove is meaningful.
@@ -454,24 +409,12 @@ function M.check(mode, opts)
   if mode ~= "agentic" then
     kernel_rows(rows)
     local required_now = M.required_executables(mode)
-    local python3_required = false
     for _, name in ipairs(required_now) do
       rows[#rows + 1] = executable_row(name, true)
-      python3_required = python3_required or name == "python3"
-    end
-    if not python3_required then
-      -- inline_exec_allowlist is unset, so bin/yana-overlay-inner never
-      -- execs python3 for this turn; report it as present-if-found, optional
-      -- either way.
-      rows[#rows + 1] = executable_row("python3", false)
     end
     -- Presence checks above prove a name resolves; these prove the resolved
     -- binary can do what the confined launchers actually need from it.
-    rows[#rows + 1] = bwrap_userns_row()
-    rows[#rows + 1] = bash_nameref_row()
     rows[#rows + 1] = gnu_stat_row()
-    rows[#rows + 1] = gnu_find_row()
-    rows[#rows + 1] = gnu_date_row()
   end
 
   local clipboard = clipboard_row()

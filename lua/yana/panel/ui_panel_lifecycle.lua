@@ -1,9 +1,6 @@
 -- Panel creation and lifecycle (open/close/quit/toggle).
 local config = require("yana.config")
 local log = require("yana.log")
-local ledger = require("yana.ledger")
-local notify = require("yana.notify")
-local notify_one_line = notify.one_line
 local V = require("yana.panel.ui_panel_views")
 
 local M = {}
@@ -30,15 +27,7 @@ local function nvim_owner_identity()
     boot_file:close()
   end
 
-  local start_ticks = 0
-  local stat_file = io.open("/proc/self/stat", "r")
-  if stat_file then
-    local after = (stat_file:read("*a") or ""):match("%)%s+(.*)")
-    stat_file:close()
-    if after then
-      start_ticks = tonumber(vim.split(after, "%s+", { trimempty = true })[20]) or 0
-    end
-  end
+  local start_ticks = (require("yana.runtime.yanad").process_identity("self") or {}).start or 0
 
   return {
     pid = pid,
@@ -66,6 +55,7 @@ function M.new(deps)
   local destroy_panel = deps.destroy_panel
   local install_stop_on_key = deps.install_stop_on_key
   local render_review_status = deps.render_review_status
+  local schedule_review_status = deps.schedule_review_status
   local stop_spinner = deps.stop_spinner
   local apply_panel_keymaps = deps.apply_panel_keymaps
   local setup_panel_autocmds = deps.setup_panel_autocmds
@@ -79,17 +69,25 @@ function M.new(deps)
   -- Spend parked submits in p.yanad_submit_queue. Sole definition: session.create here and
   -- yanad_recover's session.attach both land here; queue is cleared BEFORE fire (never sent twice).
   local function fire_parked_turn(p)
+    if p.finish_quit then return end
     local parked = p.yanad_submit_queue
     p.yanad_submit_queue = nil
     if not (parked and #parked > 0 and panel_open(p)) then
       return
     end
     vim.schedule(function()
-      -- Rest join p.queue BEFORE the first launches so a busy first inserts ahead of them; order kept.
-      for i = 2, #parked do
-        table.insert(p.queue, parked[i])
+      if p.finish_quit then
+        vim.list_extend(parked, p.yanad_submit_queue or {})
+        p.yanad_submit_queue = parked
+        return
       end
-      S.submit_panel(p, { text = parked[1], from_parked = true })
+      local unsent = {}
+      for _, text in ipairs(parked) do
+        if S.submit_panel(p, { text = text }) == false then unsent[#unsent + 1] = text end
+      end
+      if #unsent > 0 then
+        require("yana.panel.ui_followup").restore_prompt(p, table.concat(unsent, "\n\n"))
+      end
     end)
   end
 
@@ -134,7 +132,7 @@ function M.new(deps)
     p.mode = config.panel_mode(nil)
     -- Repaint review status on EVERY engine transition, not only this panel's own edges.
     p.unsubscribe_review = require("yana.inline_diff").on_state_change(function()
-      render_review_status(p)
+      schedule_review_status(p)
     end)
 
     -- Door for (re)issuing the daemon session, installed on EVERY panel. Create is the default;
@@ -320,6 +318,8 @@ function M.new(deps)
     focus = focus,
     depth = deps.depth,
     cancel_inflight = deps.cancel_inflight,
+    quit_review = deps.quit_review,
+    discard_for_quit = deps.discard_for_quit,
     panels = panels,
     win_valid = win_valid,
     buf_valid = buf_valid,

@@ -463,8 +463,7 @@ function M.new(deps)
 		-- then destroys those bytes because the identity still matches and no recorded hash
 		local function accept_checked()
 			if test_state.fault.rollback_marker_no_hash then
-				-- Mutation seam (gate): the pre-fix marker — a fresh observation of the
-				-- path, identity only, no content.
+				-- Mutation seam (gate): a fresh observation of the path, identity only, no content.
 				return identity_of(path)
 			end
 			return {

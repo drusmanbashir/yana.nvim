@@ -31,9 +31,7 @@ local function parse_yana_args(raw)
   local i = 1
   while i <= #args do
     local a = args[i]
-    if a == "--file" then
-      error("Yana --file is retired; open the file normally or use --workspace DIR", 0)
-    elseif a == "--workspace" then
+    if a == "--workspace" then
       i = i + 1
       if not args[i] or args[i] == "" then
         error("Yana --workspace requires a directory", 0)
@@ -131,7 +129,7 @@ cmd("YanaRecover", function(opts)
     local id = (opts.args and opts.args ~= "") and opts.args or nil
     yana().recover(id)
   end)
-end, { nargs = "?", desc = "Recover a daemon-kept review after editor death" })
+end, { nargs = "?", desc = "Recover a frozen partial End after editor death" })
 
 cmd("YanaMode", function()
   log.guard("YanaMode", function()
@@ -160,37 +158,6 @@ cmd("YanaRefusals", function()
   end)
 end, { desc = "List system-refused operations for the current Yana panel" })
 
-cmd("YanaIgnore", function(opts)
-  log.guard("YanaIgnore", function()
-    local ignore = require("yana.paths.ignore")
-    local pattern = vim.trim(opts.args or "")
-    if pattern == "" then
-      local patterns = ignore.patterns()
-      local lines = {
-        "yana review ignore list — gitignore syntax, matched on the workspace-relative path",
-        "persisted file: " .. tostring(ignore.persisted_path()),
-      }
-      if #patterns == 0 then
-        lines[#lines + 1] = "  (empty — every path a turn writes is offered for review)"
-      else
-        for i, pat in ipairs(patterns) do
-          lines[#lines + 1] = string.format("  %d. %s", i, pat)
-        end
-      end
-      vim.notify(table.concat(lines, "\n"), vim.log.levels.INFO)
-      return
-    end
-    local ok, err = ignore.add(pattern)
-    if not ok then
-      require("yana.notify").safe("yana: " .. tostring(err), vim.log.levels.WARN)
-      return
-    end
-    require("yana.notify").safe(
-      "yana: ignoring `" .. pattern .. "` — matching paths are written through unreviewed from the next turn",
-      vim.log.levels.INFO
-    )
-  end)
-end, { nargs = "*", desc = "List or extend the review ignore list (gitignore syntax)" })
 
 cmd("YanaReview", function()
   log.guard("YanaReview", function()
@@ -222,12 +189,6 @@ cmd("YanaSteer", function()
   end)
 end, { desc = "Interrupt the in-flight response and resend the prompt buffer as a new turn" })
 
-cmd("YanaQueue", function()
-  log.guard("YanaQueue", function()
-    yana().queue()
-  end)
-end, { desc = "View/edit/delete/reorder queued follow-up prompts" })
-
 -- Range-aware: in visual mode (or with an explicit range) the selected lines
 -- are attached as context. Any trailing text becomes the question and is sent
 -- immediately; otherwise the panel just opens with the selection attached.
@@ -240,7 +201,7 @@ cmd("YanaAsk", function(opts)
       yana().ask(question)
     end
   end)
-end, { nargs = "*", range = true, desc = "Ask yana about the current line/selection" })
+end, { nargs = "*", range = true, desc = "Open the Yana panel, attaching a selection if given" })
 
 -- Inline edit ("Ctrl-K"). Range-aware like YanaAsk, but the range is the
 -- edit target rather than context, and the turn always runs in agent mode.

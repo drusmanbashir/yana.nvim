@@ -149,7 +149,7 @@ function Factory.new(deps)
   local undo_turn = report_history_move(review_undo.undo_turn)
 
   -- No write autocmds on the review buffer: `:w` in every form is Neovim's own and
-  -- writes the buffer as it is (CORE "Saving is Neovim's", LEDGER N51).
+  -- writes the buffer as it is (CORE "Saving is Neovim's").
 
   local review_bulk = M._review_bulk_factory.new({
     facade = M,

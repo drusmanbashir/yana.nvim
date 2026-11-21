@@ -102,7 +102,7 @@ class LifecycleMixin:
         return False
 
     def live_row_count(self):
-        # Ledger row 127 (daemon decision logging): the exit decision line
+        # The exit decision line
         # reports the count, so count with the same state set live_rows uses.
         return sum(
             1
@@ -135,7 +135,6 @@ class LifecycleMixin:
         return protocol.ok(fid)
 
     def status(self):
-        pruned = store.prune_stale_recoveries(self.root, log=self.log)
         sessions = []
         for sess in store.iter_sessions(self.root, log=self.log):
             turns = store.iter_turns(self.root, sess["session_id"])
@@ -158,6 +157,7 @@ class LifecycleMixin:
                 "owner": sess["owner"],
                 "liveness": lstate,
                 "review": review_open,
+                "frozen_end": (self.root / "sessions" / sess["session_id"] / "partial-end.json").exists(),
                 "review_age_seconds": review_age_seconds,
                 "files": files,
                 "turns": [{"turn_id": t["turn_id"], "state": t["state"]} for t in turns],
@@ -166,7 +166,7 @@ class LifecycleMixin:
             {key: row[key] for key in ["key", "session_id", "turn_id", "state", "since"]}
             for row in store.iter_claims(self.root)
         ]
-        return {"sessions": sessions, "claims": claim_rows, "pruned": pruned}
+        return {"sessions": sessions, "claims": claim_rows}
 
     def replay_startup(self):
         # first.
@@ -187,7 +187,7 @@ class LifecycleMixin:
             editor_kind = liveness.owner_kind(sess.get("owner"))
             if editor_kind == "live":
                 self.watch_owner(sess["session_id"], None, sess["owner"], "editor")
-            elif editor_kind == "dead" and not sess.get("dead"):
+            elif editor_kind == "dead":
                 self.owner_dead(sess["session_id"], None, "editor")
 
     # A launcher watcher carries its run generation (F-ADDENDUM-TURN): a death
@@ -226,20 +226,13 @@ class LifecycleMixin:
             return
         self.unwatch(sid, tid, role)
         if role == "editor":
-            for turn in store.iter_turns(self.root, sid):
-                if turn["state"] == "running":
-                    self.owner_dead(sid, turn["turn_id"], "launcher")
-                elif turn["state"] in {"settling", "reviewing"}:
-                    store.set_turn_state(
-                        self.root, sid, turn["turn_id"], "dead", log=self.log,
-                        clear_workdirs=self.defer_workdir_cleanup,
-                    )
-            sess_path = self.root / "sessions" / sid / "session.json"
-            sess = store.read_json(sess_path) if sess_path.exists() else {}
-            self.clear_releasable_claims(sid)
-            if sess_path.exists():
-                sess["dead"] = True
-                store.atomic_json(sess_path, sess)
+            if not (self.root / "sessions" / sid / "session.json").exists():
+                return
+            turns = store.iter_turns(self.root, sid)
+            if store.discard_dead_session(self.root, sid, log=self.log):
+                for turn in turns:
+                    self.unwatch(sid, turn["turn_id"], "launcher")
+            self.maybe_exit()
             return
         if role == "launcher" and tid:
             state = "dead"
@@ -267,19 +260,6 @@ class LifecycleMixin:
                     else:
                         (self.root / "claims" / row["key"] / "row.json").unlink(missing_ok=True)
         self.maybe_exit()
-
-    def clear_releasable_claims(self, sid):
-        for row in store.iter_claims(self.root):
-            if row["session_id"] != sid:
-                continue
-            meta_path = self.root / "sessions" / sid / "turns" / row["turn_id"] / "meta.json"
-            try:
-                meta = store.read_json(meta_path)
-            except OSError:
-                (self.root / "claims" / row["key"] / "row.json").unlink(missing_ok=True)
-                continue
-            if meta["state"] != "dead_unsealed":
-                (self.root / "claims" / row["key"] / "row.json").unlink(missing_ok=True)
 
     def turn_meta(self, sid, tid):
         return store.read_json(self.root / "sessions" / sid / "turns" / tid / "meta.json")
@@ -348,6 +328,8 @@ class LifecycleMixin:
         """
         args = frame["args"]
         sid, tid, generation = args["session_id"], args["turn_id"], int(args["generation"])
+        if store.load_end_record(self.root, sid) is not None:
+            raise store.Refused("end_recovery_pending")
         # The last move away from running queued a work-dir clear; it lands before
         # this run's work dirs exist, never after. No await below this line.
         pending = [task for task in self.workdir_cleanup_tasks if not task.done()]

@@ -100,10 +100,6 @@ function M.record_control_plane_refusals(scope, typed)
 	return cp_count
 end
 
--- Test-only: clear the per-scope control-plane WARN dedup cache.
-function M._test.reset_control_plane_warn_recorded()
-	control_plane_warn_recorded = {}
-end
 
 
 local ops_decode = require("yana.shadow.ops_decode")
@@ -157,9 +153,8 @@ local function changes_for_root(session, root, upper, typed)
 			local lower = op.path
 			local ev, state, err
 			if M._test.fault.reobserve_base_evidence then
-				-- Mutation seam (gate): the pre-fix route, where the workspace was
-				-- observed AGAIN here, after classification, and that later look
-				-- became the recorded before-state.
+				-- Mutation seam (gate): observes the workspace AGAIN here, after
+				-- classification, and records that later look as the before-state.
 				state, err = ops_artifacts.lower_state(lower)
 				if not state then
 					return nil, err
@@ -219,6 +214,7 @@ local function changes_for_root(session, root, upper, typed)
 					-- R-b recovery reads proposal bytes only from this daemon-kept
 					-- turn layer; it never recomputes evidence from current disk.
 					upper_path = op.kind ~= "delete" and (upper .. "/" .. (op.upper_rel or op.rel)) or nil,
+					removed_dir = type(op.base_evidence) == "table" and op.base_evidence.removed_dir or nil,
 					shadow_apply = true,
 				status = "pending",
 			}
@@ -382,22 +378,6 @@ function M.changes_from_session(session, context)
 		vim.list_extend(merged.unsafe, classification.unsafe)
 	end
 	return merged.changes, nil, all_typed, merged
-end
-
--- Return typed ops with no review route: non-file kinds, or paired halves.
-function M.unreviewable_ops(typed)
-	-- `typed` here is `changes_from_session`'s third return: every root's
-	-- ops, flattened. `count_rel_ops`/`rel_op_key` key by (root, rel), so a
-	-- pairing found in one root's walk cannot reach into another root that
-	-- happens to hold the same relative path.
-	local paired = count_rel_ops(typed)
-	local out = {}
-	for _, op in ipairs(typed or {}) do
-		if not op.control_plane and (not reviewable(op) or (paired[rel_op_key(op)] or 0) > 1) then
-			out[#out + 1] = op
-		end
-	end
-	return out
 end
 
 -- Build {rel, class, hash} entries from typed ops for bundle recording.

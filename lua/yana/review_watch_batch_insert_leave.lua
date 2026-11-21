@@ -1,5 +1,6 @@
 -- Size split of review_watch_batch.lua: InsertLeave membership (the grow walk, judge, complete call).
 local M = {}
+local ownership = require("yana.review_watch_ownership")
 
 function M.new(env)
   local deps = env.deps
@@ -32,6 +33,7 @@ function M.new(env)
       undo_seq = deps.buf_undo_seq(bufnr)
     end
     local pending = state.hunk_ledger:pending()
+    local line_ownership = ownership.uses_line_ownership(bufnr, state)
 
     local function ledger_owner_other(block, row)
       for _, other in ipairs(pending) do
@@ -91,6 +93,7 @@ function M.new(env)
     -- other touched row is re-judged without its own provisional identity.
     local function judge(block, row)
       local line = line_at(row) or ""
+      if line_ownership then return { row = row, owned = false, source = line } end
       for _, owner in ipairs(block.owned_rows or {}) do
         if owner.row == row and not owner.provisional and owner.source == line then
           return { row = row, owned = true, source = line }
@@ -136,7 +139,12 @@ function M.new(env)
             end
             decisions[#decisions + 1] = decision
           end
-          if complete(block, index, decisions, {}, undo_seq, before_seq) then
+          if line_ownership and #decisions > 0 and #(block.new_lines or {}) > 0
+            and vim.iter(block.owned_rows or {}):all(function(owner) return dirty_rows[owner.row] ~= nil end)
+          then
+            absorbed_any = state._decide_destroyed_hunk(block, index, 0, before_seq, "operator replaced the proposal")
+              or absorbed_any
+          elseif complete(block, index, decisions, {}, undo_seq, before_seq) then
             absorbed_any = true
           end
         end
@@ -150,16 +158,15 @@ function M.new(env)
     -- SCOPE AND LIFETIME. The table is authority for exactly the span of
     -- `run_pass` and nothing wider. `run_pass` is its only writer, and it is
     -- dropped on the way out whether the pass returns or RAISES -- and it can
-    -- raise by design, from the classifier's loud no-parser failure or from
-    -- `complete` meeting a ledger the paint/notify callback closed. A leaked
+    -- raise if parsing fails or if `complete` meets a ledger the paint/notify
+    -- callback closed. A leaked
     -- table would keep answering for every later reader
     -- (review_watch_batch_partition, review_watch_batch, review_hunk_split) with
     -- rows `complete` never recorded.
     --
     -- The original error is re-raised UNCHANGED (level 0 adds no position and
     -- the value is passed through as it came): cleaning up is not catching, and
-    -- a swallowed raise would be exactly the fallback ownership verdict the
-    -- 2026-09-18 ruling retired.
+    -- a swallowed raise would be exactly a fallback ownership verdict, which is not allowed.
     state.pass_settled_rows = {}
     local pass_ok, pass_result = pcall(run_pass)
     state.pass_settled_rows = nil

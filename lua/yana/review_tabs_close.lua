@@ -4,7 +4,6 @@
 -- "End review?" is the one dialog; tab close is its silent consequence.
 local diff = require("yana.diff")
 local log = require("yana.log")
-local record = require("yana.review_tabs_record")
 
 local M = {}
 
@@ -38,61 +37,16 @@ function M.new(deps)
     return pending
   end
 
-  -- Which tabs does this turn own? The live record wins; the disk record is
-  -- the fallback, and the answer says which (`live_fallback`).
-  local function load_owned_record(st, opts)
-    local path = record.state_path(opts)
-    local function valid_owned(source)
-      local owned = {}
-      for abs, entry in pairs(source or {}) do
-        if type(abs) == "string"
-          and type(entry) == "table"
-          and type(entry.tab_id) == "number"
-          and vim.api.nvim_tabpage_is_valid(entry.tab_id)
-        then
-          owned[abs] = { tab_id = entry.tab_id, rel = entry.rel or abs }
-        end
-      end
-      return owned
-    end
-    local function live_record()
-      local live = st and st.review_tabs
-      return {
-        path = path,
-        turn_key = tostring((live and live.turn_key) or "unknown"),
-        owned = valid_owned(live and live.owned),
-        live_fallback = true,
-      }
-    end
-    if not path then
-      return live_record()
-    end
-    local disk = record.read_json(path)
-    if type(disk) ~= "table" or disk.turn_key == nil or type(disk.owned) ~= "table" then
-      return live_record()
-    end
-    return { path = path, turn_key = tostring(disk.turn_key), owned = valid_owned(disk.owned) }
-  end
-
-  local function owned_snapshot(owned)
-    local snapshot = {}
-    for abs, entry in pairs(owned or {}) do
-      snapshot[abs] = { tab_id = entry.tab_id, rel = entry.rel or abs }
-    end
-    return snapshot
-  end
-
-  local function tab_shows_path(tab, abs)
-    for _, win in ipairs(vim.api.nvim_tabpage_list_wins(tab)) do
-      local buf = vim.api.nvim_win_get_buf(win)
-      if vim.api.nvim_buf_is_valid(buf) then
-        local name = vim.api.nvim_buf_get_name(buf)
-        if name ~= "" and diff.abs_path(name) == abs then
-          return true
-        end
+  -- The tabs this turn owns that are still open.
+  local function open_owned(st)
+    local owned = {}
+    local live = st and st.review_tabs
+    for abs, entry in pairs(live and live.owned or {}) do
+      if vim.api.nvim_tabpage_is_valid(entry.tab_id) then
+        owned[abs] = { tab_id = entry.tab_id, rel = entry.rel or abs }
       end
     end
-    return false
+    return owned
   end
 
   local function keys_of(set)
@@ -107,17 +61,14 @@ function M.new(deps)
   function C.close_owned_tabs(opts)
     opts = opts or {}
     local st = pool_for(opts)
-    local owned_record = load_owned_record(st, opts)
-    if vim.tbl_isempty(owned_record.owned) then
-      if owned_record.path then
-        pcall(vim.fn.delete, owned_record.path)
-      end
+    local captured_owned = open_owned(st)
+    local captured_turn_key = tostring((st.review_tabs and st.review_tabs.turn_key) or "unknown")
+    if vim.tbl_isempty(captured_owned) then
       st.review_tabs = nil
       log.lifecycle_later("review.tabs_closed", {
-        turn_key = owned_record.turn_key,
+        turn_key = captured_turn_key,
         closed = {},
         refused = {},
-        live_record = owned_record.live_fallback == true,
         reason = "none_owned",
         workspace = opts.workspace,
       })
@@ -127,22 +78,13 @@ function M.new(deps)
       end
       return result
     end
-    local captured_turn_key = owned_record.turn_key
-    local captured_owned = owned_snapshot(owned_record.owned)
     local pending = pending_paths(st, captured_owned)
     local closed, refused = {}, {}
     for abs, entry in pairs(captured_owned) do
       local rel = entry.rel or abs
       local tab = entry.tab_id
       if tab and vim.api.nvim_tabpage_is_valid(tab) then
-        -- The path check remains the fallback for disk-only records, which cannot prove
-        -- live handle ownership.
-        local live = st and st.review_tabs
-        local live_entry = live and live.owned and live.owned[abs]
-        local still_live_owned_handle = type(live_entry) == "table" and live_entry.tab_id == tab
-        if not still_live_owned_handle and not tab_shows_path(tab, abs) then
-          -- Drop silently: neither live ownership nor the recorded path survives.
-        elseif (opts.keep_paths or {})[abs] then
+        if (opts.keep_paths or {})[abs] then
           refused[rel] = true
           notify_one_line("yana: keeping unsaved file open for manual write: " .. rel, vim.log.levels.WARN)
         elseif pending[abs] then
@@ -162,9 +104,6 @@ function M.new(deps)
         end
       end
     end
-    if owned_record.path then
-      pcall(vim.fn.delete, owned_record.path)
-    end
     if st.review_tabs and tostring(st.review_tabs.turn_key or "") == tostring(captured_turn_key) then
       st.review_tabs = nil
     end
@@ -172,7 +111,6 @@ function M.new(deps)
       turn_key = captured_turn_key,
       closed = keys_of(closed),
       refused = keys_of(refused),
-      live_record = owned_record.live_fallback == true,
     })
     local result = { ok = true, reason = "closed", closed = closed, refused = refused }
     if type(opts.after_close) == "function" then

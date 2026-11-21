@@ -157,10 +157,9 @@ function M.new(deps)
 				checked_hash = state.hash,
 				ts = os.time(),
 			}
-			-- Mutation seam (gate): the pre-fix `revert_start`, which recorded that
-			-- the path held the accepted BYTES and never which object held them. The
-			-- restore below carries `state` directly, so this marker is read by
-			-- exactly one thing — the gate in front of this route's `revert_done`.
+			-- Mutation seam (gate): records that the path held the accepted BYTES and never
+			-- which object held them. The restore below carries `state` directly, so this
+			-- marker is read by exactly one thing — the gate in front of this route's `revert_done`.
 			if test_state.fault.revert_marker_identity_blind then
 				marker.checked_dev = nil
 				marker.checked_ino = nil

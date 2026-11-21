@@ -1,7 +1,6 @@
 -- Small panel/claim commands: new_chat, diary/turn-key dumps, ask/inline_edit entry points, refusal listing.
 local config = require("yana.config")
 local log = require("yana.log")
-local ledger = require("yana.ledger")
 local notify = require("yana.notify")
 local notify_one_line = notify.one_line
 local renewal = require("yana.agent.renewal")
@@ -32,6 +31,7 @@ local function new_chat()
   if not p then
     return
   end
+  if p.finish_quit then return end
   if p._new_chat_pending then
     notify_one_line("yana: conversation close is still waiting for the review claim", vim.log.levels.WARN)
     return
@@ -67,6 +67,7 @@ local function new_chat()
     p.title = nil
     p.turns = 0
     p.got_result = false
+    p.prompt_handover, p.interrupt_offer, p.prompt_interrupt_id = nil, nil, nil
     p.stream_text = ""
     p.changes = {}
     p.last_question = nil
@@ -91,11 +92,9 @@ local function new_chat()
     if status ~= "completed" and not (status == "partial" and result.review_ended == true) then
       finished = true
       p._new_chat_pending = nil
-      notify_one_line(
-        "yana: conversation retained, its review has not finished ending ("
-          .. tostring(status or "unknown") .. ")",
-        vim.log.levels.WARN
-      )
+      local message = status == "partial" and require("yana.review_discard").partial_notice(result)
+        or ("yana: conversation retained, its review has not finished ending (" .. tostring(status or "unknown") .. ")")
+      notify_one_line(message, vim.log.levels.WARN)
       return
     end
     finished = true
@@ -161,14 +160,6 @@ end
 local function inline_edit(selection, instruction)
   if not selection or type(instruction) ~= "string" or instruction == "" then
     return false
-  end
-  local home_capture, home_err = require("yana.input.home_buffer_proposal").capture(selection.buf)
-  if home_err then
-    notify_one_line("yana: " .. home_err, vim.log.levels.WARN)
-    return false
-  end
-  if home_capture then
-    selection.home_buffer_capture = home_capture
   end
   local origin_win = vim.api.nvim_get_current_win()
 

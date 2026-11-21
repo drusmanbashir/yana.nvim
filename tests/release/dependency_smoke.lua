@@ -4,7 +4,7 @@ local target = assert(os.getenv("RELEASE_MISSING_EXEC"), "RELEASE_MISSING_EXEC r
 local dependencies = require("yana.runtime.dependencies")
 local config = require("yana.config")
 
-config.setup({ backends = { cursor = { cmd = root .. "/tests/release/fake-cursor-agent" } }, mode = "inline" })
+config.setup({ backends = { default = "claude", claude = { cmd = root .. "/tests/release/fake-cursor-agent" } }, mode = "inline" })
 
 local function die(message)
   error("dependency smoke: " .. message)
@@ -63,6 +63,8 @@ local done_code, done_message
 local job = require("yana.agent.agent").run({
   prompt = "must not start",
   jail_session = {},
+  inline_mcp = true,
+  mcp_context = {},
   on_done = function(code, message)
     done_code, done_message = code, message
   end,

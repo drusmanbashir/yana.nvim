@@ -2,7 +2,7 @@
 
 # Yana
 
-Yana is a Neovim plugin for using Cursor, Claude Code or Codex in your
+Yana is a Neovim plugin for using Cursor, Claude Code, Codex or Grok in your
 project. In `inline` mode, the agent's edits appear as hunks in your buffers;
 you review and accept them before they reach disk.
 
@@ -13,7 +13,7 @@ you review and accept them before they reach disk.
 - `ask` answers questions without writing files.
 - `inline` proposes edits for review, with accept, reject, undo and redo.
 - `agentic` writes files directly, without hunk review.
-- Switch agent and model, queue prompts, stop a turn, paste images, and resume
+- Switch agent and model, stop a turn, paste images, and resume
   sessions across tabs.
 
 [Feature details](docs/how-it-works.md)
@@ -22,78 +22,32 @@ you review and accept them before they reach disk.
 
 ### Prerequisites
 
-Install `git` for lazy.nvim to clone plugins and `curl` to download installers.
-Yana needs Neovim 0.11.2+, an agent CLI and, on Linux, Bubblewrap. Follow
-steps 1–3 below, or run the [script](scripts/install-deps.sh) that checks these
-and installs what is missing. Read it first if you like; it asks before every
-`sudo` command.
+Install Neovim 0.11.2+, Git and an agent CLI. On Linux, `ask` and `inline`
+also need Python 3.11+ for the Yana tool server and ripgrep for file search.
+
+```sh
+sudo apt-get install git curl python3 ripgrep
+```
+
+Use Claude Code (`claude`), Codex (`codex`) or Grok (`grok`) for all three
+modes. Cursor (`cursor-agent`) supports `agentic`. Set `backends.default`
+to your agent and run `:YanaLogin` after setup to sign in.
+
+The optional [dependency installer](scripts/install-deps.sh) checks the
+prerequisites and asks before installing missing system packages.
 
 ```sh
 curl -fsSLO https://raw.githubusercontent.com/drusmanbashir/yana.nvim/main/scripts/install-deps.sh
 bash install-deps.sh
 ```
 
-If not using the installer, you can follow steps below for the prerequisites:
-
-#### 1. Install an agent
-
-Choose an installed agent CLI: Claude Code (`claude`), Codex
-(`codex`) or Cursor (`cursor-agent`). Choose the matching agent in `backends.default` in the Neovim setup below.
-After setup, run `:YanaLogin` to sign in through that agent's official login
-in a Neovim terminal. Existing API-key authentication keeps working.
-
-<a id="bubblewrap"></a>
-
-#### 2. Install Bubblewrap
-
-In Linux `ask` and `inline` modes, Bubblewrap, also used by
-[Flatpak](https://github.com/containers/bubblewrap), keeps the agent's file writes in
-a private workspace until you accept them. Install it and its capability tool:
-
-```sh
-sudo apt-get install git curl bubblewrap libcap2-bin
-```
-
-#### 3. Allow Bubblewrap on Ubuntu 24.04+
-
-AppArmor is [Ubuntu's application security system](https://documentation.ubuntu.com/security/security-features/privilege-restriction/apparmor/).
-
-Bubblewrap builds the sandbox from a Linux user namespace, and Ubuntu 24.04 and
-newer block those by default through AppArmor. This one-time step lets
-`/usr/bin/bwrap`, and only it, create one; AppArmor stays on and the rule still
-applies to every other program. Other distributions can skip it.
-
-First check for an existing profile:
-
-```sh
-grep -rl /usr/bin/bwrap /etc/apparmor.d/
-```
-
-If a file is printed, ask your administrator to add `userns,` to that profile
-and reload it with `sudo apparmor_parser -r FILE`. Otherwise, create it below.
-Do not add a second profile for the same executable.
-
-```sh
-sudo apt-get install apparmor
-sudo tee /etc/apparmor.d/yana-bwrap <<'EOF'
-abi <abi/4.0>,
-include <tunables/global>
-profile yana-bwrap /usr/bin/bwrap flags=(unconfined) {
-  userns,
-}
-EOF
-sudo apparmor_parser -r /etc/apparmor.d/yana-bwrap
-```
-
-To undo it, run
-`sudo apparmor_parser -R /etc/apparmor.d/yana-bwrap`, then delete that file.
-macOS supports `agentic` mode only. See the
-[full requirements and troubleshooting guide](docs/installation.md).
+For an agentic-only setup, including on macOS, set `modes = { "agentic" }`.
+See the [full installation guide](docs/installation.md).
 
 ### Neovim setup
 
-Add this plugin declaration to lazy.nvim. This sample starts with Claude; set
-`backends.default` to `"codex"` or `"cursor"` to use another installed agent.
+Add this plugin declaration to lazy.nvim. Use `"codex"` as the default if you
+installed Codex.
 See [Usage](docs/usage.md) for key bindings and
 [Configuration](docs/configuration.md) for optional settings.
 
@@ -106,8 +60,7 @@ See [Usage](docs/usage.md) for key bindings and
 }
 ```
 
-With `opts = {}`, Yana starts with Cursor. It does not guess from installed
-CLIs.
+With `opts = {}`, Yana starts with Claude.
 
 ## Use
 

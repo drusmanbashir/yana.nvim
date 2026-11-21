@@ -3,7 +3,6 @@
 local M = {}
 
 local diary = require("yana.safety.diary")
-local checkpoint = require("yana.safety.checkpoint")
 local preview = require("yana.shadow.preview")
 local diff = require("yana.diff")
 
@@ -181,32 +180,6 @@ function M.accept_standalone(panel, change, composed, opts)
 	return apply_accept.commit(session, change, plan, opts and opts.own_splice)
 end
 
---- Scope-revert an out-of-zone edit through the journaled applier.
-function M.scope_revert(panel, change)
-	if not panel or not change or not change.path or change.before == nil then
-		return false, "scope revert requires a before snapshot"
-	end
-	local session, serr = standalone_session(panel, change, "scope")
-	if not session then
-		return false, serr
-	end
-	return diary.restore_workspace_bytes({
-		session = session,
-		path = change.path,
-		content = change.before,
-		base_hash = change.base_hash,
-		base_hash_captured_ts = change.base_hash_captured_ts,
-		base_state = change.base_state,
-		base_mode = change.base_mode,
-		base_link_target = change.base_link_target,
-	})
-end
-
--- `M.restore_staged_removal`, the redo half, went with them: it was reachable only
--- through the `change._undo_staged` note `stage_and_remove` was the sole writer of. The
--- file is removed by ONE press and one only -- the last `u`, walking the `file_touch`
--- register row (lua/yana/review_undo.lua).
-
 --- Put ONE path back to the bytes the turn started from, through the journaled applier.
 --- That is permitted by the ruling, but it is still a write, so it goes through the
 --- diary like every other one: intent row, displaced copy, verification, and something
@@ -283,46 +256,6 @@ function M.revert_to_turn_start(panel, change)
 	})
 end
 
--- Revert every root's checkpoint this pass opened, restoring pre-turn state.
-function M.revert_pass(pass)
-	-- A pass with no journal has nothing captured and nothing to put back.
-	if not pass or not pass.diary_session then
-		return true
-	end
-	-- Every root that opened a journal is reverted, not just the workspace's: a
-	-- turn that wrote into two roots and is reverted must put both back. Each
-	-- root's checkpoint is its own durable artefact under its own diary
-	-- directory, and the same "the artefact decides" rule applies to each.
-	for _, session in pairs(pass.diary_sessions or {}) do
-		if vim.fn.filereadable(checkpoint.manifest_path(session, pass.turn_id)) == 1 then
-			local ok, err = checkpoint.revert_turn({ session = session, turn_id = pass.turn_id })
-			if not ok then
-				return ok, err
-			end
-		end
-	end
-	-- NOT `pass.checkpoint_started`: that boolean is process-local state on the pass
-	-- OBJECT, and a retried or resumed pass is a new object over the same diary directory
-	-- and turn id. Reading it there would answer "no checkpoint" for a checkpoint that is
-	-- on disk, and this function would return `true` — a whole-turn revert reporting
-	-- success having restored nothing, which is the same silent shape
-	-- `checkpoint.begin_turn`'s guard exists to stop. The durable artefact decides.
-	if vim.fn.filereadable(checkpoint.manifest_path(pass.diary_session, pass.turn_id)) ~= 1 then
-		return true
-	end
-	return checkpoint.revert_turn({
-		session = pass.diary_session,
-		turn_id = pass.turn_id,
-	})
-end
-
--- Discard the shadow turn's preview state now this pass has finished.
-function M.finish_pass(pass)
-	if pass and pass.shadow_turn then
-		preview.discard(pass.shadow_turn)
-	end
-end
-
 -- Decode every row of the journals this pass has already opened.
 function M.journal_rows(pass)
 	local sessions = apply_sessions.opened_sessions(pass)
@@ -343,11 +276,6 @@ function M.journal_rows(pass)
 		end
 	end
 	return rows
-end
-
--- Read a path's real on-disk bytes.
-function M.read_real_bytes(path)
-	return diff.read_file_bytes(path)
 end
 
 return M

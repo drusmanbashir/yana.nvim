@@ -113,17 +113,6 @@ function M.install(Ledger, env)
 		return true, before, history:snapshot(block)
 	end
 
-	--- The explicit-band form, kept for callers that already hold the band a
-	--- transition produced. Same writer, same frame, same ordering.
-	function Ledger:absorb_buffer_change(block, changes, new_lines, start_line, end_line, undo_seq, before_seq)
-		local _, before, after = self:complete_buffer_edit(block, {
-			changes = changes,
-			span = { start_line, end_line, new_lines },
-			undo_seq = undo_seq,
-			before_seq = before_seq,
-		})
-		return before, after
-	end
 end
 
 return M

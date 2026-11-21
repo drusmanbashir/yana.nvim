@@ -99,11 +99,11 @@ function Turn:cycles()
 	return self.cycle_owner
 end
 
--- Files join the live Turn as their reviews open (W1: the pool grows the Turn).
+-- Files join the live Turn as their reviews open.
 -- The member is the STABLE `turn_file` record and the returned value is that
 -- record, not the caller's entry: a path already present is REFRESHED in place,
--- so a partial re-add can no longer drop the baseline, the ledger, the review
--- options or the owner (R3). The old `self.files[i] = f` replacement is gone.
+-- so a partial re-add cannot drop the baseline, the ledger, the review
+-- options or the owner.
 function Turn:add_file(entry)
 	if self:is_frozen() then
 		return false, "turn is frozen for End"
@@ -165,6 +165,12 @@ end
 function Turn:retire_empty(cause)
 	if self.state ~= "live" or #self.files ~= 0 then
 		return false, "turn.retire_empty: the Turn is not live and empty"
+	end
+	-- A panel may have handed this Turn its shadow-release receipt while members
+	-- were still withdrawing; retiring without it would strand the overlay.
+	local cleaned, cleanup_err = self:run_required_cleanup()
+	if not cleaned then
+		return false, "turn.retire_empty: " .. tostring(cleanup_err)
 	end
 	self.state = "gone"
 	if self.started then
@@ -284,9 +290,10 @@ function Turn:pending_count()
 	return n
 end
 
--- Review surfaces follow pending work independently of the Turn lifetime.
+-- Review surfaces follow pending work independently of the Turn lifetime. This is an edge, like
+-- `refresh_review_liveness` below: a file joining a review that is already alive repaints nothing here.
 function Turn:announce_review()
-	if self.state ~= "live" or self:is_frozen() or self:pending_count() == 0 then
+	if self.review_alive or self.state ~= "live" or self:is_frozen() or self:pending_count() == 0 then
 		return
 	end
 	self.review_alive = true
@@ -472,8 +479,12 @@ function Turn:end_turn(cause, context)
 	-- called last. A committed End keeps the cause its first write used.
 	cause = self:end_request(cause)
 
-	-- Step 1 — the ask. A confirmed End stays one-way, even on partial failure.
-	local ok_ask, answer = pcall(self.deps.ask, cause, { pending = self:pending_count() })
+	-- Step 1 — the ask, unless the caller's own dialog already confirmed this End
+	-- (F-MODES-AGENTIC-ABORT). A confirmed End stays one-way, even on partial failure.
+	local ok_ask, answer = true, "end"
+	if not (type(context) == "table" and context.confirmed == true) then
+		ok_ask, answer = pcall(self.deps.ask, cause, { pending = self:pending_count() })
+	end
 	if not ok_ask or answer ~= "end" then
 		self.ending = false
 		self:deliver_end_result(ok_ask and "cancelled" or "refused",
@@ -489,7 +500,11 @@ function Turn:end_turn(cause, context)
 		self.frozen = true
 		self.sealing = nil
 		self.bus:emit("turn_sealed", { turn = self })
-		self:deliver_end_result("partial", { phase = "local", reason = tostring(called and freeze_err or froze) })
+		local reason = tostring(called and freeze_err or froze)
+		local msg = "yana: End failed; nothing was written and it cannot be retried. Quit Neovim to clear this review: " .. reason
+		log.write("ERROR", msg)
+		require("yana.notify").one_line(msg, vim.log.levels.ERROR)
+		self:deliver_end_result("partial", { phase = "local", reason = reason })
 		return true
 	end
 

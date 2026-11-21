@@ -6,8 +6,6 @@
 -- used for `S.submit_panel`/`S.cancel_inflight`.
 local config = require("yana.config")
 local diff = require("yana.diff")
-local notify = require("yana.notify")
-local notify_one_line = notify.one_line
 local shadow_ops = require("yana.shadow.ops")
 local log = require("yana.log")
 local ledger = require("yana.ledger")
@@ -15,58 +13,15 @@ local steer_channel = require("yana.agent.steer_channel")
 local conversation = require("yana.panel.conversation")
 
 local M = {}
-local uv = vim.uv or vim.loop
 
-local function is_raw_tool_result(obj)
-  if obj.type ~= "user" then
-    return false
-  end
-  local content = obj.message and obj.message.content
-  if type(content) ~= "table" then
-    return false
-  end
-  for _, item in ipairs(content) do
-    if type(item) == "table" and item.type == "tool_result" then
-      return true
-    end
-  end
-  return false
-end
-
-local function is_tool_boundary(obj)
-  return (obj.type == "tool_call" and obj.subtype == "completed") or is_raw_tool_result(obj)
-end
-
-local function pending_is_armed(p)
-  local pending = p.steer_pending
-  if not pending or pending.at ~= "tool_boundary" then
-    return false
-  end
-  if not pending.armed_hr then
-    return true
-  end
-  -- Ignore stale same-tick tool results.
-  return ((uv.hrtime() - pending.armed_hr) / 1e6) >= 50
-end
-
--- deps.state: the parent's shared state table `S` -- read S.render_note,
--- S.submit_panel; this module ALSO assigns S.maybe_drain_queue and S.shadow_turn_gen
--- onto it (parent facade wires those after M.new returns). deps.append /
--- deps.append_stream / deps.render_tool_note / deps.render_error / deps.turn_ledger /
--- deps.with_render_gen: yana.ui_render facade locals. deps.update_winbar:
--- yana.ui_winbar facade local.
 function M.new(deps)
   local S = deps.state
   local append = deps.append
   local append_stream = deps.append_stream
   local render_tool_note = deps.render_tool_note
-  local render_user = deps.render_user
-  local start_assistant_block = deps.start_assistant_block
   local render_error = deps.render_error
   local turn_ledger = deps.turn_ledger
   local with_render_gen = deps.with_render_gen
-  local update_winbar = deps.update_winbar
-  local panel_open = deps.panel_open
   local preview_module = deps.preview_module
   local note_liveness_event = deps.note_liveness_event
 
@@ -83,8 +38,7 @@ end
 local function finish_assistant_block(p, result_obj, gen)
 	local o = config.options
 	-- Fallback: nothing rendered at all but we have a final result string.
-	local internal_proposal = require("yana.input.home_buffer_proposal").home_capture_of(p.turn_buffer_captures and p.turn_buffer_captures[gen])
-	if not internal_proposal and not p.rendered_any and result_obj and type(result_obj.result) == "string" and result_obj.result ~= "" then
+	if not p.rendered_any and result_obj and type(result_obj.result) == "string" and result_obj.result ~= "" then
 		append_stream(p, result_obj.result)
   end
   if o.ui.show_usage and result_obj and result_obj.usage then
@@ -117,27 +71,6 @@ local function is_disk_bearing_tool_call(obj)
   return diff.change_from_payload(name, payload) ~= nil
 end
 
-  function S.deliver_steer_now(p)
-    if not p
-      or not p.steer_pending
-      or p.steer_pending.at ~= "now"
-      or p.steer_channel_active ~= "stream-json"
-      or not p.job
-    then
-      return false
-    end
-    -- Submit #3 sends after the keyfeed unwinds.
-    local text = p.steer_pending.text
-    if not steer_channel.deliver(p, text, { interrupt = true }) then
-      return false
-    end
-    render_user(p, text)
-    S.render_note(p, "⏸ interrupted — sending your message")
-    start_assistant_block(p)
-    update_winbar(p)
-    return true
-  end
-
   local function on_event_body(p, gen, obj, mini)
   local stale = gen ~= p.turn_gen
   -- Provenance, record 2 of 3. Stamped for EVERY decoded event, stale ones
@@ -152,7 +85,7 @@ end
   -- the way out (and again at turn end) so an append made outside event
   -- handling records no cause rather than borrowing this one.
   ledger.set_current_event(L, seq)
-  if stale and not is_disk_bearing_tool_call(obj) then
+  if p.finish_quit or (stale and not is_disk_bearing_tool_call(obj)) then
     ledger.set_current_event(L, nil)
     return
   end
@@ -160,26 +93,22 @@ end
     ledger.bump(L, "events_stale_disk_bearing")
   end
   local o = config.options
-  if p.steer_pending and p.steer_pending.at == "now" and p.steer_channel_active == "stream-json" then
-    S.deliver_steer_now(p)
-  end
   if obj.type == "system" and obj.subtype == "init" then
     ledger.mark(L, "session_init")
     -- Bind only through Conversation against the launch-captured mini.
     conversation.get(p):bind_upstream(mini, obj.session_id)
   elseif obj.type == "assistant" then
     local content = obj.message and obj.message.content or {}
-	local internal_proposal = require("yana.input.home_buffer_proposal").home_capture_of(p.turn_buffer_captures and p.turn_buffer_captures[gen])
     for _, item in ipairs(content) do
       if item.type == "text" then
         -- Streaming deltas carry timestamp_ms but NOT model_call_id. The
         -- consolidated messages carry model_call_id (intermediate) or neither
         -- (final), so we render only true deltas to avoid duplication.
-		if not internal_proposal and obj.timestamp_ms and not obj.model_call_id then
+		if obj.timestamp_ms and not obj.model_call_id then
           append_stream(p, item.text or "")
         end
       elseif item.type == "thinking" then
-		if not internal_proposal and o.ui.show_thinking and obj.timestamp_ms and not obj.model_call_id then
+		if o.ui.show_thinking and obj.timestamp_ms and not obj.model_call_id then
           append_stream(p, item.text or item.thinking or "")
         end
       end
@@ -230,31 +159,21 @@ end
         -- record_control_plane_refusals, and the scope-revert guard above.
         render_tool_note(p, name, payload)
       end
-      if pending_is_armed(p) then
-        -- Boundary delivery trigger.
-        local text = p.steer_pending.text
-        if p.steer_channel_active == "stream-json" then
-          if steer_channel.deliver(p, text, { interrupt = true }) then
-            render_user(p, text)
-            S.render_note(p, "⏸ interrupted at tool boundary — sending your message")
-            start_assistant_block(p)
-          end
-        elseif S.steer_text then
-          p.steer_pending = nil
-          S.steer_text(p, text, { note = "⏹ interrupted to steer — waiting for the previous process to exit" })
-        end
-        update_winbar(p)
-      end
     end
-  elseif is_tool_boundary(obj) and pending_is_armed(p) then
-    -- A raw tool_result is a degradation seam.
-    local text = p.steer_pending.text
-    if S.steer_text then
-      p.steer_pending = nil
-      S.steer_text(p, text, { note = "⏹ interrupted to steer — waiting for the previous process to exit" })
+  elseif obj.type == "control_response" and p.prompt_interrupt_id and type(obj.response) == "table"
+      and obj.response.request_id == p.prompt_interrupt_id then
+    p.prompt_interrupt_id = nil
+    local input = conversation.last_input(p)
+    if input and input.failure then
+      S.render_note(p, "interrupt could not continue (" .. input.failure .. ")", true)
     end
-    update_winbar(p)
   elseif obj.type == "result" then
+    local input = conversation.last_input(p)
+    if input and not input.result_ready then
+      ledger.set_current_event(L, nil)
+      return
+    end
+    if input then steer_channel.close(p) end
     ledger.mark(L, "result_received")
     -- §2.7 usage retention: the numbers the panel renders once and forgets
     -- become a per-turn record, so "the agent got slower this week" and
@@ -287,23 +206,7 @@ end
       end
     end
 		finish_assistant_block(p, obj, gen)
-    local self_interrupted = p.self_interrupted
-    if self_interrupted then
-      p.self_interrupted = nil
-    end
-    if p.steer_channel_active == "stream-json" then
-      if p.steer_pending then
-        local text = p.steer_pending.text
-        if steer_channel.deliver(p, text, { interrupt = false }) then
-          render_user(p, text)
-          start_assistant_block(p)
-        end
-        update_winbar(p)
-      elseif not self_interrupted then
-        steer_channel.close(p)
-      end
-    end
-    if obj.is_error and not self_interrupted then
+    if obj.is_error then
       render_error(p, type(obj.result) == "string" and obj.result ~= "" and obj.result or "agent reported an error", {
         vendor_backend = config.options.backend,
         evidence_dir = turn_evidence_dir(p),
@@ -316,6 +219,9 @@ end
       evidence_dir = turn_evidence_dir(p),
     })
     p.turn_errored = true
+  elseif obj.type == "warning" then
+    -- A vendor's non-fatal notice: shown, never a failure (F-VENDOR-FAILURES).
+    S.render_note(p, "⚠ " .. tostring(config.options.backend) .. " warning: " .. obj.message)
   end
   ledger.set_current_event(L, nil)
 end
@@ -325,25 +231,6 @@ local function on_event(p, gen, obj, mini)
   -- decided to draw, and it must survive every early return below.
   note_liveness_event(p, gen, obj)
   with_render_gen(p, gen, on_event_body, p, gen, obj, mini)
-end
-function S.maybe_drain_queue(p)
-  if p.busy or p.job ~= nil or p.awaiting_exit or #p.queue == 0 or not panel_open(p) then
-    return
-  end
-  if config.options.queue.pause_on_error and p.turn_errored then
-    notify_one_line(
-      string.format(
-        "yana: turn errored — %d queued prompt(s) held; send with %s",
-        #p.queue,
-        config.options.mappings.queue or "the queue picker"
-      ),
-      vim.log.levels.WARN
-    )
-    return
-  end
-  local next_prompt = table.remove(p.queue, 1)
-  update_winbar(p)
-  S.submit_panel(p, { text = next_prompt })
 end
 local function record_control_plane_refusals(turn, p, typed)
   return shadow_ops.record_control_plane_refusals(shadow_ops.control_plane_warn_scope({

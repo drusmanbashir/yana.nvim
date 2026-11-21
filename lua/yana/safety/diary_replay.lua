@@ -112,9 +112,9 @@ function M.new(deps)
 		local reverts = {}
 		local rollbacks = {}
 		for _, op in ipairs(intents) do
-			-- Mutation seam (gate): the pre-fix blindness, where an automatic
-			-- rollback left no marker replay would look at, so a crash on either
-			-- side of its restore fell through to the accept three-way below.
+			-- Mutation seam (gate): an automatic rollback leaves no marker replay would
+			-- look at, so a crash on either side of its restore falls through to the accept
+			-- three-way below.
 			local marker = rollback_start[op.op_id]
 			if test_state.fault.replay_ignores_rollback_rows then
 				marker = nil
@@ -125,9 +125,8 @@ function M.new(deps)
 				and not revert_done[op.op_id]
 				and (rollback_done[op.op_id] or marker)
 			if revert_done[op.op_id] and test_state.fault.gate_bypass_settled then
-				-- Mutation seam (gate): the pre-fix settled branch, which counted a
-				-- `revert_done` row as a finished revert without reading the marker or
-				-- the restore record that row rests on.
+				-- Mutation seam (gate): counts a `revert_done` row as a finished revert without
+				-- reading the marker or the restore record that row rests on.
 				reverted = reverted + 1
 			elseif revert_done[op.op_id] then
 				-- A SETTLED REVERT IS A COMPLETION CLAIM LIKE ANY OTHER.

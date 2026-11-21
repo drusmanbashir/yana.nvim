@@ -60,13 +60,6 @@ local function mode_perm(mode)
 	return mode and (mode % 4096) or nil
 end
 
-local function mode_octal(mode)
-	if not mode then
-		return "?"
-	end
-	return string.format("%o", mode_perm(mode))
-end
-
 function I.review_kind(op, ev)
 	if op.kind == "delete" then
 		return "delete"
@@ -245,7 +238,7 @@ local function artifact_component_kind(component)
 	return nil
 end
 
-local function named_artifact_root(rel)
+function I.named_artifact_root(rel)
 	local prefix = {}
 	for component in rel:gmatch("[^/]+") do
 		prefix[#prefix + 1] = component
@@ -282,27 +275,13 @@ end
 --- inside it does. Accepting that file creates the directory; rejecting it leaves
 --- nothing behind.
 local function is_dir_create(op)
-	return op.kind == "create" and op.detail == "dir"
+	-- The producer reports a removed directory by its files, so one reported whole held none.
+	return (op.kind == "create" or op.kind == "delete") and op.detail == "dir"
 end
 
 --- Pure artifact/refusal classification. Filesystem and Git evidence are
 --- captured by the caller before the agent runs; this function only combines
 --- those facts with the producer's per-op base evidence.
----
---- The half of that ruling this function owns is the DIRECTORY half.
----
----   ⛔ create dicom_utils/.agent system-refused
----
---- and then queued `dicom_utils/.agent/INDEX.tsv` and `.../INDEX.lock` as
---- ordinary reviews anyway. The refusal was false in both directions: nothing
---- had been blocked, and accepting either child created the directory regardless.
----
---- The `virgin` / `structural_root` mechanism removed here could never have run in the
---- shipping product. It required `op.base_evidence.state == "absent"`, and
---- `compare_path` emits a `create dir` record with NO trailing evidence fields at all,
---- so `op.base_evidence` is nil for every directory create and the list was always
---- empty outside hand-built fixtures. `.agent` is in neither list and never was -- the
---- canonical artifact class is not what refused it.
 function I.classify_artifacts(typed, changes, _base_evidence, tracked)
 	tracked = tracked or { status = "unavailable", paths = {} }
 
@@ -344,7 +323,7 @@ function I.classify_artifacts(typed, changes, _base_evidence, tracked)
 			excluded[op.rel] = true
 		elseif not op.control_plane then
 			local canonical, canonical_error = manifest.validate_rel(op.rel)
-			local named_root, named_kind = named_artifact_root(op.rel)
+			local named_root, named_kind = I.named_artifact_root(op.rel)
 			local root = named_root
 			local root_kind = named_kind
 			local safety_root = (named_kind == "product" and named_root) or nil
@@ -444,7 +423,9 @@ function I.classify_artifacts(typed, changes, _base_evidence, tracked)
 		if carries_something(op.rel) then
 			op.structural = true
 		else
-			op.refusal_reason = "F-INLINE-DIRECTORY: empty directories have no file hunk; ask the agent to create a file inside, or create the directory yourself"
+			op.refusal_reason = op.kind == "delete"
+				and "F-INLINE-DIRECTORY: removing an empty directory has no file hunk; remove it yourself"
+				or "F-INLINE-DIRECTORY: empty directories have no file hunk; ask the agent to create a file inside, or create the directory yourself"
 			op.status = "system_refused"
 			op.retention_strength = "momentary"
 			individual[#individual + 1] = op

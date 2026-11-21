@@ -4,10 +4,6 @@ local Factory = {}
 function Factory.new(deps)
   local M = deps.facade
   local diff = deps.diff
-  local NS = deps.ns
-  local AUTH_NS = deps.authority_ns
-  local ANCHOR_NS = deps.anchor_ns
-  local HINT_NS = deps.hint_ns
   local queue_remove_change = deps.queue_remove_change
   local notify_one_line = deps.notify_one_line
   local change_ledger = deps.change_ledger

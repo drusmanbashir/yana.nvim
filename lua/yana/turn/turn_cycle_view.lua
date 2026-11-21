@@ -20,11 +20,12 @@ V.loaded = loaded
 -- the encoding.
 function V.rows_of(bytes, eol)
 	if eol and eol.bomb and bytes:sub(1, 3) == "\239\187\191" then bytes = bytes:sub(4) end
-	local lines = require("yana.review_line_space").buffer_lines(bytes)
 	if eol and eol.fileformat == "dos" then
-		for i, l in ipairs(lines) do lines[i] = (l:gsub("\r$", "")) end
+		bytes = bytes:gsub("\r\n", "\n")
+	elseif eol and eol.fileformat == "mac" then
+		bytes = bytes:gsub("\r", "\n")
 	end
-	return lines
+	return require("yana.review_line_space").buffer_lines(bytes)
 end
 
 -- One identity per file: the resolved absolute path (an unsaved new path keeps its absolute spelling).
@@ -405,23 +406,18 @@ end
 -- B5: the directed register path from submit to now
 ----------------------------------------------------------------------
 
-local function chain(register, at)
-	local out, ep = {}, at and register:endpoint(at)
-	while ep do
-		out[#out + 1] = ep
-		ep = ep.parent and register:endpoint(ep.parent) or nil
-	end
-	return out
-end
-
 -- The edge into endpoint `ep` for file `key`: its event part, if the edge is one a byte map can cross.
 local function edge(register, ep, key)
 	local event = register:event(ep.via)
 	local part = event and event.parts[key]
 	if not (part and part.after.ep_id == ep.ep_id) then return nil, "endpoint " .. tostring(ep.ep_id) .. " has no edge" end
 	if event.halted then return nil, "event " .. tostring(event.event_id) .. " halted" end
+	if event.kind == "publication" then
+		if part.structural == nil then return nil, "the publication has no complete origin map" end
+		return part
+	end
 	if not (event.kind == "buffer_edit" or event.kind == "decision") then
-		return nil, "a " .. tostring(event.kind) .. " event is on the path (publications map by lineage: S5)"
+		return nil, "a " .. tostring(event.kind) .. " event is on the path"
 	end
 	if not (ep.kind == "arrival" or ep.kind == "decision") then return nil, "a " .. ep.kind .. " endpoint is on the path" end
 	return part
@@ -452,7 +448,7 @@ function V.history_path(register, key, from, to, watermark)
 		for k = (watermark or 0) + 1, #list do suffix[#suffix + 1] = list[k] end
 		return { kind = "revision", steps = { { splices = suffix, back = false } } }
 	end
-	local down, up = chain(register, to), chain(register, from)
+	local down, up = register:ancestor_chain(to), register:ancestor_chain(from)
 	local on_up = {}
 	for i, ep in ipairs(up) do on_up[ep.ep_id] = i end
 	local meet
@@ -460,27 +456,34 @@ function V.history_path(register, key, from, to, watermark)
 		if on_up[ep.ep_id] then meet = i; break end
 	end
 	if meet == nil then return { kind = "unknown", reason = "the submit and current positions share no endpoint" } end
+	local forward = on_up[down[meet].ep_id] == 1
+	local historical = not forward
+	for i = 1, meet - 1 do
+		local event = register:event(down[i].via)
+		if event and event.kind == "publication" then historical = true end
+	end
+	local function unknown(reason) return { kind = "unknown", reason = reason, historical = historical } end
 	-- Both endpoints of every traversed edge, the common ancestor included, stand in the submit's incarnation.
 	local nodes = { down[meet] }
 	for i = 1, meet - 1 do nodes[#nodes + 1] = down[i] end
 	for i = 1, on_up[down[meet].ep_id] - 1 do nodes[#nodes + 1] = up[i] end
 	for _, ep in ipairs(nodes) do
-		if not same_incarnation(up[1], ep) then return { kind = "unknown", reason = "the native history incarnation changed" } end
+		if not same_incarnation(up[1], ep) then return unknown("the native history incarnation changed") end
 	end
-	local steps, forward = {}, on_up[down[meet].ep_id] == 1
+	local steps = {}
 	for i = 1, on_up[down[meet].ep_id] - 1 do
 		local part, why = edge(register, up[i], key)
-		if not part then return { kind = "unknown", reason = why } end
-		if part.splices == nil then return { kind = "unknown", reason = "an edge records no splices" } end
-		steps[#steps + 1] = { splices = part.splices, back = true }
+		if not part then return unknown(why) end
+		if part.splices == nil and part.structural == nil then return unknown("an edge records no origins") end
+		steps[#steps + 1] = { splices = part.splices, segments = part.structural, back = true }
 	end
 	for i = meet - 1, 1, -1 do
 		local part, why = edge(register, down[i], key)
-		if not part then return { kind = "unknown", reason = why } end
-		if part.splices == nil and not forward then return { kind = "unknown", reason = "an edge records no splices" } end
-		steps[#steps + 1] = { splices = part.splices or {}, back = false }
+		if not part then return unknown(why) end
+		if part.splices == nil and part.structural == nil and historical then return unknown("an edge records no origins") end
+		steps[#steps + 1] = { splices = part.splices or {}, segments = part.structural, back = false }
 	end
-	return { kind = forward and "forward" or "composed", steps = steps }
+	return { kind = historical and "composed" or "forward", steps = steps, historical = historical }
 end
 
 -- B7 retention during a run: pin every endpoint that is current for an input file, one holder per EpRef seen

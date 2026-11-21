@@ -5,13 +5,11 @@
 -- mirroring, park/resume, review close and a zero pending count never remove
 -- it; no pending work only DIMS buttons (F-BUTTON-STRIP).
 --
--- THE HEIGHT RULE, recorded once (design 2026-09-06, adversary round 2).
+-- THE HEIGHT RULE, recorded once.
 --
 --  1. BUDGETING IS AN OPEN-TIME EVENT. The strip pays for itself once, out of
 --     its own panel's named donors, and after that the column belongs to the
---     operator. No resize event ever re-splits the column again. (It used to,
---     from the pane weights frozen at open, and a bare `doautocmd VimResized`
---     therefore discarded an operator's own conversation/prompt split.)
+--     operator. No resize event ever re-splits the column again.
 --  2. ITS HEIGHT IS WHAT IT PAINTS: clamp(rendered lines, min_height,
 --     max_height), always. A by-hand drag of the strip's own divider is not
 --     honoured -- the next refresh puts the strip back on its render.
@@ -79,8 +77,6 @@ end
 -- operator can grep for.
 local ledger_errors, ledger_notified = { refresh = 0, press = 0 }, false
 local function ledger_call(where, fn)
-  -- MUTATION ONLY: the uncontained read, straight through to the caller.
-  if M._test.uncontained then return fn() end
   -- OPEN TIME IS NOT THIS SEAM'S. This seam exists for the two events the
   -- ruling names -- a CursorMoved refresh and a button press -- where a
   -- traceback would land in the operator's face on every keystroke. The
@@ -237,8 +233,6 @@ local function column_snapshot(entry)
 end
 -- The strip is only ever split under a PANEL's conversation window, so an
 -- entry always has a panel and the donors are always that panel's own windows.
--- The old anchor-window fallback existed for strips split under a source-file
--- review window; that anchoring is retired.
 local function panes(entry, skip)
   return panel_wins(entry, skip)
 end
@@ -275,30 +269,6 @@ function M._steal(need, heights, mins, ws)
 end
 local function height(w) local wi = vim.fn.getwininfo(w)[1]; return wi and wi.height or vim.api.nvim_win_get_height(w) end
 local function set_height(w, h) local wi = vim.fn.getwininfo(w)[1]; pcall(vim.api.nvim_win_set_height, w, math.max(1, h + ((wi and wi.winbar) or 0))) end
-local function split_heights(total, weights, min_each)
-  min_each = min_each or 1
-  local n = #weights
-  if n == 0 or total < n * min_each then
-    return nil
-  end
-  local wsum = 0
-  for _, w in ipairs(weights) do
-    wsum = wsum + w
-  end
-  if wsum <= 0 then
-    return nil
-  end
-  local out, used = {}, 0
-  for i = 1, n - 1 do
-    out[i] = math.max(min_each, math.floor(total * weights[i] / wsum))
-    used = used + out[i]
-  end
-  out[n] = total - used
-  if out[n] < min_each then
-    return nil
-  end
-  return out
-end
 local function apply_heights(entries, scale)
   local live, sum, good = 0, 0, {}; for _, e in ipairs(entries or {}) do if valid_win(e.win) then good[#good + 1] = e; live, sum = live + height(e.win), sum + e.height end end
   if #good == 0 then return end; vim.o.equalalways = false
@@ -371,10 +341,9 @@ end
 -- window directly above it, the conversation window the `belowright split`
 -- was cut from, and every other window in the column is pinned at the height
 -- the operator left it. Re-imposing the open-time pane weights on every
--- resize event, which is what this used to do, threw away an operator's own
--- conversation/prompt split on a bare `doautocmd VimResized` (conv 5 -> 10,
--- prompt 9 -> 4) -- a resize event is not an instruction to relayout the
--- sidebar.
+-- resize event would throw away an operator's own
+-- conversation/prompt split on a bare `doautocmd VimResized` -- a resize event is
+-- not an instruction to relayout the sidebar.
 local function exchange_with_anchor(entry, want)
   if not (entry and valid_win(entry.win)) then
     return nil
@@ -410,44 +379,6 @@ local function exchange_with_anchor(entry, want)
   return height(entry.win)
 end
 
--- MUTATION ONLY. The retired open-time-weights relayout, kept in one place so
--- `r_strip_resize_keeps_operator_split[mutation]` can put the defect back in
--- memory (`M._test.relayout_column`) and prove the row reds on it. No product
--- path calls this.
-local function redistribute(entry, strip_h)
-  local ps = panes(entry, entry.win)
-  local n = #ps
-  if n == 0 then
-    return
-  end
-  local ws = entry.weights or {}
-  while #ws < n do
-    ws[#ws + 1] = 1
-  end
-  if #ws > n then
-    local trimmed = {}
-    for i = 1, n do
-      trimmed[i] = ws[i]
-    end
-    ws = trimmed
-  end
-  local col_total = valid_win(entry.win) and height(entry.win) or strip_h
-  for _, p in ipairs(ps) do
-    col_total = col_total + height(p.win)
-  end
-  strip_h = math.max(1, math.min(strip_h, col_total - n))
-  local targets = split_heights(col_total - strip_h, ws, 1)
-  if not targets then
-    return
-  end
-  local entries = {}
-  for i, p in ipairs(ps) do
-    entries[i] = { win = p.win, height = targets[i] }
-  end
-  entries[#entries + 1] = { win = entry.win, height = strip_h }
-  apply_heights(entries, false)
-end
-
 -- THE review a strip renders: the file under the cursor, read fresh every time.
 -- The entry never caches a review, so park, resume and file switches need no
 -- teardown -- only a refresh.
@@ -473,7 +404,6 @@ end
 -- on this path, so a failed refresh leaves the strip exactly as it stood.
 local refresh_errors, refresh_notified = 0, false
 local function contain(where, fn)
-  if M._test.uncontained then return fn() end
   local ok, res = xpcall(fn, debug.traceback)
   if ok then return res end
   refresh_errors = refresh_errors + 1
@@ -497,7 +427,7 @@ function run_action_impl(e, action, key, live)
   if not readable then live = false end
   local change = state and state.change
   -- The `hunk_index` read is INSIDE the contained seam, not bare in this
-  -- argument list: it used to throw the ledger's error straight out of
+  -- argument list: a bare read would throw the ledger's error straight out of
   -- `run_action`, past `log.guard`, and into the operator's press.
   log.lifecycle_later("review.button_press", { button = action, key = key, live = live and true or false, change_id = change and change.id or nil, hunk_index = idx, source = "mouse" })
   if not live or not state then return end
@@ -558,11 +488,7 @@ function refresh_entry_impl(e)
   local rendered = math.max(min_h(), math.min(max_h(), #lines))
   e.rendered = rendered
   local want = rendered
-  if M._test.honour_drag then want = math.max(min_h(), math.min(max_h(), height(e.win))) end
-  if M._test.grow_only then want = math.max(want, height(e.win)) end
-  if M._test.relayout_column then
-    redistribute(e, want)
-  elseif height(e.win) ~= want then
+  if height(e.win) ~= want then
     exchange_with_anchor(e, want)
   end
   e.height = height(e.win)
@@ -601,6 +527,14 @@ function M.apply_relayout(panel, tab, conv_h, prompt_h)
   local e = entry_for(panel, tab); if e and valid_win(e.win) then pcall(vim.api.nvim_win_set_height, e.win, math.max(min_h(), btn)) end
 end
 function M.refresh(tab) for _, e in ipairs(tab and entries_in_tab(tab) or all_entries()) do refresh_entry(e) end end
+-- A strip paints one review: the one it last bound, or the one it would paint now. A change to any other review
+-- leaves it as it is, so one file's change costs one strip, not one per tab.
+local function strip_follows(e, buf)
+  if buf == nil or e.buf_bound == buf then return true end
+  local st = cur_state(e)
+  return st ~= nil and st.bufnr == buf
+end
+function M.refresh_for_buf(buf) for _, e in ipairs(all_entries()) do if strip_follows(e, buf) then refresh_entry(e) end end end
 
 local function close_entry(e, reason)
   if not e or e.closed then return end; e.closed = true; forget(e); stop_timer(e); if e.augroup then pcall(vim.api.nvim_del_augroup_by_id, e.augroup) end
@@ -685,7 +619,7 @@ local function open_impl(panel, pool, tab)
   e.grid = grid.new({ state = e, layout = "flow", max_height = max_h(), width = function() return vim.api.nvim_win_get_width(e.win) end, cells = function(_x) local defs = button_list(cur_state(e), e.tab, "refresh"); local width = vim.api.nvim_win_get_width(e.win); local full = select(1, render_layout(defs, width, function(d) return d.label end)); local compact = select(1, render_layout(defs, width, function(d) return d.short or d.label end)); local pick = #compact < #full and function(d) return d.short or d.label end or function(d) return d.label end; return button_rows(defs, pick, e) end, hl_groups = HL, map_desc = STRIP_MAP_DESC, global_mouse = true, release_anywhere = true, close_window = false, delete_buffer = false, on_press = function(_, s) press_entry(e, s) end, on_release = function(_, s) release_entry(e, s) end, on_hover = function(_, s) e.hover_action = s and s.live and s.action or nil end })
   e.grid:attach(e.buf, e.win)
   -- Resize NEVER closes the strip: it re-lays out and re-renders.
-  e.augroup = vim.api.nvim_create_augroup("YanaReviewButtons" .. tostring(e.win), { clear = true }); vim.api.nvim_create_autocmd({ "WinResized", "VimResized" }, { group = e.augroup, callback = function() refresh_entry(e) end }); vim.api.nvim_create_autocmd("User", { group = e.augroup, pattern = "YanaReviewSettled", callback = function() refresh_entry(e) end })
+  e.augroup = vim.api.nvim_create_augroup("YanaReviewButtons" .. tostring(e.win), { clear = true }); vim.api.nvim_create_autocmd({ "WinResized", "VimResized" }, { group = e.augroup, callback = function() refresh_entry(e) end }); vim.api.nvim_create_autocmd("User", { group = e.augroup, pattern = "YanaReviewSettled", callback = function(args) if strip_follows(e, args.data and args.data.buf) then refresh_entry(e) end end })
   vim.api.nvim_create_autocmd("WinClosed", { group = e.augroup, pattern = tostring(e.win),
     callback = function() close_entry(e, "window_closed") end })
   vim.api.nvim_create_autocmd({ "BufEnter", "WinEnter" }, { group = e.augroup, callback = function()
@@ -865,26 +799,6 @@ vim.api.nvim_create_autocmd({ "WinResized", "VimResized" }, {
 })
 
 M._test = M._test or {}
--- MUTATION SEAM. Set true to restore the pre-fix grow-only latch (the strip
--- keeps every row a reflow ever gave it). r_strip_height_follows_width's
--- mutation phase flips it and must go red; nothing in the product reads it.
-M._test.grow_only = false
--- MUTATION SEAMS (nothing in the product reads them; each restores one
--- retired behaviour in memory for the row that proves it is gone):
---   grow_only          -- the strip keeps every row a reflow gave it
---                         (r_strip_height_follows_width[mutation])
---   honour_drag        -- a by-hand drag of the strip's divider is kept
---                         against its own render
---                         (review_buttons_geometry_durability[drag_reverts])
---   relayout_column    -- every resize re-imposes the open-time pane weights
---                         (r_strip_resize_keeps_operator_split[mutation])
-M._test.honour_drag = false
-M._test.relayout_column = false
---   uncontained        -- the ledger read and the refresh/press guards are
---                         gone (r_strip_contains_ledger_errors[mutation])
-M._test.uncontained = false
-function M._test.open_errors() return open_errors end
-function M._test.last_open() return M._last_open end
 -- A TAB-KEYED VIEW over the (panel, tab) registry, because rows index it by
 -- tab. With two panels stacked in one tab it shows the focused panel's entry.
 local function focused_panel()
@@ -901,12 +815,6 @@ local function entry_in_tab(tab)
   return list[1]
 end
 function M._test.state() return entry_in_tab(vim.api.nvim_get_current_tabpage()) end
-function M._test.hunk_index(state, tab) return hunk_index(state, tab) end
-function M._test.ledger_errors() return ledger_errors.refresh, ledger_errors.press end
-function M._test.contained_errors() return refresh_errors end
-function M._test.mouse_move(action) local e = entry_in_tab(vim.api.nvim_get_current_tabpage()); if e then local s = span_named(e, action); e.grid.hover = s and s.live and s.action and s or nil; e.hover_action = s and s.live and s.action or nil; e.grid:render() end end
-function M._test.mouse_press(action) local e = entry_in_tab(vim.api.nvim_get_current_tabpage()); if e then e.grid:press(span_named(e, action)) end end
-function M._test.mouse_release(action) local e = entry_in_tab(vim.api.nvim_get_current_tabpage()); if e and e.grid.armed then e.grid:release(span_named(e, action)) end end
 function M._test.press(action) local e = entry_in_tab(vim.api.nvim_get_current_tabpage()); local s = e and span_named(e, action); if s then run_action(e, s.action, s.key, s.live) end end
 function M._test.registry()
   local out = {}
@@ -916,6 +824,5 @@ end
 function M._test.entries() return all_entries() end
 function M._test.ns() return grid._test.namespace() end
 function M._test.hl_groups() return HL end
-function M._test.flash_duration_ms() return FLASH_MS end
 function M.hl_groups() return HL end
 return M

@@ -4,11 +4,12 @@
 
 If Neovim and your agent CLI already work, configure Yana to use that agent:
 
-| Installed agent | Command | Setup option |
+| Agent | Command | Modes |
 |---|---|---|
-| Claude Code | `claude` | `backends.default = "claude"` |
-| Codex | `codex` | `backends.default = "codex"` |
-| Cursor | `cursor-agent` | `backends.default = "cursor"` |
+| Claude Code | `claude` | All |
+| Codex | `codex` | All |
+| Cursor | `cursor-agent` | `agentic` |
+| Grok | `grok` | All |
 
 With lazy.nvim:
 
@@ -17,13 +18,12 @@ With lazy.nvim:
   "drusmanbashir/yana.nvim",
   dependencies = { "drusmanbashir/yana-ui.nvim" },
   event = "VeryLazy",
-  opts = { backends = { default = "claude" } }, -- or "codex" / "cursor"
+  opts = { backends = { default = "claude" } }, -- or "codex"
 }
 ```
 
 The dependency entry installs `yana-ui.nvim` automatically. With `opts = {}`,
-Yana starts with Cursor; it does not select whichever CLI happens to be
-installed. Your existing agent login is used; no separate Yana account or API
+Yana starts with Claude. Your existing agent login is used; no separate Yana account or API
 key is required.
 
 If your agent is installed but not signed in, run `:YanaLogin` after configuring
@@ -39,21 +39,13 @@ authentication is preserved.
 
 ## Ubuntu extras and first use
 
-For a normal Ubuntu installation, add the tools used by Yana's sandbox:
-
 ```sh
-sudo apt-get install git curl bubblewrap libcap2-bin
+sudo apt-get install git curl python3 ripgrep
 ```
 
-These provide `bwrap` and `capsh`. The full system-tool list below covers minimal
-images too; Neovim and agent installation instructions can be skipped when those
-already work.
-
 Restart Neovim in your project directory, run `:checkhealth yana`, then open
-`:Yana`. If health reports `bwrap:userns`, the host is preventing the sandbox
-from starting; installing the packages alone does not clear that restriction.
-Read the reported platform-specific diagnostic. If health cannot find the
-selected agent, see [troubleshooting](#troubleshooting).
+`:Yana`. For an agent or system requirement reported by health, see
+[troubleshooting](#troubleshooting).
 
 The opened project is already included. The chosen agent supplies its default
 model unless you set one in its `backends` entry.
@@ -63,7 +55,7 @@ model unless you set one in its `backends` entry.
 For a new setup, install the pieces you do not already have with the commands
 below or the optional `scripts/install-deps.sh`. If Neovim and your agent
 CLI already work, skip their installation sections. Confined `ask` and `inline`
-still need the Linux sandbox tools listed here.
+use the Linux launcher and MCP tools listed here.
 
 **Get Neovim 0.11.2+ first.** `apt` on Ubuntu 24.04 and older installs an
 older Neovim (0.9.5 on a stock Ubuntu 24.04 image, verified) with no warning
@@ -80,30 +72,30 @@ chmod u+x nvim-linux-x86_64.appimage
 Other ways to get 0.11.2+ (PPA, package managers, Windows, macOS): see
 Neovim's own install docs at [neovim.io/doc/install](https://neovim.io/doc/install/).
 
-Then install the system packages:
+The launcher uses Bash 4.4+, coreutils, sed and awk. A standard Linux installation
+already provides these. The commands below include them for minimal installations.
+If Yana must enter a systemd user scope, it also needs `systemd-run` from systemd.
 
 **Debian / Ubuntu**
 ```sh
-sudo apt-get install -y git curl bubblewrap libcap2-bin python3 util-linux findutils gawk libc-bin hostname
+sudo apt-get install -y git curl python3 ripgrep bash coreutils sed mawk
 ```
 
 **Fedora / RHEL**
 ```sh
-sudo dnf install -y git curl bubblewrap libcap python3 util-linux findutils gawk glibc-common hostname
+sudo dnf install -y git curl python3 ripgrep bash coreutils sed gawk
 ```
 
 **Arch**
 ```sh
-sudo pacman -S --needed git curl bubblewrap libcap python3 util-linux findutils gawk glibc inetutils
+sudo pacman -S --needed git curl python ripgrep bash coreutils sed gawk
 ```
 
 **macOS**
 
 Only **agentic** mode works on macOS: the agent writes your real files
-directly, with no overlay and no hunk review. Confined `ask` / `inline` need
-Linux kernel facilities (bubblewrap, overlayfs, `/proc`) that Homebrew cannot
-provide, so Yana refuses those modes on Darwin instead of silently falling
-back. Merge this field into the `opts` table above:
+directly. Confined `ask` and `inline` require Linux, `/proc`, and cgroup v2 delegation.
+On macOS, add this field to the `opts` table above:
 
 ```lua
 modes = { "agentic" },
@@ -142,6 +134,14 @@ If you still need an agent CLI, install one or more below. Select it with
   What you need: an OpenAI account (ChatGPT Plus/Pro/Business/Edu/Enterprise).
   Sign in with `codex login`, or set `OPENAI_API_KEY`.
 
+- **`grok`** (xAI Grok CLI) — **experimental**.
+  ```sh
+  curl -fsSL https://x.ai/cli/install.sh | bash
+  ```
+  What you need: a grok.com or xAI account. Sign in with `grok login`, or set
+  `XAI_API_KEY`. The installer puts `grok` in `~/.grok/bin`; if that is not on
+  Neovim's `PATH`, set `backends = { grok = { cmd = "~/.grok/bin/grok" } }`.
+
 Then run `:checkhealth yana` — it names any missing package, the agent
 binary it tried, and the fix.
 
@@ -179,7 +179,7 @@ Then add this to your Neovim configuration, choosing the backend from the table
 above:
 
 ```lua
-require("yana").setup({ backends = { default = "claude" } }) -- or "codex" / "cursor"
+require("yana").setup({ backends = { default = "claude" } }) -- or "codex"
 ```
 
 ## Verify installation
@@ -194,47 +194,6 @@ global prefix your shell profile adds but Neovim never sources. Set
 `backends.<name>.cmd` to an absolute path so Yana doesn't need to find the
 binary on `$PATH` at all. `:checkhealth yana` shows exactly what it tried
 and in what order.
-
-**bubblewrap missing, or user namespaces blocked.** Confined modes (`ask`,
-`inline`) need unprivileged user namespaces; this shows up as a refusal on
-Ubuntu 24.04 with its default AppArmor profile, inside most containers, and
-on WSL2. `:checkhealth yana` names which check failed and the fix for your
-setup — installing `bubblewrap`, or the AppArmor/sysctl change needed to
-allow user namespaces again.
-
-On Ubuntu 24.04, `bwrap:userns` reporting `setting up uid map: Permission
-denied` can mean Bubblewrap lacks an AppArmor exception. AppArmor is Ubuntu's
-program permission policy; a user namespace lets Bubblewrap build the private
-environment for a confined turn. Check for an existing profile first:
-
-```sh
-grep -rl /usr/bin/bwrap /etc/apparmor.d/
-```
-
-If a file is printed, an administrator should add `userns,` to that profile
-and reload it with `sudo apparmor_parser -r FILE`. Do not create another profile
-for `/usr/bin/bwrap`: competing attachments can prevent either from applying.
-If no file is printed, an administrator can create the profile below:
-
-```sh
-sudo apt-get install apparmor
-sudo tee /etc/apparmor.d/yana-bwrap <<'EOF'
-abi <abi/4.0>,
-include <tunables/global>
-profile yana-bwrap /usr/bin/bwrap flags=(unconfined) {
-  userns,
-}
-EOF
-sudo apparmor_parser -r /etc/apparmor.d/yana-bwrap
-```
-
-This permits Bubblewrap to construct its sandbox while retaining Ubuntu's
-user-namespace restriction for other programs. It does not disable AppArmor
-globally. Follow [Ubuntu's application-profile guidance](https://documentation.ubuntu.com/release-notes/24.04/#unprivileged-user-namespace-restrictions)
-if the machine already has a Bubblewrap profile. Restart Neovim and run
-`:checkhealth yana` again. To remove this exception, run
-`sudo apparmor_parser -R /etc/apparmor.d/yana-bwrap`, then remove that file.
-The release CI uses the same exception on its disposable Ubuntu runner.
 
 **No delegated user cgroup.** A cgroup is the Linux process group used to stop
 and reclaim a confined turn. Yana automatically enters a systemd user scope

@@ -161,8 +161,8 @@ end
 --- "last" (default follows travel direction), or "none" -- focus the file and move
 --- the cursor NOWHERE. "none" exists for the undo path: a cross-file `u` must make
 --- the other buffer current for neovim's own undo to run in it, but the cursor that
---- undo restores is the answer (F-UNDO-CURSOR), and this
---- function's scheduled landing used to overwrite it after the press. `allow_empty` (optional, default false):
+--- undo restores is the answer (F-UNDO-CURSOR), so this function's scheduled landing
+--- must not overwrite it. `allow_empty` (optional, default false):
 --- a file with zero pending hunks has nothing left to decide, so `]x`/`[x` pass it
 --- true and walk on; without that the press is accepted and the user is stranded in
 --- an already-settled file. Every other caller keeps the guard.
@@ -264,13 +264,8 @@ local function park_and_open_state(state, direction, target_item, landing, allow
     and type(target_item.change) == "table"
     and (target_item.change.rel or target_item.change.path) == (change.rel or change.path)
   --
-  -- The request used to be gated on `target_item.retrace_repaint` as well.
-  -- NOTHING IN THE TREE EVER SETS THAT FIELD (no writer anywhere under `lua/`),
-  -- so the branch was dead and the cross-file park ran no `ledger_dirty` render
-  -- at all -- measured: the guard is reached with `retrace_repaint=nil`,
-  -- `same_file=false`, a valid bufnr and a live ledger callback, and
-  -- `request_paint` is never called. Crossing to ANOTHER file is the whole
-  -- condition; the `same_file` case above is the one that must not repaint.
+  -- Crossing to ANOTHER file is the whole condition for the paint request; the
+  -- `same_file` case is the one that must not repaint.
   if target_item and not same_file and bufnr and vim.api.nvim_buf_is_valid(bufnr) then
     if state.hunk_ledger then
       state.hunk_ledger:request_paint()
@@ -353,43 +348,6 @@ local function navigate_or_park_state(state, direction)
   park_and_open_state(state, direction, item)
 end
 M._navigate_or_park_state = navigate_or_park_state
-
-local function active_state_for_global_navigation()
-  local current_buf = vim.api.nvim_get_current_buf()
-  for _, st in pairs(pools) do
-    local state = state_for_buf(st, current_buf)
-    if state then return state end
-  end
-  local current = state_for_buf(pool_for({}))
-  if current then
-    return current
-  end
-  for _, st in pairs(pools) do
-    local state = state_for_buf(st)
-    if state then return state end
-  end
-  return nil
-end
-
---- Global `]x`/`[x`. Returns `true` when Yana navigated, else `false` plus a
---- REASON: "no-review" (nothing to navigate -- not a failure, the caller
---- stands aside so whatever else owns the key can run) or "bad-direction" /
---- "focus-failed" (a real navigation failure the user must be told about).
-function M.navigate_active_review(direction)
-  if direction ~= "next" and direction ~= "prev" then
-    return false, "bad-direction"
-  end
-  local state = active_state_for_global_navigation()
-  if not state then
-    return false, "no-review"
-  end
-  if not focus_buf(state.change.path, state.bufnr) then
-    notify_one_line("yana: cannot open the reviewed file " .. tostring(state.change.path), vim.log.levels.WARN)
-    return false, "focus-failed"
-  end
-  navigate_or_park_state(state, direction)
-  return true
-end
 
 M._park_and_open_state = park_and_open_state
 M._open_target_item = open_target_item

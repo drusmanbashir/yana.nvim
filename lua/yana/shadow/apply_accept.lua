@@ -80,7 +80,7 @@ function M.reconcile_applied_buffer(applied, own_splice)
 	-- overwrite. Refuse, and leave the buffer and its tick exactly as they are.
 	if applied.staged_tick ~= nil and not (M._test.fault and M._test.fault.skip_unsaved_guard) then
 		-- Neovim's write of a modified buffer moves changedtick and nothing else
-		-- (CORE "Saving is Neovim's", N51): an unmodified buffer still at the
+		-- (CORE "Saving is Neovim's"): an unmodified buffer still at the
 		-- pinned undo position is not an edit. Its bytes are checked below.
 		local moved = vim.api.nvim_buf_get_changedtick(bufnr) ~= applied.staged_tick
 			and (vim.bo[bufnr].modified or applied.staged_seq == nil
@@ -332,7 +332,7 @@ function M.commit(session, change, plan, own_splice, staged_proof)
 	local is_delete = plan.action == "delete"
 	-- THE BEFORE-EVIDENCE. An End write (`purpose == "exit"`) acts on the file as
 	-- End finds it, so whatever the operator's own `:w` left during the review is
-	-- never drift (CORE "Saving is Neovim's", LEDGER N51; RULINGS whole-agent-hunk
+	-- never drift (CORE "Saving is Neovim's"; RULINGS whole-agent-hunk
 	-- row: End checks no disk bytes against the turn). Read here, inside the
 	-- claim, so the diary's last-instant identity and content re-check still
 	-- guards the window up to the write. Every other route keeps the turn record.

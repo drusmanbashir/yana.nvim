@@ -7,9 +7,6 @@
 local M = {}
 
 local config = require("yana.config")
-local diff = require("yana.diff")
-local hash = require("yana.safety.hash")
-local manifest = require("yana.paths.manifest")
 local ops = require("yana.shadow.ops")
 local uv = vim.uv or vim.loop
 
@@ -80,6 +77,7 @@ local preview_workspace = require("yana.shadow.preview_workspace").new({
 })
 
 M.resolve_workspace = preview_workspace.resolve_workspace
+M.workspace_candidate = preview_workspace.workspace_candidate
 M.workspace_for_turn = preview_workspace.workspace_for_turn
 M.layer_dir = preview_workspace.layer_dir
 M.turn_dir = preview_workspace.turn_dir
@@ -108,6 +106,7 @@ M.stage_undo_removal = preview_settle.stage_undo_removal
 M.retain_system_refused = preview_settle.retain_system_refused
 M.retain_refusal_group = preview_settle.retain_refusal_group
 M.recover_layer = preview_settle.recover_layer
+M.recover_run = preview_settle.recover_run
 M.arm_review_open = preview_settle.arm_review_open
 M.release = preview_settle.release
 

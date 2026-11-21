@@ -1,24 +1,22 @@
 -- yana: gathers editor context (current file, line, or visual selection)
 -- to attach to a prompt.
 local config = require("yana.config")
-local selection_scope = require("yana.input.selection_scope")
 local prompts = require("yana.prompts")
-local diff = require("yana.diff")
 
 local M = {}
 
-local function relpath(name)
-  if not name or name == "" then
-    return nil
-  end
-  local rel = vim.fn.fnamemodify(name, ":.")
-  return rel ~= "" and rel or name
+-- A buffer's absolute path, or nil for an unnamed buffer.
+local function buffer_path(buf)
+  local name = vim.api.nvim_buf_get_name(buf)
+  return name ~= "" and name or nil
 end
 
--- Find the first non-excluded normal-buffer window; return its context.
+-- The file window the operator is in or just left, else the first in the tab.
 function M.current_origin(exclude)
   exclude = exclude or {}
-  for _, win in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
+  local wins = { vim.api.nvim_get_current_win(), vim.fn.win_getid(vim.fn.winnr("#")) }
+  vim.list_extend(wins, vim.api.nvim_tabpage_list_wins(0))
+  for _, win in ipairs(wins) do
     local buf = vim.api.nvim_win_get_buf(win)
     if not exclude[buf] and vim.api.nvim_buf_is_valid(buf) then
       local bt = vim.bo[buf].buftype
@@ -27,7 +25,7 @@ function M.current_origin(exclude)
         return {
           win = win,
           buf = buf,
-          name = relpath(vim.api.nvim_buf_get_name(buf)),
+          name = buffer_path(buf),
           filetype = vim.bo[buf].filetype,
           cursor = ok and cursor[1] or 1,
         }
@@ -49,9 +47,7 @@ local function filetype_for_buf(buf)
   return vim.filetype.match({ filename = name }) or ""
 end
 
--- opts.whole_buffer: a home-folder file's whole buffer goes to the agent uncut
--- the line cap does not apply.
-function M.selection_from_range(buf, l1, l2, opts)
+function M.selection_from_range(buf, l1, l2)
   if not (buf and vim.api.nvim_buf_is_valid(buf)) then
     return nil
   end
@@ -60,7 +56,7 @@ function M.selection_from_range(buf, l1, l2, opts)
   local lines = vim.api.nvim_buf_get_lines(buf, l1 - 1, l2, false)
   local cap = config.options.context.max_selection_lines
   local truncated = false
-  if #lines > cap and not (opts and opts.whole_buffer) then
+  if #lines > cap then
     local sliced = {}
     for i = 1, cap do
       sliced[i] = lines[i]
@@ -69,7 +65,7 @@ function M.selection_from_range(buf, l1, l2, opts)
     truncated = true
   end
   local selection = {
-    name = relpath(vim.api.nvim_buf_get_name(buf)),
+    name = buffer_path(buf),
     filetype = filetype_for_buf(buf),
     buf = buf,
     l1 = l1,
@@ -91,10 +87,6 @@ function M.numbered_lines(selection)
     table.insert(out, string.format("L%d|%s", selection.l1 + i - 1, line))
   end
   return out
-end
-
-local function at_path_from_question(question)
-  return question:match("@(/[^\n:]+)")
 end
 
 local SEVERITY_NAME = {
@@ -125,15 +117,25 @@ local function diagnostics_block(origin)
   return table.concat(lines, "\n")
 end
 
+-- The sentence naming the operator's file and cursor line, or nil with no file.
+function M.file_hint(origin)
+  if not (origin and origin.name) then
+    return nil
+  end
+  return prompts.render("editing_file_hint", {
+    file = origin.name,
+    filetype = origin.filetype ~= "" and origin.filetype or "none",
+    line = origin.cursor or 1,
+  })
+end
+
 -- Assemble the full prompt (instructions, context, question); return it.
 function M.build(question, origin, selection, opts)
   opts = opts or {}
-  local o = config.options
   local parts = {}
   local label = nil
+  local file = nil
   local mode = config.resolve_mode(opts.mode)
-  -- Stale HOME metadata must not override ask/agentic; only inline uses it.
-  local home_buffer = mode == "inline" and selection and selection.home_buffer_capture
   -- Standalone default announces; callers suppress when the mini already heard this mode.
   local announce = opts.announce_mode
   if announce == nil then
@@ -148,45 +150,35 @@ function M.build(question, origin, selection, opts)
     end
   end
 
-  local at_path = at_path_from_question(question)
-  if at_path then
-    table.insert(parts, prompts.render("edit_named_file", { path = at_path }))
-    table.insert(parts, "")
-  end
-
   if selection and selection.lines and #selection.lines > 0 then
-    local where = (selection.name or "buffer") .. ":" .. selection.l1 .. "-" .. selection.l2
-    label = where
+    label = (selection.name or "buffer") .. ":" .. selection.l1 .. "-" .. selection.l2
+    file = selection.name
     local fence = selection.filetype and selection.filetype ~= "" and selection.filetype or ""
 
-    -- Scope enforcement text is an inline restriction; selected bytes stay in all modes.
-    if mode == "inline" and selection.scope then
-      local describe = selection_scope.describe(selection.scope)
-      if describe then
-        table.insert(parts, prompts.render("this_request_only", { text = describe }))
-        table.insert(parts, "")
-      end
-    end
-
-    table.insert(parts, prompts.render("selected_code_header"))
+    table.insert(parts, prompts.render("selected_code_header", {
+      file = selection.name or "unnamed buffer",
+    }))
     table.insert(parts, "```" .. fence)
     vim.list_extend(parts, M.numbered_lines(selection))
     table.insert(parts, "```")
     if selection.truncated then
       table.insert(parts, prompts.render("selection_truncated"))
     end
+    if mode == "inline" then
+      table.insert(parts, prompts.render("selection_not_a_limit"))
+    end
     table.insert(parts, "")
-  elseif o.context.include_file and origin and origin.name then
-    label = origin.name
-    table.insert(parts, prompts.render("editing_file_hint", {
-      file = origin.name, filetype = origin.filetype ~= "" and origin.filetype or "none", line = origin.cursor or 1,
-    }))
-    table.insert(parts, "")
-  end
-
-  if home_buffer then
-    table.insert(parts, prompts.render("home_buffer_json_only"))
-    table.insert(parts, "")
+  else
+    local hint = M.file_hint(origin)
+    if hint then
+      label = origin.name
+      file = origin.name
+      -- Standalone default names the file; callers suppress when the mini already heard it.
+      if opts.announce_file ~= false then
+        table.insert(parts, hint)
+        table.insert(parts, "")
+      end
+    end
   end
 
   table.insert(parts, question)
@@ -202,6 +194,7 @@ function M.build(question, origin, selection, opts)
   return {
     prompt = table.concat(parts, "\n"),
     label = label,
+    file = file,
   }
 end
 

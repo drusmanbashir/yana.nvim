@@ -14,7 +14,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates curl git tar \
         python3 \
-        bubblewrap libcap2-bin \
+        ripgrep \
         procps \
     && rm -rf /var/lib/apt/lists/*
 
@@ -28,7 +28,6 @@ RUN set -eux; \
     nvim --version | head -1; \
     test "$(nvim --version | head -1)" = "NVIM v${NVIM_VERSION}"
 
-# Scratch for overlay turns must live outside /tmp (bwrap tmpfs-masks /tmp).
 RUN mkdir -p /var/yana/scratch && chmod 1777 /var/yana/scratch
 
 # Build context is never a Yana git checkout: only export/ and the inner runner.
@@ -45,7 +44,6 @@ RUN chmod 755 /opt/container_smoke_run.sh \
     && test ! -e /opt/yana-export/.git \
     && test ! -d /opt/yana-export/spec \
     && test -d /opt/yana-ui/lua/yana_ui \
-    && command -v bwrap >/dev/null \
     && command -v python3 >/dev/null
 WORKDIR /opt
 ENTRYPOINT ["/opt/container_smoke_run.sh"]

@@ -128,7 +128,10 @@ function M.new(env)
     -- property of the buffer as it stands now, and every group is pruned
     -- against the same reading.
     local reachable = reachable_seqs(state.bufnr)
-    if #order > 1 then
+    -- Parser-free writes settle their row ownership and undo together, even outside Insert.
+    if #order > 1 or (state.watch_timeline
+      and require("yana.review_watch_ownership").uses_line_ownership(state.bufnr, state))
+    then
       publish_timeline(order, reachable)
       return
     end

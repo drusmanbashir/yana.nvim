@@ -25,7 +25,6 @@ local builtin_descriptors = {
 	{ name = "backend", description = "Pick a backend", details = "Layer 1: select which binary/account/bill (cursor/claude/…); resets the model" },
 	{ name = "mode", description = "Cycle agent/ask mode", details = "Only before this chat's first turn; a chat's mode is locked once it has run a turn" },
 	{ name = "resend", description = "Resend last prompt", details = "here (default) | new = new chat | agent = new chat in agent mode" },
-	{ name = "queue", description = "Manage queued prompts", details = "View, edit, delete or send a queued prompt" },
 	{ name = "stop", description = "Stop the current turn", details = "Cancel the in-flight agent turn" },
 	{ name = "review", description = "Review file changes", details = "Open the diff review for a pending change" },
 }
@@ -81,10 +80,6 @@ local builtin_callbacks = {
 		if cb then
 			cb()
 		end
-	end,
-	queue = function(_panel, _args, cb)
-		require("yana.panel.ui").pick_queue()
-		cb(nil)
 	end,
 	stop = function(_panel, _args, cb)
 		require("yana.panel.ui").stop()

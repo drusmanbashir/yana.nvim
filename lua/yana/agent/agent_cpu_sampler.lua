@@ -114,18 +114,6 @@ local function tree_ticks(pid)
   return total
 end
 
-local function ticks_for_pids(pids)
-  local total = 0
-  local live = {}
-  for _, p in ipairs(pids or {}) do
-    if uv.fs_stat("/proc/" .. tostring(p)) then
-      live[#live + 1] = p
-      total = total + proc_ticks(p)
-    end
-  end
-  return total, live
-end
-
 local function ticks_for_status(status)
   local total = 0
   local live = {}
@@ -259,14 +247,6 @@ function M.status(job)
       and ((status.sample_cost_ms_total or 0) / status.sample_count)
       or 0,
   }
-end
-
-function M.set_sample_interval_ms(ms)
-  sample_interval_ms = (type(ms) == "number" and ms > 0) and ms or 2000
-end
-
-function M.force_status(job, status)
-  job_status[job] = status
 end
 
 M.start = start_cpu_sampler

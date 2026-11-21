@@ -47,10 +47,10 @@ add('backends')
 if type(defaults.backends) == 'table' and defaults.backends.default ~= nil then
   add('backends.default')
 end
--- Named backend entries have a fixed public wildcard path. Their command and
--- model are optional user inputs omitted from Lua defaults when nil.
+-- Named backend entries have a fixed public wildcard path. Their command,
+-- model and env are optional user inputs omitted from Lua defaults when nil.
 add('backends.<name>')
-for _, option in ipairs({'cmd', 'model'}) do
+for _, option in ipairs({'cmd', 'model', 'env'}) do
   add('backends.<name>.' .. option)
 end
 local ordered = vim.tbl_keys(paths)
@@ -127,6 +127,15 @@ local function example_paths(value, prefix, out)
   end
   return out
 end
+-- Agent settings beyond the reference are documented by the presets file.
+local preset_settings = { env = true }
+for _, preset in pairs(config.defaults.backends) do
+  for key in pairs(preset) do preset_settings[key] = true end
+end
+local function public_example_path(path)
+  local setting = path:match('^backends%.<name>%.([^.]+)')
+  return paths[path] or (setting ~= nil and preset_settings[setting] == true)
+end
 local example_documents = {'README.md', 'doc/yana.txt'}
 for _, file in ipairs(vim.fn.globpath(root, 'docs/*.md', false, true)) do
   example_documents[#example_documents + 1] = file:sub(#root + 2)
@@ -144,7 +153,7 @@ for _, name in ipairs(example_documents) do
       else
         examples = examples + 1
         for _, path in ipairs(example_paths(value, '', {})) do
-          if not paths[path] then
+          if not public_example_path(path) then
             print('CONFIG EXAMPLE FAIL: ' .. name .. ' uses `' .. path .. '`, which is not a public setting')
             failed = true
           end

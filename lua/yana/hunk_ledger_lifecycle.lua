@@ -116,8 +116,7 @@ function M.install(Ledger, helpers)
 			-- that hands back an unrelated block proposing the same bytes took
 			-- the dead hunk's lineage and a recorded frame then restored into a
 			-- stranger (probe `REBUILD_BY_BYTES inherited=lin-1`). Bytes may
-			-- validate a name (`hunk_identity.looks_like`); they may never make
-			-- one. A block with no ancestor here is a new hunk and is stamped
+			-- never make a name. A block with no ancestor here is a new hunk and is stamped
 			-- as one.
 			local ancestor = block.rebuild_ancestor
 				or (block.model_index ~= nil and lineage_by_model[block.model_index])

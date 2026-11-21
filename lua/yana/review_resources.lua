@@ -221,7 +221,7 @@ end
 --- Park: navigation away while the review stays alive. Retains owner entry,
 --- augroup (save handlers), ledger, marks, winhl and the watcher attachment, so an
 --- edit in a parked buffer is still one `buffer_edit` row, in time order, without
---- resuming the review (F-ADDENDUM-EDIT-HISTORY; integrator ruling 2026-10-02).
+--- resuming the review (F-ADDENDUM-EDIT-HISTORY).
 --- Releases buffer-local keys and the preview tab: decisions and the strip stay
 --- with the active review. Never sets `state.closed`, deletes the augroup or gives
 --- up ownership.

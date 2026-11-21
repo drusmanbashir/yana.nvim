@@ -1,12 +1,9 @@
--- yana: default backends zoo (slice of config defaults).
--- Extracted from yana.config; schema comments travel with the table.
+-- yana: vendor presets (slice of config defaults).
 
 ----------------------------------------------------------------------
--- BACKENDS -- the "zoo" the operator stocks (a named entry per vendor, plus a
--- top-level selector). The operator can add their OWN entry in their own setup({}) call
--- and select it immediately -- no plugin change needed -- because M.setup merges
--- `opts.backends` onto these defaults with `vim.tbl_deep_extend("force", ...)`: a new
--- name is added whole, an existing name (e.g. overriding just `claude.cmd`) is extended
+-- BACKENDS -- tested presets. Only the vendors named in setup({ backends }) are
+-- enabled (plus the default's preset); each listed field replaces the preset's
+-- field, and a name with no preset declares a vendor in full.
 --
 -- Row 58: model switching has TWO layers.
 -- `model` above is layer 2 (which model inside a backend). This is layer
@@ -32,25 +29,12 @@
 -- explicit location and IS checked at setup: the operator wrote a specific file down,
 -- and a typo there deserves a named refusal before the first turn. nil is legal ONLY
 -- for the built-in "cursor" entry and means "keep using the cmd/cmd_env/PATH chain
--- above unchanged" -- this is what makes the default byte-identical to pre-backends
--- Yana.
+-- above unchanged" -- so the default resolution does not depend on the backends table.
 --
 -- Tokens placed IMMEDIATELY after `cmd`, before every flag Yana adds (build_cmd).
 -- `false` with an empty/absent `subcommand` is refused BY NAME at setup -- that
 -- combination would run interactively and hang forever with nobody there to answer it.
 -- stream_protocol OPTIONAL string, default "cursor".
-local function sandbox_stamps(vendor_version)
-  local function stamp()
-    return { measured_on = "2026-10-17", vendor_version = vendor_version }
-  end
-  return {
-    full = stamp(),
-    workspace = stamp(),
-    ["read-only"] = stamp(),
-    ["vendor-default"] = stamp(),
-  }
-end
-
 local backends = {
   cursor = {
     cmd = nil,
@@ -65,7 +49,6 @@ local backends = {
       ["read-only"] = { "--mode", "ask" },
       ["vendor-default"] = {},
     },
-    sandbox_args_stamps = sandbox_stamps("2026.10.16-e3cb207"),
     allow_edits_args = {},
     select_model_flag = "--model",
     resume_flag = "--resume",
@@ -103,7 +86,29 @@ local backends = {
     noninteractive_flag = "-p",
     stream_protocol = "claude",
     stream_json_args = { "--output-format", "stream-json", "--verbose" },
-    mode_switch = "per_turn",
+    -- inline_mcp: the vendor's spelling of the MCP inline route. args are argv
+    -- tokens ("{config}" becomes the generated config path, "{tools}" the mode's list); config is the
+    -- document the writer puts the Yana server into. home_env names a private
+    -- per-run config home; auth says how a login reaches it: only "none" (a fake
+    -- CLI) is implemented, so an undecided backend keeps the overlay route.
+    -- read_tools names the read tools in the inline prompt.
+    inline_mcp = {
+      read_tools = "Yana's read, grep and list_files",
+      tools = {
+        inline = { "mcp__yana__open_buffer", "mcp__yana__edit_buffer", "mcp__yana__replace_text",
+          "mcp__yana__delete_file", "mcp__yana__rename_file", "mcp__yana__read", "mcp__yana__grep", "mcp__yana__list_files" },
+        ask = { "mcp__yana__read", "mcp__yana__grep", "mcp__yana__list_files" },
+      },
+      args = {
+        "--restricted", "--strict-mcp-config", "--no-chrome", "--disable-slash-commands",
+        "--agents", "{}", "--permission-mode", "dontAsk", "--permission-prompts", "none",
+        "--tools", "", "--mcp-config", "{config}",
+        "--allowedTools", "{tools}",
+      },
+      config = { format = "json", servers_key = "mcpServers" },
+    },
+    mode_switch = "two_seat",
+    seats = { protected = { "ask", "inline" }, agentic = { "agentic" } },
     steer_channel = "stream-json",
     sandbox_args = {
       full = { "--permission-mode", "bypassPermissions" },
@@ -111,7 +116,6 @@ local backends = {
       ["read-only"] = { "--permission-mode", "plan" },
       ["vendor-default"] = {},
     },
-    sandbox_args_stamps = sandbox_stamps("2.1.302 (Claude Code)"),
     allow_edits_args = {},
     select_model_flag = "--model",
     -- Hierarchy mode tokens: Claude Code 2.1.251 `claude --help` prints
@@ -167,10 +171,37 @@ local backends = {
                               -- SUBCOMMAND, never a flag.
     noninteractive_flag = false, -- `exec` IS the non-interactive mode.
     stream_protocol = "codex",
+    -- codex 0.170: --ignore-user-config keeps the operator's CODEX_HOME login but
+    -- skips its config.toml (servers, plugins, project trust, so no project
+    -- .codex layer). CODEX_HOME/hooks.json still loads, hence --disable hooks;
+    -- plugins and apps add servers of their own. "cli" config is -c overrides;
+    -- approval_policy never refuses an MCP call unless its tools are "approve".
+    -- read-only refuses apply_patch. The shell tool is disabled before launch.
+    inline_mcp = {
+      read_tools = "Yana's read, grep and list_files",
+      tools = {
+        inline = { "open_buffer", "edit_buffer", "replace_text", "delete_file", "rename_file", "read", "grep", "list_files" },
+        ask = { "read", "grep", "list_files" },
+      },
+      args = { "--skip-git-repo-check", "--ignore-user-config", "--ignore-rules",
+        "--disable", "hooks", "--disable", "plugins", "--disable", "apps",
+        "--disable", "shell_tool", "--disable", "shell_snapshot", "--disable", "unified_exec",
+        "--disable", "multi_agent", "--disable", "multi_agent_v2", "--disable", "goals",
+        "--disable", "request_permissions_tool", "--disable", "view_image",
+        "--disable", "default_mode_request_user_input", "{config}" },
+      config = {
+        format = "cli", flag = "-c", servers_key = "mcp_servers",
+        settings = { sandbox_mode = "read-only", approval_policy = "never", web_search = "disabled" },
+        server = { env_vars = { "YANA_MCP_SOCKET", "YANA_MCP_WORKSPACE" },
+          enabled_tools = "{tools}",
+          default_tools_approval_mode = "approve" },
+      },
+    },
     stream_json_args = { "--json" }, -- codex's JSONL request token is
                                       -- literally "json", never
                                       -- "stream-json".
-    mode_switch = "per_turn",
+    mode_switch = "two_seat",
+    seats = { protected = { "ask", "inline" }, agentic = { "agentic" } },
     -- SANDBOX LEVEL IS YANA'S KEY, THE ARGV IS THE VENDOR'S DIALECT. The shared builder
     -- (`agent.lua`'s `build_cmd`) never branches on the backend name; it asks this
     -- table for the tokens of the requested LEVEL. Yana respects whatever level the
@@ -191,7 +222,6 @@ local backends = {
       ["read-only"] = { "-c", 'sandbox_mode="read-only"' },
       ["vendor-default"] = {},
     },
-    sandbox_args_stamps = sandbox_stamps("codex-cli 0.163.0"),
     allow_edits_args = { "--skip-git-repo-check" },
     select_model_flag = "--model",
     mode_tokens = {
@@ -217,6 +247,75 @@ local backends = {
                          -- $HOME or equal to/under ~/.ssh, ~/.gnupg, ~/.aws are refused
                          -- at setup().
     state_dirs = { "~/.codex" },
+  },
+  -- grok 1.0.77, measured 2026-11-15: `--output-format streaming-messages-json`
+  -- emits Claude Code's stream-json events, so the claude reader parses it.
+  -- `--single` is the headless switch and carries the prompt; the joined
+  -- `--single=<prompt>` form keeps a prompt that starts with "-" a value.
+  -- `--permission-mode plan` made no workspace write; `acceptEdits` also runs
+  -- shell commands. `grok models` exits 0 signed in or out, so its first line
+  -- decides auth.
+  grok = {
+    cmd = "grok",
+    cmd_env = "YANA_GROK_BIN",
+    noninteractive_flag = false,
+    prompt_flag = "--single",
+    stream_protocol = "claude",
+    stream_json_args = { "--output-format", "streaming-messages-json" },
+    -- Use a private Grok config with only the Yana server and explicit tools.
+    inline_mcp = {
+      auth = "linked",
+      home_env = "GROK_HOME",
+      native_home = "~/.grok",
+      home_links = { ["auth.json"] = "read", sessions = "write" },
+      read_tools = "Yana's read, grep and list_files",
+      tools = {
+        inline = {
+          "--allow", "MCPTool(yana__open_buffer)", "--allow", "MCPTool(yana__edit_buffer)",
+          "--allow", "MCPTool(yana__replace_text)", "--allow", "MCPTool(yana__delete_file)",
+          "--allow", "MCPTool(yana__rename_file)", "--allow", "MCPTool(yana__read)",
+          "--allow", "MCPTool(yana__grep)", "--allow", "MCPTool(yana__list_files)",
+        },
+        ask = {
+          "--allow", "MCPTool(yana__read)", "--allow", "MCPTool(yana__grep)", "--allow", "MCPTool(yana__list_files)",
+        },
+      },
+      env = { GROK_CLAUDE_MCPS_ENABLED = "0", GROK_CURSOR_MCPS_ENABLED = "0",
+        GROK_CLAUDE_HOOKS_ENABLED = "0", GROK_CURSOR_HOOKS_ENABLED = "0", GROK_WORKFLOWS = "0" },
+      args = { "--no-leader", "--no-subagents", "--no-auto-update", "--no-memory", "--sandbox", "off",
+        "--tools", "search_tool,use_tool", "--permission-mode", "dontAsk", "{tools}" },
+      config = {
+        format = "toml", file = "requirements.toml", native_file = "config.toml", servers_key = "mcp_servers",
+        settings = { allow_managed_mcp_servers_only = true, allow_managed_hooks_only = true,
+          enable_all_project_mcp_servers = false,
+          allowed_mcp_servers = { { server_name = "yana" } } },
+        server = { env = {
+          YANA_MCP_SOCKET = "${YANA_MCP_SOCKET}", YANA_MCP_WORKSPACE = "${YANA_MCP_WORKSPACE}",
+        } },
+      },
+    },
+    mode_switch = "two_seat",
+    seats = { protected = { "ask", "inline" }, agentic = { "agentic" } },
+    sandbox_args = {
+      full = { "--permission-mode", "bypassPermissions" },
+      workspace = { "--permission-mode", "acceptEdits" },
+      ["read-only"] = { "--permission-mode", "plan" },
+      ["vendor-default"] = {},
+    },
+    allow_edits_args = {},
+    select_model_flag = "--model",
+    resume_flag = "--resume",
+    ask_args = {},
+    list_models_args = { "models" },
+    list_models_format = "bullets",
+    whoami_args = { "models" },
+    auth_output_patterns = { signed_in = "You are logged in", signed_out = "You are not authenticated" },
+    auth_login_hint = "grok login",
+    login_args = { "login" },
+    auth_env = { "XAI_API_KEY" },
+    install_hint = "curl -fsSL https://x.ai/cli/install.sh | bash",
+    close_stdin = true,
+    state_dirs = { "~/.grok" },
   },
 }
 

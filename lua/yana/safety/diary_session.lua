@@ -2,6 +2,8 @@
 -- restore-through-`intent`/`apply_pending` path as before the split.
 local M = {}
 
+local diary_store = require("yana.safety.diary_store")
+
 function M.new(deps)
 	local diff = deps.diff
 	local control_plane = deps.control_plane
@@ -83,13 +85,7 @@ function M.new(deps)
 		local stream = opts.stream or "default"
 		local diary_dir = opts.diary_dir or test_state.force_diary_root
 		if not diary_dir then
-			diary_dir = workspace
-				.. "/.yana/diary/"
-				.. stream
-				.. "/"
-				.. tostring(os.time())
-				.. "-"
-				.. tostring(math.random(1, 1e6))
+			diary_dir = diary_store.new_session_dir(workspace, stream)
 		end
 		diary_dir = diff.abs_path(diary_dir)
 		local parent = vim.fn.fnamemodify(diary_dir, ":h")

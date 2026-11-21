@@ -17,16 +17,25 @@ local function read_version()
 	f:close()
 	return v
 end
+-- Parent pid, start ticks and real uid of a live process (pid or "self"); nil once it is gone.
+function M.process_identity(pid)
+	local sf = io.open("/proc/" .. pid .. "/stat", "r")
+	if not sf then return nil end
+	local after = (sf:read("*a") or ""):match("^.*%)%s+(.*)$"); sf:close()
+	local fields = after and vim.split(after, "%s+", { trimempty = true }) or {}
+	local status = io.open("/proc/" .. pid .. "/status", "r")
+	local uid = status and tonumber((status:read("*a") or ""):match("\nUid:%s+(%d+)"))
+	if status then status:close() end
+	local ppid, start = tonumber(fields[2]), tonumber(fields[20])
+	if not (ppid and start and uid) then return nil end
+	return { ppid = ppid, start = start, uid = uid }
+end
 local function owner_identity()
-	local boot, ticks = "", 0
+	local boot = ""
 	local bf = io.open("/proc/sys/kernel/random/boot_id", "r")
 	if bf then boot = (bf:read("*l") or ""):gsub("%s+$", ""); bf:close() end
-	local sf = io.open("/proc/self/stat", "r")
-	if sf then
-		local after = (sf:read("*a") or ""):match("%)%s+(.*)"); sf:close()
-		if after then ticks = tonumber(vim.split(after, "%s+", { trimempty = true })[20]) or 0 end
-	end
-	return { pid = vim.fn.getpid(), boot_id = boot, start_ticks = ticks }
+	local me = M.process_identity("self")
+	return { pid = vim.fn.getpid(), boot_id = boot, start_ticks = me and me.start or 0 }
 end
 local function state_root() return require("yana.shadow.preview").state_root() end
 local function sha8_of(root) return vim.fn.sha256(uv.fs_realpath(root) or root):sub(1, 8) end
@@ -320,7 +329,7 @@ local function wrap(cmd)
 		end)
 	end
 end
-for _,_c in ipairs({"session.create","session.attach","session.delete","review.open","review.none","review.close","review.abort","file.claim","status","shutdown"}) do M[(_c:gsub("%.","_"))]=wrap(_c) end
+for _,_c in ipairs({"session.create","session.attach","session.delete","review.open","end.record","end.abandon","end.clear","review.none","review.close","review.abort","review.quit","file.claim","status","shutdown"}) do M[(_c:gsub("%.","_"))]=wrap(_c) end
 function M.render_refusal(stderr_text, answer, prompt_opts)
 	M.render_error(stderr_text)
 	local refuse = type(answer) == "table" and answer.refuse

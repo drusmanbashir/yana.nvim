@@ -33,7 +33,6 @@ end
 
 function M.prepare(env, groups, timeline)
   local real = env.state
-  local live_ledger = real.hunk_ledger
   assert(timeline and timeline.members_before and timeline:matches_live(real.bufnr),
     "watch timeline differs from live buffer")
   -- The live callback is allowed to transport old members while the Insert
@@ -181,6 +180,7 @@ function M.prepare(env, groups, timeline)
       local prior_index = change_index - #group.changes
       state.staged_text = table.concat(prior_index == 0 and timeline.before
         or states[prior_index], "\n")
+      state._ownership_dirty_rows = dirty
       local structural = {}
       local absorbed, remaining = batch.interpret(group.changes)
       if not absorbed then

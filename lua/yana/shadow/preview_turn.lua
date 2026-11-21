@@ -28,10 +28,7 @@ function I.begin_turn(opts)
 	end
 	local turn_mode = config.resolve_mode(opts.mode or config.options.mode)
 
-	local flags = opts.launch_flags or opts.single_file_flags or {}
-	if flags.file then
-		return nil, "Yana --file is retired; open the file normally or use --workspace DIR"
-	end
+	local flags = opts.launch_flags or {}
 	if flags.workspace and flags.workspace ~= "" then
 		opts.workspace = flags.workspace
 	end
@@ -60,6 +57,15 @@ function I.begin_turn(opts)
 		deps.workspace.prune_refused_turns(vim.fn.fnamemodify(turn_dir, ":h"))
 	end
 
+	-- The first run records the folder open in Neovim; a follow-up, also after a restart, reads it
+	-- back, so one Turn never changes its CAPTURE.md OC-GIT exception.
+	local open_folder_file = private_dir .. "/open-folder"
+	local open_folder = resume and vim.fn.filereadable(open_folder_file) == 1 and vim.fn.readfile(open_folder_file)[1]
+	if not open_folder then
+		open_folder = deps.workspace.workspace_candidate(opts)
+		vim.fn.writefile({ open_folder }, open_folder_file)
+	end
+
 	local yanad_session_id = opts.yanad_session_id or opts.session_id
 	local roots = {
 		{
@@ -86,6 +92,8 @@ function I.begin_turn(opts)
 	local session = {
 		workspace = primary_workspace,
 		opened_workspace = opened_workspace,
+		-- The folder open in Neovim; a `.git` folder holding it stays writable (CAPTURE.md OC-GIT).
+		open_folder = open_folder,
 		-- The ONE directory this turn's overlay is mounted at, and the base the finalize
 		-- walk's primary relative paths are read against.
 		broad_root = broad_root,
@@ -99,7 +107,6 @@ function I.begin_turn(opts)
 		upper_dir = nil,
 		yanad_session_id = yanad_session_id,
 		mode = turn_mode,
-		read_only_workspace = opts.read_only_workspace == true,
 		-- Under yanad, reclaim evidence comes from status, not disk holder files.
 		reclaimed_from = nil,
 		roots = roots,

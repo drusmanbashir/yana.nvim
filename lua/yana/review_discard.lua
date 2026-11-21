@@ -15,13 +15,22 @@
 -- answer comes; the caller is never asked to discard a second time.
 local M = {}
 
+function M.partial_notice(result)
+  local paths = {}
+  for _, failure in ipairs(result.refused or {}) do
+    if failure.path then paths[#paths + 1] = failure.path end
+  end
+  local files = #paths > 0 and (" for " .. table.concat(paths, ", ")) or ""
+  local reason = result.reason and (": " .. result.reason) or ""
+  return "yana: review retained after partial End" .. files .. reason .. ". Inspect :YanaRecover before retry or abandonment."
+end
+
 --- `new(deps)` returns the two discard doors bound to one review facade.
---- deps: facade, pool_for, review_tabs, owners_match, queue_item_owner,
+--- deps: facade, pool_for, owners_match, queue_item_owner,
 --- process_next_for, announce_state.
 function M.new(deps)
   local facade = deps.facade
   local pool_for = deps.pool_for
-  local review_tabs = deps.review_tabs
   local owners_match = deps.owners_match
   local queue_item_owner = deps.queue_item_owner
   local process_next_for = deps.process_next_for
@@ -53,20 +62,24 @@ function M.new(deps)
     if turn == nil or turn.state ~= "live" then
       return without_end(source, owner, notify, continue)
     end
-    local ran, answer = false, nil
+    local ran, answered, answer = false, false, nil
     turn:end_turn("abort", {
       source = source,
       owner = owner,
       on_result = function(result)
-        answer = result
-        if ran then return end
+        if answered then return end
+        answered, answer = true, result
         if type(result) == "table" and (result.status == "completed"
           or (result.status == "partial" and result.review_ended == true))
         then
           ran = true
           continue()
         end
-        if notify then notify(result) end
+        if notify then
+          notify(result)
+        elseif type(result) == "table" and result.status == "partial" and not ran then
+          require("yana.notify").one_line(M.partial_notice(result), vim.log.levels.WARN)
+        end
       end,
     })
     if ran then return true end
@@ -122,10 +135,6 @@ function M.new(deps)
     opts = opts or {}
     local st = pool_for(opts)
     return when_ended(st, "pool_discard", nil, on_end, function()
-      local tabs_path = review_tabs.state_path(opts)
-      if tabs_path then
-        pcall(vim.fn.delete, tabs_path)
-      end
       for _, state in pairs(st.open or {}) do pcall(facade.cleanup, state) end
       st.queue = {}
       st.batched = {}

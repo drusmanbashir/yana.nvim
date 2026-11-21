@@ -26,10 +26,8 @@ end
 
 -- THE BLOCK IS THE LIVE RECORD. A hunk's whole state already lives on one
 -- table, so a frame copies that table rather than naming fields one at a time.
--- An inclusion list is what made this defect: `shape` used to carry four of the
--- block's eighteen fields, and a reversal cannot restore what was never
--- recorded, so the verdict and the red half came back wrong however correct the
--- replay was. Adding fields to a list one bug at a time repeats that. Copying
+-- An inclusion list cannot restore a field it never recorded, so the verdict
+-- and the red half would come back wrong however correct the replay. Copying
 -- the record cannot miss a field that does not exist yet.
 --
 -- EXCLUDED, and this is the only judgement in the frame: extmark IDS are live

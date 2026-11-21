@@ -75,6 +75,7 @@ function M.new(deps)
     tool_call = "events_tool_call",
     result = "events_result",
     error = "events_error",
+    warning = "events_warning",
   }
 
   --- Stamp one decoded stream event. Returns its monotonic per-turn seq, which

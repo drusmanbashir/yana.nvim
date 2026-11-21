@@ -11,7 +11,7 @@ local M = {}
 --- agent emptied) shows that absence as ONE blank row, which Neovim cannot do
 --- without: it is no line of the file. Restoring into such a buffer replaces that
 --- row, so the buffer is the original text the moment the reject lands, not one
---- trailing blank line longer (CORE "Saving is Neovim's", LEDGER N51).
+--- trailing blank line longer (CORE "Saving is Neovim's").
 function M.span(bufnr, change, first, last, restored)
   local no_lines = change.kind == "delete" or change.after == nil or change.after == ""
   if no_lines and last < first and first == 1 and #restored > 0

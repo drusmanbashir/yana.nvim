@@ -1,7 +1,5 @@
--- Content-hash authority for safety modules (N7). NUL-safe for arbitrary binary bytes.
+-- Content-hash authority for safety modules. NUL-safe for arbitrary binary bytes.
 local M = {}
-
-local diff = require("yana.diff")
 
 local function sha256sum_bytes(s)
 	local r = vim.system({ "sha256sum", "-b" }, { stdin = s, text = false }):wait()
@@ -30,15 +28,6 @@ function M.hash_bytes(s)
 		return (vim.fn.sha256(s))
 	end
 	return (sha256sum_bytes(s))
-end
-
---- Read path and hash its bytes; nil + err when unreadable.
-function M.hash_file(path)
-	local content, err = diff.read_file_bytes(path)
-	if content == nil then
-		return nil, err
-	end
-	return M.hash_bytes(content), content
 end
 
 return M

@@ -111,7 +111,7 @@ end
 function M.check_async(name, done)
   local argv, entry = probe_args(name)
   if not argv then vim.schedule(function() done("unknown") end); return end
-  local env = vim.fn.environ()
+  local env = vim.tbl_extend("force", vim.fn.environ(), entry.env or {})
   env.DISPLAY, env.WAYLAND_DISPLAY = nil, nil
   env.ELECTRON_RUN_AS_NODE = "1"
   local ok = pcall(vim.system, argv, { text = true, timeout = 2000, env = env, clear_env = true }, function(result)
@@ -176,7 +176,7 @@ function M.login()
   local argv = { command }
   vim.list_extend(argv, entry.login_args)
   local session = { buf = buf, win = win, backend = resolution.backend, command = command }
-  local ok, job = pcall(vim.fn.jobstart, argv, { term = true, on_exit = function(_, code)
+  local ok, job = pcall(vim.fn.jobstart, argv, { term = true, env = entry.env, on_exit = function(_, code)
     vim.schedule(function()
       if active == session then active = nil end
       retire_login(session)

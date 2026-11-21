@@ -58,8 +58,8 @@ function M.new(deps)
 		if type(restored) ~= "table" then
 			return false
 		end
-		-- Mutation seam (gate): the pre-fix reader, which took the record apart
-		-- rather than validating it, and asked nothing of the fields it did not use.
+		-- Mutation seam (gate): reads the record without validating it, and asks nothing of the
+		-- fields it does not use.
 		if test_state.fault.restore_record_partial then
 			return true
 		end
@@ -144,11 +144,10 @@ function M.new(deps)
 		if not ok_rec then
 			return false, rec_err
 		end
-		-- Mutation seam (gate): the pre-fix demand, made conditional on the very
-		-- record it was meant to check. `disp and disp.displaced_state == "file"`
-		-- asked for the restore-temp record only when a displaced record happened to
-		-- be present and happened to say `file`, so a journal whose `displaced` row
-		-- was missing answered neither question and fell straight through.
+		-- Mutation seam (gate): makes the demand conditional on the very record it is meant
+		-- to check. `disp and disp.displaced_state == "file"` asks for the restore-temp
+		-- record only when a displaced record is present and says `file`, so a journal
+		-- whose `displaced` row is missing answers neither question and falls through.
 		local lax_disp = test_state.fault.completion_disp_unchecked
 		local restore_required = completion_claimed and disp ~= nil and disp.displaced_state == "file"
 		if completion_claimed and not lax_disp then
@@ -212,8 +211,8 @@ function M.new(deps)
 	--- rollback; on recovery it becomes the conflict. Either way nothing is
 	--- appended: a journal that cannot license a completion comes out unchanged.
 	local function record_completion(session, kind, op, path, ctx)
-		-- Mutation seam (gate): the pre-fix writers, each branch appending its own
-		-- completion row with nothing in front of it.
+		-- Mutation seam (gate): each branch appends its own completion row with nothing
+		-- in front of it.
 		if not test_state.fault.completion_writer_bypassed then
 			local ok_gate, gate_err =
 				rollback_record_complete(ctx.marker, op, path, ctx.disp, ctx.restored, true)
@@ -287,8 +286,8 @@ function M.new(deps)
 		local completion_claimed = opts.rollback_done
 			or opts.settled
 			or (disp ~= nil and disp.displaced_state == "file" and opts.restored ~= nil)
-		-- Mutation seam (gate): the pre-fix replay entry, which classified first and
-		-- asked what the marker recorded only if it got as far as the restore.
+		-- Mutation seam (gate): classifies first and asks what the marker recorded only if it
+		-- gets as far as the restore.
 		if not test_state.fault.replay_entry_unvalidated then
 			local ok_gate, gate_err =
 				rollback_record_complete(marker, op, path, disp, opts.restored, completion_claimed and true or false)
@@ -354,7 +353,7 @@ function M.new(deps)
 
 		local already
 		if test_state.fault.restored_by_bytes then
-			-- Mutation seam (gate): the pre-fix classifier — the displaced state and
+			-- Mutation seam (gate): classifies by the displaced state and
 			-- its fingerprint, with no idea which object carries them.
 			already = state ~= nil and displaced_state_present(disp, state)
 		else
@@ -377,9 +376,8 @@ function M.new(deps)
 
 		local licensed = false
 		if test_state.fault.revert_identity_blind then
-			-- Mutation seam (gate): the pre-fix test, which asked only whether the
-			-- bytes at the path were the accepted result's. A different inode holding
-			-- those bytes answered yes.
+			-- Mutation seam (gate): asks only whether the bytes at the path are the
+			-- accepted result's. A different inode holding those bytes answers yes.
 			licensed = state ~= nil and accepted_state_for_revert(op, state)
 		elseif marker and marker.checked_type then
 			licensed = st.kind == marker.checked_type
@@ -400,9 +398,8 @@ function M.new(deps)
 				-- A restored absence compares nil to nil and needs no special case.
 				and (
 					(state ~= nil and state.hash == marker.checked_hash)
-					-- Mutation seam (gate): the pre-fix classifier, the other half of the
-					-- pre-fix marker — the fingerprint was optional to record, and a
-					-- marker that lacked one compared equal to whatever it found.
+					-- Mutation seam (gate): the fingerprint is optional to record, and a
+					-- marker that lacks one compares equal to whatever it finds.
 					or (test_state.fault.rollback_marker_no_hash and marker.checked_hash == nil)
 				)
 		end

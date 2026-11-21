@@ -472,13 +472,7 @@ function Factory.new(deps)
       require("yana.log").write("WARN", "yana: review owner on_turn_joined failed: " .. tostring(join_err))
     end
   end
-  local review_tabs = M._review_tabs_init_for_turn(st, change, opts or {})
-  -- The strip uses this ownership record's tab, never the currently focused tab.
-  if review_tabs and review_tabs.owned and change.path then
-    local abs = diff.abs_path(change.path)
-    local owned = review_tabs.owned[abs]
-    state.review_tab = owned and owned.tab_id or nil
-  end
+  M._review_tabs_init_for_turn(st, change, opts or {})
   -- R9 WIRING. The Turn is now bound and holds this file, so the question can
   -- be asked against the exact Turn member -- and asked BEFORE the first hunk,
   -- because nothing below has painted or bound a decision key yet.
@@ -576,13 +570,10 @@ function Factory.new(deps)
 
   -- The shared redo register survives park, but its callback closed over the pre-park
   -- state. Preserve stack order and point each restored row here. The register wiring
-  -- that will make an in-memory register this walk's source lands in the integrator's
-  -- register pass -- not yet true in this tree.
 
-  -- `pool_for` was NOT on that list, which is exactly why cross-file `u` refused with
-  -- "walk plumbing unavailable" (review_undo.lua's `pool_for_walk`) for every real
-  -- review. The per-review fields below are this file's own fact; the facade's are
-  -- inline_diff's and are left alone.
+  -- `pool_for` must be among the seams below: without it cross-file `u` refuses with
+  -- "walk plumbing unavailable" (review_undo.lua's `pool_for_walk`). The per-review
+  -- fields below are this file's own fact; the facade's are inline_diff's and are left alone.
   local seams = M._test or {}
   M._test = seams
   for k, v in pairs({
@@ -615,7 +606,6 @@ function Factory.new(deps)
     accept_everything = accept_everything,
     prompt_close_owned_tabs = M.prompt_close_owned_tabs,
     close_owned_tabs = M.close_owned_tabs,
-    review_tabs_state_path = M.review_tabs_state_path,
   }) do
     seams[k] = v
   end

@@ -1,6 +1,34 @@
 -- yana: backend zoo validation / normalize (facade: yana.config).
 local M = {}
 
+-- A protected run requires a configured, enabled MCP policy.
+function M.inline_mcp_route(descriptor, mode)
+  local policy = descriptor and descriptor.inline_mcp
+  if not policy or policy.enabled == false
+      or (policy.home_env and policy.auth ~= "none" and policy.auth ~= "linked") then return nil end
+  policy = vim.deepcopy(policy)
+  local tools = policy.tools[mode or "inline"]
+  local args = {}
+  for _, token in ipairs(policy.args) do
+    vim.list_extend(args, token == "{tools}" and tools or { token })
+  end
+  policy.args = args
+  local function expand(value)
+    if value == "{tools}" then return vim.deepcopy(tools) end
+    if type(value) == "table" then
+      for key, item in pairs(value) do value[key] = expand(item) end
+    end
+    return value
+  end
+  policy.config = expand(policy.config)
+  if mode == "ask" then
+    local server = policy.config.server or {}
+    server.env = vim.tbl_extend("force", server.env or {}, { YANA_MCP_MODE = "ask" })
+    policy.config.server = server
+  end
+  return policy
+end
+
 function M.new(deps)
   local defaults = deps.defaults
   local home_dir = deps.home_dir
@@ -122,23 +150,50 @@ function M.new(deps)
   -- never supplies behaviour (the governing rule, see the schema doc comment).
   local STREAM_PROTOCOLS = { cursor = true, claude = true, codex = true }
 
-  -- Work order VENDORS -- the literal request token VALIDATED inside `stream_json_args`
-  -- for each protocol.
-  local PROTOCOL_STREAM_TOKEN = { cursor = "stream-json", claude = "stream-json", codex = "json" }
+  -- Work order VENDORS -- the literal request tokens VALIDATED inside `stream_json_args`
+  -- for each protocol. grok spells claude's event stream "streaming-messages-json".
+  local PROTOCOL_STREAM_TOKENS = {
+    cursor = { "stream-json" },
+    claude = { "stream-json", "streaming-messages-json" },
+    codex = { "json" },
+  }
 
   -- Work order VENDORS -- the closed set of `list_models_args` output shapes
   -- M.list_models (agent.lua) knows how to parse.
-  local LIST_MODELS_FORMATS = { lines = true, json_models = true }
+  local LIST_MODELS_FORMATS = { lines = true, json_models = true, bullets = true }
   local STEER_CHANNELS = { ["stream-json"] = true, ["app-server"] = true }
   local MODE_SWITCHES = { per_turn = true, two_seat = true }
-  local REQUIRED_SEATS = {
-    ask = { "ask" },
-    edit = { "inline", "agentic" },
+  local SEAT_LAYOUTS = {
+    { ask = { "ask" }, edit = { "inline", "agentic" } },
+    { protected = { "ask", "inline" }, agentic = { "agentic" } },
   }
   local SANDBOX_LEVELS = { "full", "workspace", "read-only", "vendor-default" }
-  local BUILTIN_BACKENDS = {}
-  for name in pairs(defaults.backends or {}) do
-    BUILTIN_BACKENDS[name] = true
+  local preset_names = vim.tbl_keys(defaults.backends or {})
+  table.sort(preset_names)
+
+  -- Every setting a backends entry may hold. Each is plain data; behaviour is
+  -- chosen by name (stream_protocol, list_models_format, mode_switch).
+  local FIELDS = {}
+  for _, key in ipairs({
+    "cmd", "cmd_env", "model", "env", "subcommand", "prompt_flag", "noninteractive_flag",
+    "stream_protocol", "stream_json_args", "mode_switch", "seats", "steer_channel",
+    "sandbox_args", "allow_edits_args", "select_model_flag", "mode_tokens", "resume_flag",
+    "resume_subcommand", "image_flag", "ask_args", "list_models_args", "list_models_format",
+    "models", "whoami_args", "auth_output_patterns", "auth_json_field", "auth_login_hint",
+    "login_args", "auth_env", "install_hint", "close_stdin", "state_dirs",
+  }) do
+    FIELDS[key] = true
+  end
+
+  local function refuse_non_data(value, where)
+    local kind = type(value)
+    if kind == "table" then
+      for key, item in pairs(value) do
+        refuse_non_data(item, where .. "." .. tostring(key))
+      end
+    elseif kind ~= "string" and kind ~= "number" and kind ~= "boolean" then
+      error("yana: " .. where .. " must be plain data (string, number, boolean or table), not a " .. kind, 0)
+    end
   end
 
   -- Vendor sandbox levels: missing translation is
@@ -158,51 +213,6 @@ function M.new(deps)
       if not known[level] then
         error("yana: backends." .. backend_name .. ".sandbox_args." .. tostring(level) .. " is not a Yana sandbox level", 0)
       end
-    end
-    return out
-  end
-
-  local function require_sandbox_stamps(value, backend_name, sandbox_args)
-    local has_tokens = false
-    for _, level in ipairs(SANDBOX_LEVELS) do
-      has_tokens = has_tokens or #sandbox_args[level] > 0
-    end
-    if not has_tokens and value == nil then
-      return {}
-    end
-    if value == nil then
-      for _, level in ipairs(SANDBOX_LEVELS) do
-        if #sandbox_args[level] > 0 then
-          error(
-            "yana: backends." .. backend_name .. ".sandbox_args_stamps." .. level
-              .. " is required because that level declares vendor tokens",
-            0
-          )
-        end
-      end
-    end
-    if type(value) ~= "table" then
-      error("yana: backends." .. backend_name .. ".sandbox_args_stamps must be a table", 0)
-    end
-    if not has_tokens and next(value) == nil then
-      return {}
-    end
-    local out = {}
-    for _, level in ipairs(SANDBOX_LEVELS) do
-      local stamp = value[level]
-      if type(stamp) ~= "table"
-        or type(stamp.measured_on) ~= "string"
-        or not stamp.measured_on:match("^%d%d%d%d%-%d%d%-%d%d$")
-        or type(stamp.vendor_version) ~= "string"
-        or stamp.vendor_version == ""
-      then
-        error(
-          "yana: backends." .. backend_name .. ".sandbox_args_stamps." .. level
-            .. " must contain measured_on=YYYY-MM-DD and a non-empty vendor_version",
-          0
-        )
-      end
-      out[level] = { measured_on = stamp.measured_on, vendor_version = stamp.vendor_version }
     end
     return out
   end
@@ -284,8 +294,8 @@ function M.new(deps)
     return out
   end
 
-  --- Resolve the public selector and its two supported overrides onto Yana's
-  --- private transport descriptors. Transport fields remain owned by defaults.
+  --- Build the enabled backends: each listed entry over its preset (field by
+  --- field), plus the default's preset when the default is not listed.
   local function normalize_backends(value)
     if value ~= nil and type(value) ~= "table" then
       error("yana: backends must be a table of named entries", 0)
@@ -295,45 +305,54 @@ function M.new(deps)
     local default_backend = value.default
     if default_backend == nil then
       default_backend = defaults.backend
-    elseif type(default_backend) ~= "string" or not BUILTIN_BACKENDS[default_backend] then
-      error("yana: backends.default must be cursor, claude, or codex", 0)
+    elseif type(default_backend) ~= "string" or default_backend == "" then
+      error("yana: backends.default must name a backend", 0)
     end
 
-    local overrides = {}
+    local out = {}
     for name, entry in pairs(value) do
       if name ~= "default" then
-        if type(name) ~= "string" or not BUILTIN_BACKENDS[name] then
-          error("yana: backends." .. tostring(name) .. " is not a built-in backend", 0)
+        if type(name) ~= "string" or name == "" then
+          error("yana: backends table keys must be non-empty backend names", 0)
         end
         if type(entry) ~= "table" then
           error("yana: backends." .. name .. " must be a table", 0)
         end
-        local override = {}
-        for key, setting in pairs(entry) do
-          if key ~= "cmd" and key ~= "model" then
-            error("yana: backends." .. name .. "." .. tostring(key) .. " is not a public backend setting", 0)
+        refuse_non_data(entry, "backends." .. name)
+        for key in pairs(entry) do
+          if not FIELDS[key] then
+            error("yana: backends." .. name .. "." .. tostring(key) .. " is not a backend setting", 0)
           end
-          if type(setting) ~= "string" or setting == "" then
-            error("yana: backends." .. name .. "." .. key .. " must be a non-empty string", 0)
-          end
-          override[key] = setting
         end
-        overrides[name] = override
+        out[name] = vim.tbl_extend("force", vim.deepcopy(defaults.backends[name] or {}), vim.deepcopy(entry))
       end
     end
-
-    local out = vim.deepcopy(defaults.backends)
-    for name, override in pairs(overrides) do
-      for key, setting in pairs(override) do
-        out[name][key] = setting
+    if out[default_backend] == nil then
+      if defaults.backends[default_backend] == nil then
+        error("yana: backends.default " .. vim.inspect(default_backend) .. " is neither listed in backends nor a "
+          .. "preset (" .. table.concat(preset_names, ", ") .. ")", 0)
       end
+      out[default_backend] = vim.deepcopy(defaults.backends[default_backend])
     end
     for name, entry in pairs(out) do
-      if type(name) ~= "string" or name == "" then
-        error("yana: backends table keys must be non-empty backend names", 0)
+      if entry.inline_mcp then
+        for _, mode in ipairs({ "inline", "ask" }) do
+          local tools = entry.inline_mcp.tools
+          require_arglist(type(tools) == "table" and tools[mode] or nil, name, "inline_mcp.tools." .. mode)
+        end
       end
-      if type(entry) ~= "table" then
-        error("yana: backends." .. name .. " must be a table", 0)
+      if entry.model ~= nil and (type(entry.model) ~= "string" or entry.model == "") then
+        error("yana: backends." .. name .. ".model must be a non-empty string", 0)
+      end
+      if entry.env ~= nil then
+        if type(entry.env) ~= "table" or vim.islist(entry.env) and next(entry.env) ~= nil then
+          error("yana: backends." .. name .. ".env must map variable names to strings", 0)
+        end
+        for key, setting in pairs(entry.env) do
+          if type(key) ~= "string" or not key:match("^[%a_][%w_]*$") or type(setting) ~= "string" then
+            error("yana: backends." .. name .. ".env." .. tostring(key) .. " must be a string variable name and value", 0)
+          end
+        end
       end
       if entry.cmd ~= nil then
         if type(entry.cmd) ~= "string" or entry.cmd == "" then
@@ -357,17 +376,20 @@ function M.new(deps)
         error("yana: backends." .. name .. ".cmd_env must be a non-empty environment variable name, or nil", 0)
       end
 
-      -- Work order VENDORS: `subcommand` is validated BEFORE
+      -- Work order VENDORS: `subcommand` and `prompt_flag` are validated BEFORE
       -- `noninteractive_flag` because a `false` noninteractive_flag's own
-      -- legality depends on whether a non-empty subcommand was declared.
+      -- legality depends on whether one of them was declared. `prompt_flag` is
+      -- a flag whose value is the prompt (build_cmd joins `flag=prompt`).
       entry.subcommand = optional_arglist(entry.subcommand, name, "subcommand")
+      entry.prompt_flag = optional_flag(entry.prompt_flag, name, "prompt_flag")
 
       if entry.noninteractive_flag == false then
-        if not entry.subcommand or #entry.subcommand == 0 then
+        if (not entry.subcommand or #entry.subcommand == 0) and not entry.prompt_flag then
           error(
             "yana: backends." .. name .. ".noninteractive_flag = false requires a non-empty subcommand "
-              .. "(false means \"this vendor's subcommand IS its non-interactive mode\") -- refused at "
-              .. "setup: without one, a turn would run interactively and hang with nobody there to answer it",
+              .. "or a prompt_flag (false means \"this vendor's subcommand or prompt flag IS its "
+              .. "non-interactive mode\") -- refused at setup: without one, a turn would run "
+              .. "interactively and hang with nobody there to answer it",
             0
           )
         end
@@ -391,17 +413,19 @@ function M.new(deps)
       end
 
       entry.stream_json_args = require_arglist(entry.stream_json_args, name, "stream_json_args")
-      local want_token = PROTOCOL_STREAM_TOKEN[entry.stream_protocol]
+      local want_tokens = PROTOCOL_STREAM_TOKENS[entry.stream_protocol]
       local has_token = false
       for _, tok in ipairs(entry.stream_json_args) do
-        -- want_token.
-        if tok == want_token or tok == ("--" .. want_token) then
-          has_token = true
+        for _, want in ipairs(want_tokens) do
+          if tok == want or tok == ("--" .. want) then
+            has_token = true
+          end
         end
       end
       if not has_token then
         error(
-          "yana: backends." .. name .. ".stream_json_args must contain the token \"" .. want_token
+          "yana: backends." .. name .. ".stream_json_args must contain one of the tokens \""
+            .. table.concat(want_tokens, "\", \"")
             .. "\" -- that is the " .. entry.stream_protocol .. " protocol's own request token, and an "
             .. "entry requesting a different one would leave every turn producing no visible output",
           0
@@ -429,23 +453,8 @@ function M.new(deps)
             0
           )
         end
-        for seat, modes in pairs(REQUIRED_SEATS) do
-          if type(entry.seats[seat]) ~= "table" then
-            error(
-              "yana: backends." .. name .. ".seats." .. seat
-                .. " must list the modes assigned to that seat -- refused at setup",
-              0
-            )
-          end
-          for i, mode in ipairs(modes) do
-            if entry.seats[seat][i] ~= mode then
-              error(
-                "yana: backends." .. name .. ".seats." .. seat .. " must contain mode \"" .. mode
-                  .. "\" at position " .. i .. " -- refused at setup",
-                0
-              )
-            end
-          end
+        if not vim.deep_equal(entry.seats, SEAT_LAYOUTS[1]) and not vim.deep_equal(entry.seats, SEAT_LAYOUTS[2]) then
+          error("yana: backends." .. name .. ".seats must use the ask/edit or protected/agentic layout", 0)
         end
       end
 
@@ -453,7 +462,6 @@ function M.new(deps)
       check_no_reserved_tokens(entry.allow_edits_args, name, "allow_edits_args")
 
       entry.sandbox_args = require_sandbox_args(entry.sandbox_args, name)
-      entry.sandbox_args_stamps = require_sandbox_stamps(entry.sandbox_args_stamps, name, entry.sandbox_args)
 
       entry.ask_args = optional_arglist(entry.ask_args, name, "ask_args")
       if entry.ask_args then

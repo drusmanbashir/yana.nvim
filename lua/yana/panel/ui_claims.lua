@@ -10,8 +10,6 @@ local config = require("yana.config")
 local diff = require("yana.diff")
 local notify = require("yana.notify")
 local notify_one_line = notify.one_line
-local control_plane = require("yana.safety.control_plane")
-local shadow_apply = require("yana.shadow.apply")
 local log = require("yana.log")
 
 local M = {}
@@ -94,6 +92,10 @@ end
 --- `finalized` is on the receipt itself, so finalisation happens ONCE however
 --- many times a caller replays it.
 local finalize_shadow_turn_release
+local function release_turn_snapshots(p, turn, pass)
+  require("yana.input.submit_snapshot").release_snapshots(p.turn_buffer_captures,
+    (turn and turn.turn_gen) or (pass and pass.generation))
+end
 
 local function release_receipt(p, reason, turn, pass)
   return {
@@ -118,6 +120,12 @@ function finalize_shadow_turn_release(receipt)
     return false, "shadow turn release receipt is invalid or already finalized"
   end
   local p, turn, pass, reason = receipt.p, receipt.turn, receipt.pass, receipt.reason
+  -- Several closes can each hold a receipt for the one turn (every refused file's close releases it);
+  -- the first to finalise drops local ownership and the rest have nothing left to do.
+  if turn ~= nil and turn.locally_released == true then
+    receipt.finalized = true
+    return true
+  end
   if not p then
     return false, "shadow turn release receipt names no panel"
   end
@@ -152,9 +160,13 @@ function finalize_shadow_turn_release(receipt)
       return false, discard_err or "shadow turn discard refused"
     end
   end
-  p.shadow_turn = nil
+  if p.finish_quit then release_turn_snapshots(p, turn, pass) end
+  p.shadow_turn, p.mcp_run = nil, nil
   p.shadow_pass = nil
   p.turn_pass = nil
+  if turn then
+    turn.locally_released = true
+  end
   receipt.finalized = true
   return true
 end
@@ -165,7 +177,6 @@ end
 M.finalize_shadow_turn_release = finalize_shadow_turn_release
 
 function M.new(deps)
-  local S = deps.state
   local append = deps.append
   local commit_stream = deps.commit_stream
   local update_winbar = deps.update_winbar
@@ -314,181 +325,13 @@ local function refresh_change_block(p, change)
   vim.bo[p.conv_buf].modifiable = false
 end
 
-local function reload_after_scope_revert(change)
-  local path = change.path
-  if not path or path == "" then
-    return true
-  end
-  local bufnr = vim.fn.bufnr(path)
-  if bufnr <= 0 or not vim.api.nvim_buf_is_loaded(bufnr) then
-    return true
-  end
-  if not vim.bo[bufnr].modified then
-    return diff.reload_file(path)
-  end
-  local buf_text = diff.buffer_text_normalized(bufnr)
-  if diff.text_equal_snapshot(buf_text, change.before or "") then
-    return diff.reload_file(path, { force = true })
-  end
-  return false, "buffer has divergent edits; not reloaded"
-end
-
-local function scope_rejection_cap_note(p, change, reason)
-  local scope = change.scope
-  local zone = scope
-    and string.format("L%d–L%d (%s)", scope.zone_l1, scope.zone_l2, scope.node_kind or "zone")
-    or "selection zone"
-  local wanted = reason or "edit outside selection scope"
-  append(p, {
-    "",
-    "**⏹ stopped — repeated out-of-zone edits**",
-    "",
-    "> Enforced zone: " .. zone,
-    "> Agent wanted: " .. wanted,
-    "",
-    "_Widen or clear the visual selection and re-ask, or set `selection_scope.enforce = \"warn\"` in yana config to keep out-of-zone hunks reviewable._",
-    "",
-  })
-end
-
-local function bump_scope_rejection(p, change, reason)
-  local path = vim.fs.normalize(diff.abs_path(change.path))
-  p.scope_rejections[path] = (p.scope_rejections[path] or 0) + 1
-  local cap = config.options.selection_scope.rejection_cap
-  if p.scope_rejections[path] >= cap and p.busy then
-    S.cancel_inflight(p)
-    scope_rejection_cap_note(p, change, reason)
-  end
-end
-
-local function review_rejection_cap_note(p, change)
-  append(p, {
-    "",
-    "**⏹ stopped — repeated re-edits after rejection**",
-    "",
-    "> File: " .. (change.rel or change.path or "?"),
-    "",
-    "_The agent kept re-applying hunks you rejected in `"
-      .. (change.rel or change.path or "?")
-      .. "`; the turn was stopped._",
-    "",
-  })
-end
-
--- Mirrors bump_scope_rejection but for inline-review rejections: a
--- still-running agent can re-read disk after a reject and re-apply the same
--- hunk, the same loop the selection-scope path already caps. Keyed
--- separately from p.scope_rejections since these are unrelated counters.
-local function bump_review_rejection(p, change)
-  local path = vim.fs.normalize(diff.abs_path(change.path))
-  p.review_rejections[path] = (p.review_rejections[path] or 0) + 1
-  local cap = config.options.selection_scope.rejection_cap
-  if p.review_rejections[path] >= cap and p.busy then
-    S.cancel_inflight(p)
-    review_rejection_cap_note(p, change)
-  end
-end
-
-local function render_scope_rejection(p, change, reason)
-  commit_stream(p)
-  p.rendered_any = true
-
-  -- change.rel can be nil (e.g. changes synthesized without a workspace-
-  -- relative path); every message below must fall back like the rest of
-  -- this file does, or a nil concat crashes this scheduled handler.
-  local label = change.rel or change.path or "?"
-
-  local disk_text = diff.read_file_text(change.path)
-  if disk_text == nil or not diff.text_equal_snapshot(disk_text, change.after or "") then
-    append(p, {
-      "",
-      "**⚠ could not revert `" .. label .. "`** (disk changed since agent edit)",
-      "",
-      "> " .. (reason or "edit outside selection zone"),
-      "> Preserving on-disk content; change left pending.",
-      "",
-    })
-    notify_one_line(
-      "yana: disk diverged for " .. label .. "; not reverting",
-      vim.log.levels.WARN
-    )
-    bump_scope_rejection(p, change, reason)
-    return
-  end
-
-  if change.before == nil then
-    append(p, {
-      "",
-      "**⚠ could not revert `" .. label .. "`** (no pre-edit snapshot)",
-      "",
-      "> " .. (reason or "edit outside selection zone"),
-      "> No before-content was captured for this edit; leaving it pending.",
-      "",
-    })
-    notify_one_line(
-      "yana: no pre-edit snapshot for " .. label .. "; not reverting",
-      vim.log.levels.WARN
-    )
-    bump_scope_rejection(p, change, reason)
-    return
-  end
-
-  if control_plane.is_control_plane(diff.abs_path_literal(change.path or "")) then
-    -- Legacy scope-revert is a direct real-tree write; the matcher guards it too
-    -- A control-plane path is never written back.
-    notify_one_line(
-      "yana: refused to revert control-plane path " .. tostring(change.path),
-      vim.log.levels.WARN
-    )
-    return
-  end
-  local ok, werr = shadow_apply.scope_revert(p, change)
-  if not ok then
-    append(p, {
-      "",
-      "**⚠ could not revert `" .. label .. "`** (outside selection scope)",
-      "",
-      "> " .. (reason or "edit outside selection zone"),
-      "> Revert failed: " .. tostring(werr),
-      "",
-    })
-    notify_one_line(
-      "yana: could not revert " .. label .. ": " .. tostring(werr),
-      vim.log.levels.WARN
-    )
-    bump_scope_rejection(p, change, reason)
-    return
-  end
-  local rok, rerr = reload_after_scope_revert(change)
-  if not rok then
-    append(p, {
-      "",
-      "**⚠ reverted `" .. label .. "` on disk but buffer not reloaded**",
-      "",
-      "> " .. (reason or "edit outside selection zone"),
-      "> " .. tostring(rerr),
-      "",
-    })
-    notify_one_line("yana: " .. tostring(rerr), vim.log.levels.WARN)
-  end
-  change.status = "rejected"
-  render_review_status(p)
-  append(p, {
-    "",
-    "**✗ rejected `" .. label .. "`** (outside selection scope)",
-    "",
-    "> " .. (reason or "edit outside selection zone"),
-    "",
-  })
-  notify_one_line("yana: " .. (reason or "edit outside selection zone"), vim.log.levels.WARN)
-  bump_scope_rejection(p, change, reason)
-end
 local function panel_claimed_workspace(p)
   if not p then
     return require("yana.diff").abs_path(vim.fn.getcwd())
   end
-  if p.shadow_turn and p.shadow_turn.workspace and p.shadow_turn.workspace ~= "" then
-    return require("yana.diff").abs_path(p.shadow_turn.workspace)
+  local run = p.shadow_turn or p.mcp_run
+  if run and run.workspace and run.workspace ~= "" then
+    return require("yana.diff").abs_path(run.workspace)
   end
   local preview = require("yana.shadow.preview")
   return preview.workspace_for_turn({
@@ -554,8 +397,7 @@ local function release_shadow_turn(p, reason, on_released, opts)
   local defer = type(opts) == "table" and opts.defer_local_release == true
   -- The turn ends: delete its snapshots' extmarks and listeners by their ids;
   -- the namespace is never cleared, another turn may share it.
-  require("yana.input.home_buffer_proposal").release_snapshots(p and p.turn_buffer_captures,
-    (turn and turn.turn_gen) or (pass and pass.generation))
+  if not p.finish_quit then release_turn_snapshots(p, turn, pass) end
   -- Stash the caller reason per generation so on_done's later turn.end emit
   -- (when this call skips because turn_end_outcome is not yet set — the
   -- on_exit_confirmed → finalize path) carries THIS reason, never a
@@ -564,12 +406,27 @@ local function release_shadow_turn(p, reason, on_released, opts)
     p.turn_end_reasons = p.turn_end_reasons or {}
     p.turn_end_reasons[tostring(pass.generation)] = reason
   end
+  if p.mcp_run then
+    local run = p.mcp_run
+    local receipt = release_receipt(p, reason, nil, pass)
+    receipt.finalize = finalize_shadow_turn_release
+    local function released(ok, err)
+      if ok and not defer then ok, err = finalize_shadow_turn_release(receipt) end
+      if on_released then on_released(ok, err, receipt) end
+    end
+    if run.review_open_requested then
+      return require("yana.runtime.mcp_inline").close_review(require("yana.turn.turn_bind").get(), released)
+    end
+    return require("yana.shadow.preview_settle").send_review_frame("review_none", { session_id = run.yanad_session_id,
+      turn_id = run.turn_id, generation = run.turn_pass.generation }, run.turn_id .. ":review.none", released)
+  end
   if not turn then
     if pass then
       require("yana.turn.turn_lifecycle").finish_turn(pass)
       emit_turn_end(p, pass, reason, p.turn_end_outcome and p.turn_end_outcome[pass.generation])
       p.turn_pass = nil
     end
+    if p.finish_quit then release_turn_snapshots(p, turn, pass) end
     if on_released then on_released(true) end
     return true
   end
@@ -600,7 +457,7 @@ local function release_shadow_turn(p, reason, on_released, opts)
       end
     end
     if on_released then on_released(true, nil, receipt) end
-  end)
+  end, p.finish_quit ~= nil)
 end
 -- A turn whose evidence could not be read leaves its private state intact.
 -- Whether a review is owed is unknown; the operator inspects it through
@@ -627,12 +484,6 @@ end
     change_header_text = change_header_text,
     stamp_undeclared_badge = stamp_undeclared_badge,
     refresh_change_block = refresh_change_block,
-    reload_after_scope_revert = reload_after_scope_revert,
-    scope_rejection_cap_note = scope_rejection_cap_note,
-    bump_scope_rejection = bump_scope_rejection,
-    review_rejection_cap_note = review_rejection_cap_note,
-    bump_review_rejection = bump_review_rejection,
-    render_scope_rejection = render_scope_rejection,
     panel_claimed_workspace = panel_claimed_workspace,
     refresh_review_claim = refresh_review_claim,
     preview_module = preview_module,

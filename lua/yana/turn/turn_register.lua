@@ -229,6 +229,51 @@ function Register:entries()
 	return self.actions
 end
 
+-- Replay a retained event through the ordinary action router. The selected
+-- native branch supplies the next row while unrelated files keep their reach.
+function Register:replay_native(row, back, replay)
+	local old_actions, old_cursor = self.actions, self.cursor
+	local before, after = {}, {}
+	for i, action in ipairs(old_actions) do
+		if action ~= row then
+			local side = i <= old_cursor and before or after
+			side[#side + 1] = action
+		end
+	end
+	before[#before + 1] = row
+	self.actions = vim.list_extend(before, after)
+	local position = #self.actions - #after
+	self.cursor = back and position or position - 1
+	local expected = back and position - 1 or position
+	local ok, result = pcall(replay)
+	if self.actions == before and self.cursor ~= expected then
+		self.actions, self.cursor = old_actions, old_cursor
+	end
+	if not ok then return false, result end
+	return result == true and self.cursor == expected
+end
+
+-- Keep only the selected branch in ordinary redo. Other events stay in the
+-- graph, where a native jump can select them again.
+function Register:finish_native_replay()
+	local positions, kept = self:position(), {}
+	for i = 1, self.cursor do kept[i] = self.actions[i] end
+	for i = self.cursor + 1, #self.actions do
+		local row = self.actions[i]
+		local event = self:event_of(row)
+		local available = event ~= nil and not event.halted
+		for key, part in pairs(event and event.parts or {}) do
+			local at = positions[key]
+			available = available and at ~= nil and at.ep_id == part.before.ep_id
+		end
+		if available then
+			kept[#kept + 1] = row
+			for key, part in pairs(event.parts) do positions[key] = part.after end
+		end
+	end
+	self.actions = kept
+end
+
 function Register:clear()
 	self.actions = {}
 	self.cursor = 0

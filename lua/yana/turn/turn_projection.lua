@@ -188,6 +188,9 @@ function M.compute(input)
 	end
 
 	local hunks = input.hunks or {}
+	if input.renamed_from and input.operation_verdict ~= "accepted" and any_accepted(hunks) then
+		return nil, "rename is not accepted but its text has accepted edits"
+	end
 	-- :56 — accepted text or an accepted textless operation both keep content: the
 	-- selected version's OWN decisions. Accepted work an earlier cycle's version
 	-- carried keeps content too (F-ADDENDUM-CARRY: a missing fresh hunk does not
@@ -198,7 +201,7 @@ function M.compute(input)
 
 	local target_exists
 	if proposal.exists == false then
-		target_exists = not own_accepted -- a pending or rejected deletion retains the file
+		target_exists = not own_accepted and (original.exists == true or input.carried == true)
 	elseif original.exists == false then
 		-- A created file has nothing on disk until its content is accepted
 			-- no empty file is written for a creation, so an unaccepted one stays absent.
@@ -206,13 +209,19 @@ function M.compute(input)
 	else
 		target_exists = true
 	end
+	if input.renamed_from then target_exists = input.operation_verdict == "accepted" end
 
 	-- :58-60 — the verdict alone selects the mode; the proposed mode is never
 	-- read without it. Under keep the mode is the effective accepted one an
-	-- earlier cycle carried, else the original; a creation under keep has no
-	-- original mode and takes the host's creation permissions.
+	-- earlier cycle carried, else the original. A creation being written with no
+	-- mode yet is the exception: never asked about, it keeps the mode the agent
+	-- gave it (paths/REVIEW.md); with none it takes the
+	-- host's creation permissions. Once it has a mode (a later cycle), the
+	-- verdict rules again, and a creation not being written takes no mode.
 	local target_mode
 	if input.mode_verdict == "allow" then target_mode = proposal.mode
+	elseif original.exists == false and original.mode == nil and input.accepted_mode == nil and content_accepted then
+		target_mode = proposal.mode
 	else target_mode = input.accepted_mode or original.mode end
 
 	local target_bytes, buffer_lines
@@ -241,7 +250,7 @@ function M.compute(input)
 			buffer_lines, target_bytes = lines, bytes
 		else
 			-- A later cycle's hunks index that version's `base`, never the original.
-			local base = input.base
+			local base = input.base or (input.renamed_from and original.bytes)
 			if base == nil and input.versioned then
 				return nil, "a later cycle's version has no base text; its hunks need the buffer"
 			end
@@ -260,7 +269,7 @@ function M.compute(input)
 	-- whether to write. The one disk fact is a creation's path, by stat: a creation
 	-- that ends absent removes the file only while it is still the operator's own
 	-- save of the review buffer (`original.saved`); any other file there is kept
-	-- (CORE "Saving is Neovim's", LEDGER N51).
+	-- (CORE "Saving is Neovim's").
 	local action
 	if not target_exists then
 		action = (original.exists or original.saved == true) and "delete" or "none"

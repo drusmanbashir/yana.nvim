@@ -237,10 +237,23 @@ function File:accepted()
   return false
 end
 
---- Pending ledger hunks plus one unresolved textless operation. A deletion that
---- carries text is counted through its hunks only, never hunk plus operation.
---- Permission questions are not text hunks and add nothing here.
+--- True only when this version's own operation/hunks are accepted, not merely work it carried forward.
+function File:proposal_accepted()
+  local blocks = hunks(self)
+  if blocks and #blocks > 0 then
+    for _, block in ipairs(blocks) do
+      if block.verdict ~= "accepted" then return false end
+    end
+    return true
+  end
+  return self.operation_verdict == "accepted"
+end
+
+--- The linked source counts at its destination; the rename verdict stays pending
+--- alongside its text edits. Other operations with text count through hunks only.
 function File:pending_count()
+  local change = self.change or {}
+  if change.renamed_to then return 0 end
   local n = 0
   local textless = true
   local blocks = hunks(self)
@@ -252,7 +265,7 @@ function File:pending_count()
       end
     end
   end
-  if textless and self.operation ~= nil and self.operation_verdict == "pending" then
+  if (textless or change.renamed_from) and self.operation ~= nil and self.operation_verdict == "pending" then
     n = n + 1
   end
   return n
@@ -290,11 +303,12 @@ end
 local function opt(v, kind) return v == nil or type(v) == kind end
 local TOKEN = { owner = 1, proposal = 1, operation = 1, operation_verdict = 1, carried = 1, accepted_mode = 1,
   base = 1, installed = 1 }
-local NEXT = { change = 1, proposal = 1, operation = 1, operation_verdict = 1, base = 1, review_opts = 1 }
+local NEXT = { change = 1, proposal = 1, operation = 1, operation_verdict = 1, base = 1, review_opts = 1, exists = 1 }
 -- Full shape before anything moves: known keys only, typed fields, and an operation paired with its verdict.
 local function shaped(v, keys)
   for k in pairs(v) do if not keys[k] then return false end end
   return opt(v.proposal, "table") and opt(v.base, "string") and opt(v.change, "table") and opt(v.review_opts, "table")
+    and opt(v.exists, "boolean")
     and (v.operation == nil or OPERATION_KINDS[v.operation] == true)
     and (v.operation_verdict == nil or OPERATION_VERDICTS[v.operation_verdict] == true)
     and (keys == NEXT or ((v.operation == nil) == (v.operation_verdict == nil) and type(v.carried) == "boolean"
@@ -303,7 +317,7 @@ end
 
 --- The explicit install/restore door. `install_version(next)`, called BEFORE the next cycle's members reach
 --- the ledger, carries what this version owes End (accepted work, the effective accepted mode); next =
---- {change?, proposal?, operation?, operation_verdict?, base?, review_opts?}; another textless operation
+--- {change?, proposal?, operation?, operation_verdict?, base?, review_opts?, exists?}; another textless operation
 --- starts pending. `review_opts` is the publishing cycle's write door (its live pass): it replaces the File's,
 --- no restore brings an older one back, and alone it changes no version. `restore_version` reinstalls this
 --- File's own `version()` exactly. Both return the replaced version, or nil, reason, changing nothing.
@@ -318,9 +332,13 @@ function File:install_version(next, exact)
     if next.review_opts ~= nil then self.review_opts = next.review_opts end
     local c = next.change
     if c == nil and next.proposal == nil and next.operation == nil and next.operation_verdict == nil
-      and next.base == nil then return prior end
+      and next.base == nil and next.exists == nil then return prior end
+    local removed = next.exists == false
+    local accepted = self:accepted()
+    local accepted_creation_mode = self.operation == "create" and self:proposal_accepted()
+      and ((prior.proposal or self.change or {}).after_mode) or nil
     local proposal = next.proposal or (c and { kind = c.kind, after = c.after, after_mode = c.after_mode })
-      or prior.proposal
+      or (removed and { kind = "delete" }) or prior.proposal
     local op = next.operation
     if op == nil and proposal ~= prior.proposal then op = operation_of(proposal) end
     if op == nil and proposal == prior.proposal then op = prior.operation end
@@ -328,9 +346,11 @@ function File:install_version(next, exact)
     if verdict == nil and op ~= nil then verdict = op == prior.operation and prior.operation_verdict or "pending" end
     -- The mode End owes so far: the outgoing proposal's when its exact proposal is allowed, else the carried one.
     local mv = require("yana.turn.turn_settle").current_mode_verdict(self)
-    v = { proposal = proposal, operation = op, operation_verdict = verdict, carried = self:accepted(), base =
-      next.base, installed = true, accepted_mode = mv and mv.verdict == "allow" and (self.proposal or self.change
-      or {}).after_mode or self.accepted_mode }
+    local carried = accepted and not (self.operation == "delete" and self:proposal_accepted())
+    v = { proposal = proposal, operation = op, operation_verdict = verdict, carried = carried, base =
+      next.base, installed = true, accepted_mode = (mv and mv.verdict == "allow" and (self.proposal or self.change
+      or {}).after_mode) or accepted_creation_mode
+      or self.accepted_mode }
   end
   self.proposal, self.operation, self.operation_verdict = v.proposal, v.operation, v.operation_verdict
   self.carried, self.version_base, self.version_installed = v.carried, v.base, v.installed

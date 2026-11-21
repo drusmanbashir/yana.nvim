@@ -10,7 +10,6 @@ local M = {}
 function M.new(deps)
   local depth = deps.depth
   local focus = deps.focus
-  local maybe_drain_queue = deps.maybe_drain_queue
   local panels = deps.panels
   local panel_for_buf = deps.panel_for_buf
   local prompt_winbar_text = deps.prompt_winbar_text
@@ -288,7 +287,6 @@ function M.new(deps)
         ensure_prompt_win(p, tab)
         relayout(tab)
         attach_review_strip(p, tab)
-        maybe_drain_queue(p)
         return
       end
 
@@ -433,7 +431,6 @@ function M.new(deps)
       geometry.observe(tab)
 
       attach_review_strip(p, tab)
-      maybe_drain_queue(p)
     end, debug.traceback)
     depth:leave()
     if not ok then

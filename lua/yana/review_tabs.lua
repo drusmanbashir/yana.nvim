@@ -3,11 +3,10 @@
 -- records ownership. "End review?" is the one dialog, and Yana-opened tabs
 -- MIRROR the first tab's sidebar.
 --
--- `owned` has ONE writer: `T.place`. review_tabs_record.lua mirrors the record to disk.
+-- `owned` has ONE writer: `T.place`.
 -- decide `placement_for`: pure and total; every caller obeys it.
 local diff = require("yana.diff")
 local log = require("yana.log")
-local record = require("yana.review_tabs_record")
 
 local M = {}
 
@@ -127,7 +126,6 @@ end
 -- makes a tab Yana's goes through here.
 local function adopt(rt, abs, tab, rel)
   rt.owned[abs] = { tab_id = tab, rel = rel }
-  rt.ever_owned[abs] = true
   rt.all_paths[abs] = rel
 end
 
@@ -203,7 +201,7 @@ function M.new(deps)
       out.tab, out.win = shown_tab, shown_win
       -- A tab this turn once owned keeps its owner when the file is still
       -- shown there; the handle is refreshed, never looked up by name later.
-      if rt and rt.ever_owned[abs] then
+      if rt and rt.owned[abs] then
         adopt(rt, abs, shown_tab, rel)
         out.owned = true
       end
@@ -249,9 +247,6 @@ function M.new(deps)
       mirror = out.mirror,
       reason = out.reason,
     })
-    if rt and out.owned then
-      record.save(rt)
-    end
     return out
   end
 
@@ -323,74 +318,37 @@ function M.new(deps)
     if st.review_tabs and st.review_tabs.turn_key ~= key then
       st.review_tabs = nil
     end
-    local ever_owned = {}
-    local function absorb_ever(source)
-      if type(source) ~= "table" then
-        return
-      end
-      for abs, value in pairs(source) do
-        if value then
-          ever_owned[tostring(abs)] = true
-        end
-      end
-    end
-    if st.review_tabs and st.review_tabs.turn_key == key then
-      absorb_ever(st.review_tabs.ever_owned)
-      absorb_ever(st.review_tabs.owned)
-    end
-    local state_path = record.state_path(opts)
-    local disk = record.read_json(state_path)
-    if type(disk) == "table" and tostring(disk.turn_key or "") == tostring(key) then
-      absorb_ever(disk.ever_owned)
-      absorb_ever(disk.owned)
-    else
-      disk = nil
-    end
     local rt = st.review_tabs or {
       turn_key = key,
       owned = {},
       enabled = false,
       all_paths = {},
-      ever_owned = {},
+      tabs_on = true,
     }
-    rt.turn_key = key
-    rt.tabs_on = true
-    rt.state_path = state_path
-    rt.ever_owned = ever_owned
     if rt.sidebar_open == nil then
-      if disk and type(disk.sidebar_open) == "boolean" then
-        rt.sidebar_open = disk.sidebar_open
-      else
-        rt.sidebar_open = origin_sidebar_open(vim.api.nvim_get_current_tabpage())
-      end
+      rt.sidebar_open = origin_sidebar_open(vim.api.nvim_get_current_tabpage())
     end
     st.review_tabs = rt
-    if #turn_changes < 2 and vim.tbl_isempty(ever_owned) then
+    if #turn_changes < 2 and vim.tbl_isempty(rt.owned) then
       -- Single-file turn: the file is placed when its review focuses it
       -- (T.place via focus_buf), reusing an empty window when one exists.
       rt.enabled = false
-      return rt
+      return
     end
     rt.enabled = true
-    -- Every member of the turn gets its window now, the active file included:
-    -- the strip, the sidebar mirror and End review all read `owned`, so the
-    -- record must be right before the first review paints.
+    -- Every member gets its window once, the active file included: the strip,
+    -- the sidebar mirror and End review all read `owned`, so the record must be
+    -- right before the first review paints. A later bind places only members
+    -- that joined since; a tab the operator closed stays closed until its review
+    -- is focused or a later run publishes pending hunks to it (`reopen_pending`).
     for _, candidate in ipairs(turn_changes) do
       local abs = diff.abs_path(candidate.path)
-      local rel = candidate.rel or candidate.path
-      rt.all_paths[abs] = rel
-      T.place(st, { abs = abs, rel = rel })
-    end
-    for abs, _ in pairs(ever_owned) do
-      if rt.owned[abs] == nil then
-        local tab = select(1, tab_for_path(abs))
-        if tab then
-          adopt(rt, abs, tab, rt.all_paths[abs] or abs)
-        end
+      if rt.all_paths[abs] == nil then
+        local rel = candidate.rel or candidate.path
+        rt.all_paths[abs] = rel
+        T.place(st, { abs = abs, rel = rel })
       end
     end
-    record.save(rt)
-    return rt
   end
 
   -- Place by path alone (focus_buf knows no pool): the pool is the one whose
@@ -454,7 +412,6 @@ function M.new(deps)
   T.close_owned_tabs = close.close_owned_tabs
   -- Compat alias: callers and mutation plants still name the old entry.
   T.prompt_close_owned_tabs = close.close_owned_tabs
-  T.state_path = record.state_path
   return T
 end
 

@@ -118,12 +118,6 @@ function M.level_name(nr)
   return LEVEL_NAME[nr] or tostring(nr)
 end
 
---- Sorted list of every accepted level name for legacy callers; the
---- operator-facing closed set is `config_level_names()`.
-function M.level_names()
-  return M.config_level_names()
-end
-
 local durable_unhealthy = false
 local durable_unhealthy_reason = nil
 local durable_unhealthy_notified = false
@@ -164,12 +158,6 @@ end
 
 M._test = M._test or {}
 
--- Test-only: reset durable-log health flags back to healthy/unnotified.
-function M._test.reset_durable_health()
-  durable_unhealthy = false
-  durable_unhealthy_reason = nil
-  durable_unhealthy_notified = false
-end
 
 -- Accepts a closed-set name ("info"/"debug"/…) or legacy WARN/DEBUG string.
 function M.set_level(level)
@@ -183,11 +171,6 @@ function M.set_level(level)
       config.options.log_level = name
     end
   end)
-end
-
--- Return the current minimum log level number.
-function M.get_level()
-  return current_level
 end
 
 -- Return the current closed-set config name ("info", "debug", …).
@@ -224,15 +207,6 @@ end
 -- `at_ms` field uses (`lifecycle_line` below), so a line's own stamp and the
 -- `at_ms` inside it are the same instant read microseconds apart, and never
 -- two clocks that can drift.
---
--- It used to be `os.date("%Y-%m-%d %H:%M:%S")`, a whole second. A reader that
--- has to order a logged line against a keypress -- the screen recorder in
--- tests/headless/xrec, whose gestures are paced in tens of milliseconds --
--- could not do it from the line at all, and had to bracket the line between
--- the product's own `at_ms` stamps either side of it; when the product stamped
--- nothing before the line that bracket was a whole second wide, and on bug 7
--- it named the wrong deciding frame. The millisecond here is the fact those
--- brackets were approximating.
 local function stamp()
   local s, us = uv.gettimeofday()
   return string.format("%s.%03d", os.date("%Y-%m-%d %H:%M:%S", s), math.floor((us or 0) / 1000))
@@ -349,8 +323,8 @@ local log_session = tostring(uv.os_getpid()) .. ":" .. tostring(uv.hrtime())
 
 local function lifecycle_line(kind, fields)
   event_seq = event_seq + 1
-  -- Additive millisecond epoch alongside the existing second-resolution
-  -- `at`, which stays byte-identical. vim.uv falls back to vim.loop on
+  -- Millisecond epoch alongside the second-resolution
+  -- `at`. vim.uv falls back to vim.loop on
   -- older builds (module-level `uv` above already resolves this).
   local s, us = uv.gettimeofday()
   local payload = {
@@ -406,17 +380,6 @@ local function lifecycle_harness_override()
   return nil
 end
 
--- True only when a DEBUG lifecycle row can reach disk. Expensive diagnostic
--- capture points use this before gathering state; lifecycle() remains the
--- sole writer and repeats the policy check before append.
-function M.lifecycle_enabled()
-  local force = lifecycle_harness_override()
-  if force ~= nil then
-    return force
-  end
-  return current_level <= vim.log.levels.DEBUG
-end
-
 -- Full undo-tree snapshots are materially heavier than ordinary lifecycle
 -- rows. The headless harness enables lifecycle logging globally, so keep this
 -- diagnostic on the real debug threshold unless a focused probe opts in.
@@ -443,6 +406,16 @@ function M.lifecycle(kind, fields)
   return append_record("DEBUG", line, force == true)
 end
 
+-- Deferred rows captured in one tick share one durable write. WARN and ERROR do not wait for these: order across
+-- the two is `log_seq`, not file position.
+local later_lines = {}
+local function drain_later()
+  local lines = later_lines
+  later_lines = {}
+  run_before_append()
+  write_durable(table.concat(lines))
+end
+
 -- Like M.lifecycle, but defers the write via vim.schedule.
 function M.lifecycle_later(kind, fields)
   local force = lifecycle_harness_override()
@@ -455,11 +428,10 @@ function M.lifecycle_later(kind, fields)
   end
   if force ~= true and current_level > vim.log.levels.DEBUG then return true end
   -- Freeze the outer timestamp too; deferred writes retain capture order via event_seq.
-  local frozen = record_line("DEBUG", line)
-  vim.schedule(function()
-    run_before_append()
-    write_durable(frozen)
-  end)
+  later_lines[#later_lines + 1] = record_line("DEBUG", line)
+  if #later_lines == 1 then
+    vim.schedule(drain_later)
+  end
   return true
 end
 

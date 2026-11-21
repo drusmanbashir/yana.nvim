@@ -316,7 +316,6 @@ function M.new(env)
             -- (caller policy), not geometry.
             local trailing_insert = rel.trailing_insert
             local interior = rel.interior and not merge_gap[change_index]
-            local interior_line_insert = interior
               and pure_insert
               and change.last_new > change.first
             -- A human does not materialise a finished line; they open a blank one and

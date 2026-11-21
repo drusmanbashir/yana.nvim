@@ -28,7 +28,7 @@ function M.install()
   if installed then return end
   installed = true
   turn_bind.on_turn_wired(subscribe)
-  resources.on_change(function() buttons().refresh() end)
+  resources.on_change(function(state) buttons().refresh_for_buf(state and state.bufnr) end)
 end
 
 return M

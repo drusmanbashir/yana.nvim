@@ -7,7 +7,7 @@
 --
 -- Five checks come from the brainstorm's §4.2 (orphaned bookkeeping, leaked
 -- decoration, drift, unresolvable highlight group, lost window mapping). The
--- sixth is the N8 addition and the reason this exists at all:
+-- sixth is the reason this exists at all:
 --
 --   MODEL EXTENT — for every hunk, the number of buffer rows actually covered
 --   by new-line highlight extmarks must equal the hunk's new-line count IN THE
@@ -207,7 +207,7 @@ function M.evaluate(input)
     if input.model and block.model_index then
       model = input.model[block.model_index]
     end
-    -- N16: a context-merged block is scored against the model SPAN the join
+    -- A context-merged block is scored against the model SPAN the join
     -- derived for it (first spanned run's first new line .. last spanned run's
     -- last new line), not against run `mi` alone — otherwise a healthy merged
     -- render reads as an extent defect. Both numbers come from the model.
@@ -345,7 +345,7 @@ function M.evaluate(input)
       })
     end
 
-    -- N16: `verdict` says HOW the hunk was reconciled, and a context-merged
+    -- `verdict` says HOW the hunk was reconciled, and a context-merged
     -- block is a weaker certification than a 1:1 run join even when its extent
     -- is right: the span matches, but rows cannot be attributed to individual
     -- payload runs. Name that state rather than let it wear the plain "ok" of a
@@ -608,7 +608,7 @@ function M.collect(desc)
       -- inline_diff.stamp_model_index; carried here so a `model_unavailable`
       -- record says which refusal fired instead of just "no model".
       model_join = block.model_join,
-      -- N16: at ctxlen > 0 one block can span several payload runs. The join
+      -- At ctxlen > 0 one block can span several payload runs. The join
       -- derives the span's new-line count from the model (see
       -- inline_diff.stamp_model_index) and hands it over here; this module
       -- still never computes a model of its own.

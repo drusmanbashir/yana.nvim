@@ -2,7 +2,6 @@
 -- and accept/reject review (revert to captured "before" on reject).
 local M = {}
 
-local log = require("yana.log")
 local flush = require("yana.safety.flush")
 local uv = vim.uv or vim.loop
 local _write_seq = 0
@@ -53,9 +52,7 @@ function M.abs_path(path)
       norm = vim.fs.normalize(vim.fn.getcwd() .. "/" .. path)
     end
   end
-  -- Resolve symlinks so Mac /var/folders and /private/var/folders compare equal
-  -- (selection_scope paths_match). Existing path
-  -- components resolve; a missing final segment stays on the resolved parent.
+  -- Resolve symlinks; a missing final segment stays on the resolved parent.
   local resolved = vim.fn.resolve(norm)
   if resolved ~= "" then
     return vim.fs.normalize(resolved)
@@ -231,17 +228,6 @@ function M.tool_summary(name, payload)
     return short .. " " .. M.relpath(args.target_file)
   end
   return short
-end
-
--- Split diffstr into lines, dropping the --- / +++ headers.
-function M.diff_hunks(diffstr)
-  local out = {}
-  for _, l in ipairs(vim.split(diffstr or "", "\n", { plain = true })) do
-    if not (l:match("^%-%-%- ") or l:match("^%+%+%+ ")) then
-      table.insert(out, l)
-    end
-  end
-  return out
 end
 
 -- Map change.status/review_error to its panel status icon.
@@ -462,8 +448,6 @@ function M.write_file(path, content, opts)
   return true
 end
 
-M.diary_atomic_write = M.write_file
-
 -- Unlink path; missing file counts as success, non-file is an error.
 function M.delete_file(path)
   if not path or path == "" then
@@ -483,40 +467,12 @@ function M.delete_file(path)
   return true
 end
 
--- Save a buffer through Vim itself rather than raw io.write, for callers that already
--- hold the resolved content in a live buffer. `!` bypasses the W12 "changed since
--- reading it" prompt — intentional, because the review buffer is *supposed* to differ
--- from disk mid-review. Resolve-time protection against external disk edits is
--- inline_diff's CAS (`change.disk_at_open`), not W12.
-function M.save_buffer(bufnr)
-  local ok, err = pcall(vim.api.nvim_buf_call, bufnr, function()
-    vim.cmd("noautocmd write!")
-  end)
-  return ok, err
-end
-
 local function snapshot_lines(text)
   local lines = vim.split(text or "", "\n", { plain = true })
   if #lines > 0 and lines[#lines] == "" then
     table.remove(lines)
   end
   return lines
-end
-
--- Read path as text via vim.fn.readfile, joined with "\n".
-function M.read_file_text(path)
-  if not path or path == "" then
-    return nil, "no path"
-  end
-  local abs = M.abs_path(path)
-  if vim.fn.filereadable(abs) ~= 1 then
-    return nil, "file not readable"
-  end
-  local lines = vim.fn.readfile(abs)
-  if vim.v.shell_error ~= 0 then
-    return nil, "read failed"
-  end
-  return table.concat(lines, "\n")
 end
 
 -- Raw on-disk bytes for CAS anchors. Unlike read_file_text this preserves
@@ -543,16 +499,18 @@ function M.buffer_text_normalized(bufnr)
   return table.concat(vim.api.nvim_buf_get_lines(bufnr, 0, -1, false), "\n")
 end
 
+M.NUL_BUFFER_ERROR = "NUL bytes in buffer"
+
 -- Canonical buffer bytes for CAS against staged_text and disk anchors.
 function M.buffer_bytes_snapshot(bufnr)
-  if vim.bo[bufnr].binary then
-    return nil, "binary buffer cannot be reviewed inline"
-  end
   local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
   for _, line in ipairs(lines) do
     if line:find("\0", 1, true) then
-      return nil, "NUL bytes in buffer"
+      return nil, M.NUL_BUFFER_ERROR
     end
+  end
+  if vim.bo[bufnr].binary then
+    return nil, "binary buffer cannot be reviewed inline"
   end
   local eol_byte
   if vim.bo[bufnr].fileformat == "dos" then

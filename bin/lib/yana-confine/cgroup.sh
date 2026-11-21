@@ -14,24 +14,24 @@ cgroup_ensure_user_scope() {
 	[[ -d "$own" && -w "$own" ]] || return 0
 	rel=$(sed -n 's/^0:://p' "$CGROUP_PROC_SELF_PATH")
 	if [[ "$CGROUP_MOUNT$rel" == "$own" || "$CGROUP_MOUNT$rel" == "$own/"* ]]; then
-		unset YANA_OVERLAY_USER_SCOPE
+		unset YANA_CONFINE_USER_SCOPE
 		return 0
 	fi
-	if [[ ${YANA_OVERLAY_USER_SCOPE:-} == 1 ]]; then
-		printf 'yana-overlay: user scope did not enter the delegated cgroup %s (current: %s)\n' "$own" "$rel" >&2
+	if [[ ${YANA_CONFINE_USER_SCOPE:-} == 1 ]]; then
+		printf 'yana-confine: user scope did not enter the delegated cgroup %s (current: %s)\n' "$own" "$rel" >&2
 		return 66
 	fi
 	if ! command -v systemd-run >/dev/null; then
-		printf 'yana-overlay: launching from outside the delegated user cgroup requires systemd-run\n' >&2
+		printf 'yana-confine: launching from outside the delegated user cgroup requires systemd-run\n' >&2
 		return 66
 	fi
 	runtime=${XDG_RUNTIME_DIR:-/run/user/$EUID}
 	if [[ ! -d "$runtime" || $(stat -c %u "$runtime") != "$EUID" ]] \
 		|| [[ ! -S "$runtime/systemd/private" && ! -S "$runtime/bus" ]]; then
-		printf 'yana-overlay: cannot reach the user manager in %s; log in through a systemd user session\n' "$runtime" >&2
+		printf 'yana-confine: cannot reach the user manager in %s; log in through a systemd user session\n' "$runtime" >&2
 		return 66
 	fi
-	export XDG_RUNTIME_DIR="$runtime" YANA_OVERLAY_USER_SCOPE=1
+	export XDG_RUNTIME_DIR="$runtime" YANA_CONFINE_USER_SCOPE=1
 	exec systemd-run --user --scope --quiet --collect -- "$@"
 }
 

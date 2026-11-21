@@ -26,14 +26,11 @@ end
 --- A `file.claim` THIS change already won, remembered with the (root, rel) it
 --- was won for.
 ---
---- yanad claims are never handed back by the client -- `release_file_claim` is
---- retired plumbing (yanad_async_claim_renewal asserts its absence) -- so a
---- claim this session holds, it still holds. Asking the daemon a second time
---- for an answer already in hand buys nothing and costs a round trip, and it
---- is that round trip that made `<C-r>` on an already-claimed `cA` row need
---- two presses: the first press could only START the request and the reapply
---- had to wait for a callback. Served from here, the same door answers
---- immediately, on the main thread, with NO wait of any kind.
+--- yanad claims are never handed back by the client, so a claim this session
+--- holds, it still holds. Asking the daemon a second time for an answer already
+--- in hand costs a round trip and would make the reapply wait for a callback.
+--- Served from here, the same door answers immediately, on the main thread, with
+--- NO wait of any kind.
 ---
 --- Only GRANTS are remembered. A refusal clears the record
 --- (`record_file_claim_refusal`), so a file we do not hold is always re-asked.
@@ -388,11 +385,10 @@ end
 ---
 --- This check NEVER talks to the daemon. It reads one fact -- did the door that
 --- issued this accept already win a `file.claim` for it? -- and answers. Asking
---- here used to mean BLOCKING on an RPC whose own budget is
+--- here would BLOCK on an RPC whose own budget is
 --- `yanad.timeout_ms + retries * retry_ms + 500` = 7.5s, and a blocking poll
---- freezes the editor: a silent daemon socket froze a routine accept for 7562ms and a
---- three-file `<C-r>` replay for 22643ms, with the user unable to type. Even a
---- HEALTHY daemon cost 387ms per accept. The claim is a QUESTION FOR A DOOR,
+--- freezes the editor with the user unable to type.
+--- The claim is a QUESTION FOR A DOOR,
 --- not for the applier: every door pre-requests it asynchronously and enters
 --- this synchronous applier from the request's own callback
 --- (`review_lifecycle.finish_session`, `turn_settle`).
@@ -444,19 +440,7 @@ local function ensure_session(pass)
 		pass.diary_begin_halted = err
 		return nil, err
 	end
-	local diary_begin = pass.diary_begin
-	local turn = pass.shadow_turn
-	if turn and turn.home_buffer_capture then
-		if type(turn.turn_dir) ~= "string" or turn.turn_dir == "" then
-			local err = "buffer-only turn carries no pinned private turn directory"
-			pass.diary_begin_halted = err
-			return nil, err
-		end
-		diary_begin = vim.tbl_extend("force", {}, diary_begin, {
-			diary_dir = turn.turn_dir .. "/home-buffer-diary",
-		})
-	end
-	local session, berr = diary.begin(diary_begin)
+	local session, berr = diary.begin(pass.diary_begin)
 	if not session then
 		pass.diary_begin_halted = berr or "opening the durable journal failed"
 		return nil, pass.diary_begin_halted

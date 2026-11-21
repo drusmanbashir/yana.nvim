@@ -9,93 +9,9 @@ local start = health.start or health.report_start
 local ok = health.ok or health.report_ok
 local warn = health.warn or health.report_warn
 local err = health.error or health.report_error
--- No legacy report_info equivalent existed in the old vimscript health API,
--- so a Neovim old enough to lack vim.health.info degrades this to ok()
--- rather than erroring.
+-- Neovim versions without vim.health.info degrade this to ok() rather than
+-- erroring.
 local info = health.info or ok
-
--- Probes whether `dir`'s filesystem reports a usable inode birth time, the
--- same signal bin/yana-sandbox's path_identity() keys workspace-root approval
--- on. A fresh, uniquely-named file is created directly inside `dir` (not
--- TMPDIR: the point is to measure the CURRENT workspace's filesystem, not
--- wherever temp files happen to land) and removed again before returning,
--- success or failure.
---
--- Returns (true, birth_string) when supported, (false, birth_string) when
--- the filesystem reports no usable birth time, or (nil, reason) when the
--- probe itself could not run (e.g. `dir` is not writable).
-local function probe_birth_time_support(dir)
-  local name = string.format(".yana-birthcheck-%d-%d", vim.fn.getpid(), math.random(100000, 999999))
-  local path = dir .. "/" .. name
-  local f, open_err = io.open(path, "w")
-  if not f then
-    return nil, "could not create a probe file in " .. dir .. ": " .. tostring(open_err)
-  end
-  f:write("yana birth-time probe\n")
-  f:close()
-
-  -- The probe file must be removed on EVERY path out of this function, even when `stat`
-  -- itself errors rather than merely returning a non-zero shell exit -- e.g. an
-  -- interrupted headless run, where vim.fn.system() can throw instead of returning. The
-  -- old code only reached `pcall(os.remove, path)` AFTER vim.fn.system() had already
-  -- returned, so a throw there skipped cleanup entirely and left the dotfile behind
-  -- (two such `.yana-birthcheck-*` files were found stray in this repo).
-  local uname = (vim.uv or vim.loop).os_uname()
-  local stat_argv
-  local stat_label
-  if uname.sysname == "Darwin" then
-    stat_argv = { "stat", "-f", "%B", path }
-    stat_label = "`stat -f %B`"
-  else
-    stat_argv = { "stat", "-c", "%w", path }
-    stat_label = "`stat -c %w`"
-  end
-  local stat_ok, out = pcall(vim.fn.system, stat_argv)
-  local shell_err = vim.v.shell_error
-  pcall(os.remove, path)
-
-  if not stat_ok then
-    return nil, stat_label .. " failed on " .. dir .. ": " .. tostring(out)
-  end
-  if shell_err ~= 0 or type(out) ~= "string" then
-    return nil, stat_label .. " failed on " .. dir
-  end
-
-  local birth = vim.trim(out)
-  -- Same "unusable birth time" test as bin/yana-sandbox's path_identity():
-  -- empty, "-", "?" or a value starting with "0" all mean the filesystem does
-  -- not carry a real birth time. That refuses there, fail-closed, rather
-  -- than falling back to a weaker (dev, ino) identity — this row exists so
-  -- the user learns that BEFORE a turn hits the refusal.
-  local supported = birth ~= "" and birth ~= "-" and birth ~= "?" and birth:sub(1, 1) ~= "0"
-  return supported, birth
-end
-
--- Workspace-root approval (bin/yana-sandbox) only runs for confined modes
--- (ask, inline); direct `agentic` mode never sandboxes, so it never needs the
--- birth-time identity and the probe is skipped there.
-local function birth_time_row()
-  if config.options.mode == "agentic" then
-    return
-  end
-  local cwd = vim.fn.getcwd()
-  local supported, detail = probe_birth_time_support(cwd)
-  if supported == nil then
-    warn("workspace filesystem birth-time: could not probe (" .. tostring(detail) .. ")")
-    return
-  end
-  if supported then
-    ok("workspace filesystem birth-time: supported (" .. cwd .. ")")
-  else
-    warn(
-      "workspace filesystem birth-time: NOT supported (" .. cwd .. ", stat %w=" .. (detail == "" and "empty" or detail) .. "). "
-        .. "Confined-mode workspace approval (ask, inline) requires a usable inode birth time and refuses turns "
-        .. "here rather than falling back to a weaker check; this is common on some network filesystems (e.g. NFS) "
-        .. "and layered/overlay filesystems.",
-      { "move the workspace to a filesystem that reports inode birth time (e.g. ext4, xfs, btrfs)" }
-    )
-  end
-end
 
 -- Best-effort human name for whatever already owns a foreign-mapped lhs, so
 -- the WARN/INFO below can name both sides of the collision.
@@ -393,7 +309,6 @@ function M.check()
       { "Correct the reported vendor permission, model/account or network error and retry; run Neovim without root/sudo for a root refusal." })
   end
   backend_auth_rows()
-  birth_time_row()
   keymap_collision_row()
   completion_menu_row()
   steer_key_row()

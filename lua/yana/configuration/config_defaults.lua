@@ -50,13 +50,10 @@ local defaults = {
 
   backends = require("yana.configuration.config_defaults_backends"),
 
-  -- The active backend (layer 1). Session-scoped at runtime exactly like
-  -- `model` (config.options.backend is the sole authority once Neovim is
-  -- running; see ui.lua's pick_backend) -- this default is only the value a
-  -- fresh Neovim session starts with. "cursor" + every backends.cursor
-  -- field above being the pre-existing behaviour is what makes an operator
-  -- who sets nothing see no change at all.
-  backend = "cursor",
+  -- Existing folders bypass overlay/review for every backend; missing folders are skipped.
+  ignore_folders = {},
+
+  backend = "claude",
 
   -- The modes this session may enter. The first entry is the starting mode, the
   -- list order is the toggle_mode cycle, and a mode missing here cannot be
@@ -86,11 +83,6 @@ local defaults = {
   -- Ask and agentic modes do not receive the rule.
   inline_exec_allowlist = nil,
 
-  single_file = {
-    enabled = false,
-    max_entries = 0,
-  },
-
   -- Workspace resolution asks, in order: the nearest `.git` root at or above the open
   -- file; then the entry here that contains it; then the file's own folder. A
   -- repository always wins, because the repository is the unit a claim is taken on.
@@ -112,6 +104,12 @@ local defaults = {
     -- The Turn snapshots this into `review_opts.permissions` at turn start, so
     -- a mid-turn setup() cannot change the policy a live review runs under.
     permissions = "ask",
+
+    -- MOST FILES ONE TURN'S REVIEW MAY HOLD, follow-ups included. A run that
+    -- would take it past this (e.g. an agent that checked out a whole worktree)
+    -- is refused before any review work: nothing is applied and the refused
+    -- files are kept in a recovery folder; an open review stays as it was.
+    max_files = 30,
 
     -- PATHS THE OPERATOR NEVER WANTS TO REVIEW. Gitignore syntax, matched on the
     -- workspace-relative path.
@@ -148,24 +146,6 @@ local defaults = {
   -- leaves the standout colour to the mode chip.
   model_highlight = { link = "Identifier" },
 
-  selection_scope = {
-    -- "reject" hard-blocks out-of-zone edits; "warn" keeps them reviewable with a note; "off" disables.
-    enforce = "reject",
-    -- When no function/class/cell resolves, bare selection uses this level instead of a 1-line jail.
-    unstructured = "warn",
-    cell_markers = { "# %%", "#%%" },
-    min_zone_lines = 1,
-    -- Out-of-zone rejections per path in one turn before cancel_inflight.
-    rejection_cap = 3,
-  },
-
-  queue = {
-    -- When a turn finishes with an agent-level error, hold any queued
-    -- follow-ups (do not auto-fire the next one) and notify instead — the
-    -- user decides whether to still send them via the queue picker/keymap.
-    pause_on_error = false,
-  },
-
   redirect = {
     -- After cancelling, wait this long for the process's exit to be observed
     -- before escalating to SIGKILL.
@@ -178,8 +158,6 @@ local defaults = {
   },
 
   context = {
-    -- File/cursor hints are opt-in; ordinary typed prompts attach no code.
-    include_file = false,
     -- Hard cap on selection lines embedded into the prompt.
     max_selection_lines = 600,
   },
@@ -249,7 +227,6 @@ local defaults = {
     completion_menu = "<C-Space>",
     -- Advanced.
     new_panel = "<M-n>",
-    queue = "<M-q>",
     -- Many terminals cannot tell <C-CR> from <CR> without the Kitty keyboard
     -- protocol; rebind (e.g. "<M-CR>") if steer never fires.
     steer = "<C-CR>",

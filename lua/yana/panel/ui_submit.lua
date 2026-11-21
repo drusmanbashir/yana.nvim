@@ -1,4 +1,4 @@
--- Submit + resend. Queue/steer/cancel live in yana.ui_queue, which calls submit_panel back.
+-- Submit and resend. Redirect and stop are owned by the run controls.
 -- Every turn and event callback arrives by name, so who answers a turn is decided where
 -- this service is built.
 local config = require("yana.config")
@@ -7,7 +7,6 @@ local notify = require("yana.notify")
 local notify_one_line = notify.one_line
 local sessions = require("yana.runtime.sessions")
 local context = require("yana.input.context")
-local selection_scope = require("yana.input.selection_scope")
 local ledger = require("yana.ledger")
 local agent = require("yana.agent.agent")
 local log = require("yana.log")
@@ -15,19 +14,6 @@ local steer_channel = require("yana.agent.steer_channel")
 local uv = vim.uv or vim.loop
 local renewal = require("yana.agent.renewal")
 local conversation = require("yana.panel.conversation")
-
-local function preview_module()
-  return require("yana.shadow.preview")
-end
-
-local function consume_next_launch_flags()
-  local flags = vim.g.yana_next_launch_flags
-  vim.g.yana_next_launch_flags = nil
-  if type(flags) ~= "table" then
-    return {}
-  end
-  return vim.deepcopy(flags)
-end
 
 -- Session failures the client never recovers from itself (yanad ensure() autostarts only when the
 -- socket is absent/refused). Value = operator action.
@@ -105,8 +91,87 @@ function M.new(deps)
     return true
   end
 
--- opts.text: submit this text instead of the prompt buffer (queue drain).
+  local function clear_prompt(p)
+    vim.bo[p.prompt_buf].modifiable = true
+    vim.api.nvim_buf_set_lines(p.prompt_buf, 0, -1, false, { "" })
+  end
+
+  local function hold_handover(p, text)
+    p.prompt_handover = { text = text, selection = p.pending_selection }
+    p.pending_selection = nil
+    notify_one_line("yana: prompt will start when this result is ready", vim.log.levels.INFO)
+  end
+
+  local function submit_during_run(p, text, from_prompt)
+    if p.awaiting_exit then
+      notify_one_line("yana: waiting for the agent to stop", vim.log.levels.INFO)
+    elseif p.got_result then
+      if text ~= "" then
+        hold_handover(p, text)
+        if from_prompt then clear_prompt(p) end
+        return true
+      end
+    elseif conversation.can_steer(p) then
+      if text ~= "" then
+        local mentions = require("yana.input.mentions").extract_mentions(text)
+        local agent_text = expand_attachments(p, mentions.new_content, { expand_paths = true })
+        local built = context.build(agent_text, context.current_origin(), p.pending_selection, {
+          mode = config.panel_mode(p.mode), announce_mode = false, announce_file = false,
+          enable_diagnostics = mentions.enable_diagnostics,
+        })
+        local id, reason = conversation.deliver(p, built.prompt)
+        if not id then
+          notify_one_line("yana: prompt was not sent (" .. reason .. ")", vim.log.levels.WARN)
+          return
+        end
+        if from_prompt then clear_prompt(p) end
+        p.pending_selection = nil
+        p.last_question = text
+        render_user(p, text, built.label)
+        start_assistant_block(p)
+        return true
+      else
+        local input = conversation.last_input(p)
+        if input and input.steered and not input.acknowledged and not input.interrupting then
+          local id, reason = conversation.interrupt(p, nil)
+          if id then
+            p.prompt_interrupt_id = id
+            render_note(p, "⏸ interrupted", true)
+          else
+            notify_one_line("yana: interrupt failed (" .. reason .. ")", vim.log.levels.WARN)
+          end
+        else
+          notify_one_line("yana: still responding (use stop to cancel)", vim.log.levels.WARN)
+        end
+      end
+    elseif text == "" then
+      notify_one_line("yana: still responding (use stop to cancel)", vim.log.levels.WARN)
+    else
+      -- The draft stays in the prompt. Track the job and buffer version only.
+      local tick = vim.api.nvim_buf_get_changedtick(p.prompt_buf)
+      local offer = p.interrupt_offer
+      if from_prompt and offer and offer.job == p.job and offer.tick == tick then
+        local ok, reason = conversation.interrupt(p, text, function(prompt, session, job)
+          if p.job ~= job or p.session_id ~= session then
+            return nil, "run_changed"
+          end
+          return steer_text(p, prompt, { take_prompt = true }) ~= false
+        end)
+        if not ok then
+          notify_one_line("yana: interrupt failed (" .. reason .. ")", vim.log.levels.WARN)
+        end
+      else
+        if from_prompt then p.interrupt_offer = { job = p.job, tick = tick } end
+        local backend = (p.turn_backends or {})[p.job_spawn_gen or p.turn_gen] or config.options.backend
+        notify_one_line("yana: " .. backend .. " cannot take a prompt mid-run. Press submit again to interrupt.",
+          vim.log.levels.INFO)
+      end
+    end
+  end
+
+-- opts.text supplies text from a caller such as the redirect or End continuation.
   local function submit_panel(p, opts)
+    if p.finish_quit then return end
     if M._test.on_submit_panel then
       M._test.on_submit_panel(p, opts)
     end
@@ -115,7 +180,18 @@ function M.new(deps)
     end
   opts = opts or {}
 
-  if config.overlay_mode() and not p.yanad_session_id then
+  local yana_mode = config.panel_mode(p.mode)
+  local backend_name = config.options.backend
+  local protected = yana_mode == "inline" or yana_mode == "ask"
+  local inline_policy = protected
+    and require("yana.configuration.config_backends").inline_mcp_route(config.backend_descriptor(backend_name), yana_mode)
+  if protected and not inline_policy then
+    render_error(p, ("yana: %s does not support MCP in %s mode"):format(backend_name, yana_mode))
+    return
+  end
+  local inline_mcp = inline_policy and true or false
+
+  if protected and not p.yanad_session_id then
     if p.yanad_session_pending then
       if park_submit(p, opts) then
         notify_one_line("yana: daemon session starting — turn queued", vim.log.levels.INFO)
@@ -146,93 +222,19 @@ function M.new(deps)
     return
   end
 
-  local question
-  if opts.text then
-    question = vim.trim(opts.text)
-  else
-    -- Spawn barrier: one process per panel; a live or awaiting-exit turn queues instead.
+  local from_prompt = opts.text == nil
+  local question = vim.trim(opts.text or table.concat(vim.api.nvim_buf_get_lines(p.prompt_buf, 0, -1, false), "\n"))
+  if not p.end_closing then
+    if p.prompt_handover then
+      notify_one_line("yana: the submitted prompt is waiting for the prior result", vim.log.levels.INFO)
+      return false
+    end
     if p.busy or p.job ~= nil or p.awaiting_exit then
-      local lines = vim.api.nvim_buf_get_lines(p.prompt_buf, 0, -1, false)
-      local queued_text = vim.trim(table.concat(lines, "\n"))
-      if queued_text == "" then
-        if p.steer_pending and p.steer_pending.at == "tool_boundary" then
-          -- Submit #3 sends now.
-          p.steer_pending.at = "now"
-          notify_one_line("yana: interrupting — sending now", vim.log.levels.INFO)
-          if p.steer_channel_active == "stream-json" then
-            vim.api.nvim_create_autocmd("SafeState", {
-              once = true,
-              callback = function()
-                if not p
-                  or not p.steer_pending
-                  or p.steer_pending.at ~= "now"
-                  or p.steer_channel_active ~= "stream-json"
-                  or not p.job
-                then
-                  return
-                end
-                -- Submit #3 sends after the keyfeed unwinds.
-                local text = p.steer_pending.text
-                if steer_channel.deliver(p, text, { interrupt = true }) then
-                  render_user(p, text)
-                  render_note(p, "⏸ interrupted — sending your message")
-                  start_assistant_block(p)
-                  update_winbar(p)
-                end
-              end,
-            })
-          elseif steer_text then
-            local backend = p.turn_backends[p.turn_gen] or config.options.backend or "cursor"
-            notify_one_line(
-              string.format("yana: %s lacks an in-turn channel — restarting now", backend),
-              vim.log.levels.INFO
-            )
-            local text = p.steer_pending.text
-            p.steer_pending = nil
-            steer_text(p, text, { note = "⏹ interrupted to steer — waiting for the previous process to exit" })
-          end
-          update_winbar(p)
-        elseif #p.queue > 0 then
-          -- Submit #2 promotes the queue tail.
-          local text = table.remove(p.queue)
-          p.steer_pending = { text = text, at = "tool_boundary", armed_hr = uv.hrtime() }
-          if p.steer_channel_active == "stream-json" then
-            notify_one_line(
-              "yana: promoted — sends at the end of the current tool call (press again to send now)",
-              vim.log.levels.INFO
-            )
-          else
-            local backend = p.turn_backends[p.turn_gen] or config.options.backend or "cursor"
-            notify_one_line(
-              string.format(
-                "yana: %s lacks an in-turn channel — restart at next tool boundary",
-                backend
-              ),
-              vim.log.levels.INFO
-            )
-          end
-          update_winbar(p)
-        else
-          notify_one_line("yana: still responding (use stop to cancel)", vim.log.levels.WARN)
-        end
-        return
-      end
-      table.insert(p.queue, queued_text)
-      vim.bo[p.prompt_buf].modifiable = true
-      vim.api.nvim_buf_set_lines(p.prompt_buf, 0, -1, false, { "" })
-      update_winbar(p)
-      notify_one_line(
-        string.format("yana: queued (%d pending) — sends when the current turn finishes", #p.queue),
-        vim.log.levels.INFO
-      )
-      return
+      return submit_during_run(p, question, from_prompt) == true
     end
-
-    local lines = vim.api.nvim_buf_get_lines(p.prompt_buf, 0, -1, false)
-    question = vim.trim(table.concat(lines, "\n"))
-    if question == "" then
-      return
-    end
+  end
+  if from_prompt then
+    if question == "" then return end
 
     -- CLI-parity: a known first-line /command dispatches its callback; cb(nil) = handled locally,
     -- cb(text) rewrites the prompt. An unknown /foo is sent verbatim.
@@ -282,6 +284,13 @@ function M.new(deps)
     return
   end
 
+  -- A confirmed End owns the review until its result, including a partial result.
+  if p.end_closing then
+    table.insert(p.end_closing.prompts, question)
+    return
+  end
+
+  local submitted_question = question
   do
     local extracted = require("yana.input.mentions").extract_mentions(question)
     question = extracted.new_content
@@ -308,15 +317,13 @@ function M.new(deps)
   end
 
 
-  -- opts.text callers believed the barrier clear; re-check (a race must never spawn a second process).
-  -- Head insert keeps FIFO.
-  if opts.text and (p.busy or p.job ~= nil or p.awaiting_exit) then
-    table.insert(p.queue, 1, question)
+  -- An existing review continues on the same mini-conversation.
+  local owns_open_review = not opts.ordinary and (p.shadow_turn ~= nil or p.mcp_run ~= nil)
+  local follow = owns_open_review and require("yana.panel.ui_followup").follow_up(p, question)
+  if follow == "handover" then
+    hold_handover(p, submitted_question)
     return
   end
-
-  -- An open review of this conversation: the prompt is its follow-up (F-ADDENDUM-TRIGGER), held or refused.
-  local follow = p.shadow_turn and require("yana.panel.ui_followup").follow_up(p, question)
   if follow and type(follow) ~= "table" then return end
 
   focus:set_last(p)
@@ -327,36 +334,18 @@ function M.new(deps)
     if q.prompt_buf then exclude[q.prompt_buf] = true end
   end
   local origin = context.current_origin(exclude)
-  local selection = p.pending_selection
-  p.pending_selection = nil
-  if not selection and config.panel_mode(p.mode) == "inline" and origin and origin.buf then
-    local capture, capture_err = require("yana.input.home_buffer_proposal").capture(origin.buf)
-    if capture_err then
-      notify_one_line("yana: " .. capture_err, vim.log.levels.WARN)
-      return
-    end
-    if capture then
-      selection = context.selection_from_range(origin.buf, 1, vim.api.nvim_buf_line_count(origin.buf),
-        { whole_buffer = true })
-      selection.home_buffer_capture = capture
-    end
+  local selection
+  if opts.handover then
+    selection = opts.handover.selection
+  else
+    selection, p.pending_selection = p.pending_selection, nil
   end
-  p.scope_rejections = {}
-  p.review_rejections = {}
 
   log.buffer_event("submit", { panel_id = p.id, generation = p.turn_gen + 1,
     cwd = vim.fn.getcwd(), bufnr = selection and selection.buf or (origin and origin.buf), selection = selection })
-  if selection and selection.buf and vim.api.nvim_buf_is_valid(selection.buf) then
-    selection.scope = selection_scope.compute(selection.buf, selection)
-    p.active_turn_scope = selection.scope
-  else
-    p.active_turn_scope = nil
-  end
 
   local enable_diagnostics = p.pending_enable_diagnostics
   p.pending_enable_diagnostics = nil
-  local yana_mode = config.panel_mode(p.mode)
-  local backend_name = config.options.backend or "cursor"
   local owner = conversation.get(p)
   local mini = owner:activate(yana_mode, backend_name)
   local announce = owner:needs_mode_notice(mini, yana_mode)
@@ -368,6 +357,7 @@ function M.new(deps)
       mode = yana_mode,
       enable_diagnostics = enable_diagnostics,
       announce_mode = announce,
+      announce_file = owner:needs_file_notice(mini, origin.name),
     }
   )
 
@@ -438,16 +428,14 @@ function M.new(deps)
     backend = config.options.backend,
     cwd = p.cwd,
     redirect = opts.redirect and true or false,
-    queued = #p.queue,
     prompt_bytes = #agent_question,
     title = p.title,
     turn_id = turn_id,
     attachments = vim.deepcopy(attachments),
   })
-  p.turn_scopes[gen] = (selection and selection.scope) or false
   p.turn_modes[gen] = config.panel_mode(p.mode)
-  p.turn_backends[gen] = config.options.backend or "cursor"
-  p.steer_channel_active = (config.backend_descriptor(p.turn_backends[gen]) or {}).steer_channel
+  p.turn_backends[gen] = backend_name
+  p.interrupt_offer, p.prompt_interrupt_id = nil, nil
   p.turn_questions[gen] = question
   p.turn_attachments = p.turn_attachments or {}
   p.turn_attachments[gen] = vim.deepcopy(attachments)
@@ -462,66 +450,24 @@ function M.new(deps)
   p.job_spawn_gen = gen
   if not follow then p.shadow_pass = nil end
   p.job_shadow_turn = nil
-  if config.overlay_mode() then
-    local preview = require("yana.shadow.preview")
-    local turn, perr = preview.begin_turn({
-      cwd = p.cwd,
-      selection = selection,
-      origin = origin,
-      launch_flags = consume_next_launch_flags(),
-      stream = follow and follow.prior.stream or p.session_id or ("panel-" .. tostring(p.conv_buf)),
-      session_id = p.session_id,
-      turn_id = turn_id,
-      turn_gen = gen,
-      panel_id = p.id,
-      mode = p.turn_modes[gen],
-      yanad_session_id = p.yanad_session_id,
-      read_only_workspace = selection and selection.home_buffer_capture ~= nil,
-      resume = follow and true or nil,
-    })
-    if not turn then
-      log.buffer_event("launch_failed", { panel_id = p.id, generation = gen, turn_id = turn_id, reason = perr })
-      p.busy = false
-      stop_spinner(p)
-      ledger.close_turn(L, { exit_code = nil, confinement_failed = perr or "shadow turn failed" })
-      render_error(p, perr or "shadow turn failed")
-      update_winbar(p)
-      return
-    end
-    ledger.mark(L, "confinement_established")
-    L.turn.workspace = turn.workspace
-    L.turn.turn_dir = turn.turn_dir
-    p.shadow_turn = turn
-    p.job_shadow_turn = turn
-    update_winbar(p)
-  end
-  -- Inline turns snapshot every open buffer in the turn's roots and hand each B0 to the
-  -- overlay before the agent starts.
-  if p.turn_modes[gen] == "inline" then
-    local snapshot = require("yana.input.home_buffer_proposal")
-    local roots = {}
-    for _, root in ipairs(p.shadow_turn and require("yana.shadow.ops").session_roots(p.shadow_turn) or {}) do
-      roots[#roots + 1] = root.workspace
-    end
-    local snaps, order = snapshot.take_snapshots(roots, selection and selection.buf or (origin and origin.buf),
-      selection and selection.home_buffer_capture)
+  if inline_mcp then
     p.turn_buffer_captures = p.turn_buffer_captures or {}
-    p.turn_buffer_captures[gen] = next(snaps) and snaps or nil
-    local private_dir = p.shadow_turn and (p.shadow_turn.private_dir
-      or (p.shadow_turn.turn_dir and p.shadow_turn.turn_dir .. "/private"))
-    local seeds, seed_err = p.shadow_turn and snapshot.write_seeds(order, roots, private_dir)
-    if p.shadow_turn and not seeds then
-      snapshot.release_snapshots(p.turn_buffer_captures, gen)
-      if follow then require("yana.panel.ui_followup").drop_launch(p, follow)
-      else preview_module().discard(p.shadow_turn) end
-      p.shadow_turn, p.job_shadow_turn, p.busy = follow and follow.prior or nil, nil, false
-      stop_spinner(p)
-      ledger.close_turn(L, { exit_code = nil, confinement_failed = seed_err })
-      render_error(p, seed_err)
-      update_winbar(p)
-      return
-    end
-    if p.shadow_turn then p.shadow_turn.seed_files = seeds end
+    local refusals = {}
+    p.turn_buffer_captures[gen] = require("yana.input.submit_snapshot").take_snapshots({ "/" },
+      selection and selection.buf or origin and origin.buf, refusals)
+    local open_folder = follow and follow.prior.open_folder or require("yana.shadow.preview").workspace_candidate({
+      cwd = p.cwd, selection = selection, origin = origin,
+    })
+    p.mcp_run = require("yana.runtime.mcp_inline").new({
+      snapshots = p.turn_buffer_captures[gen], snapshot_refusals = refusals,
+      workspace = p.cwd, open_folder = open_folder,
+    })
+    local run = p.mcp_run
+    run.open_folder = open_folder
+    run.stream = follow and follow.prior.stream or p.session_id or ("panel-" .. tostring(p.conv_buf))
+    run.turn_id, run.turn_gen, run.mode = turn_id, gen, p.turn_modes[gen]
+    run.yanad_session_id, run.source = p.yanad_session_id, "buffer"
+    p.job_mcp_run = run
   end
   -- Open the lifecycle pass: durable id + owning tuple, explicitly NOT actionable until walked and classified.
   p.turn_pass = lifecycle.begin_turn({
@@ -529,15 +475,16 @@ function M.new(deps)
     generation = gen,
     stream = follow and follow.prior.stream or p.session_id or ("panel-" .. tostring(p.conv_buf)),
     session_id = p.session_id,
-    workspace = p.shadow_turn and p.shadow_turn.workspace or p.cwd,
-    state_dir = p.shadow_turn and p.shadow_turn.turn_dir or lifecycle.state_dir(),
-    tracked_evidence = lifecycle.capture_tracked_evidence(
-      p.shadow_turn and p.shadow_turn.workspace or p.cwd
-    ),
+    workspace = p.cwd,
+    state_dir = lifecycle.state_dir(),
+    tracked_evidence = { paths = {} },
     turn_id = turn_id,
   })
+  if inline_mcp then p.mcp_run.turn_pass, p.mcp_run.run_generation = p.turn_pass, gen end
   if follow and not require("yana.panel.ui_followup").begin_follow_up(p, follow, gen) then
     p.busy, p.job_spawn_gen, p.job_shadow_turn = false, nil, nil
+    if p.job_mcp_run then p.job_mcp_run:close(); p.job_mcp_run = nil end
+    require("yana.input.submit_snapshot").release_snapshots(p.turn_buffer_captures, gen)
     stop_spinner(p)
     ledger.close_turn(L, { exit_code = nil, confinement_failed = "follow-up input not captured" })
     update_winbar(p)
@@ -554,14 +501,21 @@ function M.new(deps)
     model = config.options.model,
     session_id = p.session_id,
     cwd = p.cwd,
-    jail_session = p.shadow_turn,
+    jail_session = inline_mcp and { workspace = p.cwd, turn_id = turn_id, mode = p.turn_modes[gen],
+      yanad_session_id = p.yanad_session_id, generation = gen, resume = follow and true or nil } or nil,
+    inline_mcp = inline_mcp,
+    inline_policy = inline_policy,
+    mcp_context = inline_mcp and p.mcp_run or nil,
+    mcp_input = inline_mcp and require("yana.turn.turn_cycle").recording_run(p.mcp_run) or nil,
+    turn_pass = p.turn_pass,
     panel_id = p.id,
     turn_gen = gen,
     turn_id = turn_id,
     steer_enabled = true,
     spawn_reason = opts.redirect and "redirect" or (opts.text and "queue_drain" or "submit"),
     is_current = function()
-      return p.turn_gen == gen and type(p.conv_buf) == "number" and vim.api.nvim_buf_is_valid(p.conv_buf)
+      return not p.finish_quit and p.turn_gen == gen
+        and type(p.conv_buf) == "number" and vim.api.nvim_buf_is_valid(p.conv_buf)
     end,
     on_event = function(obj)
       on_event(p, gen, obj, mini)
@@ -577,22 +531,26 @@ function M.new(deps)
     end,
   })
   local send_ok = true
-  if p.job and steer_channel.can_steer(config.backend_descriptor(p.turn_backends[gen])) then
+  if p.job and conversation.can_steer(p) then
     send_ok = steer_channel.open(p, p.job, built.prompt) and true or false
   end
   if p.job and send_ok then
     owner:mark_sent(mini, p.turn_modes[gen])
+    owner:mark_file(mini, built.file)
   end
   if not p.job then
     log.buffer_event("launch_failed", { panel_id = p.id, generation = gen, turn_id = turn_id, reason = "agent did not start" })
     p.job_spawn_gen = nil
-    require("yana.input.home_buffer_proposal").release_snapshots(p.turn_buffer_captures, gen)
-    -- The overlay never ran, so it never took a claim; nothing to release.
+    require("yana.input.submit_snapshot").release_snapshots(p.turn_buffer_captures, gen)
     if follow then
       require("yana.panel.ui_followup").drop_launch(p, follow)
-    elseif p.shadow_turn then
-      preview_module().discard(p.shadow_turn)
-      p.shadow_turn = nil
+
+    end
+    local run = p.job_mcp_run
+    if run then
+      run:close()
+      if p.mcp_run == run then p.mcp_run = nil end
+      p.job_mcp_run = nil
     end
   end
 end

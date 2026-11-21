@@ -150,8 +150,20 @@ local function codex_item_completed(state, obj)
       },
     }
   end
+  -- An `error` ITEM is codex's non-fatal notice (a config warning, a retried stream);
+  -- its failures are the top-level `error` and `turn.failed`. Codex repeats a config
+  -- warning per config layer, so each distinct text is narrated once per turn.
   if itype == "error" then
-    return { { type = "error", message = item.message, timestamp_ms = ts } }
+    local message = nilify(item.message)
+    message = type(message) == "string" and message:gsub("%s+$", "") or ""
+    if message == "" then
+      message = "agent warning"
+    end
+    if state.warnings_seen[message] then
+      return {}
+    end
+    state.warnings_seen[message] = true
+    return { { type = "warning", message = message, timestamp_ms = ts } }
   end
   state.unknown_count = state.unknown_count + 1
   return {}
@@ -224,6 +236,8 @@ function M.new_state(opts)
     content_cache = {},
     -- unrecognised event/item shapes this turn has seen.
     unknown_count = 0,
+    -- codex: non-fatal notice texts already narrated this turn.
+    warnings_seen = {},
     -- Stamped onto each protocol's outgoing `result`; other events are untouched.
     file_change_count = 0,
   }

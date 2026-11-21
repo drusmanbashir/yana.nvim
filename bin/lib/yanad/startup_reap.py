@@ -312,6 +312,13 @@ def reap(root, current_owner, log, version=None):
             outcomes.append((str(session_path), "keep", code))
             continue
         if version is not None and session_version != version:
+            for path in (session_path / "turns").glob("*/meta.json"):
+                try:
+                    meta = base_store._read_json(path)
+                    if meta["state"] in {"running", "dead_unsealed"}:
+                        liveness.seal_cgroup(meta["cgroup"])
+                except (OSError, ValueError, KeyError, TypeError) as exc:
+                    log.write("WARN", "zombie_reap code=zombie_epoch_seal_skipped path=%s error=%s" % (path, type(exc).__name__))
             try:
                 base_store._force_rmtree(session_path, log=log)
                 if os.path.lexists(session_path):
@@ -344,8 +351,14 @@ def reap(root, current_owner, log, version=None):
             _log_keep(log, code, owner_path, owner)
             outcomes.append((str(session_path), "keep", code))
             continue
+        if (session_path / "partial-end.json").exists():
+            code = "frozen_end_recovery"
+            _log_keep(log, code, session_path)
+            outcomes.append((str(session_path), "keep", code))
+            continue
         try:
-            base_store._force_rmtree(session_path, log=log)
+            if not base_store.discard_dead_session(root, session_path.name, log=log):
+                raise OSError("writer shutdown unconfirmed")
             if os.path.lexists(session_path):
                 raise OSError("session tree remains after removal")
         except Exception as exc:

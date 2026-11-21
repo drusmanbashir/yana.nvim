@@ -198,7 +198,7 @@ end
 -- moves it clears the marker -- here, `apply` and `rewind`. The undo's own
 -- `on_lines` opens a group the suspended watcher never `finish`es, and that
 -- orphan dated a 2->3 record `before_seq=2`: the second `u` read
--- `APPLY dir=none frames=0` and the band stayed narrow (LEDGER.md N20).
+-- `APPLY dir=none frames=0` and the band stayed narrow.
 function History:observe(seq)
 	if type(seq) == "number" then
 		self.current_seq = seq

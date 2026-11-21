@@ -1,22 +1,7 @@
--- yana: the sidebar chat UI (conversation + prompt windows). Panels stack in the sidebar,
--- each with its own session, mode, model and job; commands act on the current panel
--- (cursor's, else most recently used).
-local config = require("yana.config")
-local agent = require("yana.agent.agent")
-local context = require("yana.input.context")
-local diff = require("yana.diff")
-local control_plane = require("yana.safety.control_plane")
-local selection_scope = require("yana.input.selection_scope")
-local clipboard = require("yana.input.clipboard")
 local log = require("yana.log")
-local shadow_ops = require("yana.shadow.ops")
 local ui_panel_views = require("yana.panel.ui_panel_views")
 local ui_pickers_factory = require("yana.panel.ui_pickers")
 local ui_winbar_factory = require("yana.panel.ui_winbar")
--- Pin the applier with the UI so a live turn outliving its runtime dir can still finalize and release its claim.
-local shadow_apply = require("yana.shadow.apply")
--- Per-turn flight recorder: in-memory writes only; never affects control flow.
-local ledger = require("yana.ledger")
 -- Every notification goes through the one-line budget: a wrapped message raises a hit-enter prompt that blocks the main loop.
 local notify = require("yana.notify")
 local notify_one_line = notify.one_line
@@ -52,8 +37,7 @@ local panels = {}       -- list of panel state tables, in creation order
 local S = {}
 S._panel_seq = 0
 S.cancel_inflight = nil   -- defined after S.submit_panel; used by scope rejection cap
-S.submit_panel = nil      -- defined below; forward-declared so on_done can drain the queue
-S.maybe_drain_queue = nil -- defined below; review-close drain after release_shadow_turn
+S.submit_panel = nil      -- defined below; used by the handover and redirect continuations
 S.finalize_shadow_turn = nil -- confirmed-exit overlay consume; also used by on_done spawn-fail
 S.render_note = nil
 
@@ -101,17 +85,13 @@ local function new_panel_state()
     pending_redirect = nil, -- steer text awaiting old process death (last-wins)
     awaiting_exit = false, -- cancelled, exit not yet observed (spawn barrier)
     busy = false,
-    queue = {},            -- prompts submitted while busy; cancel returns them to the prompt buffer, never drops them
     cancelled = false,     -- true when we jobstop()'d; on_done must not treat as error
     got_result = false,
-    turn_errored = false,  -- finished turn rendered an agent error or failed exit; gates queue.pause_on_error
-                           -- process exit) — gates queue.pause_on_error.
+    turn_errored = false,  -- finished turn rendered an agent error or failed exit
     rendered_any = false,  -- did this turn render any text/tool output?
     stream_text = "",
     assistant_start = 0,   -- 0-based line where the streaming answer begins
     pending_selection = nil,
-    active_turn_scope = nil,
-    turn_scopes = {}, -- turn_gen -> scope table or false (explicitly unscoped)
     changes = {},          -- file changes made by the agent this session
     review_epoch = 0,      -- bumped on new_chat; batch owners must match or flush must not enqueue
     -- afterFullFileContent is a PER-EDIT snapshot: touching one file twice leaves earlier `after` unmatchable (see flush_review_batch).
@@ -123,8 +103,6 @@ local function new_panel_state()
     spinner = { timer = nil, idx = 1 },
     closing = false,       -- guard for the WinClosed sibling-close autocmd
     augroup = nil,
-    scope_rejections = {}, -- per-turn out-of-zone rejections by path
-    review_rejections = {}, -- per-turn inline-review rejections by path
     turn_modes = {},       -- turn_gen -> resolved mode used for that submit
     turn_backends = {},    -- turn_gen -> backend resolved at submit
     turn_end_outcome = {}, -- turn_gen -> close_turn outcome for turn.end
@@ -191,18 +169,6 @@ vim.api.nvim_create_autocmd({ "WinEnter", "BufEnter" }, {
     end)
   end,
 })
-
-local function find_panel_by_session(session_id)
-  if not session_id then
-    return nil
-  end
-  for _, p in ipairs(panels) do
-    if p.session_id == session_id and panel_alive(p) then
-      return p
-    end
-  end
-  return nil
-end
 
 -- The panel commands act on: the one under the cursor, else the most
 -- recently used, else any open one, else the newest alive one.
@@ -289,8 +255,6 @@ local renewal_brief = ui_modes.renewal_brief
 local seat_shared_context = ui_modes.seat_shared_context
 local mode_change_refused_notify = ui_modes.mode_change_refused_notify
 local reconcile_pending = ui_modes.reconcile_pending
--- Also required directly: used outside the mode-lock cluster.
-local renewal = require("yana.agent.renewal")
 
 ----------------------------------------------------------------------
 -- turn liveness: elapsed, last event, stall notice
@@ -350,12 +314,6 @@ local conv_base_line = ui_claims.conv_base_line
 local change_header_text = ui_claims.change_header_text
 local stamp_undeclared_badge = ui_claims.stamp_undeclared_badge
 local refresh_change_block = ui_claims.refresh_change_block
-local reload_after_scope_revert = ui_claims.reload_after_scope_revert
-local scope_rejection_cap_note = ui_claims.scope_rejection_cap_note
-local bump_scope_rejection = ui_claims.bump_scope_rejection
-local review_rejection_cap_note = ui_claims.review_rejection_cap_note
-local bump_review_rejection = ui_claims.bump_review_rejection
-local render_scope_rejection = ui_claims.render_scope_rejection
 local panel_claimed_workspace = ui_claims.panel_claimed_workspace
 local refresh_review_claim = ui_claims.refresh_review_claim
 local preview_module = ui_claims.preview_module
@@ -381,7 +339,6 @@ local ui_review = ui_review_factory.new({
   change_footer_text = change_footer_text,
   conv_base_line = conv_base_line,
   stamp_undeclared_badge = stamp_undeclared_badge,
-  bump_review_rejection = bump_review_rejection,
 })
 render_review_status = ui_review.render_review_status
 require("yana.panel.ui_followup").set_doors({ render_review_status = render_review_status })
@@ -409,13 +366,14 @@ M.accept_changes = ui_changes.accept_changes
 M.reject_changes = ui_changes.reject_changes
 M.review_changes = ui_changes.review_changes
 
-S.render_note = function(p, text)
+S.render_note = function(p, text, streaming)
+  if streaming then commit_stream(p) end
   append(p, { "  " .. notify.flatten(text), "" }, "note")
+  if streaming then commit_stream(p) end
 end
 
 -- Pure-function boundary probe for the headless row (no panel needed).
 M._test = M._test or {}
-M._test.utf8_safe_truncate = utf8_safe_truncate
 
 ----------------------------------------------------------------------
 -- event handling / refusal recording / turn completion (ui_events, ui_turn_shadow, ui_turn_end).
@@ -427,14 +385,9 @@ local ui_events = ui_events_factory.new({
   append = append,
   append_stream = append_stream,
   render_tool_note = render_tool_note,
-  render_user = render_user,
-  start_assistant_block = start_assistant_block,
   render_error = render_error,
   turn_ledger = turn_ledger,
   with_render_gen = with_render_gen,
-  update_winbar = update_winbar,
-  panel_open = panel_open,
-  panel_open_in = panel_open_in,
   preview_module = preview_module,
   remember_seat_session = remember_seat_session,
   note_liveness_event = note_liveness_event,
@@ -448,8 +401,7 @@ local write_through_ignored = ui_events.write_through_ignored
 local record_artifact_refusals = ui_events.record_artifact_refusals
 local record_confinement_refusals = ui_events.record_confinement_refusals
 
-local ui_turn_shadow_factory = require("yana.panel.ui_turn_shadow")
-local ui_turn_shadow = ui_turn_shadow_factory.new({
+require("yana.panel.ui_turn_shadow").new({
   state = S,
   render_error = render_error,
   turn_ledger = turn_ledger,
@@ -473,7 +425,6 @@ local ui_turn_end_factory = require("yana.panel.ui_turn_end")
 local ui_turn_end = ui_turn_end_factory.new({
   shadow_turn_gen = ui_events.shadow_turn_gen,
   finalize_shadow_turn = S.finalize_shadow_turn,
-  maybe_drain_queue = S.maybe_drain_queue,
   submit_panel = function(p, opts)
     return submit_panel(p, opts)
   end,
@@ -492,18 +443,20 @@ local ui_turn_end = ui_turn_end_factory.new({
   buf_valid = buf_valid,
   M = M,
 })
+S.finish_handover = ui_turn_end.finish_handover
 local on_done = ui_turn_end.on_done
 local on_exit_confirmed = ui_turn_end.on_exit_confirmed
 local set_model_actual = ui_turn_end.set_model_actual
 
 ----------------------------------------------------------------------
--- submit / queue
+-- submit and run controls
 ----------------------------------------------------------------------
 
--- submit_panel, M.submit, M.resend: yana.panel.ui_submit. cancel_inflight, M.stop, M.steer, M.pick_queue: yana.panel.ui_queue.
+-- submit_panel, M.submit, M.resend: yana.panel.ui_submit. cancel_inflight, M.stop, M.steer: yana.panel.ui_queue.
 local ui_submit_factory = require("yana.panel.ui_submit")
 local ui_submit_deps = {
   focus = focus,
+  inline_review_opts = inline_review_opts,
   finalize_shadow_turn = S.finalize_shadow_turn,
   render_note = S.render_note,
   steer_text = function(p, text, opts)
@@ -540,7 +493,6 @@ local ui_queue_factory = require("yana.panel.ui_queue")
 local ui_queue = ui_queue_factory.new({
   state = S,
   buf_valid = buf_valid,
-  win_valid = win_valid,
   current_panel = current_panel,
   update_winbar = update_winbar,
   stop_spinner = stop_spinner,
@@ -551,7 +503,6 @@ S.cancel_inflight = ui_queue.cancel_inflight
 steer_text = S.steer_text
 M.stop = ui_queue.stop
 M.steer = ui_queue.steer
-M.pick_queue = ui_queue.pick_queue
 
 -- Panel <C-c> target accessor, paste and stop-key: yana.panel.ui_input.
 M._stop_key_probe = { seen = 0, mode = nil, had_panel = nil, had_job = nil, scheduled = false, error = nil }
@@ -623,7 +574,8 @@ local ui_panel = ui_panel_factory.new({
   focus = focus,
   depth = depth,
   cancel_inflight = ui_queue.cancel_inflight,
-  maybe_drain_queue = S.maybe_drain_queue,
+  quit_review = ui_review.quit_review,
+  discard_for_quit = ui_review.discard_for_quit,
   M = M,
   panels = panels,
   panel_open = panel_open,
@@ -641,6 +593,7 @@ local ui_panel = ui_panel_factory.new({
   update_winbar = update_winbar,
   prompt_winbar_text = prompt_winbar_text,
   render_review_status = render_review_status,
+  schedule_review_status = ui_review.schedule_review_status,
   stop_spinner = stop_spinner,
 })
 local apply_panel_keymaps = ui_panel.apply_panel_keymaps
@@ -666,20 +619,6 @@ function M.panel_views(tab)
     end
   end
   return out
-end
-
--- The panel index owning `win` in `tab`, plus which view it is
--- ("conv"/"prompt"), or nil when no panel owns it.
-function M.window_owner(win, tab)
-  for _, v in ipairs(M.panel_views(tab)) do
-    if v.conv == win then
-      return v.index, "conv"
-    end
-    if v.prompt == win then
-      return v.index, "prompt"
-    end
-  end
-  return nil
 end
 
 M.is_open = ui_panel.is_open
@@ -767,36 +706,19 @@ M._test.on_done = on_done
 M._test.emit_turn_end = emit_turn_end
 M._test.on_event = on_event
 M._test.on_exit_confirmed = on_exit_confirmed
-M._test.maybe_drain_queue = function(p)
-  return S.maybe_drain_queue(p)
-end
 M._test.finalize_shadow_turn = S.finalize_shadow_turn
 M._test.render_tool_change = render_tool_change
 M._test.flush_review_batch = flush_review_batch
-M._test.REVIEW_RETRY_EXHAUSTED = REVIEW_RETRY_EXHAUSTED
-M._test.MAX_REVIEW_RETRY = MAX_REVIEW_RETRY
 M._test.inline_review_opts = inline_review_opts
 M._test.change_footer_text = change_footer_text
-M._test.begin_accept_indication = begin_accept_indication
 M._test.panel_claimed_workspace = panel_claimed_workspace
 M._test.new_chat = M.new_chat
 M._test.expand_attachments = ui_submit_deps.expand_attachments
--- Exported so a row can prove the REFUSALS fire, not merely that a switch succeeds.
-M._test.renewal_blocked_reason = renewal_blocked_reason
 M._test.renewal_brief = renewal_brief
-M._test.winbar_text = winbar_text
 M._test.update_winbar = update_winbar
-M._test.mode_chip = mode_chip
-M._test.model_chip = model_chip
 M._test.set_model_actual = set_model_actual
-M._test.fit_winbar = fit_winbar
-M._test.trunc_display = trunc_display
 M._test.backend_label = backend_label
 M._test.turn_evidence_dir = turn_evidence_dir
--- Liveness seams: the threshold is policy with no operator option; tests move the one number from here. `liveness`
--- exposes per-turn state so a row can assert the pairing, not only its text.
-M._test.set_stall_threshold_ms = ui_liveness.set_stall_threshold_override
-M._test.stall_threshold_ms = stall_threshold_ms
 M._test.liveness = function(p)
   return p and liveness_for(p) or nil
 end

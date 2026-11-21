@@ -1,4 +1,4 @@
--- Per-row HUNK OWNERSHIP, answered from the live syntax tree.
+-- Per-row hunk ownership, from the live syntax tree or the recorded editor writes.
 --
 --
 -- Why a FACTORY and not a plain module: every one of these predicates closes
@@ -8,34 +8,37 @@
 -- boundary moved.
 local M = {}
 
---- The live syntax tree root for `bufnr`, or a LOUD FAILURE. A buffer whose
---- language has no parser has no ownership answer, only a guess: the fallback
---- that used to stand here judged an operator-typed row "owned" and hid a
---- treesitter-rule bug for hours.
---- No caller may catch this and substitute an answer. `state` carries the
---- notify latch, so the operator sees it once per buffer per review rather
---- than once per keystroke; `review_hunk_split` shares this one raiser.
-function M.tree_root(bufnr, state)
+local function parser_for(bufnr, state)
+  local path = vim.api.nvim_buf_get_name(bufnr)
+  if path == "" and state and state.change then path = state.change.path or path end
   local filetype = vim.bo[bufnr].filetype
   if filetype == "" then
-    local ok, matched = pcall(vim.filetype.match, { filename = vim.api.nvim_buf_get_name(bufnr) })
+    local ok, matched = pcall(vim.filetype.match, { filename = path })
     if ok and matched then
       filetype = matched
     end
   end
   local lang = filetype ~= "" and (vim.treesitter.language.get_lang(filetype) or filetype) or nil
+  local ok, parser = pcall(vim.treesitter.get_parser, bufnr, lang)
+  return ok and parser or nil, path, filetype, lang
+end
+
+function M.uses_line_ownership(bufnr, state)
+  return not (state.change and state.change.before == nil) and parser_for(bufnr, state) == nil
+end
+
+--- The live root, or nil if this buffer's language has no parser.
+function M.tree_root(bufnr, state)
+  local parser, path, filetype, lang = parser_for(bufnr, state)
+  if not parser then return nil end
   local function fail()
-    local msg = ("yana: hunk ownership cannot be resolved for %s: filetype %q (treesitter language %q) has no parser")
-      :format(vim.api.nvim_buf_get_name(bufnr), filetype, lang or filetype)
+    local msg = ("yana: hunk ownership cannot be resolved for %s: filetype %q (treesitter language %q) produced no syntax tree")
+      :format(path, filetype, lang or filetype)
     if type(state) == "table" and not state.no_parser_notified then
       state.no_parser_notified = true
       vim.notify(msg, vim.log.levels.ERROR)
     end
     error(msg, 0)
-  end
-  local ok, parser = pcall(vim.treesitter.get_parser, bufnr, lang)
-  if not ok or not parser then
-    fail()
   end
   local parsed, trees = pcall(parser.parse, parser)
   if not parsed or not trees or not trees[1] then
@@ -64,9 +67,10 @@ end
 --- row is this" but "are these two rows on opposite sides of a CLASS boundary".
 --- `review_hunk_split` asks it here so this module stays the only one that
 --- walks the tree. The veto fires only when both rows resolve to a class and
---- those classes differ; no parser fails loud through the one raiser above.
+--- those classes differ. Without a parser, row adjacency decides.
 function M.same_class_scope(bufnr, line_a, line_b, state)
   local root = M.tree_root(bufnr, state)
+  if not root then return true end
   local node_a, node_b = node_at(bufnr, root, line_a), node_at(bufnr, root, line_b)
   if node_a == nil or node_b == nil then
     return true
@@ -274,7 +278,9 @@ function M.new(bufnr, state)
       return true
     end
     local line = text_at(line_1)
-    if line == nil or line:match("^%s*$") then
+    if line == nil then return false end
+    local blank = line:match("^%s*$") ~= nil
+    if blank and parser_for(bufnr, state) then
       -- Existing file: a blank row is the operator's UNLESS the ledger already
       -- holds a SETTLED ANCHOR for this exact row whose recorded source is this
       -- exact text -- the proposal's own separator, transported onto this row and
@@ -283,12 +289,12 @@ function M.new(bufnr, state)
       -- a provisional anchor is a claim (F-OWN-PROVISION) and the running pass's
       -- settled-row table is a boolean with nothing behind it, so neither may
       -- vouch for a blank -- the same distinction the InsertLeave judge draws.
-      return line ~= nil and settled_anchor_source(line_1) == line
+      return settled_anchor_source(line_1) == line
     end
-    -- The tree is asked for FIRST, before any ledger answer: an existing file
-    -- whose language has no parser gets the loud raise and never a verdict
-    -- (u_no_parser_ownership_fails_loud).
-    local root = M.tree_root(bufnr, state)
+    local root = not blank and M.tree_root(bufnr, state)
+    if not root then
+      return (state._ownership_dirty_rows or {})[line_1] == nil and settled_owns_row(line_1)
+    end
     -- The ledger's own settled record of a member, which no syntax question
     -- overturns (F-OWN-DEF 1).
     if settled_owns_row(line_1) then

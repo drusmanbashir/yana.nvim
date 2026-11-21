@@ -1,6 +1,8 @@
--- Sole owner of resumable backend mini-conversations and last successfully
--- sent mode per mini. p.session_id is an owner-written read projection only.
+-- Sole owner of resumable backend mini-conversations and the last successfully
+-- sent mode and file per mini. p.session_id is an owner-written read projection only.
 local config = require("yana.config")
+local context = require("yana.input.context")
+local steer_channel = require("yana.agent.steer_channel")
 
 local Conversation = {}
 Conversation.__index = Conversation
@@ -40,6 +42,11 @@ function Conversation:owns(mini)
   return mini ~= nil and mini.key ~= nil and self.minis[mini.key] == mini
 end
 
+-- The agent behind this mini has heard nothing: not ours, or nothing to resume.
+local function is_fresh(self, mini)
+  return not self:owns(mini) or mini.id == nil or mini.id == ""
+end
+
 --- Select (creating if needed) the mini for mode/backend; becomes active.
 function Conversation:activate(mode, backend_name)
   local p = self.panel
@@ -59,16 +66,15 @@ end
 --- True when this launch must carry the mode sentence.
 function Conversation:needs_mode_notice(mini, mode)
   mode = config.panel_mode(mode)
-  if not self:owns(mini) then
-    return true
-  end
-  if mini.id == nil or mini.id == "" then
-    return true
-  end
-  if mini.last_mode == nil then
+  if is_fresh(self, mini) or mini.last_mode == nil then
     return true
   end
   return mini.last_mode ~= mode
+end
+
+--- True when this prompt must name `path`: the last file this mini heard differs.
+function Conversation:needs_file_notice(mini, path)
+  return is_fresh(self, mini) or mini.last_file ~= path
 end
 
 --- First upstream ID wins for a still-owned mini. Projects p.session_id only
@@ -95,6 +101,13 @@ function Conversation:mark_sent(mini, mode)
     return
   end
   mini.last_mode = config.panel_mode(mode)
+end
+
+--- Record the file a sent prompt named; nil keeps the last one.
+function Conversation:mark_file(mini, path)
+  if path and self:owns(mini) then
+    mini.last_file = path
+  end
 end
 
 --- Retire every mini and clear the session projection.
@@ -126,6 +139,11 @@ function M.attach(p)
   if type(p.session_id) == "string" and p.session_id ~= "" then
     local mode = config.panel_mode(p.mode)
     local backend = config.options.backend or "cursor"
+    local descriptor = config.backend_descriptor(backend) or {}
+    if descriptor.seats and descriptor.seats.protected then
+      p.session_id = nil
+      return self
+    end
     local key = mini_key(backend, seat_of(mode, backend))
     local mini = { key = key, id = p.session_id, last_mode = nil }
     self.minis[key] = mini
@@ -136,5 +154,51 @@ end
 
 M.get = M.attach
 M.seat_of = Conversation.seat_of
+
+local function running_descriptor(p)
+  local backend = p and p.turn_backends and p.turn_backends[p.job_spawn_gen or p.turn_gen]
+  return config.backend_descriptor(backend)
+end
+
+function M.can_steer(p)
+  return steer_channel.can_steer(running_descriptor(p))
+end
+
+local function with_file_notice(p, text, send)
+  if type(text) ~= "string" or text == "" then
+    return nil, "empty_input"
+  end
+  local owner, origin = M.get(p), context.current_origin()
+  local mini = owner.active
+  local hint = owner:needs_file_notice(mini, origin.name) and context.file_hint(origin)
+  local id, reason = send(p, hint and (hint .. "\n\n" .. text) or text)
+  if id then
+    owner:mark_file(mini, origin.name)
+  end
+  return id, reason
+end
+
+--- Send an input immediately and return its receipt ID.
+function M.deliver(p, text)
+  if not M.can_steer(p) then
+    return nil, "unsupported"
+  end
+  if not p then
+    return nil, "no_channel"
+  end
+  return with_file_notice(p, text, steer_channel.deliver)
+end
+
+--- With nil text, Claude interrupts with the last still-pending steered input.
+--- For a backend without a live channel, restart receives (text, session_id, job).
+function M.interrupt(p, text, restart)
+  local owner = M.get(p)
+  local mini = owner and owner.active
+  return steer_channel.interrupt(p, text, running_descriptor(p), mini and mini.id, restart)
+end
+
+function M.last_input(p)
+  return steer_channel.last_input(p)
+end
 
 return M

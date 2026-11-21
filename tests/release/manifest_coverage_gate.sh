@@ -6,8 +6,8 @@
 # CLAIM
 #   Every require("yana.X")/require("blink_yana.X") in a listed lua file,
 #   direct or under pcall, resolves to a listed lua/<mod>.lua or
-#   lua/<mod>/init.lua; every bin/yana-* name in a listed lua/ or bin/ file is
-#   itself listed.
+#   lua/<mod>/init.lua; every required bin/yana-* name in a listed lua/ or bin/
+#   file is itself listed.
 #
 # Usage: manifest_coverage_gate.sh [TREE] [MANIFEST]
 #   TREE      repo root to read sources from (default: this repo).
@@ -61,10 +61,19 @@ while IFS= read -r manifest_file; do
 	[[ -f "$ROOT/$manifest_file" ]] || continue
 	while IFS= read -r bin_ref; do
 		[[ -n "$bin_ref" ]] || continue
+		case $manifest_file:$bin_ref in
+		# These retired overlay lookups check that the dev fixture exists before use.
+		lua/yana/shadow/ops_decode.lua:bin/yana-changeset | lua/yana/shadow/jail.lua:bin/yana-overlay)
+			if [[ -n "${in_manifest[$bin_ref]:-}" ]]; then
+				note_fail "$bin_ref is a development fixture and must stay out of the manifest"
+			fi
+			continue
+			;;
+		esac
 		if [[ -z "${in_manifest[$bin_ref]:-}" ]]; then
 			note_fail "$manifest_file references $bin_ref -> missing from manifest"
 		fi
-	done < <(grep -ohE "bin/yana-[a-zA-Z0-9_-]+" "$ROOT/$manifest_file" | sort -u)
+	done < <(sed '/^[[:space:]]*--/d' "$ROOT/$manifest_file" | grep -oE "bin/yana-[a-zA-Z0-9_-]+" | sort -u)
 done < <(grep -E '^(lua|bin)/' "$MANIFEST")
 
 if ((fail != 0)); then

@@ -6,25 +6,9 @@ tree=$(realpath "$1")
 nvim=$(realpath "$2")
 . "$tree/tests/lib/sigsafe.sh"
 
-# This scratch becomes the overlay's WORKSPACE and LAYER_ROOT
-# (bin/yana-overlay --workspace/--upper/--work). run_overlay applies
-# `--tmpfs /tmp` while building the bwrap sandbox, so any host path under
-# /tmp is masked by the time the later `--ro-bind $WORKSPACE ...` /
-# `--bind $LAYER_ROOT ...` args run -- a scratch placed under /tmp binds in
-# empty and the confined turn cannot run. Same requirement, same resolution
-# order as tests/headless_gate.sh: an explicit YANA_HEADLESS_TMPDIR wins,
-# then a TMPDIR that itself is not under /tmp, else refuse rather than hand
-# the overlay a root that cannot work.
-if [[ -n ${YANA_HEADLESS_TMPDIR:-} ]]; then
-	jail_tmpdir=$YANA_HEADLESS_TMPDIR
-elif [[ -n ${TMPDIR:-} && $TMPDIR != /tmp && $TMPDIR != /tmp/* ]]; then
-	jail_tmpdir=$TMPDIR
-else
-	echo "confined_turn_gate: refusing -- overlay workspace root needs YANA_HEADLESS_TMPDIR or a TMPDIR outside /tmp (the jail mounts a fresh tmpfs over /tmp)" >&2
-	exit 65
-fi
-mkdir -p "$jail_tmpdir"
-scratch=$(mktemp -d "$jail_tmpdir/yana-confined.XXXXXX")
+tmp=${YANA_HEADLESS_TMPDIR:-${TMPDIR:-/tmp}}
+mkdir -p "$tmp"
+scratch=$(mktemp -d "$tmp/yana-confined.XXXXXX")
 
 # Every yanad this gate starts runs with --root under $scratch (XDG_STATE_HOME
 # is $scratch/turn/state). Empty roots are skipped: an empty root would match
@@ -102,9 +86,7 @@ cleanup_confined_gate() {
 trap cleanup_confined_gate EXIT
 
 run_smoke() {
-	# Yanad stores session layers under $XDG_STATE_HOME/yana/…. The smoke forces
-	# preview.state_root to $YANA_CONFINED_SCRATCH/state; point XDG at that same
-	# tree so layer paths land under the gate scratch the smoke inspects.
+	# Keep launcher and daemon state under the disposable gate directory.
 	mkdir -p "$scratch/home" "$scratch/turn/state" "$scratch/config" "$scratch/data" "$scratch/cache"
 	env -i \
 		HOME="$scratch/home" \
@@ -129,10 +111,6 @@ fi
 
 rc=0
 run_smoke || rc=$?
-if [[ $rc == 65 ]]; then
-	echo "CONFINED TURN GATE INCONCLUSIVE: bwrap unavailable" >&2
-	exit 65
-fi
 [[ $rc == 0 ]] || exit "$rc"
 
 echo "CONFINED TURN GATE PASS"

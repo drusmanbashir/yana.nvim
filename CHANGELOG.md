@@ -533,7 +533,7 @@ without a tag or GitHub release; everything listed under 0.1.0-alpha.6 ships in
 - Confined `cursor-agent` turns for ask and inline-edit workflows.
 - Inline hunk review with per-hunk and per-file accept/reject decisions.
 - Durable apply journal, crash recovery, workspace claims, and review timeline.
-- Session resume, parallel panels, prompt queueing, and selection-scoped edits.
+- Session resume, parallel panels, and selection-scoped edits.
 - Health diagnostics backed by the same dependency table as the turn preflight.
 - Deterministic export, verification, and archive tooling (`scripts/release/`).
 

@@ -32,7 +32,7 @@ M.OUT_OF_WORKSPACE_REMEDIES = {
 }
 
 --- The remedy sentence. `paths` is accepted for callers that pass the refused
---- paths; the remedy no longer depends on them.
+--- paths; the remedy does not depend on them.
 function M.out_of_workspace_remedy(_paths)
 	return "remedy: " .. table.concat(M.OUT_OF_WORKSPACE_REMEDIES, ", ")
 end
@@ -116,80 +116,6 @@ local function under_any(paths, roots)
 		end
 	end
 	return false
-end
-
---- F-EROFS-REFUSAL. WHY this write landed outside every layer, in one class.
----
---- `CONFINEMENT.md` "Outside capture" fixes four. They are tested here
---- most-specific first because a path can satisfy several at once: a protected
---- path is also, trivially, unseeded.
----
---- READ FROM THE PLAN AND MOUNTINFO, NEVER FROM CONFIGURATION -- which is the
---- point of having a class at all. A class states what the kernel and the plan
---- make true, and three of the four name no remedy, because none exists.
----
---- Returns `class, remedy`; `remedy` is nil when there is none.
-M.OUTSIDE_CAPTURE_CLASSES = { "protected", "mount-kind", "host-mount", "unseeded" }
-
-function M.outside_capture_class(path, plan, mounts)
-	if type(path) ~= "string" or path == "" then
-		return nil
-	end
-	plan = plan or {}
-	mounts = mounts or {}
-
-	-- `protected`: yana's own state, or a layer's upper or work directory --
-	-- the change set this turn is reviewed out of. Handing an agent its own
-	-- evidence is the thing confinement exists to prevent, so: no remedy.
-	for _, root in ipairs(plan.protected or {}) do
-		if under(path, root) then
-			return "protected", nil
-		end
-	end
-	for _, layer in ipairs(plan.layers or {}) do
-		if under(path, layer.upper) or under(path, layer.work) then
-			return "protected", nil
-		end
-	end
-
-	-- The mount the path sits on: longest matching mountpoint wins.
-	local mount
-	for _, entry in ipairs(mounts) do
-		if under(path, entry.mountpoint) and (not mount or #entry.mountpoint > #mount.mountpoint) then
-			mount = entry
-		end
-	end
-
-	-- `mount-kind`: read-only, pseudo, tmpfs, overlay, squashfs or FUSE. No
-	-- layer can be built on one, so no remedy.
-	if mount then
-		local blocked = { proc = true, sysfs = true, devtmpfs = true, devpts = true, tmpfs = true, overlay = true, squashfs = true, fuse = true, fuseblk = true }
-		local writable = false
-		for _, option in ipairs(vim.split(mount.options or "", ",", { trimempty = true })) do
-			if option == "rw" then
-				writable = true
-			end
-		end
-		if blocked[mount.fstype] or not writable then
-			return "mount-kind", nil
-		end
-	end
-
-	-- `host-mount`: something is mounted strictly below the path's own
-	-- directory, so no layer can contain the path -- an unprivileged mount
-	-- namespace cannot clone a tree carrying locked child mounts. Kernel
-	-- limit, no remedy.
-	local parent = vim.fn.fnamemodify(path, ":h")
-	for _, entry in ipairs(mounts) do
-		if entry.mountpoint ~= parent and under(entry.mountpoint, parent) then
-			return "host-mount", nil
-		end
-	end
-
-	-- `unseeded`: an ordinary writable directory the turn's seeds never
-	-- reached. The only class with a remedy, and it is an editor action rather
-	-- than a configuration line.
-	return "unseeded", "open a file there and resend"
 end
 
 local function root_list(...)

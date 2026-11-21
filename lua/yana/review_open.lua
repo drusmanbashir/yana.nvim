@@ -7,7 +7,7 @@
 local hunk_ledger = require("yana.hunk_ledger")
 -- Module-level for the same reason: buffer drift placement (INTERFACE.md section 3).
 local place_on_b1 = require("yana.review_ownership").place_on_b1
--- Stage 3: a deleted parent comes back with the agent's edit (INTERFACE.md section 3).
+-- A deleted parent comes back with the agent's edit (INTERFACE.md section 3).
 local restore_parents = require("yana.review_queued_hunks").restore_parents
 
 -- Hand-test tracing (tools/handtest). Inert unless YANA_HANDTEST_TRACE is set.
@@ -113,7 +113,8 @@ function Factory.new(deps)
         end, change, "on_close")
       end)
     end
-    notify_one_line("yana: refused " .. detail, vim.log.levels.WARN)
+    -- Expected, not a fault: said once here, at INFO (F-LOGGING); callers do not repeat it.
+    notify_one_line("yana: refused " .. detail, vim.log.levels.INFO)
     log.buffer_event("review_staged", { change = change, outcome = "system_refused", reason = detail,
       engine = { not_reached = "refused before review: " .. bin_class } })
     announce_state()
@@ -143,13 +144,8 @@ function Factory.new(deps)
       expected_fp = refusal and refusal.expected_fp or nil,
       actual_fp = actual_fp,
     })
-    -- The "kept unreviewed, no pre-edit snapshot" branch is gone with E9. It
-    -- existed because a missing `before` meant the agent's edit was already on
-    -- disk with nothing to revert to; now a missing `before` is simply a
-    -- create, reviewed against an empty base, and nothing is on disk to keep.
-    --
-    -- Retryable refusals stay pending. A buffer with unsaved edits no longer
-    -- refuses (buffer drift stage 1): it is placed on B1 or falls back to B0.
+    -- Retryable refusals stay pending. A buffer with unsaved edits is not refused:
+    -- it is placed on B1 or falls back to B0.
     if change.review_error == nil then
       change.review_error = open_err
     end
@@ -207,12 +203,10 @@ function Factory.new(deps)
   -- inherit anything from the block list.
   local model, model_source = payload_model(change, target)
   local parked = change._parked_review
-  -- Fresh retrace geometry supersedes parked.blocks below, but T14's redo
+  -- Fresh retrace geometry supersedes parked.blocks below, but the redo
   -- stack survives that rebuild and must be rebound to the fresh members.
   local parked_undone_decisions = parked and parked.undone_decisions
   local retrace_floor = parked and parked.undo_open_seq or change.undo_pre_stage_seq
-  -- `_retrace_fresh` died with the retrace writer (S2 P-C): the parked
-  -- snapshot below is never pre-empted by a fresh retrace pair anymore.
   -- One-shot: read now (before the staging pcall below), then clear, so a
   -- LATER, genuinely different reopen of this same change object never
   -- inherits a stale "already staged" verdict from a press that has

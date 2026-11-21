@@ -74,9 +74,6 @@ function Factory.new(env)
 
       -- NOTHING LANDS THE CURSOR. `U` is an undo path, and after undo the
       -- cursor is wherever neovim left it (F-UNDO-CURSOR).
-      -- The jump to the turn's first hunk that used to close this branch --
-      -- `M._focus_turn_first_hunk` -> `land_on` + `normal! zz` -- is deleted
-      -- with the function it called; undo was its only caller.
     end
   return { undo_turn = undo_turn }
 end

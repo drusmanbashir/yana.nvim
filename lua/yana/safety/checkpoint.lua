@@ -2,10 +2,8 @@
 -- Captures pre-turn bytes into the diary folder; revert restores via diary.write_bytes.
 local M = {}
 
-local diary = require("yana.safety.diary")
 local diff = require("yana.diff")
 local hash = require("yana.safety.hash")
-local control_plane = require("yana.safety.control_plane")
 local uv = vim.uv or vim.loop
 
 M._test = {}
@@ -194,111 +192,6 @@ function M.begin_turn(opts)
 		turn_id = turn_id,
 		entries = entries,
 	}
-end
-
---- Restore every checkpointed path byte-exactly through the journaled applier.
-function M.revert_turn(opts)
-	opts = opts or {}
-	local session = opts.session
-	local turn_id = tostring(opts.turn_id or "0")
-	local manifest, err = read_manifest(session, turn_id)
-	if not manifest then
-		return false, err
-	end
-
-	for _, entry in ipairs(manifest.entries or {}) do
-		-- Validate the PERSISTED path before it drives a real-tree write: a
-		-- forged checkpoint manifest naming `.git/config` must be refused, independent of
-		-- ingestion. The write is routed through the guarded primitive with the workspace +
-		-- persisted rel so `write_bytes` re-derives and re-classifies the target itself
-		-- (defense-in-depth). It stays FIRST: a forged entry must be refused as a
-		-- control-plane path, not as an untagged one.
-		local rel = entry.rel
-		if type(rel) ~= "string" or rel == "" then
-			return false, "checkpoint entry has no rel: refusing to restore an unvalidated path"
-		end
-		if control_plane.is_control_plane(rel) then
-			return false, "checkpoint restore refused — control-plane path: " .. rel
-		end
-		-- The pre-turn state TAG decides the action. No default: an entry with no
-		-- tag is a manifest this build did not write, and the bytes beside it
-		-- cannot say whether they mean "an empty file was here" or "nothing was".
-		-- Restoring them as an empty file is the defect; refusing by name is the
-		-- same discipline `diary.evidence_complete` applies to an untagged accept.
-		local state = entry.state
-		if state ~= "absent" and state ~= "file" then
-			return false,
-				"checkpoint entry for "
-					.. rel
-					.. (state == nil and " records no pre-turn state" or (" records a pre-turn " .. tostring(state)))
-					.. " — refusing to restore it; the path is left exactly as found"
-		end
-
-		if state == "absent" then
-			-- ABSENCE IS RESTORED AS ABSENCE. The turn created this path, so the
-			-- revert removes it — through the journaled delete, never by writing the
-			-- "" that `read_bytes` reported for a path that was not there.
-			if uv.fs_lstat(entry.path) ~= nil then
-				local ok, werr = diary.restore_workspace_bytes({
-					session = session,
-					path = entry.path,
-					content = "",
-					op_kind = "delete",
-					raw_rel = rel,
-				})
-				if not ok then
-					return false, werr
-				end
-			end
-			-- Verified by EXISTENCE, not by fingerprint. The empty hash is what an
-			-- empty file has too, so the old hash comparison passed on precisely the
-			-- state this branch exists to prevent.
-			if uv.fs_lstat(entry.path) ~= nil then
-				return false,
-					"revert verify failed for " .. entry.path .. ": it did not exist before the turn and still exists"
-			end
-		else
-			local stored, serr = read_bytes(entry.store_path)
-			if stored == nil then
-				return false, serr or ("missing checkpoint bytes: " .. entry.store_path)
-			end
-			local ok, werr = diary.restore_workspace_bytes({
-				session = session,
-				path = entry.path,
-				content = stored,
-				raw_rel = rel,
-				-- The mode the path carried at turn start, installed on the temp
-				-- before the rename by the applier that is already doing the write.
-				-- Without it a reverted delete of a 755 script returned at the umask
-				-- and the file came back unrunnable.
-				target_mode = entry.mode,
-			})
-			if not ok then
-				return false, werr
-			end
-			local now, nerr = read_bytes(entry.path)
-			if now == nil then
-				return false, nerr
-			end
-			if hash_bytes(now) ~= entry.base_hash then
-				return false, "revert verify failed for " .. entry.path
-			end
-			if entry.mode then
-				local st = uv.fs_lstat(entry.path)
-				if not st or (st.mode % 4096) ~= entry.mode then
-					return false,
-						"revert verify failed for "
-							.. entry.path
-							.. ": mode is "
-							.. (st and string.format("%o", st.mode % 4096) or "gone")
-							.. ", the pre-turn mode was "
-							.. string.format("%o", entry.mode)
-				end
-			end
-		end
-	end
-
-	return true
 end
 
 --- The manifest a caller guards on. Normalised the same way `begin_turn` and

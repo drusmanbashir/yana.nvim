@@ -48,9 +48,8 @@
 --- again would overrule him. That is also why `FileType` and `Syntax` are NOT
 --- tracked: measured here, the swallowed read fires its own `Syntax` with the
 --- highlighter already destroyed, so tracking it would record "no treesitter"
---- over the language the profile is holding for exactly that read -- and the
---- previous-value fallback that used to paper over it is what overruled the
---- operator. Not listening to the read's own events removes both.
+--- over the language the profile is holding for exactly that read. Not listening
+--- to the read's own events avoids that.
 ---
 --- A PROFILE DOES NOT GO STALE WITH THE CONTENTS. Highlighting is a property of
 --- the buffer's language and engine, not of its text, so a profile recorded many
@@ -242,7 +241,7 @@ end
 local function apply(bufnr, profile, fault)
   -- BOTH ENGINES, NOT THE FIRST ONE FOUND. A buffer can carry a treesitter
   -- highlighter and a legacy syntax at once, and returning after the treesitter
-  -- start left the operator's `'syntax'` blanked by the read.
+  -- start would leave the operator's `'syntax'` blanked by the read.
   local ts_restored = false
   if profile.ts_lang then
     if fault and fault.skip_rehighlight_treesitter then

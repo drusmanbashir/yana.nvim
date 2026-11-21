@@ -13,8 +13,7 @@
 -- NOT the proposal bytes. Two unrelated hunks with the same `old_lines` and
 -- `new_lines` are two hunks, and a record whose hunk is GONE matches the
 -- survivor's bytes exactly as well as its own would have: bytes select a
--- stranger and call it lineage. They may VALIDATE a name (see `looks_like`)
--- but they may not create one. NOT `model_join` either -- that is repeated
+-- stranger and call it lineage, so they may not create a name. NOT `model_join` either -- that is repeated
 -- provenance, e.g. every split child inherits "payload_run"
 -- (review_hunk_split.lua), so it cannot tell two hunks apart.
 local M = {}
@@ -66,17 +65,6 @@ function M.inherit(block, ancestor)
     block.lineage_id = ancestor.lineage_id
   end
   return block
-end
-
---- Bytes as VALIDATION, not identity: does this candidate still hold the
---- proposal the record was taken against? Callers that want to notice a name
---- resolving to a hunk whose content has since changed ask this AFTER `same`.
-function M.looks_like(a, b)
-  if a == nil or b == nil then
-    return false
-  end
-  return table.concat(a.old_lines or {}, "\n") == table.concat(b.old_lines or {}, "\n")
-    and table.concat(a.new_lines or {}, "\n") == table.concat(b.new_lines or {}, "\n")
 end
 
 function M.same(a, b)

@@ -10,6 +10,8 @@ function M.new(deps)
   local focus = deps.focus
   local depth = deps.depth
   local cancel_inflight = deps.cancel_inflight
+  local quit_review = deps.quit_review
+  local discard_for_quit = deps.discard_for_quit
   local panels = deps.panels
   local win_valid = deps.win_valid
   local buf_valid = deps.buf_valid
@@ -54,7 +56,7 @@ function M.new(deps)
     focus:set_last(saved_recent)
   end
 
-  local function quit_panel(p)
+  local function destroy_chat(p)
     local idx = panel_index(p)
     if idx == 0 then
       return false
@@ -65,7 +67,6 @@ function M.new(deps)
       strip_tabs = require("yana.panel.ui_review_buttons").detach_panel(p) or {}
     end)
 
-    cancel_inflight(p)
     stop_spinner(p)
     p.closing = true
     local tabs = V.tabs(p)
@@ -116,6 +117,40 @@ function M.new(deps)
           pcall(require("yana.panel.ui_review_buttons").attach_tab, tab)
         end
       end)
+    end
+    return true
+  end
+
+  local function quit_panel(p)
+    if panel_index(p) == 0 or p.finish_quit then return false end
+    local _, reason = quit_review(p)
+    if reason then
+      notify_one_line("yana: Quit could not close this chat (" .. reason .. ")", vim.log.levels.WARN)
+      return false
+    end
+    local function finish(stopped)
+      local completed = false
+      local function complete(ok, err)
+        if completed or p.finish_quit ~= finish then return end
+        completed = true
+        if ok then
+          destroy_chat(p)
+        else
+          p.finish_quit = nil
+          if err == "unknown_command" then
+            err = "the background service needs a restart to support Quit"
+          end
+          notify_one_line("yana: Quit could not close this chat (" .. tostring(err) .. ")", vim.log.levels.WARN)
+        end
+      end
+      local ok, err = pcall(discard_for_quit, p, stopped, complete)
+      if not ok then complete(false, err) end
+    end
+    p.finish_quit = finish
+    if p.job_spawn_gen ~= nil then
+      cancel_inflight(p)
+    else
+      finish()
     end
     return true
   end

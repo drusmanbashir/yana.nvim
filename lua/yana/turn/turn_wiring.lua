@@ -2,11 +2,8 @@ local log = require("yana.log")
 
 local M = {}
 
--- W5 — deps.ask for a real Turn. Config suppression (negation 5) is deleted for now; it
--- re-enters only under a re-ruling, inside the one gate's own config table — not as a
--- cause-keyed map that never matched Turn causes (decided/undo_exhausted/abort vs
--- leave_edge/floor_pending/floor_decided). The box is byte-identical whatever route
--- reached it -- no per-cause wording, no cost line.
+-- deps.ask for a real Turn. The box is identical whatever route reached it --
+-- no per-cause wording, no cost line.
 local DIALOG_MSG = "End turn?"
 local DIALOG_BUTTONS = "&End turn\n&Keep reviewing"
 local NO_UI_DEFAULT = { decided = "end", undo_exhausted = "keep", abort = "keep" }

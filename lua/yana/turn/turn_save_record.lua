@@ -2,7 +2,7 @@
 -- carries one BufWritePost observer (never a write interception) that records
 -- the stat identity -- dev, inode, size, mtime -- of the file Neovim just wrote
 -- from it. End removes a rejected or undecided creation only while the path is
--- still exactly that file (CORE "Saving is Neovim's", LEDGER N51): a file
+-- still exactly that file (CORE "Saving is Neovim's"): a file
 -- another program made, or one it replaced after the save, is never deleted.
 --
 -- Bookkeeping only: it changes no save, decision, prompt or review behaviour,
@@ -41,7 +41,7 @@ local function drop(key)
 end
 
 --- Drop every record `turn` owns, by the key stored at watch time: the path is
---- not re-resolved, so one that became a symlink still goes (critic N51 L1).
+--- not re-resolved, so one that became a symlink still goes.
 function M.forget_turn(turn)
   for key, rec in pairs(records) do
     if rec.turn == turn then

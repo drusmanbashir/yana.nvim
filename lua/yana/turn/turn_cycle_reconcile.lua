@@ -41,21 +41,45 @@ local function step_splice(rec, back)
 	return s
 end
 
--- Where each of `n_input` submit rows stands among the buffer's `n_now` rows after `steps` ({{splices, back}}
--- in walk order: a back step's splices inverted and newest first), each row moved as Neovim moves an
--- `invalidate` point extmark (`hunk_anchor_splice.point`): a row number, or false once consumed. A composition
+-- A publication's unchanged segments carry row identities through either
+-- direction. Its created, deleted and replaced rows have no matching origin.
+local function cross_publication(rows, count, segments, back)
+	local map, from_count, to_count = {}, 0, 0
+	for _, segment in ipairs(segments) do
+		local from, to = segment.src, segment.dst
+		if back then from, to = to, from end
+		local width = from.first and from.last - from.first + 1 or 0
+		from_count = from_count + width
+		to_count = to_count + (to.first and to.last - to.first + 1 or 0)
+		if segment.kind == "unchanged" then
+			for i = 0, width - 1 do map[from.first + i] = to.first + i end
+		end
+	end
+	if from_count ~= count then return nil, "the publication origin map does not match its source rows" end
+	for i, row in ipairs(rows) do rows[i] = map[row] or false end
+	return to_count
+end
+
+-- Where each submit row stands after recorded splices and publication segments.
+-- A row maps to its new position, or false once consumed. A composition
 -- that does not land on the buffer's row count is not this buffer's history: nil, reason.
 function R.compose(n_input, n_now, steps)
 	local rows, count = {}, n_input
 	for r = 1, n_input do rows[r] = r end
 	for _, step in ipairs(steps) do
-		local list = step.splices
-		for k = 1, #list do
-			local s = step_splice(list[step.back and #list + 1 - k or k], step.back)
-			for r = 1, n_input do
-				if rows[r] then rows[r] = splice.point(s, rows[r]) or false end
+		if step.segments then
+			local why
+			count, why = cross_publication(rows, count, step.segments, step.back)
+			if count == nil then return nil, why end
+		else
+			local list = step.splices
+			for k = 1, #list do
+				local s = step_splice(list[step.back and #list + 1 - k or k], step.back)
+				for r = 1, n_input do
+					if rows[r] then rows[r] = splice.point(s, rows[r]) or false end
+				end
+				count = count + s.nr - s.er
 			end
-			count = count + s.nr - s.er
 		end
 	end
 	-- Neovim's mandatory empty row stands for a buffer with no rows left.
@@ -273,19 +297,6 @@ function R.tracked(view, pending, regions)
 	if not groups then return nil, why end
 	local T, blocks, segments = assemble(view, groups)
 	return { lines = T, blocks = blocks, segments = segments, coverage = "complete" }
-end
-
--- Map rows through segments: forward (V -> T) or inverted (T -> V); a row in a replaced region maps to nil.
-function R.map_row(segments, row, inverted)
-	for _, s in ipairs(segments) do
-		local from, to = s.src, s.dst
-		if inverted then from, to = s.dst, s.src end
-		if from.first and from.first <= row and row <= from.last then
-			if s.kind == "unchanged" then return to.first + (row - from.first) end
-			return nil
-		end
-	end
-	return nil
 end
 
 ----------------------------------------------------------------------

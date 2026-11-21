@@ -331,12 +331,27 @@ class Daemon(LifecycleMixin):
                 return await self.turn_resume(frame)
             if cmd == "turn.end":
                 return self.exit_checked(self.turn_end(frame))
+            if cmd in {"end.record", "end.abandon", "end.clear"}:
+                sid = args["session_id"]
+                session = store.load_session(self.root, sid)
+                if any(session["owner"][key] != owner[key] for key in ("pid", "boot_id", "start_ticks")):
+                    raise store.Refused("not_holder")
+                if cmd == "end.record":
+                    value = store.publish_end_record(self.root, sid, args["record"])
+                elif cmd == "end.abandon":
+                    value = store.abandon_end_record(self.root, sid, args["plan_id"], args.get("confirmed"))
+                else:
+                    store.clear_end_record(self.root, sid, args["plan_id"])
+                    value = {}
+                return protocol.ok(fid, value)
             if cmd == "review.open":
                 return self.review_open(frame)
             if cmd in {"review.close", "review.abort"}:
                 return self.exit_checked(self.review_close(frame))
             if cmd == "review.none":
                 return self.exit_checked(self.review_none(frame))
+            if cmd == "review.quit":
+                return self.exit_checked(self.review_quit(frame))
             if cmd == "file.claim":
                 return self.file_claim(frame)
             if cmd == "shutdown":
@@ -408,23 +423,18 @@ class Daemon(LifecycleMixin):
 
     def session_attach(self, frame):
         sid = frame["args"]["session_id"]
+        session = store.load_session(self.root, sid)
+        if liveness.owner_kind(session["owner"]) == "dead":
+            self.owner_dead(sid, None, "editor")
+            store.load_session(self.root, sid)
+            if store.load_end_record(self.root, sid) is None:
+                raise store.Refused("editor_dead")
         recovery = store.load_recovery(self.root, sid)
         self.unwatch(sid, None, "editor")
-        if recovery:
-            session = store.rebind_review(self.root, sid, frame["owner"], recovery)
-        else:
-            session = store.rebind_session(self.root, sid, frame["owner"])
+        session = store.rebind_session(self.root, sid, frame["owner"])
         self.watch_owner(sid, None, frame["owner"], "editor")
         result = dict(session)
         if recovery:
-            # O8: surface the turn's persisted mode from meta.json onto the
-            # recovery payload (load_recovery does not yet copy it). Absence
-            # stays absence — yanad_recover refuses a mode-less record.
-            meta = store.read_json(
-                self.root / "sessions" / sid / "turns" / recovery["turn_id"] / "meta.json"
-            )
-            if isinstance(meta, dict) and "mode" in meta:
-                recovery["mode"] = meta["mode"]
             result["recovery"] = recovery
         return protocol.ok(frame["id"], result)
 
@@ -434,6 +444,8 @@ class Daemon(LifecycleMixin):
 
     def turn_request(self, frame):
         args = frame["args"]
+        if store.load_end_record(self.root, args["session_id"]) is not None:
+            raise store.Refused("end_recovery_pending")
         sid = args["session_id"]
         store.load_session(self.root, sid)
         owner = frame["owner"]
@@ -474,6 +486,7 @@ class Daemon(LifecycleMixin):
             return store.turn_dir(
                 self.root, sid, args["turn_id"], args["cgroup"], owner,
                 args["mounted_root"], args.get("roots", []), mode, args.get("plan"), store.run_generation(args),
+                layers=args.get("source") != "buffer",
             )
         except Exception as exc:
             self.log.write(
@@ -503,8 +516,6 @@ class Daemon(LifecycleMixin):
         ]
         state, reason = liveness.seal_cgroup(store.read_json(meta_path).get("cgroup", ""))
         next_state = self.settled_state(sid, tid, args, state)
-        if next_state == "reviewing":  # a verified launch rollback: that run never became a cycle
-            store.uncount_cycle(self.root, sid, tid)
         for row in held:
             store.write_claim_row(self.root, row["key"], sid, tid, next_state)
         store.set_turn_state(
@@ -521,6 +532,8 @@ class Daemon(LifecycleMixin):
 
     def review_open(self, frame):
         args = frame["args"]
+        if store.load_end_record(self.root, args["session_id"]) is not None:
+            raise store.Refused("end_recovery_pending")
         sid = args["session_id"]
         tid = args["turn_id"]
         meta_path = self.root / "sessions" / sid / "turns" / tid / "meta.json"
@@ -539,9 +552,7 @@ class Daemon(LifecycleMixin):
             code, result = claims.refusal_for(self.root, holder, files)
             if code:
                 return protocol.refuse(frame["id"], code, result)
-        store.open_review(
-            self.root, sid, tid, files, args.get("tabs", []), args.get("bundle", []),
-        )
+        store.open_review(self.root, sid, tid, files, args.get("bundle", []), source=args.get("source"))
         store.publish_run(self.root, sid, tid, int(args["generation"]))
         store.clear_claim_rows(self.root, sid)
         for key in incoming_keys:
@@ -550,6 +561,36 @@ class Daemon(LifecycleMixin):
             self.root, sid, tid, "reviewing", log=self.log,
             clear_workdirs=self.defer_workdir_cleanup,
         )
+        return protocol.ok(frame["id"])
+
+    def review_quit(self, frame):  #AI
+        """Close only the named run after the daemon confirms its writer stopped."""
+        args = frame["args"]
+        sid, tid = args["session_id"], args["turn_id"]
+        opened = self.open_review_turn(sid)
+        if opened is not None and opened != tid:
+            raise store.Refused("review_is_open", "turn %s has an open review" % opened)
+        try:
+            self.require_run(args, sid, tid, review_run=opened is not None)
+        except FileNotFoundError:
+            store.load_session(self.root, sid)
+            has_claim = any(
+                row["session_id"] == sid and row["turn_id"] == tid
+                for row in store.iter_claims(self.root)
+            )
+            if opened is not None or has_claim:
+                raise store.Refused("writer_unconfirmed", "turn %s has no writer record" % tid)
+            return protocol.ok(frame["id"])
+        state = self.turn_meta(sid, tid)["state"]
+        if state not in {"settling", "reviewing", "sealed", "closed", "dead", "recovery_required"}:
+            raise store.Refused("writer_unconfirmed", "turn %s is %s" % (tid, state))
+        if opened is not None:
+            store.close_review(self.root, sid)
+        store.set_turn_state(
+            self.root, sid, tid, "closed", log=self.log,
+            clear_workdirs=self.defer_workdir_cleanup,
+        )
+        store.clear_claim_rows_for_turn(self.root, sid, tid)
         return protocol.ok(frame["id"])
 
     def review_none(self, frame):

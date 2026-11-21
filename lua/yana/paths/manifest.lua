@@ -109,24 +109,6 @@ function M.read_file(path)
 	return map
 end
 
--- Read a manifest as hash/rel entries, sorted by rel path.
-function M.read_lines(path)
-	local map, err = M.read_file(path)
-	if not map then
-		return nil, err
-	end
-	local lines = {}
-	for rel, h in pairs(map) do
-		if rel:sub(1, 1) ~= "_" then
-			lines[#lines + 1] = { hash = h, rel = rel }
-		end
-	end
-	table.sort(lines, function(a, b)
-		return a.rel < b.rel
-	end)
-	return lines, nil, map._header
-end
-
 -- Write entries to a v2 manifest file, validating each rel/hash first.
 function M.write_file(path, entries, opts)
 	opts = opts or {}

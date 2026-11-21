@@ -13,19 +13,11 @@ shown). After End-turn, `u` / `<C-r>` are native Neovim. Nothing reaches disk
 until you accept; accepted bytes are written through an applier that refuses
 if the file drifted underneath.
 
-**Confinement.** In `ask` and `inline`, the agent runs inside a sandbox
-(bubblewrap). Proposed writes go into a private overlay; the agent's own
-configuration and session directories may remain writable. The sandbox limits
-writes; it does not prevent reading files your account can read. Refused
-writes, including `.git/` metadata and paths outside the captured areas, are
-named in the panel and in `:YanaRefusals`.
-
-**Write scope.** An `inline` turn can propose edits anywhere in your home
-folder, on every writable data disk (a mounted ordinary filesystem whose top
-folder you can write) and in the turn's own folder, wherever the turn starts.
-There is nothing to configure. The turn's folder is normally the nearest
-`.git` root above the file, or the file's folder when there is no `.git` above
-it. Other paths, such as system folders, stay read-only.
+**Tool permissions.** In `ask` and `inline`, Yana starts the agent in a
+private directory and configures the agent CLI to permit Yana's workspace tools.
+Reads see unsaved buffer text from submit time. In `inline`, the agent can
+also submit changes for review. These modes trust the installed agent CLI
+to enforce its tool permissions.
 
 **Modes.** One dial, three results: `ask` (reads and answers, no edits),
 `inline` (edits become hunks), `agentic` (direct, unconfined). `modes` picks
@@ -33,16 +25,13 @@ which of the three are available: the first entry is the starting mode,
 `:YanaMode` cycles in that order, and a mode not listed cannot be entered.
 Yana assigns no cycle shortcut; bind the command in your own keymap configuration.
 
-**Backends and models.** Yana supports `cursor`, `claude`, and `codex`. Set
-`backends.default` to choose the starting agent. Each named `backends` entry
-can set `cmd` to a custom executable path and `model` to that agent's model ID.
+**Backends and models.** Yana ships presets for `cursor`, `claude`, `codex`, and
+`grok`, and offers only the agents your `backends` table lists plus
+`backends.default`. Each entry can set `cmd`, `model`, `env` or any preset flag;
+a new name adds an agent Yana has no preset for.
 The picker can change agent and model during a session; saved picker choices
 continue to take precedence after restart. See
 [configuration](configuration.md#agent-and-backend) for the setup syntax.
-
-Yana applies the CLI sandbox policy automatically: ask uses read-only access,
-while inline and agentic use full vendor access by default. Inline changes still
-pass through Yana's overlay and review before they reach files.
 
 **Machine-specific resolution.** Yana searches Neovim's `$PATH` for each CLI.
 For a custom location, set `backends.<name>.cmd` to its path. `:checkhealth yana`
@@ -58,30 +47,16 @@ cause.
 home folder itself when Neovim starts there with no file open; only `/` is
 refused. `:Yana --workspace DIR` binds one turn to a named directory.
 
-**Recovery.** One claim per workspace keeps two editors from clobbering each
-other; a second turn on a busy repo is refused by name. If Neovim dies with a
-review open, the next turn reclaims the dead editor's claim, keeps its
-pending edits for recovery, and logs why. Sessions attach and recover only
-while the daemon that owns them is still alive (`:YanaSessions`,
-`:YanaRecover`), naming a still-open review's files instead of discarding
-them; once that daemon dies the session dies with it — nothing resumes a
-session from disk.
+**Recovery.** If Neovim crashes, Yana discards the open review. Your files
+stay as they were at the crash.
 
-**Portability.** Tested on Neovim 0.11.2 and 0.12.4 on every change;
-dependencies probed for real capability (user namespaces, GNU tools) not just
-presence, with the exact `apt`/`dnf`/`pacman` line for anything missing.
+**Portability.** Yana is tested on Neovim 0.11.2 and 0.12.4.
 
-**How confinement checks your machine.** Most required tools are checked by
-name only, so a non-GNU build with the same name (e.g. BusyBox) can still
-pass; `stat`, `find`, `date`, `bash`, and `bwrap` are checked functionally
-instead (GNU stat/find/date behavior, bash 4.3+ nameref support, and a real
-unprivileged-user-namespace probe), since those are the ones confinement
-actually depends on beyond presence. The Linux/overlayfs/`/proc` requirement
-is enforced only for confined modes (`ask`, `inline`); direct `agentic` mode
-skips it entirely, since it never sandboxes. Confined-mode workspace approval
-also requires the filesystem to report inode birth time (`stat %w`);
-`:checkhealth yana` probes your current working directory for this. It also
-distinguishes required tools from optional session-discovery helpers, names
+**How confinement checks your machine.** For `ask` and `inline`, Yana checks
+Linux, `/proc`, cgroup v2 delegation, and the tools used by the launcher and
+MCP server. It checks that `stat` reports filesystem type and owner. Direct
+`agentic` mode skips these launcher checks.
+`:checkhealth yana` distinguishes required tools from optional session-discovery helpers, names
 the action that clears each failure, and checks Yana's own default panel
 keymaps against anything already mapped: a genuine collision with a global
 user/plugin mapping warns, naming both sides, while merely shadowing a

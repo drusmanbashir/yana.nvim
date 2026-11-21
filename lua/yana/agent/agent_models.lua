@@ -51,6 +51,21 @@ local function parse_lines_models(out)
 	return models
 end
 
+-- bullets parser: `  * <id> (default)` / `  - <id>` rows (grok models); other
+-- lines such as "Default model: ..." are ignored.
+local function parse_bullet_models(out)
+	local models = {}
+	local seen = {}
+	for _, line in ipairs(out) do
+		local id, rest = line:match("^%s*[%*%-]%s+(%S+)(.*)$")
+		if id and not seen[id] then
+			seen[id] = true
+			table.insert(models, { id = id, label = id, default = rest:match("%(default%)") ~= nil })
+		end
+	end
+	return models
+end
+
 -- json_models parser. Keeps visibility=="list" only. Never reads
 -- model_messages. Capability fields (reasoning levels, speed tiers) are
 -- forwarded for the hierarchy loader; they are not prompt payloads.
@@ -204,7 +219,7 @@ local function spawn_list_models(backend, bd, pending, retain_on_fail)
 	local argv = { command }
 	vim.list_extend(argv, bd.list_models_args)
 	job = vim.fn.jobstart(argv, {
-		env = { LC_ALL = "C" },
+		env = vim.tbl_extend("force", bd.env or {}, { LC_ALL = "C" }),
 		-- No prompt of ours will ever answer one of the CLI's; give it
 		-- nothing to wait on rather than an open pipe nobody writes to.
 		stdin = "null",
@@ -232,6 +247,8 @@ local function spawn_list_models(backend, bd, pending, retain_on_fail)
 					local models
 					if bd.list_models_format == "json_models" then
 						models = parse_json_models(out)
+					elseif bd.list_models_format == "bullets" then
+						models = parse_bullet_models(out)
 					else
 						models = parse_lines_models(out)
 					end
@@ -345,8 +362,5 @@ function M._test.set_list_timeout_ms(ms)
 	list_timeout_ms = ms
 end
 
-function M._test.list_timeout_ms()
-	return list_timeout_ms
-end
 
 return M

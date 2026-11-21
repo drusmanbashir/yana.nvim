@@ -93,12 +93,11 @@ end
 -- widen what a turn can write before a file under that mount becomes part of
 -- the turn's context.
 --
--- `tests/turn_plan_gate.sh` -- the S1 contract row, written against the same
+-- `tests/turn_plan_gate.sh` -- the contract row, written against the same
 -- feature ID -- forbids exactly that. Its fixture mounts `$GATE/nested/inner`
 -- as a writable, leaf, ext4 mount, and requires the derived layers to be
 -- `proj` ALONE: "ro/tmpfs/submount excluded, one root per mount". Implemented
--- literally, step 4 adds `nested/inner` and the row goes red (measured
--- 2026-09-12: "layers are 'nested/inner|proj', expected 'proj'").
+-- literally, step 4 adds `nested/inner` and the row goes red.
 --
 -- The spec's own refusal table points the same way as the test: it keeps an
 -- `unseeded` class for "a writable directory no seed reached", with the remedy
@@ -108,7 +107,7 @@ end
 -- So one of the two is wrong, and deciding which is a behavioural ruling, not
 -- an implementation detail: step 4 widens what a turn may write without the
 -- operator opening anything there. The pinned contract row wins until that is
--- ruled on. Raised in CLOUD-PACKET-capture-scope-STATUS.md.
+-- ruled on.
 
 function M.build(input)
 	local mounts = M.mountinfo(input.mountinfo)

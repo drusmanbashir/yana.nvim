@@ -1,6 +1,6 @@
 -- Size split of ui_turn_end.lua and ui_turn_shadow.lua: a follow-up on an open review, from its prompt to its
 -- publication (panel rules F-ADDENDUM-TRIGGER, -NO-RESUME, -MEMORY, -PUBLISH, -RECOMPUTE,
--- F-PROMPT-HANDOVER; prompt-delivery plan steps 3-4; plan followup-addendum-turn.md "### Publication and
+-- F-PROMPT-HANDOVER; plan followup-addendum-turn.md "### Publication and
 -- history"). ui_submit asks `follow_up`, then `begin_follow_up` / `drop_launch`; ui_turn_shadow hands a refused
 -- launch to `launch_refused` and a recorded result to `publish_result`.
 local say = require("yana.notify").one_line
@@ -11,7 +11,7 @@ local M = {}
 
 -- The panel doors this route uses, handed over by the factories that own them: ui_turn_end (review_opts =
 -- ui_review's inline_review_opts, flush = flush_review_batch) and ui_turn_shadow (render_error,
--- render_tool_change, preview, turn_ledger, shadow_turn_gen, set_review_bundle, drain).
+-- render_tool_change, preview, turn_ledger, shadow_turn_gen, set_review_bundle, finish_handover).
 local doors = {}
 function M.set_doors(t) for k, v in pairs(t) do doors[k] = v end end
 
@@ -35,15 +35,25 @@ function M.prompt_line(turn)
   return prompts.render("followup_open_review", { files = names })
 end
 
--- F-ADDENDUM-TRIGGER, -NO-RESUME, F-PROMPT-HANDOVER (panel rules; prompt-delivery plan steps 3-4): the
--- route of a prompt from a panel whose overlay turn is still held. "held": re-queued at the head until this
--- cycle's result is published or the review opens (maybe_drain_queue fires it); "refused": no resume id, the text
--- is back in the prompt; else the follow-up's launch context {turn, turn_id, cycles, prior}.
+-- A handover is waiting on release, the first review receipt, or an in-progress publication.
+function M.handover_waiting(p)
+  local session = p.shadow_turn or p.mcp_run
+  if not session then return false end
+  if session.result_release_pending or (session.review_open_requested and session.review_open_marked == nil) then
+    return true
+  end
+  local owner = require("yana.turn.turn_cycle").run_of(session).owner
+  local state = owner and owner.state
+  return state == "preparing" or state == "publishing"
+end
+
+-- Route a prompt to the current review once its publication permits a new run.
 function M.follow_up(p, question)
-  local session = p.shadow_turn
+  local session = p.shadow_turn or p.mcp_run
+  if M.handover_waiting(p) then return "handover" end
   local turn = require("yana.turn.turn_bind").get()
-  local function refused(code, held)
-    clog.submit_refused(code, { turn_id = session.turn_id, panel_id = p.id, resume_id = p.session_id, held = held,
+  local function refused(code)
+    clog.submit_refused(code, { turn_id = session.turn_id, panel_id = p.id, resume_id = p.session_id,
       generation = doors.shadow_turn_gen and doors.shadow_turn_gen(session, p) or nil })
   end
   local owned = turn ~= nil and vim.iter(turn.files):any(function(f)
@@ -54,12 +64,11 @@ function M.follow_up(p, question)
       vim.log.levels.WARN)
     return M.restore_prompt(p, question)
   end
-  if not owned or turn:cycles().state ~= "reviewing" then
-    table.insert(p.queue, 1, question)
-    refused(owned and "running" or "review_not_open", true)
-    say(owned and "yana: prompt held until the follow-up result is published"
-      or "yana: prompt held until this conversation's review opens", vim.log.levels.INFO)
-    return "held"
+  if not owned or turn:cycles().state ~= "reviewing" or session.review_open_marked == false then
+    refused("review_unavailable")
+    say("yana: follow-up refused because the review is unavailable. Resolve the review before resubmitting.",
+      vim.log.levels.WARN)
+    return M.restore_prompt(p, question)
   end
   if not p.session_id or p.session_id == "" then
     refused("no_resume")
@@ -70,36 +79,46 @@ function M.follow_up(p, question)
   return { turn = turn, turn_id = session.turn_id, cycles = turn:cycles(), prior = session, line = M.prompt_line(turn) }
 end
 
--- A refused follow-up keeps its typed text in the prompt.
+-- Restore an unsent submission before any new draft without losing either.
 function M.restore_prompt(p, question)
-  vim.bo[p.prompt_buf].modifiable = true
-  vim.api.nvim_buf_set_lines(p.prompt_buf, 0, -1, false, vim.split(question, "\n", { plain = true }))
+  if p.prompt_buf and vim.api.nvim_buf_is_valid(p.prompt_buf) then
+    local draft = table.concat(vim.api.nvim_buf_get_lines(p.prompt_buf, 0, -1, false), "\n")
+    if draft ~= "" then question = question .. "\n\n" .. draft end
+    vim.bo[p.prompt_buf].modifiable = true
+    vim.api.nvim_buf_set_lines(p.prompt_buf, 0, -1, false, vim.split(question, "\n", { plain = true }))
+  end
   return "refused"
 end
 
--- Submit, after the run's overlay session and lifecycle pass exist: capture the immutable CycleInput (every Turn
--- member plus the other snapshotted buffers, input only) and begin cycle k+1 on the SAME Turn (turn/turn_cycle.lua),
--- cycle 1 adopted first. False (one line said, launch dropped) when the input cannot be captured or the run begun.
+-- Capture the CycleInput at submit and start the next Run on the same Turn. The overlay also includes
+-- snapshotted buffers outside the review. Adopt cycle 1 first. Return false if the new Run cannot start.
 function M.begin_follow_up(p, follow, gen)
   local turn_cycle, cycles, turn = require("yana.turn.turn_cycle"), follow.cycles, follow.turn
   if #cycles.runs == 0 and cycles:begin_run(follow.prior, follow.prior.turn_pass, nil) then
     cycles:set_state("reviewing")
   end
-  local ws, buffers = p.shadow_turn.workspace, {}
+  local session = p.shadow_turn or p.mcp_run
+  local ws, buffers = session.workspace, {}
   for _, f in ipairs(turn.files) do
     ws = (f.change and f.change.review_workspace) or (f.review_opts and f.review_opts.workspace) or ws
   end
   for path, snap in pairs((p.turn_buffer_captures or {})[gen] or {}) do
     buffers[#buffers + 1] = { path = path, bufnr = snap.bufnr }
   end
+  local files = turn_cycle.input_files(turn, buffers)
+  if session.source == "buffer" then
+    -- MCP keeps non-members in its submit snapshots. Their first proposal uses the engine's first-run path.
+    files = vim.tbl_filter(function(entry) return entry.member end, files)
+  end
   local register = require("yana.turn.turn_register").for_workspace(ws)
   local input, why = turn_cycle.capture_input({ turn_id = follow.turn_id, workspace_id = ws, workspace = ws,
-    pass = p.turn_pass, cycle_id = cycles:next_cycle_id(), register = register, files = turn_cycle.input_files(turn,
-      buffers), seq_of = require("yana.undo_action_followup_cycle").seq_of })
-  local run = input and cycles:begin_run(p.shadow_turn, p.turn_pass, input)
+    pass = p.turn_pass, cycle_id = cycles:next_cycle_id(), register = register, files = files,
+    seq_of = require("yana.undo_action_followup_cycle").seq_of })
+  local run
+  if input then run, why = cycles:begin_run(session, p.turn_pass, input) end
   if not run then
     if input then turn_cycle.release_input(input, register) end
-    clog.submit_refused("input_not_captured", { turn_id = follow.turn_id, panel_id = p.id, generation = gen,
+    clog.submit_refused(input and "run_refused" or "input_not_captured", { turn_id = follow.turn_id, panel_id = p.id, generation = gen,
       resume_id = p.session_id })
     say("yana: follow-up not started -- " .. tostring(why or "the run was refused"), vim.log.levels.WARN)
     M.drop_launch(p, follow)
@@ -116,13 +135,13 @@ end
 
 -- A follow-up launch that will not run: the Turn gets its prior session back, input released, reviewing again.
 function M.drop_launch(p, follow)
-  local run = require("yana.turn.turn_cycle").recording_run(p.shadow_turn)
+  local run = require("yana.turn.turn_cycle").recording_run(p.shadow_turn or p.mcp_run)
   if run then
     follow.cycles:release_run(run, run.register)
     if follow.cycles:current() == run then table.remove(follow.cycles.runs) end
   end
   follow.cycles:set_state("reviewing")
-  p.shadow_turn = follow.prior
+  if follow.prior.source == "buffer" then p.mcp_run = follow.prior else p.shadow_turn = follow.prior end
 end
 
 -- A refused follow-up launch (S2): an unconfirmed writer exit stays a running follow-up; a daemon too old for
@@ -144,7 +163,7 @@ function M.launch_refused(p, run, code, reason)
   end
   run.owner:release_run(run, run.register)
   run.owner:set_state("reviewing")
-  p.shadow_turn = run.prior_session
+  if run.prior_session.source == "buffer" then p.mcp_run = run.prior_session else p.shadow_turn = run.prior_session end
 end
 
 -- Not published: the prior review stays and the result and its pins are kept (retryable). A failed compensation
@@ -157,10 +176,46 @@ local function unpublished(p, run, code, reason, prepared)
   if recovery then
     doors.render_error(p, "follow-up result acknowledged but not shown -- " .. tostring(reason)
       .. "; End or Abort the review to reconcile")
-    return run.owner:set_state("recovery_required")
+    run.owner:set_state("recovery_required")
+    return doors.finish_handover(p)
   end
   doors.render_error(p, "follow-up result not published -- " .. tostring(reason) .. "; the prior review is kept")
   run.owner:set_state("reviewing")
+  doors.finish_handover(p)
+end
+
+-- A refused run's files, for `:YanaRefusals` and the next prompt's decision note: the agent would otherwise resume
+-- believing its changes landed.
+function M.record_refused_run(p, session, changes, reason)
+  p.system_refusals = p.system_refusals or {}
+  for _, change in ipairs(changes) do
+    p.system_refusals[#p.system_refusals + 1] = { status = "system_refused", turn = session.turn_id, rel = change.rel,
+      kind = change.kind, reason = reason, retention_strength = "recovered" }
+  end
+end
+
+-- A refused result (over review.max_files, or with an unsafe operation) is never prepared or shown: its files are copied to a recovery folder and the open
+-- review stays as it was. Hunk decisions, End and Abort still work; no further follow-up starts until it closes.
+function M.refuse_result(p, session, run, changes, reason)
+  M.record_refused_run(p, session, changes, reason)
+  local folders, err = doors.preview().recover_run(session, changes)
+  clog.publish(run, "recovery_required", "too_large")
+  -- The daemon holds the stopped run's Turn until a review is published; republish the open one unchanged, as a
+  -- follow-up that changed nothing does, so End and Abort can close it.
+  local members = {}
+  for _, f in ipairs(require("yana.turn.turn_bind").get().files) do
+    members[#members + 1] = f.change
+  end
+  doors.set_review_bundle(session, members, run.prior_session and run.prior_session.review_bundle)
+  doors.preview().arm_review_open(session, function(ok)
+    if not ok then doors.render_error(p, "the daemon did not acknowledge the kept review (review.open)") end
+  end)
+  local recover = not folders and ("; recover it at nowhere (" .. tostring(err) .. ")")
+    or #folders > 0 and ("; recover it at " .. table.concat(folders, " and "))
+    or ""
+  doors.render_error(p, string.format("follow-up result not shown -- %s; nothing was applied%s; the open review is"
+    .. " kept: accept what you want and End, or Abort", reason, recover))
+  return run.owner:set_state("recovery_required")
 end
 
 -- A newly changed file joins the publication through the first-run door: render and batch flush admit its Turn
@@ -220,7 +275,7 @@ end
 function M.publish_result(p, turn, run, attempt)
   local live, cycle = require("yana.turn.turn_bind").get(), require("yana.turn.turn_cycle")
   local publication = require("yana.undo_action_followup_cycle")
-  if not live or run.published then return end
+  if not live or run.published then return doors.finish_handover(p) end
   if not run.result_logged then
     run.result_logged = true
     clog.result(run, turn, p, nil, false)
@@ -253,8 +308,8 @@ function M.publish_result(p, turn, run, attempt)
         members[#members + 1] = change
       end
     end
-    doors.set_review_bundle(turn, members)
-    return doors.preview().arm_review_open(turn, function(ok)
+    doors.set_review_bundle(turn, members, run.prior_session and run.prior_session.review_bundle)
+    return doors.arm_review_open(turn, function(ok)
       if not ok then return unpublished(p, run, "halted", "the daemon did not acknowledge the review (review.open)") end
       run.acked = true
       require("yana.ledger").mark(doors.turn_ledger(p, doors.shadow_turn_gen(turn, p)), "review_claim_open")
@@ -285,7 +340,7 @@ function M.publish_result(p, turn, run, attempt)
   if not tabs_ok then
     doors.render_error(p, "follow-up review tabs could not be restored: " .. tostring(tabs_err))
   end
-  doors.drain(p)
+  doors.finish_handover(p)
 end
 
 return M

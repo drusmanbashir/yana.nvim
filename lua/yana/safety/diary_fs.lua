@@ -173,7 +173,7 @@ function M.new(deps)
 		return p:sub(#ws + 2)
 	end
 
-	-- Path safety: no escape above workspace; reject symlink components (N7: hash is
+	-- Path safety: no escape above workspace; reject symlink components (hash is
 	-- authority); refuse control-plane paths by name; refuse mount crossings.
 	--
 	-- Applier fail-safe, the last line and independent of the producer/consumer.
@@ -232,7 +232,9 @@ function M.new(deps)
 		-- refuse writes to its top-level git-internal entries (HEAD/objects/refs/…),
 		-- which carry no `.git` segment. The proof gate keeps ordinary projects with
 		-- a top-level `HEAD`/`refs`/`objects` fully writable.
-		if control_plane.is_bare_entry(rel) and control_plane.workspace_is_bare(workspace) then
+		-- The open `.git` folder (CAPTURE.md OC-GIT) is a root with a bare-repository layout; its
+		-- edits, `core.bare` included, are the operator's to accept and to undo.
+		if control_plane.is_bare_entry(rel) and vim.fs.basename(workspace) ~= ".git" and control_plane.workspace_is_bare(workspace) then
 			return nil, "refused — write into a bare repository root (control-plane): " .. rel
 		end
 
@@ -277,21 +279,19 @@ function M.new(deps)
 	end
 
 	local function check_cap(session, extra)
-		local cap = test_state.force_cap_bytes or config.max_bytes
 		local used = diary_usage(session.diary_dir)
-		if used + (extra or 0) > cap then
+		if used + (extra or 0) > config.max_bytes then
 			return false, "diary size cap exceeded"
 		end
 		return true
 	end
 
 	local function check_space(session, need)
-		if test_state.force_no_space then
-			return false, "insufficient disk space for diary accept"
-		end
-		local st = uv.fs_statvfs and uv.fs_statvfs(session.workspace)
-		if st and st.bavail and st.bsize and (st.bavail * st.bsize) < need then
-			return false, "insufficient disk space for diary accept"
+		for _, dir in ipairs({ session.workspace, session.diary_dir }) do
+			local st = uv.fs_statvfs and uv.fs_statvfs(dir)
+			if st and st.bavail and st.bsize and (st.bavail * st.bsize) < need then
+				return false, "insufficient disk space for diary accept"
+			end
 		end
 		return true
 	end

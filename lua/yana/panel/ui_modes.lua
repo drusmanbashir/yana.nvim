@@ -152,6 +152,89 @@ function M.new(deps)
     end
   end
 
+  local function apply_switch(p, want)
+    local from_mode = config.options.mode
+    local from_session = p.session_id
+    remember_seat_session(p)
+    config.options.mode = want
+    p.mode = want
+    restore_seat_session(p, want)
+    log.lifecycle("mode.switch", {
+      panel = p.id,
+      from = from_mode,
+      to = want,
+      session = from_session,
+      from_session = from_session,
+      to_session = p.session_id,
+      from_seat = seat_of(from_mode, config.options.backend),
+      to_seat = seat_of(want, config.options.backend),
+    })
+    update_winbar(p)
+    notify_one_line("yana: mode → " .. p.mode, vim.log.levels.INFO)
+  end
+
+  local SWITCH_MSG = "A review is open in this chat. Abort it and switch to agentic?"
+  local SWITCH_BUTTONS = "&Abort review and switch\n&Cancel"
+
+  -- F-MODES-AGENTIC-*: an open review or pending changes stand between this chat and agentic. One dialog;
+  -- accepting is the End confirmation for the existing Abort, and the switch waits for that End to end the
+  -- review. True when this owned the request (dialog shown or refusal said); the caller then stops.
+  local function offer_abort_and_switch(p, want, arbitration)
+    if want ~= "agentic" or (arbitration.code ~= "review_open" and arbitration.code ~= "pending_changes") then
+      return false
+    end
+    -- Only this chat's own live review is offered; another chat's review, or pending changes with no Turn,
+    -- keep the plain refusal.
+    local turn_bind = require("yana.turn.turn_bind")
+    local shadow = p.shadow_turn or p.mcp_run or (p.shadow_pass and p.shadow_pass.shadow_turn)
+    if not (shadow and turn_bind.owned_by(shadow.turn_id)) then
+      return false
+    end
+    log.lifecycle_info("mode.switch.dialog", { panel = p.id, to = want, reason = arbitration.code })
+    local asked, answer = pcall(vim.fn.confirm, SWITCH_MSG, SWITCH_BUTTONS, 2, "Question")
+    local accepted = asked and answer == 1
+    log.lifecycle_info("mode.switch.choice", { panel = p.id, to = want, answer = accepted and "abort" or "cancel" })
+    if not accepted then
+      update_winbar(p)
+      return true
+    end
+    turn_bind.abort(nil, { panel_id = p.id, epoch = p.review_epoch }, {
+      source = "agentic_switch",
+      confirmed = true,
+      on_result = function(result)
+        vim.schedule(function()
+          local status = type(result) == "table" and result.status or nil
+          -- No live Turn means no review is open, whatever the End said (it ended before the Abort reached it).
+          local ended = status == "completed" or (status == "partial" and result.review_ended == true)
+            or turn_bind.get() == nil
+          if not ended then
+            local why = type(result) == "table" and result.reason or nil
+            notify_one_line("yana: mode stays " .. tostring(p.mode) .. " — the review is still open (End "
+              .. tostring(status) .. (why and (": " .. tostring(why)) or "") .. ")", vim.log.levels.WARN)
+            update_winbar(p)
+            return
+          end
+          local blocked, reason = mode_change_blocked(p)
+          if blocked then
+            mode_change_refused_notify(p, reason)
+            update_winbar(p)
+            return
+          end
+          -- The End said the review ended; the switch still needs the chat itself to agree.
+          local still = renewal.blocked(p)
+          if still then
+            notify_one_line("yana: mode stays " .. tostring(p.mode) .. " — "
+              .. tostring(renewal.blocked_reason(p) or still.condition), vim.log.levels.WARN)
+            update_winbar(p)
+            return
+          end
+          apply_switch(p, want)
+        end)
+      end,
+    })
+    return true
+  end
+
   -- Cycle the panel's mode. O1/O4/O6: seat re-attach, never session renewal.
   local function toggle_mode()
     local p = current_panel()
@@ -165,39 +248,26 @@ function M.new(deps)
       return
     end
     -- G2/G3: every panel — including session-less — must hit review_open / pending.
+    local nextmode = renewal.next_mode(config.options.mode)
     local arbitration = renewal.blocked(p)
     if arbitration then
       if arbitration.code == "turn_in_flight" then
         mode_change_refused_notify(p, "in_flight")
         return
       end
+      if offer_abort_and_switch(p, nextmode, arbitration) then
+        return
+      end
       local why = renewal.blocked_reason(p) or arbitration.condition
       notify_one_line("yana: cannot switch mode — " .. tostring(why), vim.log.levels.WARN)
       return
     end
-    local nextmode = renewal.next_mode(config.options.mode)
-    local from_mode = config.options.mode
-    local from_session = p.session_id
-    remember_seat_session(p)
-    config.options.mode = nextmode
-    p.mode = nextmode
-    restore_seat_session(p, nextmode)
-    log.lifecycle("mode.switch", {
-      panel = p.id,
-      from = from_mode,
-      to = nextmode,
-      session = from_session,
-      from_session = from_session,
-      to_session = p.session_id,
-      from_seat = seat_of(from_mode, config.options.backend),
-      to_seat = seat_of(nextmode, config.options.backend),
-    })
-    update_winbar(p)
-    notify_one_line("yana: mode → " .. p.mode, vim.log.levels.INFO)
+    apply_switch(p, nextmode)
   end
 
   -- Set a panel's mode programmatically. Subject to the same lock as the <M-t> toggle: callers go through here,
-  -- never assign p.mode. Returns true when the panel is in `mode` on return, false when refused.
+  -- never assign p.mode. Returns true when the panel is in `mode` on return, false when refused or when the
+  -- switch waits on the agentic dialog's Abort (it then happens later, or is refused in one line).
   local function set_mode(p, mode)
     p = p or current_panel()
     if not p then
@@ -226,6 +296,8 @@ function M.new(deps)
     if arbitration then
       if arbitration.code == "turn_in_flight" then
         mode_change_refused_notify(p, "in_flight")
+      elseif offer_abort_and_switch(p, want, arbitration) then
+        return false
       else
         local why = renewal.blocked_reason(p) or arbitration.condition
         notify_one_line("yana: cannot switch mode — " .. tostring(why), vim.log.levels.WARN)

@@ -69,13 +69,6 @@ function M.install(Ledger, env)
 		return self.buffer_history:begin_group(marker, undo_seq)
 	end
 
-	--- Drop every record for a native undo state the buffer can no longer reach.
-	--- The reachable set is the buffer's, so the caller that owns the buffer
-	--- passes it (review_watch.lua); the ledger holds no buffer of its own.
-	function Ledger:prune_buffer_history(reachable)
-		return self.buffer_history:prune(reachable)
-	end
-
 	-- The destroy counterpart of `complete_buffer_edit`. An absorbed edit records
 	-- itself through that function; a hunk deleted outright absorbs nothing, so
 	-- without this call `remember` is never reached for it and the keyed history

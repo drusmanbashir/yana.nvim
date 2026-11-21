@@ -262,9 +262,9 @@ function Factory.new(env)
   --- repaint rolls the effect back with everything else. `hooks.rollback()`
   --- undoes a hook that applied but could not settle; the native layer stays
   --- unaware of what the effect actually is.
-  local function move_and_settle(command, suppress_rewind, direction, expect_seq, hooks)
+  local function move_and_settle(command, suppress_rewind, direction, expect_seq, hooks, native_branch)
     -- Past End's confirmation barrier the ledger refuses every restore, so a move would leave the bytes ahead
-    -- of a ledger that stood still (LEDGER N46): refuse before the bytes move.
+    -- of a ledger that stood still: refuse before the bytes move.
     if state.hunk_ledger and state.hunk_ledger.frozen_for_end then
       return { ok = false, code = "frozen", changed = false, byte_location = "pre_call",
         reason = "turn is frozen for End" }
@@ -314,24 +314,28 @@ function Factory.new(env)
       end
       return roll_back(snapshot, outcome, direction, suppress_rewind, err, extra_stuck)
     end
-    vim.schedule(function()
+    if native_branch then
       release_watcher(snapshot)
-    end)
+    else
+      vim.schedule(function() release_watcher(snapshot) end)
+    end
     require("yana.review_undo_trace").capture("native_settled", state, {
       direction = direction, outcome = outcome })
     outcome.touched_blocks = touched
     return outcome
   end
 
-  local function native_undo(suppress_rewind, expect_seq, hooks)
-    return move_and_settle("silent undo", suppress_rewind, "undo", expect_seq, hooks)
+  local function native_undo(suppress_rewind, expect_seq, hooks, native_branch)
+    return move_and_settle("silent undo", suppress_rewind, "undo", expect_seq, hooks, native_branch)
   end
 
   --- Plain `:redo`, unsilenced (Neovim's own "Already at newest change"
   --- shows when there is nothing left), then repainted. `_` is the unused
   --- suppression flag, so both directions share one call shape.
-  local function native_redo(_, expect_seq, hooks)
-    return move_and_settle("redo", false, "redo", expect_seq, hooks)
+  local function native_redo(_, expect_seq, hooks, native_branch)
+    -- Replaying a native branch selection names the sequence explicitly.
+    local command = native_branch and expect_seq and ("silent undo " .. expect_seq) or "redo"
+    return move_and_settle(command, false, "redo", expect_seq, hooks, native_branch)
   end
 
   return {

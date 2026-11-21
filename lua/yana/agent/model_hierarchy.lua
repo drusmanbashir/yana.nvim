@@ -39,10 +39,6 @@ local CAPABILITY_FIELDS = {
 	speed = "speeds",
 }
 
-function M.capability_field(col)
-	return CAPABILITY_FIELDS[col]
-end
-
 --- True when at least one row carries data for this capability column.
 function M.column_live(col, rows)
 	local field = CAPABILITY_FIELDS[col]
@@ -71,15 +67,6 @@ end
 
 function M.columns(backend)
 	return vim.deepcopy(COLUMNS[backend] or { "model" })
-end
-
---- Confirmed vendor model for display, or the literal "unknown".
---- Strict: never falls back to the operator's request (row 91).
-function M.confirmed_identity(panel)
-	if type(panel) == "table" and type(panel.model_actual) == "string" and panel.model_actual ~= "" then
-		return panel.model_actual
-	end
-	return "unknown"
 end
 
 local function mode_display_suffix(modes)
@@ -126,15 +113,6 @@ function M.display_identity(panel, opts)
 		return { text = backend .. ":" .. requested .. suffix, confirmed = false }
 	end
 	return { text = backend .. ":auto", confirmed = false }
-end
-
-local function sorted_keys(set)
-	local keys = {}
-	for k in pairs(set or {}) do
-		keys[#keys + 1] = k
-	end
-	table.sort(keys)
-	return keys
 end
 
 local function build_cursor(raw_list)
@@ -294,87 +272,6 @@ function M.build(backend, source)
 		end
 	end
 	return rows
-end
-
--- Test/diagnostic helper: stable effort/speed key lists.
-function M.effort_keys(row)
-	return sorted_keys(row and row.efforts)
-end
-
-function M.speed_keys(row)
-	return sorted_keys(row and row.speeds)
-end
-
-local function row_matches(row, fixed, col)
-	if not fixed then
-		return true
-	end
-	for key, want in pairs(fixed) do
-		if key ~= col and want ~= nil and want ~= "" then
-			if key == "provider" and row.provider ~= want then
-				return false
-			end
-			if key == "model" and row.model ~= want then
-				return false
-			end
-			if (key == "effort" or key == "reasoning") and not (row.efforts and row.efforts[want]) then
-				-- Cursor families may omit effort entirely when only the bare id exists.
-				if key == "effort" and want == "-" then
-					if next(row.efforts or {}) ~= nil then
-						return false
-					end
-				else
-					return false
-				end
-			end
-			if key == "speed" then
-				if want == "-" then
-					-- bare (no speed) remains valid for every matching family
-				elseif not (row.speeds and row.speeds[want]) then
-					return false
-				end
-			end
-		end
-	end
-	return true
-end
-
---- Values offered for `col` given already-fixed cells. Never invents modes.
-function M.column_values(backend, rows, col, fixed)
-	local cols = M.columns(backend)
-	local allowed = false
-	for _, c in ipairs(cols) do
-		if c == col then
-			allowed = true
-			break
-		end
-	end
-	if not allowed then
-		return {}
-	end
-	local set = {}
-	for _, row in ipairs(rows or {}) do
-		if row_matches(row, fixed, col) then
-			if col == "provider" and row.provider then
-				set[row.provider] = true
-			elseif col == "model" and row.model then
-				set[row.model] = true
-			elseif col == "effort" or col == "reasoning" then
-				for k in pairs(row.efforts or {}) do
-					set[k] = true
-				end
-			elseif col == "speed" then
-				for k in pairs(row.speeds or {}) do
-					set[k] = true
-				end
-				-- Bare (no speed suffix / no tier) is always a legal choice when
-				-- the family exists; shown as "-" so it is not confused with a
-				-- vendor token.
-				set["-"] = true
-			end
-		end
-	end
-	return sorted_keys(set)
 end
 
 local function compose_cursor_id(row, effort, speed)

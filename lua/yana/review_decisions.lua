@@ -118,6 +118,10 @@ function M.record_operation_decision(file, verdict, state)
   if type(change) ~= "table" or type(file.path) ~= "string" then
     return false, "review_decisions.record_operation_decision needs the exact File/change identity"
   end
+  local bulk = require("yana.review_bulk")
+  local pair, pair_err = bulk.linked_files(file)
+  if pair_err then return false, pair_err end
+  if pair then return bulk.record_pair_decision(pair, verdict, state) end
   local previous = file.operation_verdict or "pending"
   if previous == verdict then
     return true
@@ -245,7 +249,7 @@ function M.new(deps)
   -- path) must not let each hunk push its own register row -- that made `cx` write N
   -- rows for ONE press. The caller passes true and pushes ONE aggregate row itself once
   -- the loop is done.
-  local function reject_block_at(idx, suppress_register)
+  local function reject_block_at(idx, suppress_register, suppress_edge)
     if state.hunk_ledger and state.hunk_ledger.frozen_for_end then
       return false, "turn is frozen for End"
     end
@@ -299,7 +303,7 @@ function M.new(deps)
       new_count = #(block.new_lines or {}),
     })
     local anchor = park_anchor(block, start_line, start_line + math.max(#restored, 1) - 1)
-    state.decisions[#state.decisions + 1] = {
+    local entry = {
       action = "reject",
       idx = idx,
       block = block,
@@ -308,9 +312,11 @@ function M.new(deps)
       post_seq = deps.buf_undo_seq(bufnr),
       anchor = anchor,
     }
+    state.decisions[#state.decisions + 1] = entry
     if not suppress_register then
       push_register_decision(state, change, 1)
     end
+    require("yana.review_history").record_rejection(state, entry)
     if state.hunk_ledger:count() == 0 then
       deps.record_last_hunk_decided("reject", block)
     end
@@ -328,7 +334,7 @@ function M.new(deps)
     -- A1: the edge is polled HERE, at the door's tail, never inside `decide`.
     -- End review? (turn-scope zero) lives inside `_poll_leave_edge` via
     -- turn_bind.on_decision. Never returns true — no try_finalize branch.
-    facade._poll_leave_edge(state, "reject_hunk")
+    if not suppress_edge then facade._poll_leave_edge(state, "reject_hunk") end
   end
 
   local function accept_block_at(idx, suppress_register)
@@ -338,6 +344,14 @@ function M.new(deps)
     local block = state.hunk_ledger:pending()[idx]
     if not block then
       return
+    end
+    local bulk = require("yana.review_bulk")
+    local file = current_file()
+    local pair = bulk.linked_files(file)
+    if pair and pair[2] == file then
+      local ok, err = bulk.record_pair_decision(pair, "accepted", state)
+      if ok then facade._poll_leave_edge(state, "accept_rename") end
+      return ok, err
     end
     deps.break_undo_block(bufnr)
     local at_seq = deps.buf_undo_seq(bufnr)
@@ -351,9 +365,7 @@ function M.new(deps)
     if state.hunk_ledger and state.hunk_ledger:owns(block) then
       state.hunk_ledger:decide(block, "accept")
     end
-    -- Nothing is written here, so nothing advances the undo seq behind the decision's
-    -- back either, and the W13 `save_buffer` stamp this site existed to sequence around
-    -- is gone with it.
+    -- Nothing is written here, so nothing advances the undo seq behind the decision's back.
     deps.record_decision(state, "accept_hunk", {
       hunk = idx,
       model_index = block.model_index,
@@ -462,6 +474,15 @@ function M.new(deps)
   local function accept_all()
     if state.hunk_ledger and state.hunk_ledger.frozen_for_end then
       return false, "turn is frozen for End"
+    end
+    local bulk = require("yana.review_bulk")
+    local pair = bulk.linked_files(current_file())
+    if pair then
+      local ok, err = bulk.record_pair_decision(pair, "accepted", state, true)
+      if not ok then deps.notify_one_line("yana: " .. tostring(err), vim.log.levels.WARN); return false end
+      if state._flush_paint then state._flush_paint("accept_rename") end
+      facade._poll_leave_edge(state, "accept_rename")
+      return true
     end
     deps.record_decision(state, "accept_file", { hunks_remaining = state.hunk_ledger:count() })
     local pending_before = state.hunk_ledger:pending()

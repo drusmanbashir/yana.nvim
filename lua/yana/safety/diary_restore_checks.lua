@@ -65,9 +65,9 @@ function M.new(deps)
 		if ROLLBACK_PURPOSES[purpose] then
 			return purpose
 		end
-		-- Mutation seam (gate): the pre-fix default, at both ends at once — a caller
-		-- that named no purpose and a marker that recorded none were each read as a
-		-- user revert, and the revert route completed on them.
+		-- Mutation seam (gate): defaults the purpose to a user revert at both ends at once —
+		-- a caller that names no purpose and a marker that recorded none are each read as a
+		-- user revert, and the revert route completes on them.
 		if test_state.fault.gate_purpose_defaulted then
 			return "revert"
 		end
@@ -149,8 +149,8 @@ function M.new(deps)
 	--- that is not a regular file, one that cannot be read, and one whose bytes do not
 	--- hash to the recorded fingerprint.
 	local function verify_displaced_copy(displaced_path, op)
-		-- Mutation seam (gate): the pre-fix laxness — existence only, hash compared
-		-- only when one happens to be recorded.
+		-- Mutation seam (gate): existence only, hash compared only when one happens to
+		-- be recorded.
 		local lax = test_state.fault.accept_incomplete_displaced
 		if not lax then
 			local ok_rec, rec_err = displaced_record_complete(op)
@@ -208,8 +208,8 @@ function M.new(deps)
 					.. ": the marker licensing this rollback records no identity for the object it checked, so a"
 					.. " same-bytes substitution cannot be ruled out — refusing; nothing was changed"
 		end
-		-- Mutation seam (gate): the pre-fix marker, where the content fingerprint was
-		-- optional and an automatic rollback never carried one at all.
+		-- Mutation seam (gate): the content fingerprint is optional and an automatic
+		-- rollback never carries one at all.
 		if test_state.fault.rollback_marker_no_hash then
 			return true
 		end

@@ -231,7 +231,7 @@ function Cycles:record_result(run, changes, opts)
 	local files = {}
 	for _, path in ipairs(paths) do
 		local o = seen[path] or { unreadable = "the run's view was not read" }
-		files[path] = { exists = o.exists, bytes = o.bytes, mode = o.mode, source = o.source, unreadable = o.unreadable,
+		files[path] = { exists = o.exists, bytes = o.bytes, rows = o.rows, mode = o.mode, source = o.source, unreadable = o.unreadable,
 			kind = classified[path] and classified[path].kind, change = classified[path] }
 	end
 	run.result = { schema_version = SCHEMA, turn_id = run.turn_id, cycle_id = run.cycle_id,
@@ -245,7 +245,7 @@ function Cycles:record_result(run, changes, opts)
 	return run.result, "a late result is kept; the cycle state is unchanged"
 end
 
--- B7 retention hook: pin every endpoint current for the run's input files (call on each register position
+-- Retention hook: pin every endpoint current for the run's input files (call on each register position
 -- change while the run's input is held; preparation calls it too). `release` drops the input's marks and pins
 -- once history mapping no longer needs them.
 function Cycles:retain(run, register)
@@ -285,16 +285,15 @@ local function first_run_file(f, out)
 	if base == nil and change.kind == "create" then base = "" end
 	if base == nil then return nil, "no base for the newly classified path" end
 	f.mode, f.change = "first_run", out.change
-	f.lines = out.exists and view.rows_of(out.bytes) or {}
-	f.blocks = require("yana.review_open").fallback_blocks(base, out.exists and out.bytes or "")
+	f.lines = out.exists and (out.rows or view.rows_of(out.bytes)) or {}
+	local target = out.exists and (out.rows and change.after or out.bytes) or ""
+	f.blocks = require("yana.review_open").fallback_blocks(base, target)
 	return f
 end
 
 -- Step 3-5 for one file through its B5 path: the identity, the live submit extmarks (forward edges in one
 -- incarnation) or the composed recorded splices; else FALLBACK over the retained accepted/operator view.
-local function tracked_result(input, path, rec, cur, rows_now, facts, edits, now, register, f)
-	local p = view.history_path(register, rec.key, input.positions[path], now[rec.key], (input.splice_watermark[path] or {}).splices)
-	f.path_type = p.kind
+local function tracked_result(input, rec, cur, rows_now, facts, edits, p)
 	local rows, why
 	if p.kind == "same" or p.kind == "forward" or (p.kind == "revision" and p.steps == nil) then
 		if cur.bufnr ~= rec.bufnr then return nil, "another buffer holds the file now" end
@@ -337,7 +336,7 @@ local function prepare_file(input, path, rec, out, cur, now, register)
 	f.exists, f.file_mode = out.exists, out.mode
 	if rec == nil then return first_run_file(f, out) end
 	f.eol = rec.eol
-	local agent = out.exists and view.rows_of(out.bytes, rec.eol) or {}
+	local agent = out.exists and (out.rows or view.rows_of(out.bytes, rec.eol)) or {}
 	local edits = reconcile.edits(rec.lines, agent)
 	local rows_now, live = view.current_rows(cur, rec.eol)
 	local facts = cur and cur.ledger and view.facts(cur.ledger, rows_now or rec.lines) or nil
@@ -348,17 +347,21 @@ local function prepare_file(input, path, rec, out, cur, now, register)
 		f.mode, f.lines, f.blocks = "unchanged", rows_now or rec.lines, {}
 		return f
 	end
+	local history = view.history_path(register, rec.key, input.positions[path], now[rec.key],
+		(input.splice_watermark[path] or {}).splices)
+	f.path_type = history.kind
 	local result, reason
 	if not live then
 		reason = "the buffer captured at submit is gone"
 	elseif out.exists == false then
 		reason = "the agent deleted the file (typed operations across cycles: M3)"
 	else
-		result, reason = tracked_result(input, path, rec, cur, rows_now, facts, edits, now, register, f)
+		result, reason = tracked_result(input, rec, cur, rows_now, facts, edits, history)
 	end
 	if result then
 		f.mode = "tracked"
 	else
+		if history.historical then return nil, reason end
 		local resolved, accounted = view.resolve_contributions(rec.contributions, facts)
 		local unplaced = view.unplaced_rejections(facts, accounted, rec.submit_members or {})
 		for _, c in ipairs(resolved) do

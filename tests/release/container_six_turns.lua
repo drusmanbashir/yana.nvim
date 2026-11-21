@@ -2,7 +2,7 @@
 --
 -- Env:
 --   YANA_SIX_TURNS_MODE   agentic | inline | ask  (required)
---   YANA_SIX_TURNS_SCRATCH  writable root OUTSIDE /tmp (required for overlay)
+--   YANA_SIX_TURNS_SCRATCH  writable root
 --
 -- Asserts: two completed turns, mode-correct on-disk bytes, no leftover review
 -- for ask, and prints one SIX-TURNS PASS line the host greps.
@@ -12,8 +12,8 @@ if mode ~= "agentic" and mode ~= "inline" and mode ~= "ask" then
   print("FAIL: YANA_SIX_TURNS_MODE must be agentic|inline|ask")
   os.exit(1)
 end
-if not scratch or scratch == "" or scratch:sub(1, 5) == "/tmp/" or scratch == "/tmp" then
-  print("FAIL: YANA_SIX_TURNS_SCRATCH required outside /tmp")
+if not scratch or scratch == "" then
+  print("FAIL: YANA_SIX_TURNS_SCRATCH required")
   os.exit(1)
 end
 if os.getenv("YANA_UI_ROOT") and os.getenv("YANA_UI_ROOT") ~= "" then
@@ -43,12 +43,6 @@ local function die(msg)
   os.exit(1)
 end
 
-local jail = require("yana.shadow.jail")
-if (mode == "inline" or mode == "ask") and not jail.available() then
-  print("SIX-TURNS INCONCLUSIVE: bwrap unavailable for overlay mode " .. mode)
-  os.exit(65)
-end
-
 vim.fn.mkdir(scratch, "p")
 local workspace = scratch .. "/ws"
 local state_root = scratch .. "/state"
@@ -62,7 +56,9 @@ do
 end
 local seed = "seed\n"
 
-local agent = repo .. "/tests/release/six_turns_agent"
+local backend = mode == "agentic" and "cursor" or "claude"
+local fixture = mode == "agentic" and "six_turns_agent" or "turn_smoke_agent"
+local agent = repo .. "/tests/release/" .. fixture
 if vim.fn.executable(agent) ~= 1 then
   die("six_turns_agent not executable: " .. agent)
 end
@@ -72,7 +68,7 @@ vim.env.YANA_SIX_TURNS_TARGET = "notes.txt"
 
 local setup_opts = {
   mode = mode,
-  backends = { cursor = { cmd = agent } },
+  backends = { default = backend, [backend] = { cmd = agent } },
   sessions = { dir = scratch .. "/sessions", chats_dir = scratch .. "/chats" },
 }
 if mode == "agentic" then
@@ -154,13 +150,13 @@ local function clear_confined_turn()
   end
   pcall(inline.discard_pool, { workspace = workspace })
   local ready = vim.wait(30000, function()
-    return p.shadow_turn == nil
+    return p.mcp_run == nil
       and inline.active_state({ workspace = workspace }) == nil
       and not p.busy
       and p.job == nil
       and not p.awaiting_exit
   end, 25)
-  check(ready, "confined turn cleared (no shadow claim / review)")
+  check(ready, "protected run and review cleared")
   return ready
 end
 
@@ -196,9 +192,9 @@ local function wait_turn(before_gen)
     check(reviewed, "inline: review opened for turn " .. tostring(launched))
   elseif mode == "ask" then
     local settled = vim.wait(30000, function()
-      return p.shadow_turn == nil
+      return p.mcp_run == nil
     end, 25)
-    check(settled, "ask: shadow claim released for turn " .. tostring(launched))
+    check(settled, "ask: MCP run released for turn " .. tostring(launched))
   end
   return launched
 end

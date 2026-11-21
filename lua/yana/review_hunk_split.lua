@@ -416,9 +416,9 @@ function M.new(deps)
             new_end_line = b_end,
           }
           -- `Ledger:merge` hands back the inverse of the membership it just
-          -- consumed (hunk_ledger_lifecycle.lua:294-309). Dropping it here is
-          -- what left `u` rewinding the TEXT while the ledger kept a merged
-          -- block the buffer no longer justified. `after` is the merged block's
+          -- consumed (hunk_ledger_lifecycle.lua:294-309). It must be kept: without it
+          -- `u` rewinds the TEXT while the ledger keeps a merged
+          -- block the buffer no longer justifies. `after` is the merged block's
           -- own model tag read AFTER the call, because the primitive blanks
           -- `model_index` and stamps `model_join = "lost_at_merge"` -- redo has
           -- to put those back too, or a re-merge wears a stale tag.

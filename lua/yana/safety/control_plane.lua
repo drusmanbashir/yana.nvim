@@ -84,6 +84,15 @@ function M.is_control_plane(rel, opts)
 	return M.match(rel, opts) ~= nil
 end
 
+--- `is_control_plane` on a lexical absolute path measured from `root` when it lies inside it,
+--- as the applier measures it; the open `.git` folder is a root of its own (CAPTURE.md OC-GIT).
+function M.is_control_plane_in(path, root)
+	if root and path:sub(1, #root + 1) == root .. "/" then
+		path = path:sub(#root + 2)
+	end
+	return M.is_control_plane(path)
+end
+
 -- Top-level entries of a BARE repository. A bare repo has no `.git/` segment to catch,
 -- so its `HEAD`/`objects/`/`refs/`/`config` sit at the workspace root. These are
 -- refused ONLY when the caller has PROVEN the workspace root is bare (git `core.bare =
@@ -148,19 +157,17 @@ function M.workspace_is_bare(workspace)
 	return data:match("bare%s*=%s*true") ~= nil
 end
 
---- A refusal message naming the path and the offending segment, for the
---- applier's fail-safe.
+--- A refusal message naming the path and offending segment. Callers that
+--- refuse before capture can request the message without the overlay outcome.
 function M.refusal(rel, opts)
 	local seg = M.match(rel, opts)
 	if not seg then
 		return nil
 	end
-	return string.format(
-		"%s: refused — control-plane path (segment %q). Repository-internal paths owned by "
-			.. "another program (git/hg/svn) are never applied; they are recorded and discarded with the overlay",
-		tostring(rel),
-		seg
-	)
+	local reason = string.format("%s: refused — control-plane path (segment %q)", rel, seg)
+	if opts and opts.short then return reason end
+	return reason .. ". Repository-internal paths owned by another program (git/hg/svn) "
+		.. "are never applied; they are recorded and discarded with the overlay"
 end
 
 return M

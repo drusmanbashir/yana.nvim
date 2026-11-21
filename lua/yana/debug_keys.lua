@@ -1,12 +1,10 @@
 -- THE KEY STREAM, WRITTEN INTO YANA'S OWN LOG BY YANA'S OWN LOGGER.
 --
 -- WHY THIS MODULE EXISTS. Evidence about a keyed bug has to say which key a
--- logged line answers. The recorder used to infer that from ITS OWN clock in a
--- SEPARATE file (keys.tsv, one process away), against a log stamped only to the
--- second -- two clocks and a rounding, which on bug 7 named the wrong deciding
--- frame. A key line written through the SAME append path, in the SAME process,
--- into the SAME file makes ORDER IN THE FILE THE ORDER OF EVENTS, with no clock
--- comparison left to get wrong. keys.tsv stays as the independent cross-check.
+-- logged line answers. A key line written through the SAME append path, in the
+-- SAME process, into the SAME file makes ORDER IN THE FILE THE ORDER OF EVENTS,
+-- with no clock comparison left to get wrong. keys.tsv stays as the independent
+-- cross-check.
 --
 -- WHAT IT MAY DO, AND NOTHING ELSE. It is attached only under
 -- `setup({ profile = "debugger", debug_modules = { "keys" } })`, it registers
@@ -19,8 +17,7 @@
 --
 -- ON `vim.on_key`, MEASURED ON THIS RIG, NOT ASSUMED. nvim 0.12 under kitty's
 -- keyboard protocol, keys delivered by xdotool, the bug-2 gesture recorded with
--- EVERY callback logged (`XREC_KEYS_RECORD_ALL=1`, xrec dbg-onkey-b2 take,
--- 2026-09-09):
+-- EVERY callback logged (`XREC_KEYS_RECORD_ALL=1`, xrec dbg-onkey-b2 take):
 --
 --   17 keys sent -> 18 callbacks.
 --
@@ -39,8 +36,8 @@
 --   `key` is the raw terminal code -- `vim.fn.keytrans` renders it `<t_...>`
 --   with a non-printable byte inside -- while `typed` is `u`. Both are logged
 --   and every byte outside printable ASCII is escaped `<HH>`, because the raw
---   bytes made the log a binary file: `grep` silently reported no matches in a
---   log full of them until this escape went in.
+--   bytes make the log a binary file: `grep` silently reports no matches in a
+--   log full of them.
 --
 -- COST, MEASURED (`M._test.bench`, this box, 5 runs of 1000 synthetic keys):
 --   callback body, format and queue only, no write:  6.0-6.9 us per key

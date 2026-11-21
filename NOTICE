@@ -49,7 +49,6 @@ Runtime provenance inventory:
 
 - post-fork original: `bin/yana-apply`
 - post-fork original: `bin/yana-changeset`
-- post-fork original: `bin/yana-jail`
 - post-fork original: `bin/yana-ledger`
 - post-fork original: `bin/yana-overlay`
 - post-fork original: `bin/yana-overlay-inner`
@@ -108,7 +107,6 @@ Runtime provenance inventory:
 - post-fork original: `lua/yana/safety/diary.lua`
 - post-fork original: `lua/yana/safety/flush.lua`
 - post-fork original: `lua/yana/safety/hash.lua`
-- post-fork original: `lua/yana/input/selection_scope.lua`
 - upstream-derived: `lua/yana/runtime/sessions.lua`
 - post-fork original: `lua/yana/shadow/apply.lua`
 - post-fork original: `lua/yana/shadow/jail.lua`
@@ -220,7 +218,7 @@ Runtime provenance inventory:
 - post-fork original: `lua/yana/hunk_ledger_lifecycle.lua`
 - post-fork original: `lua/yana/hunk_ledger_settle.lua`
 - post-fork original: `lua/yana/hunk_ledger_transport.lua`
-- post-fork original: `lua/yana/input/home_buffer_proposal.lua`
+- post-fork original: `lua/yana/input/submit_snapshot.lua`
 - post-fork original: `lua/yana/agent/model_hierarchy.lua`
 - post-fork original: `lua/yana/runtime/persisted_state.lua`
 - post-fork original: `lua/yana/runtime/recovery_entry.lua`
@@ -244,7 +242,6 @@ Runtime provenance inventory:
 - post-fork original: `lua/yana/review_reread_highlight.lua`
 - post-fork original: `lua/yana/review_resources.lua`
 - post-fork original: `lua/yana/review_tabs_close.lua`
-- post-fork original: `lua/yana/review_tabs_record.lua`
 - post-fork original: `lua/yana/review_turn_reset.lua`
 - post-fork original: `lua/yana/review_undo_replay.lua`
 - post-fork original: `lua/yana/review_undo_trace.lua`
@@ -261,7 +258,6 @@ Runtime provenance inventory:
 - post-fork original: `lua/yana/turn/turn.lua`
 - post-fork original: `lua/yana/turn/turn_bind.lua`
 - post-fork original: `lua/yana/turn/turn_file.lua`
-- post-fork original: `lua/yana/turn/turn_listeners.lua`
 - post-fork original: `lua/yana/turn/turn_overlay.lua`
 - post-fork original: `lua/yana/turn/turn_register.lua`
 - post-fork original: `lua/yana/turn/turn_settle.lua`
@@ -311,3 +307,11 @@ Runtime provenance inventory:
 - post-fork original: `lua/yana/runtime/yanad_recover.lua`
 - post-fork original: `lua/yana/ui.lua`
 - post-fork original: `lua/yana/yanad.lua`
+- post-fork original: `bin/lib/yana-confine/cgroup.sh`
+- post-fork original: `bin/lib/yanad/recovery_store.py`
+- post-fork original: `bin/yana-confine`
+- post-fork original: `lua/yana/runtime/mcp_inline.lua`
+- post-fork original: `lua/yana/runtime/mcp_inline_io.lua`
+- post-fork original: `lua/yana/panel/ui_review_nothing.lua`
+- post-fork original: `lua/yana/safety/diary_store.lua`
+- post-fork original: `lua/yana/shadow/git_shield.lua`

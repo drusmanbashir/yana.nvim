@@ -6,6 +6,7 @@ local register_factory = require("yana.review_watch_register")
 local flush_factory = require("yana.review_watch_flush")
 local splice = require("yana.hunk_anchor_splice")
 local timeline = require("yana.review_watch_timeline")
+local history = require("yana.review_history")
 
 local Watcher = {}
 Watcher.__index = Watcher
@@ -257,7 +258,7 @@ function Watcher.new(deps)
     if vim.api.nvim_get_current_buf() == bufnr then
       local ok, tree = pcall(vim.fn.undotree)
       if ok and type(tree) == "table" and type(tree.seq_cur) == "number" then
-        return tree.seq_cur
+        return tree.seq_cur, tree
       end
     end
     return (deps.buf_undo_seq and bufnr) and deps.buf_undo_seq(bufnr) or nil
@@ -306,7 +307,9 @@ function Watcher.new(deps)
       clear_queue = clear_queue,
       diff = diff,
     })
-    local process_pending_watch = flush.process_pending_watch
+    local function process_pending_watch()
+      if not history.native_pending(state) then return flush.process_pending_watch() end
+    end
     local on_insert_leave_ownership = flush.on_insert_leave_ownership
     state.on_insert_leave_ownership = on_insert_leave_ownership
     -- An `o` edit reaches on_bytes while Neovim still reports Normal mode, so
@@ -343,6 +346,8 @@ function Watcher.new(deps)
         if splice.is_noop(s) then
           return
         end
+        local undo_marker, undo_tree = callback_undo_marker(bufnr)
+        if history.native_splice(state, undo_tree) then return end
         local first, last_orig, last_new = splice.line_change(s)
         -- STAMPED HERE, not at flush time: only now is the state this change
         -- departs from still current. A BOUNDARY MARKER, not a sequence number.
@@ -352,7 +357,7 @@ function Watcher.new(deps)
           last_orig = last_orig,
           last_new = last_new,
           splice = s,
-          undo_marker = callback_undo_marker(bufnr),
+          undo_marker = undo_marker,
           barrier = state.reload_barrier or nil,
         }
         if not state.watch_suspended then
@@ -451,6 +456,7 @@ function Watcher.new(deps)
         -- Suspension mutes interpretation and ownership capture. The ledger
         -- geometry callback above consumed the edit, including native undo's inverse.
         if state.watch_suspended then
+          history.note_owned_splice(state, undo_tree, sr, sc, oer, oec, ner, nec)
           return
         end
         state.watch_changes = state.watch_changes or {}

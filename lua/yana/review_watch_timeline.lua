@@ -134,7 +134,7 @@ end
 
 -- The range the timeline observes for one member: its live authority mark, else -- for a decided member, which the
 -- painter leaves without marks (review_paint repaints pending hunks only) -- its band as the ledger transports it.
--- Without this, an edit in a buffer whose hunks are all decided filed no register row (LEDGER N46).
+-- Without this, an edit in a buffer whose hunks are all decided filed no register row.
 function M.member_range(read_range, bufnr, block)
   local first, last = read_range(bufnr, block)
   if first == nil and block.verdict ~= "pending" and type(block.new_start_line) == "number" then

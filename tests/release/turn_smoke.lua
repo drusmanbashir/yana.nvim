@@ -1,27 +1,6 @@
 local hunks_lib = dofile((debug.getinfo(1, "S").source:sub(2)):match("^(.*)/tests/") .. "/tests/headless/lib/hunks.lua")
--- turn_smoke.lua — the fresh-install smoke that actually spawns a turn.
---
--- Setup alone cannot prove that modules reached only during a turn shipped.
--- Drive a real confined turn from the installed tree, then exercise acceptance,
--- native undo after review closes, and an explicit save of the undone buffer.
---
--- Driven through the ORDINARY product path, no shortcuts: yana.panel.ui.open() +
--- yana.panel.ui.submit(), mode = "inline" (the confined path, real bwrap overlay,
--- same mechanism tests/release/confined_turn_smoke.lua already proves
--- works from an exported tree), with tests/release/turn_smoke_agent as the
--- fixture -- see that file's header for why it differs from
--- tests/release/fake-cursor-agent. Accepting the only hunk ends the review and
--- saves the accepted bytes. After End, ordinary Neovim undo changes only the
--- buffer; writing that buffer saves the restored bytes.
---
--- ENVIRONMENT: needs YANA_TURN_SMOKE_SCRATCH, a writable directory OUTSIDE
--- /tmp (same requirement, same reason, as tests/headless_gate.sh and
--- tests/release/confined_turn_gate.sh: the overlay applies `--tmpfs /tmp`
--- while building the bwrap sandbox, so a scratch placed under /tmp binds in
--- empty and the confined turn cannot run).
---
--- EXIT CODES: 0 pass, 1 a check failed, 65 bwrap unavailable (INCONCLUSIVE,
--- same convention tests/release/confined_turn_smoke.lua uses).
+-- Drive one installed-tree MCP turn through the panel and verify review,
+-- acceptance, native undo after End, and a save of the undone buffer.
 local repo = vim.fn.fnamemodify(debug.getinfo(1, "S").source:sub(2), ":p:h:h:h")
 vim.opt.runtimepath:prepend(repo)
 
@@ -40,15 +19,9 @@ local function die(msg)
   os.exit(1)
 end
 
-local jail = require("yana.shadow.jail")
-if not jail.available() then
-  print("TURN SMOKE INCONCLUSIVE: bwrap unavailable")
-  os.exit(65)
-end
-
 local scratch = os.getenv("YANA_TURN_SMOKE_SCRATCH")
 if not scratch or scratch == "" then
-  die("YANA_TURN_SMOKE_SCRATCH required (writable directory outside /tmp)")
+  die("YANA_TURN_SMOKE_SCRATCH required")
 end
 vim.fn.mkdir(scratch, "p")
 
@@ -77,7 +50,7 @@ require("yana.shadow.preview")._test.force_state_root = scratch .. "/state"
 
 require("yana").setup({
   mode = "inline",
-  backends = { cursor = { cmd = agent_fixture } },
+  backends = { default = "claude", claude = { cmd = agent_fixture } },
   sessions = { dir = scratch .. "/sessions-data", chats_dir = scratch .. "/chats" },
 })
 
@@ -133,7 +106,7 @@ local got_hunk = vim.wait(30000, function()
     and hunks_lib.pending_count(state) > 0
 end, 25)
 check(got_hunk and state ~= nil and hunks_lib.hunks(state) and hunks_lib.pending_count(state) > 0,
-  "a hunk appeared after the turn (overlay walk + inline_diff review, proves vendor_stream loaded)")
+  "a hunk appeared after the turn (MCP proposal + inline review)")
 
 if not state then
   print("TURN SMOKE panel state: " .. vim.inspect({

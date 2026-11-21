@@ -180,12 +180,6 @@ function M.close(s) close_session(s or active, false) end
 
 M._test = {}
 function M._test.active() return active end
-function M._test.selectable_values(s, col)
-	s = s or active
-	if not s or not contains(s.columns, col) then return s and {} or nil end
-	refresh_columns(s); matrix.rebuild_axes(s)
-	return vim.deepcopy(s.axes[col] or {})
-end
 function M._test.fixed(s) return s and vim.deepcopy(s.fixed) or {} end
 function M._test.move(s, col, value)
 	s = s or active
@@ -215,22 +209,7 @@ function M._test.click(s, col, value)
 	end
 	render(s)
 end
-function M._test.click_apply(s) return apply_session(s or active) end
-function M._test.active_cell(s)
-	s = s or active
-	return s and { col = s.active_col, value = s.active_val } or nil
-end
-function M._test.mouse_maps_installed(s)
-	s = s or active
-	if not (s and vim.api.nvim_buf_is_valid(s.buf)) then return false end
-	local found = {}
-	for _, map in ipairs(vim.api.nvim_buf_get_keymap(s.buf, "n")) do found[map.lhs] = map.desc end
-	return found["<LeftMouse>"] == "yana: model hierarchy press"
-		and found["<LeftRelease>"] == "yana: model hierarchy release"
-		and found["<MouseMove>"] == "yana: model hierarchy hover"
-end
 function M._test.spans(s) s = s or active; return s and s.spans or {} end
-function M._test.hl_usage() return { active = HL.hover, fixed = HL.flash, key = HL.key, dim = HL.dim, live = HL.live } end
 function M._test.geometry(s)
 	s = s or active
 	if not (s and vim.api.nvim_win_is_valid(s.win)) then return {} end

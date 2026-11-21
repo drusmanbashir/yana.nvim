@@ -47,9 +47,9 @@ function M.new(deps)
 	--- is validated against the very row on disk rather than against a second,
 	--- separately assembled idea of what was installed.
 	local function record_restore_temp(session, op, tmp_path, info)
-		-- Mutation seam (gate): the pre-fix restore, which installed an object and
-		-- went on to claim the completion without ever recording WHICH object it
-		-- installed. The completion gate is the only thing that notices.
+		-- Mutation seam (gate): installs an object and goes on to claim the completion
+		-- without recording WHICH object it installed. The completion gate is the only
+		-- thing that notices.
 		if test_state.fault.restore_temp_unrecorded then
 			return true, nil
 		end
@@ -132,8 +132,7 @@ function M.new(deps)
 		end
 		-- Mandatory above, so this branch is always taken for a file; only the
 		-- mutation seam in `checked_record_complete` can produce a hashless marker,
-		-- and skipping the comparison then is exactly the pre-fix behaviour it
-		-- reproduces.
+		-- and skipping the comparison then reproduces the mutation.
 		if checked.hash then
 			local content, rerr = read_bytes(path)
 			if content == nil then
@@ -155,8 +154,8 @@ function M.new(deps)
 			end
 		end
 		if test_state.fault.revert_identity_blind then
-			-- Mutation seam (gate): the pre-fix check, content and nothing else, in
-			-- the one place the swap is still visible.
+			-- Mutation seam (gate): checks content and nothing else, in the one place the
+			-- swap is still visible.
 			return true
 		end
 		if checked.dev == nil or checked.ino == nil then
@@ -355,9 +354,8 @@ function M.new(deps)
 					})
 				end
 
-				-- Mutation seam (gate): the pre-fix ordering, where the object was
-				-- removed first and the record of what it had been was written
-				-- afterwards.
+				-- Mutation seam (gate): removes the object first and writes the record of
+				-- what it had been afterwards.
 				local retain_late = test_state.fault.retain_after_unlink
 				if not retain_late then
 					local keep_ok, keep_err = retain_found()
@@ -442,8 +440,8 @@ function M.new(deps)
 				return true
 			end,
 			on_before_rename = function()
-				-- Mutation seam (gate): the pre-fix order, where the blocking
-				-- directory fsync ran AFTER the check that licenses the rename.
+				-- Mutation seam (gate): the blocking directory fsync runs AFTER the check that
+				-- licenses the rename.
 				if test_state.fault.restore_fsync_after_revalidate then
 					local drift_ok, drift_err = refuse_restore_drift(checked, path, accepted_op)
 					if not drift_ok then

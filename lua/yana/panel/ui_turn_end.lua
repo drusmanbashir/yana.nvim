@@ -12,7 +12,7 @@ local M = {}
 -- Every callback this service needs, by name. Building it one short is refused here,
 -- where the map is written, rather than failing later inside a turn.
 local REQUIRED = {
-  "shadow_turn_gen", "finalize_shadow_turn", "maybe_drain_queue", "submit_panel",
+  "shadow_turn_gen", "finalize_shadow_turn", "submit_panel",
   "turn_evidence_dir", "append", "render_error", "backend_label", "turn_ledger",
   "inline_review_opts", "flush_review_batch", "emit_turn_end", "build_apply_resend",
   "update_winbar", "panel_open", "stop_spinner", "buf_valid", "M",
@@ -26,7 +26,6 @@ function M.new(deps)
   end
   local shadow_turn_gen = deps.shadow_turn_gen
   local finalize_shadow_turn = deps.finalize_shadow_turn
-  local maybe_drain_queue = deps.maybe_drain_queue
   local submit_panel = deps.submit_panel
   local turn_evidence_dir = deps.turn_evidence_dir
   local append = deps.append
@@ -117,10 +116,24 @@ local function persist_session(p)
     end
   end
 end
+local function finish_handover(p)
+  local pending = p.prompt_handover
+  if not pending or p.finish_quit or p.busy or p.job or p.awaiting_exit then return end
+  local followup = require("yana.panel.ui_followup")
+  if followup.handover_waiting(p) then return end
+  p.prompt_handover = nil
+  if panel_open(p) then
+    submit_panel(p, { text = pending.text, redirect = pending.redirect, handover = pending })
+  else
+    p.pending_selection = p.pending_selection or pending.selection
+    followup.restore_prompt(p, pending.text)
+  end
+end
+
 local function on_done(p, gen, code, stderr, agent_outcome)
   log.buffer_event("agent_exit", { panel_id = p.id, generation = gen, exit_code = code,
     cancelled = p.cancelled == true, stale = gen ~= p.turn_gen })
-  if gen ~= p.turn_gen then
+  if p.finish_quit or gen ~= p.turn_gen then
     return
   end
   local L = ledger.ensure(p.id, gen)
@@ -128,7 +141,7 @@ local function on_done(p, gen, code, stderr, agent_outcome)
   p.busy = false
   local cancelled = p.cancelled
   p.cancelled = false
-  local completed_turn = p.job_shadow_turn or p.shadow_turn
+  local completed_turn = p.job_shadow_turn or p.job_mcp_run or p.shadow_turn or p.mcp_run
   -- jobstop() → exit 143 (SIGTERM). Intentional cancel already noted in the panel.
   local job_failed = (code ~= 0)
   local process_failure = agent_outcome and agent_outcome.failure
@@ -157,7 +170,7 @@ local function on_done(p, gen, code, stderr, agent_outcome)
     -- housekeeping beside it -- it decides nothing, and a dismissal is a no-op
     -- (review-apply.md:114-116, the same rule the close-tabs prompt is held to).
     pcall(function()
-      local turn = p.job_shadow_turn or p.shadow_turn
+      local turn = p.job_shadow_turn or p.job_mcp_run or p.shadow_turn or p.mcp_run
       local ap = turn and turn.yanad_answer_out
       if type(ap) ~= "string" or ap == "" or vim.fn.filereadable(ap) ~= 1 then
         return
@@ -197,7 +210,6 @@ local function on_done(p, gen, code, stderr, agent_outcome)
     cancelled = cancelled and true or false,
     changes = turn_changes,
     changes_pending = turn_pending,
-    queued = #p.queue,
     session_id = p.session_id,
     shell_steps_total = p.shell_steps_total or 0,
     shell_steps_failed = p.shell_steps_failed or 0,
@@ -233,9 +245,8 @@ local function on_done(p, gen, code, stderr, agent_outcome)
 
   -- p.job / awaiting_exit / job_spawn_gen: owned by on_exit_confirmed only
   -- (agent.lua fires that first). Never clear them here — a live turn's
-  -- drain/redirect may already own a newer job by the time a stale on_done
+  -- redirect may already own a newer job by the time a stale on_done
   -- would have run, and even the live-path clear races that contract.
-  p.active_turn_scope = nil
   stop_spinner(p)
   update_winbar(p)
   persist_session(p)
@@ -269,14 +280,14 @@ local function on_done(p, gen, code, stderr, agent_outcome)
   -- WITHOUT closing the pass.
   local end_reason = p.turn_end_reasons and p.turn_end_reasons[tostring(gen)] or nil
   if not (p.turn_end_emitted and p.turn_end_emitted[gen]) then
-    if not end_reason and not cancelled and not p.turn_errored and turn_changes == 0 and turn_pending == 0 and #p.queue == 0 then
+    if not end_reason and not cancelled and not p.turn_errored and turn_changes == 0 and turn_pending == 0 then
       end_reason = "no_changes"
     end
     end_reason = end_reason or "process exited"
     if p.turn_end_reasons then
       p.turn_end_reasons[tostring(gen)] = nil
     end
-    if p.turn_pass and tostring(p.turn_pass.generation) == tostring(gen) and p.shadow_turn == nil then
+    if p.turn_pass and tostring(p.turn_pass.generation) == tostring(gen) and p.shadow_turn == nil and p.mcp_run == nil then
       local pass = p.turn_pass
       require("yana.turn.turn_lifecycle").close_turn(pass, end_reason)
       emit_turn_end(p, pass, end_reason, outcome)
@@ -292,8 +303,7 @@ local function on_done(p, gen, code, stderr, agent_outcome)
     end
   end
 
-  -- Drain one queued follow-up (queued via submit_panel while p.busy was
-  -- true). Zero-edit advice must be decided BEFORE draining. Row 85: the
+  -- Finish the current turn before starting a handover. The
   -- turn_edits loop already existed for ask; extend it for edit-capable modes.
   -- Witness is p.changes for this generation (and optional force_turn_edits
   -- mutation hook) — NEVER a vendor subtype / tool_calls field.
@@ -303,7 +313,7 @@ local function on_done(p, gen, code, stderr, agent_outcome)
     turn_edits = ui_M._test.force_turn_edits
   end
   -- A follow-up publishes into the open review (ui_turn_shadow): no new change record is no empty turn.
-  if not cancelled and not p.turn_errored and turn_edits == 0 and #p.queue == 0 and not (p.turn_followups or {})[gen] then
+  if not cancelled and not p.turn_errored and turn_edits == 0 and not (p.turn_followups or {})[gen] then
     if resolved_mode == "ask" then
       local completed_question = p.turn_questions and p.turn_questions[gen]
       local completed_answer = p.turn_answers and p.turn_answers[gen]
@@ -346,30 +356,39 @@ local function on_done(p, gen, code, stderr, agent_outcome)
     end
   end
 
-  maybe_drain_queue(p)
-
   -- A turn that never established an upstream session must not consume lock
   -- authority (spawn failure, early agent exit before init).
   if job_failed and not cancelled and p.turns > 0 then
     p.turns = p.turns - 1
   end
+  finish_handover(p)
 end
 local function on_exit_confirmed(p, gen, _code)
   if p.job_spawn_gen ~= gen then
     return -- a newer job owns the panel; this is a late old exit
   end
-  do
-    local L = ledger.ensure(p.id, gen)
-    ledger.mark(L, "exit_confirmed")
-    ledger.set_current_event(L, nil)
+  p.awaiting_exit = false
+  local captured = p.job_shadow_turn or p.job_mcp_run
+  local L = ledger.ensure(p.id, gen)
+  ledger.mark(L, "exit_confirmed")
+  ledger.set_current_event(L, nil)
+  if p.finish_quit then
+    p.job, p.job_spawn_gen, p.job_shadow_turn, p.job_mcp_run = nil, nil, nil, nil
+    p.busy = false
+    local outcome = { exit_code = _code, cancelled = true, generation = gen, panel = p.id,
+      turn_id = captured and captured.turn_id, session_id = p.session_id }
+    p.turn_end_outcome = p.turn_end_outcome or {}
+    p.turn_end_outcome[gen] = outcome
+    ledger.close_turn(L, outcome)
+    p.finish_quit(captured)
+    return
   end
   -- Overlay consume first, then the report-batch flush. This is the only callback that
   -- fires for EVERY job death: a cancelled turn bumps turn_gen, so its on_done
   -- early-returns at the generation gate and would strand the overlay (and the old
   -- report batch) forever — unreviewed and unrevertable. It also must precede both the
-  -- pending_redirect submit and the was_awaiting drain below, or a new turn starts
+  -- pending_redirect submit below, or a new turn starts
   -- owning the old turn's batch.
-  local captured = p.job_shadow_turn
   if captured then captured.agent_exit_code = _code end
   -- job_shadow_turn is already bound to this job, and job_spawn_gen above
   -- proved this callback owns that job. Older/recovered turn records may not
@@ -386,24 +405,13 @@ local function on_exit_confirmed(p, gen, _code)
   flush_review_batch(p)
   p.job = nil
   p.job_spawn_gen = nil
-  p.job_shadow_turn = nil
-  local was_awaiting = p.awaiting_exit
-  p.awaiting_exit = false
+  p.job_shadow_turn, p.job_mcp_run = nil, nil
   local text = p.pending_redirect
   p.pending_redirect = nil
   update_winbar(p)
-  local held = p.shadow_turn ~= nil
   if text then
-    if held or not panel_open(p) then
-      -- Held: prior turn is finalized but not released (review open). Do not
-      -- start a new jailed turn on top of it. Closed panel: same as before.
-      table.insert(p.queue, 1, text)
-    else
-      submit_panel(p, { text = text, redirect = true })
-    end
-  elseif was_awaiting and not held then
-    -- Prompts submitted while the exit was pending queued up; fire them now.
-    maybe_drain_queue(p)
+    p.prompt_handover = { text = text, redirect = true }
+    finish_handover(p)
   end
 end
 local function set_model_actual(p, gen, model)
@@ -415,6 +423,7 @@ local function set_model_actual(p, gen, model)
 end
 
   return {
+    finish_handover = finish_handover,
     persist_session = persist_session,
     on_done = on_done,
     on_exit_confirmed = on_exit_confirmed,

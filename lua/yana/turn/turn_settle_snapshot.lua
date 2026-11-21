@@ -157,7 +157,7 @@ function M.snapshot_of(f, purpose)
       -- A creation's path EXISTENCE now (one lstat, never content), and whether it
       -- is still exactly the file its review buffer last wrote (stat identity):
       -- only the operator's own save may be removed when a creation ends absent
-      -- (CORE "Saving is Neovim's", LEDGER N51).
+      -- (CORE "Saving is Neovim's").
       present = is_creation and (vim.uv or vim.loop).fs_lstat(change.path or f.path) ~= nil or nil,
       saved = is_creation and require("yana.turn.turn_save_record").matches(change.path or f.path) or nil,
     },
@@ -168,6 +168,7 @@ function M.snapshot_of(f, purpose)
     },
     hunks = M.hunks_of(f, buffer and buffer.lines or nil),
     operation_verdict = f.operation_verdict,
+    renamed_from = change.renamed_from,
     -- Accepted work and the effective accepted mode an earlier cycle's version
     -- owes End, and the text a later version's hunks index (F-ADDENDUM-CARRY).
     carried = f.carried == true,
@@ -205,7 +206,7 @@ end
 --- file whose final buffer Neovim calls 'modified' is still saved through the
 --- buffer, so whatever the operator's `:w` put on disk during the review --
 --- pending agent lines included -- never outlives End (CORE "Saving is
---- Neovim's", LEDGER N51). Never a disk read. A kept deletion projects from the
+--- Neovim's"). Never a disk read. A kept deletion projects from the
 --- original, not from its buffer, so its buffer owes the terminal text when it
 --- does not hold it. Absence (`plan.bytes == nil`) owes nothing.
 function M.buffer_owes_save(f, plan)

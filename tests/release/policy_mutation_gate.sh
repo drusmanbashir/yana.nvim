@@ -159,6 +159,15 @@ expect_red development-config-manifest \
 	"manifest path outside the allowed public classes: lua/yana/config_development.lua" \
 	"$case_tree/scripts/release/verify.sh" "$case_tree" "v$version"
 
+case_tree=$(copy_case development-helper-manifest)
+helper=lua/yana/development/repl_prompt.lua
+mkdir -p "$case_tree/${helper%/*}"
+printf '%s\n' 'return {}' >"$case_tree/$helper"
+LC_ALL=C sort -u -o "$case_tree/scripts/release/manifest.txt" \
+	<(cat "$case_tree/scripts/release/manifest.txt"; printf '%s\n' "$helper")
+expect_red development-helper-manifest "manifest path outside the allowed public classes: $helper" \
+	"$case_tree/scripts/release/verify.sh" "$case_tree" "v$version"
+
 case_tree=$(copy_case legacy-bytes)
 printf '%s%s\n' neo cursor >>"$case_tree/README.md"
 expect_red legacy-bytes "forbidden bytes in README.md" \
@@ -365,9 +374,9 @@ PY
 expect_red missing-ci-guard "release must require exact-commit CI" \
 	"$case_tree/scripts/release/verify.sh" "$case_tree" "v$version"
 
-case_tree=$(copy_case bubblewrap-doc-drift)
-sed -i 's/^  userns,$/  network,/' "$case_tree/README.md"
-expect_red bubblewrap-doc-drift "Bubblewrap AppArmor profile differs in README.md" \
+case_tree=$(copy_case bubblewrap-dependency)
+sed -i 's/install -y ripgrep python3/install -y bubblewrap ripgrep python3/' "$case_tree/.github/workflows/ci.yml"
+expect_red bubblewrap-dependency "CI system dependencies contain Bubblewrap" \
 	"$case_tree/scripts/release/verify.sh" "$case_tree" "v$version"
 
 case_tree=$(copy_case mode-drift)
@@ -382,10 +391,10 @@ mkdir -p "$scratch/yanad-py-out"
 expect_red yanad-py-executable "must be mode 644" \
 	env SOURCE_DATE_EPOCH=1787170000 "$case_tree/scripts/release/archive.sh" "$case_tree" "$scratch/yanad-py-out"
 
-case_tree=$(copy_case overlay-sh-nonexec)
-chmod 644 "$case_tree/bin/lib/yana-overlay/yanad.sh"
-mkdir -p "$scratch/overlay-sh-out"
-expect_red overlay-sh-nonexec "must be mode 755" \
-	env SOURCE_DATE_EPOCH=1787170000 "$case_tree/scripts/release/archive.sh" "$case_tree" "$scratch/overlay-sh-out"
+case_tree=$(copy_case confine-nonexec)
+chmod 644 "$case_tree/bin/yana-confine"
+mkdir -p "$scratch/confine-out"
+expect_red confine-nonexec "helper is not executable: bin/yana-confine" \
+	env SOURCE_DATE_EPOCH=1787170000 "$case_tree/scripts/release/archive.sh" "$case_tree" "$scratch/confine-out"
 
 echo "POLICY MUTATION GATE PASS"

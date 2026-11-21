@@ -1,0 +1,180 @@
+#!/usr/bin/env bash
+# Register a protected MCP agent with the daemon and own its process group.
+set -euo pipefail
+
+dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly CGROUP_MOUNT=/sys/fs/cgroup CGROUP_SLICE_NAME=yana.slice
+source "$dir/lib/yana-confine/cgroup.sh"
+state_root=${YANA_STATE_ROOT:-${XDG_STATE_HOME:-"$HOME/.local/state"}/yana}
+workspace=
+runtime_dir=
+session=
+auto_session=0
+turn=
+mode=
+generation=0
+resume=0
+touched=()
+launch_args=("$@")
+
+usage() {
+	cat <<'HELP'
+Usage: yana-confine --workspace DIR --runtime-dir DIR --turn ID
+                    --mode ask|inline (--session ID | --session-auto)
+                    [--generation N] [--resume] -- CMD [ARGS...]
+HELP
+}
+
+die_usage() {
+	printf 'yana-confine: %s\n' "$*" >&2
+	exit 64
+}
+
+while (( $# )); do
+	case $1 in
+		--help|-h) usage; exit ;;
+		--session-auto) auto_session=1; shift ;;
+		--resume) resume=1; shift ;;
+		--) shift; break ;;
+		--workspace|--runtime-dir|--session|--turn|--mode|--generation|--touched)
+			(( $# >= 2 )) || die_usage "$1 requires a value"
+			case $1 in
+				--workspace) workspace=$2 ;;
+				--runtime-dir) runtime_dir=$2 ;;
+				--session) session=$2 ;;
+				--turn) turn=$2 ;;
+				--mode) mode=$2 ;;
+				--generation) generation=$2 ;;
+				--touched) touched+=("$2") ;;
+			esac
+			shift 2
+			;;
+		*) die_usage "unexpected argument: $1" ;;
+	esac
+done
+(( $# )) || die_usage "missing command after --"
+[[ -n $workspace && -d $workspace ]] || die_usage "--workspace must name an existing directory"
+[[ -n $runtime_dir && -d $runtime_dir ]] || die_usage "--runtime-dir must name an existing directory"
+[[ $mode == ask || $mode == inline ]] || die_usage "--mode must be ask or inline"
+[[ -n $turn && $turn != . && $turn != .. && $turn != */* && $turn != *$'\n'* ]] || die_usage "invalid --turn"
+[[ $generation =~ ^[0-9]+$ ]] || die_usage "invalid --generation"
+state_root=$(realpath -m -- "$state_root")
+runtime_dir=$(realpath -m -- "$runtime_dir")
+workspace=$(realpath -- "$workspace")
+[[ ${runtime_dir%/*} == "$state_root/mcp-runtime" && ${runtime_dir##*/} == ym* ]] \
+	|| die_usage "--runtime-dir must be one Yana MCP socket directory"
+agent_dir=$state_root/mcp-agent
+if [[ -L $agent_dir ]] || ! mkdir -p -m 700 -- "$agent_dir" \
+	|| [[ ! -O $agent_dir || $(stat -c %a -- "$agent_dir") != 700 ]]; then
+	printf 'yana-confine: cannot open a private agent directory at %s\n' "$agent_dir" >&2
+	exit 66
+fi
+shopt -s dotglob nullglob
+entries=("$agent_dir"/*)
+shopt -u dotglob nullglob
+if (( ${#entries[@]} )); then
+	printf 'yana-confine: the private agent directory must be empty: %s\n' "$agent_dir" >&2
+	exit 66
+fi
+cgroup_ensure_user_scope "$0" "${launch_args[@]}" || exit 66
+
+daemon_call() {
+	PYTHONPATH="$dir/lib" python3 -m yanad.client --root "$state_root" --owner-pid "$$" \
+		--kind launcher --id "$1" "$2" --json "$3"
+}
+
+if [[ -z $session ]]; then
+	(( auto_session )) || die_usage "--session or --session-auto is required"
+	body=$(PYTHONPATH="$dir/lib" python3 - "$workspace" "$$" <<'PY'
+import json
+import sys
+
+from yanad.client import owner_identity
+
+print(json.dumps({"workspace": sys.argv[1], "backend": "launcher", "kind": "cli",
+                  "owner": owner_identity(int(sys.argv[2]))}))
+PY
+)
+	reply=$(daemon_call "$turn:session.create" session.create "$body")
+	session=$(python3 -c 'import json, sys; print(json.load(sys.stdin)["result"]["session_id"])' <<<"$reply")
+fi
+
+if ! cgroup_enter "$turn" >/dev/null; then
+	printf 'yana-confine: %s\n' "$CGROUP_UNAVAILABLE_REASON" >&2
+	exit 66
+fi
+body=$(python3 - "$session" "$turn" "$mode" "$workspace" "$TURN_CGROUP" "$generation" "$resume" "${touched[@]}" <<'PY'
+import json
+import sys
+
+session, turn, mode, root, cgroup, generation, resume, *files = sys.argv[1:]
+payload = {"session_id": session, "turn_id": turn, "mode": mode,
+           "mounted_root": root, "roots": [], "cgroup": cgroup,
+           "files": files, "generation": int(generation)}
+if resume == "0":
+    payload["source"] = "buffer"
+print(json.dumps(payload))
+PY
+)
+command=turn.request
+request_id="$turn:$command"
+if (( resume )); then
+	command=turn.resume
+	request_id="$turn:g$generation:$command"
+fi
+report_refusal() {
+	python3 -c 'import json, sys; f = json.load(sys.stdin); print(f.get("code"), f.get("result", {}).get("reason") or "")' <<<"$1" >&2
+}
+if reply=$(daemon_call "$request_id" "$command" "$body"); then
+	if ! python3 -c '
+import json, sys
+result = json.load(sys.stdin)["result"]
+launch = result.get("launch", result)
+sys.exit(0 if "layers" in launch and launch["layers"] is None else 1)
+' <<<"$reply"; then
+		printf 'yana-confine: incompatible launch response for an MCP turn; restart the Yana daemon and retry\n' >&2
+		exit 66
+	fi
+else
+	rc=$?
+	if (( rc == 65 )); then report_refusal "$reply"; fi
+	exit "$rc"
+fi
+
+run_agent() {
+	unset NVIM NVIM_LISTEN_ADDRESS VIM VIMRUNTIME GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_INDEX_FILE
+	cd -- "$agent_dir"
+	export GIT_CEILING_DIRECTORIES="$state_root"
+	exec "$@"
+}
+
+cancelled=0
+run_agent "$@" 0<&0 &
+child=$!
+trap 'cancelled=1; kill -TERM "$child" 2>/dev/null || true' TERM INT HUP
+while true; do
+	if wait "$child"; then rc=0; else rc=$?; fi
+	kill -0 "$child" 2>/dev/null || break
+done
+trap - TERM INT HUP
+outcome=ok
+(( rc == 0 )) || outcome=failed
+(( cancelled == 0 )) || outcome=cancelled
+if ! cgroup_leave_launcher; then
+	printf 'yana-confine: %s\n' "$CGROUP_LEAVE_REASON" >&2
+	exit 66
+fi
+body=$(python3 - "$session" "$turn" "$outcome" "$generation" <<'PY'
+import json
+import sys
+
+session, turn, outcome, generation = sys.argv[1:]
+print(json.dumps({"session_id": session, "turn_id": turn, "outcome": outcome,
+                  "generation": int(generation)}))
+PY
+)
+end_rc=0
+reply=$(daemon_call "$turn:turn.end" turn.end "$body") || end_rc=$?
+if (( end_rc == 65 )); then report_refusal "$reply"; fi
+if (( rc != 0 )); then exit "$rc"; fi
+exit "$end_rc"

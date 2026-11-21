@@ -4,6 +4,79 @@ local parked = require("yana.review_bulk_parked")
 local disclosure = require("yana.review_bulk_disclosure")
 
 local Factory = {}
+Factory.refusal_message = "undo those edits or accept the rename"
+
+function Factory.linked_files(file)
+  local turn, change = file and file.turn, file and file.change or {}
+  if not turn then return nil end
+  local target, source
+  if change.renamed_from then
+    target, source = file, turn:file(change.renamed_from)
+  elseif change.renamed_to then
+    target, source = turn:file(change.renamed_to), file
+  end
+  if not target and not source then return nil end
+  if not target or not source then return nil, "rename partner is not a Turn member" end
+  return { target, source }
+end
+
+function Factory.record_pair_decision(files, verdict, state, select_text)
+  local target, entries, changed = files[1], {}, false
+  if verdict == "rejected" and target.ledger:count("accepted") > 0 then
+    return false, Factory.refusal_message
+  end
+  if files[2].review_opts == nil and target.review_opts ~= nil then
+    local ok, err = files[2]:refresh({ review_opts = target.review_opts })
+    if not ok then return false, err end
+  end
+  for _, file in ipairs(files) do
+    if file.turn:is_frozen() then return false, "turn is frozen for End" end
+    if file.operation == nil then return false, "rename partner has no operation" end
+    local previous = file.operation_verdict or "pending"
+    local blocks = select_text and file.ledger:pending() or {}
+    changed = changed or previous ~= verdict or #blocks > 0
+      or (verdict == "rejected" and file.ledger:count() > 0)
+    entries[#entries + 1] = { rel = file.change.rel or file.path, file = file, change = file.change,
+      ledger = file.ledger, blocks = blocks, operation = previous ~= verdict and {
+        file = file, file_path = file.path, change = file.change, change_id = file.change_id,
+        previous = previous, next = verdict,
+      } or nil }
+  end
+  if not changed then return true end
+  local rejected_count, complete = 0, true
+  if verdict == "rejected" and target.ledger:count() > 0 then
+    local review = target.review_state or state
+    if not review or not review._ops then return false, "rename edits have no live review" end
+    local i = 1
+    while i <= target.ledger:count() do
+      local before = target.ledger:count()
+      review._ops.reject_block_at(i, true, true)
+      local removed = before - target.ledger:count()
+      if removed == 0 then complete = false; i = i + 1
+      else rejected_count = rejected_count + removed end
+    end
+  end
+  local operations = {}
+  for _, entry in ipairs(entries) do
+    if complete and entry.operation then operations[#operations + 1] = entry.operation end
+  end
+  if not complete and rejected_count == 0 then return false, "rename edits could not be rejected" end
+  local change = target.change
+  local ok, result = pcall(function()
+    return require("yana.turn.turn_register"):push({ kind = verdict == "rejected" and "decision" or "accept_turn_step",
+      rel = change.rel or target.path,
+      workspace = change.review_workspace or (state and state.opts and state.opts.workspace) or vim.fn.getcwd(),
+      turn_id = change.turn_id or change.turn_gen, files = entries,
+      operations = verdict == "rejected" and operations or nil, count = rejected_count })
+  end)
+  if not ok or result == false then return false, "rename decision history refused: " .. tostring(result) end
+  for _, entry in ipairs(entries) do
+    if complete and entry.operation then assert(entry.file:decide_operation(verdict)) end
+    if select_text then entry.ledger:decide_all("accept") end
+  end
+  if not complete then return false, "rename edits could not all be rejected" end
+  return true
+end
 
 function Factory.new(deps)
   local M = deps.facade
@@ -31,7 +104,7 @@ function Factory.new(deps)
       return nil
     end
     local members = file.ledger and type(file.ledger.members) == "function" and file.ledger:members() or {}
-    if #members > 0 or file.operation_verdict == verdict then
+    if (#members > 0 and not Factory.linked_files(file)) or file.operation_verdict == verdict then
       return nil
     end
     return {
@@ -57,6 +130,14 @@ function Factory.new(deps)
   end
 
     local function reject_all()
+      local turn = require("yana.turn.turn_bind").get(pool_for(state.opts or {}))
+      local pair = Factory.linked_files(turn and turn:file(diff.abs_path(change.path)))
+      if pair then
+        local ok, err = Factory.record_pair_decision(pair, "rejected", state)
+        if not ok then notify_one_line("yana: " .. tostring(err), vim.log.levels.WARN); return false end
+        M._poll_leave_edge(state, "reject_rename")
+        return true
+      end
       record_decision(state, "reject_file", { hunks_remaining = state.hunk_ledger:count() })
       -- A hunk already decided is a RECORDED decision and stands. This record has only
       -- ever claimed the REMAINING hunks (hunks_remaining), so the old whole-file
@@ -172,10 +253,10 @@ function Factory.new(deps)
         -- What a PARKED change contributes: its own staged bytes, and the
         -- reason it cannot be used if the human moved them after the park.
         local parked_text, parked_err, parked_bufnr = parked_composition(change_i)
-        -- Control-plane fail-safe before any accept write, covering
-        -- BOTH the shadow_apply route and the legacy direct write/delete below.
+        -- Control-plane fail-safe before any accept write.
         -- Classify the lexical path so a `.git` name is not resolved away.
-        if control_plane.is_control_plane(diff.abs_path_literal(change_i.path)) then
+        if control_plane.is_control_plane_in(diff.abs_path_literal(change_i.path),
+          change_i.root and diff.abs_path_literal(change_i.root)) then
           change_i.review_error = "refused — control-plane path (never written): " .. change_i.path
           table.insert(skipped, change_i.rel or path)
           table.insert(to_requeue, item)
@@ -193,11 +274,8 @@ function Factory.new(deps)
         -- the turn immediately, pending, so the turn's count is honest even if the
         -- write below refuses.
         --
-        -- THE DELETED GUARD, named so it cannot come back: `buffer_clash` stood here
-        -- and refused any queued file whose buffer was `modified`. It was a per-FILE
-        -- answer to a per-HUNK question. Nothing is refused for overlapping your
-        -- edit either: each agent edit is placed on B1, the buffer as the agent
-        -- left it.
+        -- Nothing is refused because the buffer is `modified`: each agent edit is
+        -- placed on B1, the buffer as the agent left it.
         local file_ledger, materialize_err
         -- End starts from the text the ledger's rows are counted in: B1 when the
         -- edits were placed on it, else B0.
@@ -226,8 +304,7 @@ function Factory.new(deps)
             path = path,
             ledger = file_ledger,
             change = change_i,
-            -- The press no longer spends these inputs. Turn exit needs them to
-            -- compose and save this selected file's projection.
+            -- Turn exit needs these inputs to compose and save this selected file's projection.
             base_text = base_text,
             bufnr = parked_bufnr,
             review_opts = item.opts,
@@ -308,6 +385,34 @@ function Factory.new(deps)
           file = active_file,
           operation = active_operation,
         }
+      end
+
+      local selected = {}
+      if active_file then selected[active_file] = true end
+      for _, entry in ipairs(bulk_files) do selected[entry.file or entry] = true end
+      local participants = {}
+      if active_file then participants[#participants + 1] = active_file end
+      for _, entry in ipairs(bulk_files) do
+        if entry.file then participants[#participants + 1] = entry.file end
+      end
+      for _, participant in ipairs(participants) do
+        local pair = Factory.linked_files(participant)
+        for _, file in ipairs(pair or {}) do
+          if not selected[file] then
+            selected[file] = true
+            if file.review_opts == nil then
+              local refreshed, err = file:refresh({ review_opts = participant.review_opts })
+              if not refreshed then
+                st.queue = drained
+                notify_one_line("yana: cA refused — " .. tostring(err), vim.log.levels.WARN)
+                return false
+              end
+            end
+            bulk_files[#bulk_files + 1] = { rel = file.change.rel or file.path, file = file, change = file.change,
+              ledger = file.ledger, blocks = file.ledger:pending(), operation = operation_transition(file, "accepted"),
+              band_bufnr = file.bufnr }
+          end
+        end
       end
 
       if active_entry and not operation_ready(active_entry.operation) then

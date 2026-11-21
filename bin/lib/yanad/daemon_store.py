@@ -1,12 +1,12 @@
 """U2 daemon API over the authoritative U1 store implementation."""
 
-import hashlib
 import os
 import time
 from pathlib import Path
 
-from . import liveness
 from . import store as base
+from .recovery_store import (load_end_record, publish_end_record, abandon_end_record,
+                             clear_end_record)
 
 
 Refused = base.Refused
@@ -17,6 +17,7 @@ close_review = base.close_review
 replay = base.replay
 atomic_json = base.write_json_atomic
 clear_turn_workdirs = base._clear_turn_workdirs
+discard_dead_session = base.discard_dead_session
 
 
 def read_json(path):
@@ -36,46 +37,10 @@ def load_session(root, session_id):
     return read_json(path)
 
 
-def _review_files(path):
-    lines = path.read_text(encoding="utf-8").splitlines()
-    if not lines or lines[0] != "yana-review-files 1":
-        raise ValueError("invalid review files header")
-    return lines[1:]
-
-
 def load_recovery(root, session_id):
-    session_dir = Path(root) / "sessions" / session_id
-    review = session_dir / "review"
-    if not (review / "open").exists():
-        return None
-    try:
-        opened = read_json(review / "open")
-        turn_id = opened["turn_id"]
-        turn_dir = session_dir / "turns" / turn_id
-        meta = read_json(turn_dir / "meta.json")
-        bundle = read_json(review / "bundle.json")
-        tabs = read_json(review / "tabs.json")
-        files = _review_files(review / "files")
-    except (OSError, KeyError, TypeError, ValueError) as exc:
-        raise Refused("review_unreadable", str(exc)) from exc
-    if not isinstance(bundle, list) or not bundle:
-        raise Refused("review_unreadable", "review bundle is missing or empty")
-    root_layers = {}
-    roots_dir = turn_dir / "roots"
-    if roots_dir.exists():
-        root_layers = {path.name: str(path) for path in sorted(roots_dir.iterdir()) if path.is_dir()}
-    return {
-        "turn_id": turn_id,
-        "generation": run_generation(meta),
-        "cycles": cycle_count(meta),
-        "turn_dir": str(turn_dir),
-        "mounted_root": meta.get("mounted_root"),
-        "roots": meta.get("roots", []),
-        "layers": {"workspace": str(turn_dir / "layer"), "roots": root_layers},
-        "files": files,
-        "tabs": tabs,
-        "bundle": bundle,
-    }
+    """Only a frozen End survives editor death."""
+    frozen = load_end_record(root, session_id)
+    return {"kind": "frozen_end", "record": frozen} if frozen is not None else None
 
 
 def rebind_session(root, session_id, owner):
@@ -84,24 +49,6 @@ def rebind_session(root, session_id, owner):
     session["owner"] = owner
     session.pop("dead", None)
     atomic_json(session_path, session)
-    return session
-
-
-def rebind_review(root, session_id, owner, recovery):
-    session_dir = Path(root) / "sessions" / session_id
-    pointers = sorted((Path(root) / "claims").glob(f"*/reviews/{session_id}"))
-    if not pointers:
-        raise Refused("review_unreadable", "review claim pointers are missing")
-    session = rebind_session(root, session_id, owner)
-
-    opened_path = session_dir / "review" / "open"
-    opened = read_json(opened_path)
-    opened["owner"] = owner
-    atomic_json(opened_path, opened)
-    set_turn_state(root, session_id, recovery["turn_id"], "reviewing")
-
-    for pointer in pointers:
-        write_claim_row(root, pointer.parent.parent.name, session_id, recovery["turn_id"], "reviewing")
     return session
 
 
@@ -138,7 +85,9 @@ def resume_turn(root, session_id, turn_id, owner, cgroup, generation, log=None):
     change set), private/ and review/open stay. meta.json names the new writer.
     """
     turn_dir = Path(root) / "sessions" / session_id / "turns" / turn_id
-    layers = [turn_dir / "layer"]
+    # A buffer turn has no layer (turn_dir layers=False) and resumes without one.
+    has_layer = (turn_dir / "layer").is_dir()
+    layers = [turn_dir / "layer"] if has_layer else []
     roots_dir = turn_dir / "roots"
     if roots_dir.is_dir():
         layers.extend(sorted(path for path in roots_dir.iterdir() if path.is_dir()))
@@ -148,32 +97,19 @@ def resume_turn(root, session_id, turn_id, owner, cgroup, generation, log=None):
         base._bare_layer(str(layer))
     meta = read_json(turn_dir / "meta.json")
     old = meta["state"]
-    meta.update({"state": "running", "owner": owner, "cgroup": cgroup, "generation": generation,
-                 "cycles": cycle_count(meta) + 1})
+    meta.update({"state": "running", "owner": owner, "cgroup": cgroup, "generation": generation})
     meta.pop("reason", None)
     atomic_json(turn_dir / "meta.json", meta)
     if log is not None:
         log.write("DEBUG", "turn state session=%s turn=%s from=%s to=running trigger=turn.resume generation=%d"
                   % (session_id, turn_id, old, generation))
+    if not has_layer:
+        return {"turn_dir": str(turn_dir), "layers": None}
     return {
         "turn_dir": str(turn_dir),
         "layers": {"workspace": str(turn_dir / "layer"),
                    "roots": {path.name: str(path) for path in layers[1:]}},
     }
-
-
-def cycle_count(meta):
-    """Runs of the Turn that got past launch (turn.request's run is 1; each admitted
-    turn.resume adds one, a verified launch rollback takes it back). Read by the
-    interim recovery decline (plan "Milestones")."""
-    return int(meta["cycles"]) if "cycles" in meta else 1
-
-
-def uncount_cycle(root, session_id, turn_id):
-    path = Path(root) / "sessions" / session_id / "turns" / turn_id / "meta.json"
-    meta = read_json(path)
-    meta["cycles"] = cycle_count(meta) - 1
-    atomic_json(path, meta)
 
 
 def review_generation(meta):
@@ -319,129 +255,3 @@ def delete_session(root, session_id, log=None, cause=None):
     removed = base.delete_session(root, session_id, log=log, cause=cause)
     clear_claim_rows(root, session_id)
     return removed
-
-
-def _file_sha256(path):
-    digest = hashlib.sha256()
-    with open(path, "rb") as fh:
-        for chunk in iter(lambda: fh.read(65536), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def _bundle_row_stale(row):
-    """Return (path, reason) when the row cannot restore, else (None, None)."""
-    if not isinstance(row, dict):
-        return None, None
-    path = row.get("path")
-    if not isinstance(path, str) or path == "":
-        return None, None
-    # A file snapshotted at submit keeps its B0 in the record (review_before);
-    # its review restores from that, so a changed disk file does not make it
-    # stale.
-    if isinstance(row.get("review_before"), str) and row.get("home_buffer_only") is not True:
-        return None, None
-    base_state = row.get("base_state")
-    expected = row.get("base_hash")
-    if base_state == "absent":
-        if os.path.lexists(path):
-            return path, "base_hash_mismatch"
-        return None, None
-    if base_state != "file" or not isinstance(expected, str):
-        return path, "base_hash_mismatch"
-    if not os.path.isfile(path):
-        return path, "base_hash_mismatch"
-    try:
-        actual = _file_sha256(path)
-    except OSError:
-        return path, "base_hash_mismatch"
-    if actual != expected:
-        return path, "base_hash_mismatch"
-    return None, None
-
-
-def _log_recovery_pruned(log, path, turn_id, reason):
-    """One DEBUG lifecycle line per silent prune: path, turn_id, reason."""
-    if log is None:
-        return
-    log.write(
-        "DEBUG",
-        "recovery.pruned path=%s turn_id=%s reason=%s" % (path, turn_id, reason),
-    )
-
-
-def prune_stale_recoveries(root, log=None):
-    """Drop open reviews that can never restore (hash drift or missing mode).
-
-    Called at status/discovery so the offer list never names a session that
-    would only refuse on accept. Silent: no dialog, one DEBUG `recovery.pruned`
-    line per deletion.
-
-    The offer list is scoped by R-b to sessions NOT attached to a LIVE Neovim
-    (liveness = the daemon's `pidfd`, never a file), so a review whose owning
-    editor is still live is never a recovery candidate and is never pruned:
-    deleting it would destroy retained proposal bytes the editor still owns.
-    A dead or unknown owner prunes exactly as before.
-    """
-    pruned = []
-    for sess in list(iter_sessions(root, log=log)):
-        sid = sess["session_id"]
-        review_open = (Path(root) / "sessions" / sid / "review" / "open").exists()
-        if not review_open:
-            continue
-        if liveness.owner_kind(sess.get("owner")) == "live":
-            continue
-        try:
-            recovery = load_recovery(root, sid)
-        except Refused:
-            continue
-        if not recovery:
-            continue
-        turn_id = recovery.get("turn_id")
-        try:
-            meta = read_json(Path(recovery["turn_dir"]) / "meta.json")
-        except (OSError, ValueError, TypeError):
-            meta = {}
-        mode = meta.get("mode") if isinstance(meta, dict) else None
-        if not isinstance(mode, str) or mode == "":
-            try:
-                delete_session(root, sid, log=log, cause="missing_mode")
-            except Refused as exc:
-                if log is not None:
-                    log.write(
-                        "WARN",
-                        "stale recovery prune skipped session=%s turn=%s code=%s"
-                        % (sid, turn_id, exc.code),
-                    )
-                continue
-            _log_recovery_pruned(log, None, turn_id, "mode_missing")
-            pruned.append({
-                "session_id": sid,
-                "turn_id": turn_id,
-                "path": None,
-                "reason": "mode_missing",
-            })
-            continue
-        for row in recovery.get("bundle") or []:
-            path, reason = _bundle_row_stale(row)
-            if reason is None:
-                continue
-            try:
-                delete_session(root, sid, log=log, cause="base_hash_drift")
-            except Refused as exc:
-                if log is not None:
-                    log.write(
-                        "WARN",
-                        "stale recovery prune skipped session=%s turn=%s code=%s"
-                        % (sid, turn_id, exc.code),
-                    )
-                continue
-            _log_recovery_pruned(log, path, turn_id, reason)
-            pruned.append({
-                "session_id": sid,
-                "turn_id": turn_id,
-                "path": path,
-                "reason": reason,
-            })
-            break
-    return pruned

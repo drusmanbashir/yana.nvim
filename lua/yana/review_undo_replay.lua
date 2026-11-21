@@ -87,7 +87,15 @@ function Factory.new(deps)
     --- The redo half of one popped decision, called when the top of the
     --- cross-file redo register is a decision this review popped. Refuses when
     --- the buffer has moved since (row r75_new_action_prunes_redo).
-    local function redo_local(entry)
+    local function resume_watcher(native_branch)
+      local function resume()
+        state.watch_suspended = false
+        state.watch_changes = {}
+      end
+      if native_branch == true then resume() else vim.schedule(resume) end
+    end
+
+    local function redo_local(native_branch)
       local stack = state.undone_decisions or {}
       local top = stack[#stack]
       if top == nil then
@@ -110,7 +118,7 @@ function Factory.new(deps)
       local after = before
       if top.action ~= "accept" then
         local ok, err = pcall(vim.api.nvim_buf_call, bufnr, function()
-          vim.cmd("silent redo")
+          vim.cmd(native_branch == true and ("silent undo " .. tonumber(top.post_seq)) or "silent redo")
         end)
         if not ok then
           log.write("WARN", "yana.inline_diff redo: " .. tostring(err))
@@ -193,16 +201,14 @@ function Factory.new(deps)
         state.staged_text = snap
         state.latest_undo_seq = buf_undo_seq(bufnr)
       end
+      if top.action == "reject" and top.pre_seq ~= top.post_seq then L:observe_buffer_seq(top.post_seq) end
       rerender_after_history_move("native_redo")
-      vim.schedule(function()
-        state.watch_suspended = false
-        state.watch_changes = {}
-      end)
+      resume_watcher(native_branch)
       return true
     end
     --- Take one decision back. True when popped, false when refused (and said
     --- so), nil when there was none.
-    local function pop_decision()
+    local function pop_decision(native_branch)
       local top = state.decisions[#state.decisions]
       if top == nil then
         local pool = turn_pool()
@@ -217,10 +223,24 @@ function Factory.new(deps)
         -- Suspension does NOT stop the ledger moving spans: `record_buffer_change`
         -- runs before the `watch_suspended` gate. It mutes interpretation and
         -- paint; this replay must not apply the same physical delta again.
+        -- `cx` restores every hunk in ONE native sequence: entries that joined it
+        -- (pre == post) undo nothing alone, and a later pop's `:undo` would move
+        -- the bytes under this span. Undo the whole sequence now, so the span is
+        -- read from the anchor Neovim moved.
+        local seq = top.pre_seq
+        if top.post_seq == seq then
+          for i = #state.decisions - 1, 1, -1 do
+            local d = state.decisions[i]
+            if d.action ~= "reject" or d.post_seq ~= top.post_seq or d.pre_seq == nil then
+              break
+            end
+            seq = math.min(seq, d.pre_seq)
+          end
+        end
         state.watch_suspended = true
         local ok = pcall(M._rewind_suppress, function()
           vim.api.nvim_buf_call(bufnr, function()
-            vim.cmd("silent undo " .. tonumber(top.pre_seq))
+            vim.cmd("silent undo " .. tonumber(seq))
           end)
         end)
         if not ok then
@@ -343,6 +363,7 @@ function Factory.new(deps)
         state.staged_text = snap
         state.latest_undo_seq = buf_undo_seq(bufnr)
       end
+      if top.action == "reject" and top.pre_seq ~= top.post_seq then state.hunk_ledger:observe_buffer_seq(top.pre_seq) end
       -- This site asks for the ONE coalesced repaint instead of calling the painter
       -- itself.
       state.hunk_ledger:request_paint()
@@ -350,10 +371,7 @@ function Factory.new(deps)
         state._flush_paint("undo_decision")
       end
       M._emit_review_settled(bufnr, change.turn_id or change.turn_gen, "undo_decision")
-      vim.schedule(function()
-        state.watch_suspended = false
-        state.watch_changes = {}
-      end)
+      resume_watcher(native_branch)
       return true
     end
 

@@ -158,7 +158,7 @@ function Factory.new(env)
     })
 
     --- `<C-r>` inside an open review.
-    local function redo_key()
+    local function redo_key(native_branch)
       local ready, reason = require("yana.review_watch").finalize(bufnr, state)
       if not ready then undo_refuse("could not finish pending edit: " .. tostring(reason)); return false end
       -- LIFO: `U`'s last act was the turn sweep, so redo owes its removals first.
@@ -180,7 +180,7 @@ function Factory.new(env)
       local live_turn = change.turn_id or change.turn_gen
       local peeked = register:peek_forward()
       if peeked ~= nil and peeked.turn_id == live_turn and peeked.kind == "buffer_edit" then
-        return spend_buffer_edit(register, peeked, "redo")
+        return spend_buffer_edit(register, peeked, "redo", native_branch)
       end
       if peeked ~= nil and peeked.turn_id == live_turn and peeked.kind == "followup_cycle" then
         return spend_publication(register, peeked, "redo")
@@ -230,13 +230,14 @@ function Factory.new(env)
       if peeked ~= nil and peeked.turn_id == live_turn then
         local target_state = resolve_target(peeked.rel)
         if target_state then
-          local ok
+          local ok, why
           if peeked.kind == "decision" then
-            ok = decision.forward(peeked, target_state)
+            ok, why = decision.forward(peeked, target_state, native_branch)
           else
             undo_refuse("unknown undo action kind: " .. tostring(peeked.kind))
             return false
           end
+          if ok ~= true then undo_refuse("could not redo that decision -- " .. tostring(why)) end
           if ok == true and register:peek_forward() == peeked then register:walk_forward() end
           return ok
         end
@@ -268,7 +269,7 @@ function Factory.new(env)
     --- Exhaustion is NOT bare `walk_back()==nil` (ADJUDICATED 28/correction 1-2): a row
     --- belonging to a FOREIGN turn is nothing for THIS turn too, since its payload died
     --- with the state object that pushed it.
-    local function undo_key()
+    local function undo_key(native_branch)
       local ready, reason = require("yana.review_watch").finalize(bufnr, state)
       if not ready then undo_refuse("could not finish pending edit: " .. tostring(reason)); return false end
       local workspace = change.review_workspace or (state.opts and state.opts.workspace) or vim.fn.getcwd()
@@ -304,7 +305,7 @@ function Factory.new(env)
         return true
       end
       if peeked.kind == "buffer_edit" then
-        return spend_buffer_edit(register, peeked, "undo")
+        return spend_buffer_edit(register, peeked, "undo", native_branch)
       end
       if peeked.kind == "followup_cycle" then
         return spend_publication(register, peeked, "undo")
@@ -314,19 +315,35 @@ function Factory.new(env)
         undo_refuse("could not reach " .. tostring(peeked.rel) .. " to undo -- " .. tostring(err))
         return false
       end
-      local ok
+      local ok, why
       if peeked.kind == "decision" then
-        ok = decision.reverse(peeked, target_state)
+        ok, why = decision.reverse(peeked, target_state, native_branch)
       else
         undo_refuse("unknown undo action kind: " .. tostring(peeked.kind))
         return false
       end
+      if ok ~= true then undo_refuse("could not undo that decision -- " .. tostring(why)) end
       if ok == true and register:peek_back() == peeked then register:walk_back() end
       return ok
     end
 
-  keys.undo, keys.redo = undo_key, redo_key
-  return { undo_key = undo_key, redo_key = redo_key }
+  local function retain_run(door)
+    return function(...)
+      local moved = door(...)
+      if moved == true then
+        local turn = require("yana.turn.turn_bind").get()
+        local cycles = turn and turn:cycles()
+        if cycles and cycles.state == "running" then
+          local run = cycles.runs[#cycles.runs]
+          if run then cycles:retain(run, run.register) end
+        end
+      end
+      return moved
+    end
+  end
+
+  keys.undo, keys.redo = retain_run(undo_key), retain_run(redo_key)
+  return { undo_key = keys.undo, redo_key = keys.redo }
 end
 
 return Factory

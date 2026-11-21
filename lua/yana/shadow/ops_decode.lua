@@ -5,6 +5,7 @@ local M = {}
 local EXPECTED_PRODUCER = "yana-changeset-v1"
 
 local control_plane = require("yana.safety.control_plane")
+local git_shield = require("yana.shadow.git_shield")
 local repo_root = require("yana.paths.repo_root")
 
 local function changeset_bin()
@@ -46,8 +47,9 @@ function M.decode(data)
 end
 
 --- Run the producer over one turn's upper layer.
---- Returns a list of records, each `{ kind, rel, extra... }`.
-function M.read_records(workspace, upper)
+--- Returns a list of records, each `{ kind, rel, extra... }`. `open_git_rel` is the `.git`
+--- folder open in Neovim relative to `workspace` (CAPTURE.md OC-GIT), or nil.
+function M.read_records(workspace, upper, open_git_rel)
 	local bin = changeset_bin()
 	if vim.fn.filereadable(bin) ~= 1 then
 		return nil, "yana-changeset not found at " .. bin
@@ -58,15 +60,11 @@ function M.read_records(workspace, upper)
 		return nil, "no overlay upper layer at " .. tostring(upper)
 	end
 	local meta_out = vim.fn.fnamemodify(upper, ":h") .. "/changeset.meta"
-	local result = vim.system({
-		bin,
-		"--workspace",
-		workspace,
-		"--upper",
-		upper,
-		"--meta-out",
-		meta_out,
-	}, { text = false }):wait()
+	local argv = { bin, "--workspace", workspace, "--upper", upper, "--meta-out", meta_out }
+	if open_git_rel then
+		vim.list_extend(argv, { "--open-git", open_git_rel })
+	end
+	local result = vim.system(argv, { text = false }):wait()
 	if result.code ~= 0 then
 		local err = (result.stderr or "")
 		if type(err) ~= "string" then
@@ -176,8 +174,8 @@ local PAIRED_REFUSAL_REASON = "part of a paired filesystem change (file-type "
 	.. "offered as an independent review decision"
 
 --- Turn decoded records into typed operations with absolute paths.
-function M.typed_ops(workspace, upper)
-	local records, err = M.read_records(workspace, upper)
+function M.typed_ops(workspace, upper, open_git_rel)
+	local records, err = M.read_records(workspace, upper, open_git_rel)
 	if not records then
 		return nil, err
 	end
@@ -191,7 +189,8 @@ function M.typed_ops(workspace, upper)
 	local ws_bare = control_plane.workspace_is_bare(workspace)
 	for _, rec in ipairs(records) do
 		local kind, rel = rec[1], rec[2]
-		if kind and rel and (control_plane.is_control_plane(rel) or (ws_bare and control_plane.is_bare_entry(rel))) then
+		local open_git = open_git_rel and vim.fs.relpath(open_git_rel, rel) ~= nil
+		if kind and rel and not open_git and (control_plane.is_control_plane(rel) or (ws_bare and control_plane.is_bare_entry(rel))) then
 			-- Control-plane refusal at the consumer, INDEPENDENT of the producer (defense in
 			-- depth). Even a forged or older producer that emitted `create file .git/objects/…`
 			-- cannot make it reviewable: the kind is forced to the non-content `control-plane`,
@@ -373,17 +372,24 @@ end
 --- identical code with identical results.
 local function walks_for_session(session)
 	local walks = {}
-	for _, root in ipairs(M.session_roots(session)) do
+	local open_git = git_shield.open_git(session)
+	local roots = M.session_roots(session)
+	-- Repository groups number after every capture root, so no two groups share an index.
+	local next_index = #roots + 1
+	for _, root in ipairs(roots) do
 		local upper = root_upper(root)
 		if not upper then
 			return nil, "turn has no overlay upper layer"
 		end
 		local base = walk_base(session, root)
-		local typed, err = M.typed_ops(base, upper)
+		-- CAPTURE.md OC-GIT: the open `.git` folder is a group of its own, so every later
+		-- check, measured from the group, sees its paths without a `.git` segment.
+		local open_git_rel = open_git and open_git:sub(1, #base + 1) == base .. "/" and open_git:sub(#base + 2) or nil
+		local typed, err = M.typed_ops(base, upper, open_git_rel)
 		if not typed then
 			return nil, err or "reading the change set failed"
 		end
-		if base == root.workspace then
+		if base == root.workspace and not open_git_rel then
 			-- Unchanged shape: one group, the root exactly as it was built.
 			for _, op in ipairs(typed) do
 				op.upper_rel = op.rel
@@ -403,7 +409,8 @@ local function walks_for_session(session)
 		else
 			local groups, order = {}, {}
 			for _, op in ipairs(typed) do
-				local repo = repo_root_for(op.path, base, root.workspace)
+				local repo = open_git_rel and vim.fs.relpath(open_git, op.path) and open_git
+					or repo_root_for(op.path, base, root.workspace)
 				local bucket = groups[repo]
 				if not bucket then
 					bucket = {}
@@ -422,14 +429,13 @@ local function walks_for_session(session)
 				bucket[#bucket + 1] = op
 			end
 			table.sort(order)
-			-- The turn's own workspace is always index 1 when it was touched, so
-			-- every change id a single-repository turn has ever minted is
-			-- unchanged; the other repositories take 2..N in path order.
+			-- The root's own workspace keeps the root's index (1 for the turn's), so every
+			-- change id a single-repository turn has ever minted is unchanged; the other
+			-- repositories take the indices after every capture root, in path order.
 			local indexed = {}
-			local next_index = 2
 			for _, repo in ipairs(order) do
 				if repo == root.workspace then
-					indexed[repo] = 1
+					indexed[repo] = root.index or 1
 				else
 					indexed[repo] = next_index
 					next_index = next_index + 1
@@ -454,7 +460,7 @@ local function walks_for_session(session)
 				walks[#walks + 1] = {
 					root = {
 						index = indexed[repo],
-						primary = repo == root.workspace,
+						primary = repo == root.workspace and root.primary,
 						workspace = repo,
 						upper_prefix = prefix,
 					},

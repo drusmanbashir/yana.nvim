@@ -253,7 +253,7 @@ function M.observe_open(pool, file_entry, hooks)
 		local attached, attach_err = t:attach_review(file.path, file_entry.review_state)
 		assert(attached, attach_err)
 	end
-	-- A creation's buffer: observe the operator's own saves (bookkeeping only, N51).
+	-- A creation's buffer: observe the operator's own saves (bookkeeping only).
 	if require("yana.turn.turn_settle_snapshot").creation(file, file.change or {}) then
 		require("yana.turn.turn_save_record").watch(file.path, file.bufnr, t)
 	end
@@ -303,9 +303,15 @@ function M.get(pool)
 	return nil
 end
 
+-- True when `path` is the live Turn's only member: withdrawing it empties the Turn.
+function M.sole_member(path)
+	return current ~= nil and current:is_live() and #current.files == 1 and current:file(path) ~= nil
+end
+
 -- Intake binds a file before its buffer opens. A terminal refusal must undo
 -- that pre-bind so an empty singleton cannot block or contaminate the next review.
-function M.withdraw_unopened(path)
+-- The withdrawal that empties the Turn retires it with `opts.cause`.
+function M.withdraw_unopened(path, opts)
 	if not (current and current:is_live()) then
 		return true
 	end
@@ -320,7 +326,7 @@ function M.withdraw_unopened(path)
 		current_overlay:remove_file(path)
 	end
 	if empty_or_err then
-		return current:retire_empty("review_open_refused")
+		return current:retire_empty(opts and opts.cause or "review_open_refused")
 	end
 	return true
 end
@@ -346,7 +352,7 @@ function M.closing_refused(door)
 		return false
 	end
 	require("yana.turn.turn_cycle_log").door_refused((door:lower():gsub("%-", "_")), state)
-	-- INFO: ruled behaviour, not an actionable problem (2026-09-27 logging ruling).
+	-- INFO: expected behaviour, not an actionable problem.
 	require("yana.notify").one_line("yana: " .. door .. " refused -- follow-up is running", vim.log.levels.INFO)
 	return true
 end
@@ -400,11 +406,32 @@ end
 -- Abort routes through the same end steps.
 --- The `cR` control. It has its own source: an Abort is not the last hunk
 --- being decided, and a result that says `last_hunk` for it is a lie about
---- what the operator did.
-function M.abort(pool, owner)
+--- what the operator did. `opts` lets another control (the agentic-switch
+--- dialog) name itself, carry its own confirmation and hear the one result,
+--- including a refusal decided here, before any End.
+function M.abort(pool, owner, opts)
+	opts = opts or {}
 	local t = M.get(pool)
 	if t and not M.closing_refused("Abort") then
-		return t:end_turn("abort", { source = "abort_control", owner = owner })
+		return t:end_turn("abort", { source = opts.source or "abort_control", owner = owner,
+			confirmed = opts.confirmed, on_result = opts.on_result })
+	end
+	if opts.on_result then
+		opts.on_result({ status = "refused", reason = t and "a follow-up is running" or "no review is open" })
+	end
+	return false
+end
+
+-- F-MODES-OPEN-REVIEW: the live Turn is this conversation's review when one of its
+-- members came from that conversation's turn, whether or not anything is pending.
+function M.owned_by(turn_id)
+	if turn_id == nil or not (current and current:is_live()) then
+		return false
+	end
+	for _, f in ipairs(current.files) do
+		if f.change ~= nil and tostring(f.change.turn_id) == tostring(turn_id) then
+			return true
+		end
 	end
 	return false
 end

@@ -27,13 +27,14 @@ forbidden_bytes_allowed_path() {
 	case $1 in
 	# Keep private development, diagnostic capture and operator configuration out
 	# even if a manifest edit names them.
+	# lua/yana/development/ holds personal helpers and never enters release.
 	*/"$agents_name" | "$agents_name" | "$spec_dir"/* | "$specs_dir"/* \
 		| */"$spec_dir"/* | */"$specs_dir"/* \
-		| "$handoff_dir"/* | "$handoffs_dir"/* | notes/* | mcpyana/* | .agent/* | */.agent/* \
+		| "$handoff_dir"/* | "$handoffs_dir"/* | notes/* | .agent/* | */.agent/* \
 		| .claude/* | */.claude/* | worktrees/* | */worktrees/* \
 		| evidence/* | .evidence/* | out/* \
 		| lua/yana/"$agents_name" | lua/yana/debug_buffer_states.lua \
-		| lua/yana/debug_buffer_states_bundle.lua | lua/yana/config_development.lua \
+		| lua/yana/debug_buffer_states_bundle.lua | lua/yana/config_development.lua | lua/yana/development/* \
 		| nvim/lua/user/yana.lua \
 		| tools/buffer-snapshot-triple.sh | prompt.txt \
 		| .github/workflows/tests.yml | bin/yana-ollama-agent | bin/yana-release \
@@ -62,7 +63,8 @@ forbidden_bytes_allowed_path() {
 	bin/yana-[a-z]*) return 0 ;;
 	bin/yanad) return 0 ;;
 	bin/lib/yanad/*.py) return 0 ;;
-	bin/lib/yana-overlay/*.sh) return 0 ;;
+	bin/lib/yana-overlay/*.sh | bin/lib/yana-confine/*.sh) return 0 ;;
+	mcpyana/__init__.py | mcpyana/__main__.py | mcpyana/mcp_server.py | mcpyana/read_paths.py | mcpyana/read_tools.py) return 0 ;;
 	scripts/install-deps.sh | scripts/release/*) return 0 ;;
 	tests/release/*) return 0 ;;
 	tests/headless/lib/hunks.lua) return 0 ;;
