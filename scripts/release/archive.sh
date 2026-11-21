@@ -24,7 +24,7 @@ trap 'rm -f "$list" "$tarball"' EXIT
 mkdir -p "$out"
 (
 	cd "$tree"
-	printf '%s\n' LICENSE NOTICE README.md CHANGELOG.md VERSION scripts/install-deps.sh
+	printf '%s\n' LICENSE NOTICE README.md CHANGELOG.md VERSION
 	find assets doc docs lua plugin bin mcpyana -type f -print
 ) | LC_ALL=C sort -u >"$list"
 
@@ -43,8 +43,8 @@ done < <(grep -E '\.md$' "$list")
 # export and build would ship silently (both comparison builds see the same
 # drifted mode). Enforce the Git mode shape while tolerating the checkout
 # umask's group-write bit, which tar normalizes away below. Executable
-# classes: bin launchers (bin/yana-*, bin/yanad), the optional dependency
-# installer. The sourced confinement helpers and Python modules are non-executable.
+# classes: bin launchers (bin/yana-*, bin/yanad). The sourced confinement helpers
+# and Python modules are non-executable.
 while IFS= read -r member; do
 	mode=$(stat -c %a "$tree/$member")
 	case $member in
@@ -56,7 +56,7 @@ while IFS= read -r member; do
 		[[ "$mode" == 644 || "$mode" == 664 ]] \
 			|| { echo "archive: $member must be mode 644, found $mode" >&2; exit 1; }
 		;;
-	bin/* | scripts/install-deps.sh)
+	bin/*)
 		[[ "$mode" == 755 || "$mode" == 775 ]] \
 			|| { echo "archive: $member must be mode 755, found $mode" >&2; exit 1; }
 		;;

@@ -284,7 +284,6 @@ mcpyana/mcp_server.py
 mcpyana/read_paths.py
 mcpyana/read_tools.py
 plugin/yana.lua
-scripts/install-deps.sh
 scripts/release/archive.sh
 scripts/release/candidate.sh
 scripts/release/export.sh

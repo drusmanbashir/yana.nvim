@@ -33,14 +33,6 @@ Use Claude Code (`claude`), Codex (`codex`) or Grok (`grok`) for all three
 modes. Cursor (`cursor-agent`) supports `agentic`. Set `backends.default`
 to your agent and run `:YanaLogin` after setup to sign in.
 
-The optional [dependency installer](scripts/install-deps.sh) checks the
-prerequisites and asks before installing missing system packages.
-
-```sh
-curl -fsSLO https://raw.githubusercontent.com/drusmanbashir/yana.nvim/main/scripts/install-deps.sh
-bash install-deps.sh
-```
-
 For an agentic-only setup, including on macOS, set `modes = { "agentic" }`.
 See the [full installation guide](docs/installation.md).
 

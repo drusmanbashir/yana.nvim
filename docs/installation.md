@@ -52,10 +52,8 @@ model unless you set one in its `backends` entry.
 
 ## System requirements
 
-For a new setup, install the pieces you do not already have with the commands
-below or the optional `scripts/install-deps.sh`. If Neovim and your agent
-CLI already work, skip their installation sections. Confined `ask` and `inline`
-use the Linux launcher and MCP tools listed here.
+Use the commands below to install missing prerequisites. On Linux, `ask` and
+`inline` use the launcher and MCP tools listed here.
 
 **Get Neovim 0.11.2+ first.** `apt` on Ubuntu 24.04 and older installs an
 older Neovim (0.9.5 on a stock Ubuntu 24.04 image, verified) with no warning
